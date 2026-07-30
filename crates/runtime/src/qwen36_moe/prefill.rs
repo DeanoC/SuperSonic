@@ -920,7 +920,7 @@ fn run_prefill_token(
     ))
 }
 
-fn lookup_embed_row(
+pub(crate) fn lookup_embed_row(
     store: &BakedStore,
     weight_prefix: &str,
     token_id: usize,

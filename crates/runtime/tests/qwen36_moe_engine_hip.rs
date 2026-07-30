@@ -9,6 +9,15 @@ use supersonic_runtime::qwen36_moe_config::{
     Qwen36KvVmmMode, Qwen36MoeRuntimeConfig, Qwen36MoeRuntimeConfigInputs,
 };
 
+fn greedy_token(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index as u32)
+        .expect("serving logits must be non-empty")
+}
+
 #[test]
 fn load_and_reset_preserve_resident_model() -> anyhow::Result<()> {
     let flm_path = PathBuf::from(
@@ -147,6 +156,56 @@ fn load_and_reset_preserve_resident_model() -> anyhow::Result<()> {
         }),
         "{:?}",
         reset_profile.entries
+    );
+
+    let prompt = engine
+        .tokenizer()
+        .encode("Hello from Sofia", false)
+        .map_err(|error| anyhow::anyhow!("encode lifecycle prompt: {error}"))?
+        .get_ids()
+        .to_vec();
+    assert!(!prompt.is_empty());
+    let serving_load_sequence = engine.load_evidence().load_sequence;
+    let serving_resident_pointers = after.resident_allocation_pointers.clone();
+
+    let first_prefill_logits = engine.prefill(&prompt)?;
+    assert_eq!(first_prefill_logits.len(), 248_320);
+    let mut generated_ids = vec![greedy_token(&first_prefill_logits)];
+    let decode_logits = engine.decode_step(generated_ids[0], prompt.len())?;
+    assert_eq!(decode_logits.len(), 248_320);
+    generated_ids.push(greedy_token(&decode_logits));
+    assert!(!generated_ids.is_empty());
+    assert_eq!(
+        engine.test_only_reset_snapshot()?.next_position,
+        Some(prompt.len() + 1)
+    );
+
+    engine.reset()?;
+    assert_eq!(
+        engine.test_only_reset_snapshot()?.next_position,
+        None,
+        "reset must return the engine to prefill-ready state"
+    );
+    let repeated_prefill_logits = engine.prefill(&prompt)?;
+    assert_eq!(repeated_prefill_logits.len(), first_prefill_logits.len());
+    for (index, (first, repeated)) in first_prefill_logits
+        .iter()
+        .zip(&repeated_prefill_logits)
+        .enumerate()
+    {
+        assert_eq!(
+            repeated.to_bits(),
+            first.to_bits(),
+            "repeat-prefill logit {index} changed across reset/reuse"
+        );
+    }
+
+    let reused = engine.test_only_reset_snapshot()?;
+    assert_eq!(engine.load_evidence().load_sequence, serving_load_sequence);
+    assert_eq!(reused.source_open_count, evidence.source_open_count);
+    assert_eq!(
+        reused.resident_allocation_pointers,
+        serving_resident_pointers
     );
     Ok(())
 }

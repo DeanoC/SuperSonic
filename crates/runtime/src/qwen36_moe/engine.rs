@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,24 +15,31 @@ use tokenizers::Tokenizer;
 
 use crate::chat_template::ChatTemplate;
 use crate::flm_model_source::FlmModelSourceOptions;
+use crate::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep, Qwen36ChainStepOutput};
+use crate::qwen36_moe::decode::Qwen36ExecutionOptions;
 use crate::qwen36_moe::geometry::build_multi_layer_geom;
 use crate::qwen36_moe::layer_loader::{
     load_qwen36_layers, Qwen36LayerLoadStrategy, Qwen36LoadOptions,
     Qwen36WeightMode as LayerWeightMode, SparseExpertLoadOptions,
 };
 use crate::qwen36_moe::layers::LoadedQwen36Layers;
+use crate::qwen36_moe::lm_head::{
+    bf16_bytes_to_f32, launch_lm_head_from_final_hidden_bytes, LmHeadBuffers,
+};
 use crate::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;
 use crate::qwen36_moe::persistent_decode::{
-    build_int4_descs, build_kv_fp8_descs, build_layer_descs,
+    build_int4_descs, build_kv_fp8_descs, build_layer_descs, LmHeadFold,
 };
+use crate::qwen36_moe::prefetch::handle_moe_expert_prefetch;
+use crate::qwen36_moe::prefill::{lookup_embed_row, run_batched_prefill, PrefillTokenTimings};
 use crate::qwen36_moe::route_telemetry::{MoeRouteTelemetry, MoeTransitionPredictor};
 use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver, Qwen36WeightMode};
 use crate::qwen36_moe::types::{
-    AttnLayerBuffers, ExpertRoute, FullAttnKvCache, LayerBuffers, MultiLayerGeom,
+    AttnLayerBuffers, ExpertRoute, FullAttnKvCache, LayerBuffers, MultiLayerGeom, PositionPair,
 };
 use crate::qwen36_moe::weights::{load_to_gpu, prepare_lm_head_bf16};
 use crate::qwen36_moe_config::{
-    should_try_moe_expert_vmm, should_use_qwen36_kv_vmm, MoeExpertVmmMode,
+    should_try_moe_expert_vmm, should_use_qwen36_kv_vmm, MoeExpertVmmMode, Qwen36MoeRuntimeConfig,
 };
 
 pub use crate::qwen36_moe::source::Qwen36MoeDirectProfile;
@@ -159,6 +166,70 @@ fn build_load_evidence(
     })
 }
 
+#[derive(Default)]
+struct Qwen36SessionPosition {
+    next: Option<usize>,
+}
+
+impl Qwen36SessionPosition {
+    fn validate_prefill(&self, prompt_len: usize, max_context_len: usize) -> Result<()> {
+        if prompt_len == 0 {
+            anyhow::bail!("Qwen3.6 prefill rejects an empty prompt");
+        }
+        if prompt_len > max_context_len {
+            anyhow::bail!(
+                "Qwen3.6 prefill prompt length {prompt_len} exceeds context {max_context_len}"
+            );
+        }
+        if let Some(next) = self.next {
+            anyhow::bail!(
+                "Qwen3.6 prefill requires reset before starting a new request; \
+                 current next absolute position is {next}"
+            );
+        }
+        Ok(())
+    }
+
+    fn prefill_succeeded(&mut self, prompt_len: usize) {
+        self.next = Some(prompt_len);
+    }
+
+    fn validate_decode(&self, absolute_pos: usize, max_context_len: usize) -> Result<()> {
+        let expected = self
+            .next
+            .ok_or_else(|| anyhow!("Qwen3.6 decode_step called before prefill"))?;
+        if absolute_pos != expected {
+            anyhow::bail!(
+                "Qwen3.6 decode_step expected absolute position {expected}, got {absolute_pos}"
+            );
+        }
+        if absolute_pos >= max_context_len {
+            anyhow::bail!(
+                "Qwen3.6 decode_step absolute position {absolute_pos} exceeds context \
+                 {max_context_len}"
+            );
+        }
+        Ok(())
+    }
+
+    fn decode_succeeded(&mut self, absolute_pos: usize) -> Result<()> {
+        self.next = Some(
+            absolute_pos
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("Qwen3.6 decode_step absolute position overflow"))?,
+        );
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.next = None;
+    }
+
+    fn next(&self) -> Option<usize> {
+        self.next
+    }
+}
+
 #[allow(dead_code)]
 pub struct Qwen36MoeEngine {
     source: Qwen36MoeSource,
@@ -175,7 +246,7 @@ pub struct Qwen36MoeEngine {
     counter: GpuBuffer,
     final_hidden: GpuBuffer,
     route_state: Qwen36MoeRouteState,
-    next_position: Option<usize>,
+    session_position: Qwen36SessionPosition,
     source_open_observer: Qwen36MoeSourceOpenObserver,
     load_evidence: Qwen36MoeLoadEvidence,
     backend: Backend,
@@ -187,24 +258,42 @@ struct Qwen36MoeRouteState {
     num_layers: usize,
     top_k: usize,
     sparse: bool,
-    transition_min_observations: u32,
+    policy: Qwen36MoeRuntimeConfig,
     previous_topk_by_layer: Vec<Vec<usize>>,
     telemetry: Option<MoeRouteTelemetry>,
     predictors: Option<Vec<MoeTransitionPredictor>>,
+    hot_expert_counts: Option<Vec<HashMap<usize, u32>>>,
 }
 
 impl Qwen36MoeRouteState {
+    #[cfg(test)]
     fn new(
         top_k: usize,
         num_layers: usize,
         sparse: bool,
         transition_min_observations: u32,
     ) -> Self {
+        let mut policy = Qwen36MoeRuntimeConfig {
+            sparse_requested: sparse,
+            transition_min_observations,
+            ..Qwen36MoeRuntimeConfig::default()
+        };
+        if !sparse {
+            policy.transition_min_observations = 0;
+        }
+        Self::with_policy(top_k, num_layers, policy)
+    }
+
+    fn with_policy(top_k: usize, num_layers: usize, policy: Qwen36MoeRuntimeConfig) -> Self {
+        let sparse = policy.sparse_requested;
+        let transition_min_observations = policy.transition_min_observations;
+        let track_hot_experts =
+            policy.hot_protect_min_hits.is_some() || policy.fixed_hot_min_hits.is_some();
         Self {
             num_layers,
             top_k,
             sparse,
-            transition_min_observations,
+            policy,
             previous_topk_by_layer: vec![Vec::new(); num_layers],
             telemetry: sparse.then(|| MoeRouteTelemetry::new(top_k)),
             predictors: (sparse && transition_min_observations > 0).then(|| {
@@ -212,6 +301,8 @@ impl Qwen36MoeRouteState {
                     .map(|_| MoeTransitionPredictor::new(top_k, transition_min_observations))
                     .collect()
             }),
+            hot_expert_counts: (sparse && track_hot_experts)
+                .then(|| vec![HashMap::new(); num_layers]),
         }
     }
 
@@ -220,11 +311,96 @@ impl Qwen36MoeRouteState {
             routes.clear();
         }
         self.telemetry = self.sparse.then(|| MoeRouteTelemetry::new(self.top_k));
-        self.predictors = (self.sparse && self.transition_min_observations > 0).then(|| {
+        self.predictors = (self.sparse && self.policy.transition_min_observations > 0).then(|| {
             (0..self.num_layers)
-                .map(|_| MoeTransitionPredictor::new(self.top_k, self.transition_min_observations))
+                .map(|_| {
+                    MoeTransitionPredictor::new(self.top_k, self.policy.transition_min_observations)
+                })
                 .collect()
         });
+        if let Some(counts) = self.hot_expert_counts.as_mut() {
+            for layer in counts {
+                layer.clear();
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_step(
+        &mut self,
+        ordinal: usize,
+        geom: &MultiLayerGeom,
+        store: &model_store::BakedStore,
+        loaded_layers: &mut LoadedQwen36Layers,
+        initial_hidden: &[u8],
+        position: PositionPair,
+        step: usize,
+        fold: Option<LmHeadFold<'_>>,
+        download_final_hidden: bool,
+        execution: &Qwen36ExecutionOptions,
+    ) -> Result<Qwen36ChainStepOutput> {
+        let sparse = loaded_layers.has_sparse_expert_residency();
+        if sparse != self.sparse {
+            anyhow::bail!(
+                "Qwen3.6 route-state residency mismatch: owner sparse={sparse}, \
+                 policy sparse={}",
+                self.sparse
+            );
+        }
+        let mut next_topk_by_layer = vec![Vec::new(); self.num_layers];
+        let output = {
+            let policy = &self.policy;
+            let previous_topk_by_layer = &self.previous_topk_by_layer;
+            let telemetry = &mut self.telemetry;
+            let predictors = &mut self.predictors;
+            let hot_expert_counts = &mut self.hot_expert_counts;
+            let mut prefetch =
+                |manager: &mut crate::qwen36_moe::residency::MoeExpertResidencyManager,
+                 phase,
+                 layer_idx,
+                 routes: &[ExpertRoute]|
+                 -> Result<()> {
+                    handle_moe_expert_prefetch(
+                        manager,
+                        store,
+                        policy.prefetch_mode,
+                        policy.prefetch_ranks,
+                        policy.prefetch_evict_min_probability,
+                        policy.protect_demand_routes,
+                        policy.hot_protect_min_hits,
+                        policy.fixed_hot_min_hits,
+                        previous_topk_by_layer,
+                        &mut next_topk_by_layer,
+                        sparse,
+                        telemetry.as_mut(),
+                        predictors.as_deref_mut(),
+                        hot_expert_counts.as_deref_mut(),
+                        phase,
+                        layer_idx,
+                        routes,
+                    )
+                };
+            let expert_prefetch = sparse.then_some(
+                &mut prefetch as &mut crate::qwen36_moe::chain::ChainExpertPrefetchCallback<'_>,
+            );
+            run_chain_step(Qwen36ChainStep {
+                ordinal,
+                geom,
+                loaded_layers,
+                initial_hidden,
+                position,
+                step,
+                accurate_stage_timings: false,
+                execution,
+                fold,
+                download_final_hidden,
+                expert_prefetch,
+            })
+        }?;
+        if sparse {
+            self.previous_topk_by_layer = next_topk_by_layer;
+        }
+        Ok(output)
     }
 }
 
@@ -360,11 +536,10 @@ impl Qwen36MoeEngine {
             load_evidence.resident_allocation_pointers.len() as u64;
         load_evidence.mapped_virtual_ranges = collect_mapped_virtual_ranges(&gpu.layers);
 
-        let route_state = Qwen36MoeRouteState::new(
+        let route_state = Qwen36MoeRouteState::with_policy(
             geom.top_k as usize,
             geom.num_layers as usize,
-            config.policy.moe.sparse_requested,
-            config.policy.moe.transition_min_observations,
+            config.policy.moe.clone(),
         );
         let mut engine = Self {
             source,
@@ -381,7 +556,7 @@ impl Qwen36MoeEngine {
             counter: gpu.counter,
             final_hidden: gpu.final_hidden,
             route_state,
-            next_position: None,
+            session_position: Qwen36SessionPosition::default(),
             source_open_observer,
             load_evidence,
             backend: config.backend,
@@ -406,6 +581,144 @@ impl Qwen36MoeEngine {
 
     pub fn load_evidence(&self) -> &Qwen36MoeLoadEvidence {
         &self.load_evidence
+    }
+
+    pub fn prefill(&mut self, prompt_ids: &[u32]) -> Result<Vec<f32>> {
+        self.session_position
+            .validate_prefill(prompt_ids.len(), self.max_context_len)?;
+        let final_index = prompt_ids.len() - 1;
+        let positions = (0..final_index)
+            .map(|position| PositionPair::dense(position as i32))
+            .collect::<Vec<_>>();
+        let execution = Qwen36ExecutionOptions::default();
+
+        {
+            let ordinal = self.device_ordinal;
+            let geom = &self.geom;
+            let store = &self.source.source.store;
+            let route_state = &mut self.route_state;
+            let mut fallback = |callback_layers: &mut LoadedQwen36Layers,
+                                step: usize,
+                                token: u32,
+                                position: PositionPair|
+             -> Result<PrefillTokenTimings> {
+                let embed_start = Instant::now();
+                let initial_hidden = lookup_embed_row(
+                    store,
+                    QWEN36_35B_A3B_WEIGHT_PREFIX,
+                    token as usize,
+                    geom.hidden as usize,
+                )
+                .with_context(|| {
+                    format!("Qwen3.6 serving prefill embedding token {token} at step {step}")
+                })?;
+                let embed = embed_start.elapsed();
+                let chain_start = Instant::now();
+                route_state.run_step(
+                    ordinal,
+                    geom,
+                    store,
+                    callback_layers,
+                    &initial_hidden,
+                    position,
+                    step,
+                    None,
+                    false,
+                    &execution,
+                )?;
+                Ok(PrefillTokenTimings {
+                    embed,
+                    chain: chain_start.elapsed(),
+                })
+            };
+            run_batched_prefill(
+                ordinal,
+                geom,
+                store,
+                QWEN36_35B_A3B_WEIGHT_PREFIX,
+                &mut self.layers,
+                &prompt_ids[..final_index],
+                &positions,
+                false,
+                &execution,
+                Some(&mut fallback),
+                None,
+            )
+            .context("Qwen3.6 serving batched prefill")?;
+        }
+
+        let logits = self.run_production_step(prompt_ids[final_index], final_index, &execution)?;
+        self.session_position.prefill_succeeded(prompt_ids.len());
+        Ok(logits)
+    }
+
+    pub fn decode_step(&mut self, token_id: u32, absolute_pos: usize) -> Result<Vec<f32>> {
+        self.session_position
+            .validate_decode(absolute_pos, self.max_context_len)?;
+        let execution = Qwen36ExecutionOptions::default();
+        let logits = self.run_production_step(token_id, absolute_pos, &execution)?;
+        self.session_position.decode_succeeded(absolute_pos)?;
+        Ok(logits)
+    }
+
+    fn run_production_step(
+        &mut self,
+        token_id: u32,
+        absolute_pos: usize,
+        execution: &Qwen36ExecutionOptions,
+    ) -> Result<Vec<f32>> {
+        let initial_hidden = lookup_embed_row(
+            &self.source.source.store,
+            QWEN36_35B_A3B_WEIGHT_PREFIX,
+            token_id as usize,
+            self.geom.hidden as usize,
+        )
+        .with_context(|| {
+            format!(
+                "Qwen3.6 serving embedding token {token_id} at absolute position {absolute_pos}"
+            )
+        })?;
+        let sparse = self.layers.has_sparse_expert_residency();
+        let fold = (!sparse).then_some(LmHeadFold {
+            final_norm_w: &self.final_norm_w,
+            lm_head_w: &self.lm_head_w,
+            logits_out: Some(&mut self.logits),
+            top1_out: None,
+            vocab: self.geom.vocab,
+        });
+        let output = self.route_state.run_step(
+            self.device_ordinal,
+            &self.geom,
+            &self.source.source.store,
+            &mut self.layers,
+            &initial_hidden,
+            PositionPair::dense(absolute_pos as i32),
+            absolute_pos,
+            fold,
+            sparse,
+            execution,
+        )?;
+        let logits_bytes = if output.lm_head_folded {
+            self.logits
+                .to_host_bytes()
+                .context("download Qwen3.6 folded serving logits")?
+        } else {
+            launch_lm_head_from_final_hidden_bytes(
+                self.device_ordinal,
+                &self.geom,
+                &output.outputs.final_hidden_bytes,
+                &execution.prefill_kernel,
+                LmHeadBuffers {
+                    final_norm_w: &self.final_norm_w,
+                    lm_head_w: &self.lm_head_w,
+                    final_hidden: &mut self.final_hidden,
+                    logits: &mut self.logits,
+                    counter: &mut self.counter,
+                },
+            )
+            .context("run Qwen3.6 serving LM head")?
+        };
+        Ok(bf16_bytes_to_f32(&logits_bytes))
     }
 
     #[doc(hidden)]
@@ -513,12 +826,12 @@ impl Qwen36MoeEngine {
             }
         }
         if let Some(predictors) = self.route_state.predictors.as_mut() {
-            let observations = self.route_state.transition_min_observations.max(1);
+            let observations = self.route_state.policy.transition_min_observations.max(1);
             for _ in 0..observations {
                 predictors[0].update(&routes, &[7, 11]);
             }
         }
-        self.next_position = Some(73);
+        self.session_position.prefill_succeeded(73);
         gpu_hal::sync(self.device_ordinal).context("sync after dirty-reset hook")
     }
 
@@ -590,7 +903,7 @@ impl Qwen36MoeEngine {
             route_history_entries,
             route_observations,
             transition_candidates,
-            next_position: self.next_position,
+            next_position: self.session_position.next(),
         })
     }
 
@@ -642,7 +955,7 @@ impl Qwen36MoeEngine {
             reset_phase(phase, zero_gpu_buffer(self.device_ordinal, phase, buffer))?;
         }
         self.route_state.reset();
-        self.next_position = None;
+        self.session_position.reset();
         Ok(())
     }
 
@@ -1725,7 +2038,7 @@ mod tests {
         build_load_evidence, reset_full_attention_cache, reset_phase, run_reset_transaction,
         validate_35b_a3b_config, validate_descriptor_pointer_ownership, validate_load_contract,
         zero_gpu_buffer, zero_mapped_virtual_buffer, LoadEvidenceInput, Qwen36MoeDirectProfile,
-        Qwen36MoeEngine, Qwen36MoeLoadConfig, Qwen36MoeRouteState,
+        Qwen36MoeEngine, Qwen36MoeLoadConfig, Qwen36MoeRouteState, Qwen36SessionPosition,
     };
     use crate::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;
     use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver};
@@ -1733,6 +2046,103 @@ mod tests {
     use crate::qwen36_moe_config::{Qwen36KvVmmMode, Qwen36MoeRuntimeConfig};
 
     const MODEL_MAX_CONTEXT: usize = 262_144;
+
+    #[test]
+    fn session_prefill_rejects_an_empty_prompt() {
+        let session = Qwen36SessionPosition::default();
+
+        let err = session
+            .validate_prefill(0, 16)
+            .expect_err("empty prompt must fail");
+
+        assert!(err.to_string().contains("empty prompt"), "{err:#}");
+    }
+
+    #[test]
+    fn session_prefill_rejects_prompt_context_overflow() {
+        let session = Qwen36SessionPosition::default();
+
+        let err = session
+            .validate_prefill(17, 16)
+            .expect_err("prompt beyond context must fail");
+
+        assert!(err.to_string().contains("context"), "{err:#}");
+    }
+
+    #[test]
+    fn session_prefill_requires_a_reset_after_a_completed_request() {
+        let mut session = Qwen36SessionPosition::default();
+        session.prefill_succeeded(4);
+
+        let err = session
+            .validate_prefill(2, 16)
+            .expect_err("second prefill without reset must fail");
+
+        assert!(err.to_string().contains("reset"), "{err:#}");
+    }
+
+    #[test]
+    fn session_decode_rejects_decode_before_prefill() {
+        let session = Qwen36SessionPosition::default();
+
+        let err = session
+            .validate_decode(0, 16)
+            .expect_err("decode before prefill must fail");
+
+        assert!(err.to_string().contains("before prefill"), "{err:#}");
+    }
+
+    #[test]
+    fn session_decode_rejects_duplicate_and_skipped_absolute_positions() {
+        let mut session = Qwen36SessionPosition::default();
+        session.prefill_succeeded(4);
+
+        for pos in [3, 5] {
+            let err = session
+                .validate_decode(pos, 16)
+                .expect_err("non-next decode position must fail");
+            assert!(
+                err.to_string().contains("expected absolute position 4"),
+                "{err:#}"
+            );
+        }
+        session
+            .validate_decode(4, 16)
+            .expect("exact next position must pass");
+    }
+
+    #[test]
+    fn session_decode_rejects_context_overflow() {
+        let mut session = Qwen36SessionPosition::default();
+        session.prefill_succeeded(16);
+
+        let err = session
+            .validate_decode(16, 16)
+            .expect_err("decode beyond context must fail");
+
+        assert!(err.to_string().contains("context"), "{err:#}");
+    }
+
+    #[test]
+    fn session_reset_returns_to_prefill_ready_state() {
+        let mut session = Qwen36SessionPosition::default();
+        session.prefill_succeeded(4);
+        session
+            .validate_decode(4, 16)
+            .expect("exact decode position");
+        session.decode_succeeded(4).expect("advance session");
+
+        session.reset();
+
+        assert_eq!(session.next(), None);
+        session
+            .validate_prefill(2, 16)
+            .expect("reset session accepts prefill");
+        let err = session
+            .validate_decode(0, 16)
+            .expect_err("reset session rejects decode before prefill");
+        assert!(err.to_string().contains("before prefill"), "{err:#}");
+    }
 
     fn canonical_35b_a3b_execution_config() -> TextConfig {
         TextConfig {
@@ -2139,8 +2549,12 @@ mod tests {
     }
 
     #[test]
-    fn reset_api_is_part_of_the_engine_lifecycle() {
+    fn serving_apis_are_part_of_the_engine_lifecycle() {
         let _: fn(&mut Qwen36MoeEngine) -> anyhow::Result<()> = Qwen36MoeEngine::reset;
+        let _: fn(&mut Qwen36MoeEngine, &[u32]) -> anyhow::Result<Vec<f32>> =
+            Qwen36MoeEngine::prefill;
+        let _: fn(&mut Qwen36MoeEngine, u32, usize) -> anyhow::Result<Vec<f32>> =
+            Qwen36MoeEngine::decode_step;
     }
 
     #[test]
