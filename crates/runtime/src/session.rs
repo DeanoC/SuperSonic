@@ -288,7 +288,7 @@ pub struct DeterministicSession {
     after_reset: Option<Box<dyn FnOnce() + Send>>,
     prefill_logits: Vec<f32>,
     prefill_failure: Option<String>,
-    prefill_gpu_status: Option<(gpu_hal::Backend, i32)>,
+    prefill_gpu_status: Option<(gpu_hal::Backend, gpu_hal::BackendApi, i32)>,
     decode_logits: VecDeque<Vec<f32>>,
     after_prefill: Option<Box<dyn FnOnce() + Send>>,
     prefill_panics: bool,
@@ -347,17 +347,21 @@ impl DeterministicSession {
         self
     }
 
-    pub(crate) fn with_prefill_device_loss(mut self) -> Self {
-        self.prefill_gpu_status = Some((gpu_hal::Backend::Hip, 709));
-        self
+    pub(crate) fn with_prefill_device_loss(self) -> Self {
+        self.with_prefill_gpu_status(gpu_hal::Backend::Hip, 709)
     }
 
-    pub(crate) fn with_prefill_gpu_status(
+    pub(crate) fn with_prefill_gpu_status(self, backend: gpu_hal::Backend, status: i32) -> Self {
+        self.with_prefill_gpu_status_in(backend, gpu_hal::BackendApi::Runtime, status)
+    }
+
+    pub(crate) fn with_prefill_gpu_status_in(
         mut self,
         backend: gpu_hal::Backend,
+        api: gpu_hal::BackendApi,
         status: i32,
     ) -> Self {
-        self.prefill_gpu_status = Some((backend, status));
+        self.prefill_gpu_status = Some((backend, api, status));
         self
     }
 
@@ -429,8 +433,10 @@ impl DeterministicSession {
         if let Some(action) = self.after_prefill.take() {
             action();
         }
-        if let Some((backend, status)) = self.prefill_gpu_status.take() {
-            return Err(gpu_hal::GpuError::backend_status(backend, "test prefill", status).into());
+        if let Some((backend, api, status)) = self.prefill_gpu_status.take() {
+            return Err(
+                gpu_hal::GpuError::backend_status_in(backend, api, "test prefill", status).into(),
+            );
         }
         if let Some(failure) = self.prefill_failure.take() {
             return Err(anyhow!(failure));

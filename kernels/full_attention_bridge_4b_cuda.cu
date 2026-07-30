@@ -16,6 +16,16 @@ static inline cudaError_t supersonic_cuda_malloc(void** ptr, size_t size) { retu
 #include <limits>
 #include <stdint.h>
 
+extern "C" int supersonic_prefill_encode_bridge_status(
+    int project_status,
+    int native_status);
+
+extern "C" int supersonic_qwen35_4b_bf16_matmul_bridge_status(
+    int project_status,
+    int native_status) {
+    return supersonic_prefill_encode_bridge_status(project_status, native_status);
+}
+
 namespace {
 
 int prefill_backend_failure(int project_status, cudaError_t native_status) {
@@ -3677,7 +3687,13 @@ int matmul_rhs_transposed_bf16_cublas_device(
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) return 274;
-    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 275;
+    if (sync_each_kernel_enabled()) {
+        const cudaError_t sync_status = cudaDeviceSynchronize();
+        if (sync_status != cudaSuccess) {
+            return supersonic_qwen35_4b_bf16_matmul_bridge_status(
+                275, static_cast<int>(sync_status));
+        }
+    }
     return 0;
 }
 

@@ -5,6 +5,16 @@
 #include <mutex>
 #include <stdint.h>
 
+extern "C" int supersonic_prefill_encode_bridge_status(
+    int project_status,
+    int native_status);
+
+extern "C" int supersonic_qwen35_4b_bf16_matmul_bridge_status(
+    int project_status,
+    int native_status) {
+    return supersonic_prefill_encode_bridge_status(project_status, native_status);
+}
+
 namespace {
 
 // Per-model launch preset, set once at startup by the Rust registry via
@@ -3741,8 +3751,14 @@ static int matmul_rhs_transposed_tiled_wmma_bf16_device(
         static_cast<hip_bfloat16*>(out));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = maybe_sync();
-    if (launch_err != hipSuccess) return 280;
-    if (sync_err != hipSuccess) return 281;
+    if (launch_err != hipSuccess) {
+        return supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            280, static_cast<int>(launch_err));
+    }
+    if (sync_err != hipSuccess) {
+        return supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            281, static_cast<int>(sync_err));
+    }
     return 0;
 }
 
@@ -3792,8 +3808,14 @@ static int matmul_rhs_transposed_wmma_small_m_bf16_device(
     }
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = maybe_sync();
-    if (launch_err != hipSuccess) return 282;
-    if (sync_err != hipSuccess) return 283;
+    if (launch_err != hipSuccess) {
+        return supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            282, static_cast<int>(launch_err));
+    }
+    if (sync_err != hipSuccess) {
+        return supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            283, static_cast<int>(sync_err));
+    }
     return 0;
 }
 

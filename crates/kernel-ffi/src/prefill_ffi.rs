@@ -1044,6 +1044,11 @@ mod typed_bridge_status_tests {
             project_status: c_int,
             native_status: c_int,
         ) -> c_int;
+
+        fn supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            project_status: c_int,
+            native_status: c_int,
+        ) -> c_int;
     }
 
     fn encoded_status(project_status: i32, native_status: i32) -> i32 {
@@ -1085,6 +1090,53 @@ mod typed_bridge_status_tests {
                 backend: Backend::Hip,
                 ref message,
             } if message == "rms_norm_rows failed with project status 340"
+        ));
+    }
+
+    #[test]
+    fn bf16_matmul_production_branch_status_preserves_native_and_project_failures() {
+        let branch_status = |project_status, native_status| unsafe {
+            supersonic_qwen35_4b_bf16_matmul_bridge_status(project_status, native_status)
+        };
+
+        let device_lost = prefill_bridge_result(
+            Backend::Hip,
+            "matmul_rhs_transposed",
+            branch_status(280, 709),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            device_lost,
+            GpuError::DeviceLost {
+                backend: Backend::Hip,
+                api: gpu_hal::BackendApi::Runtime,
+                ref operation,
+                status: 709,
+            } if operation == "matmul_rhs_transposed"
+        ));
+
+        let ordinary =
+            prefill_bridge_result(Backend::Hip, "matmul_rhs_transposed", branch_status(275, 1))
+                .unwrap_err();
+        assert!(matches!(
+            ordinary,
+            GpuError::BackendStatus {
+                backend: Backend::Hip,
+                api: gpu_hal::BackendApi::Runtime,
+                ref operation,
+                status: 1,
+            } if operation == "matmul_rhs_transposed"
+        ));
+
+        let project =
+            prefill_bridge_result(Backend::Hip, "matmul_rhs_transposed", branch_status(272, 0))
+                .unwrap_err();
+        assert!(matches!(
+            project,
+            GpuError::Backend {
+                backend: Backend::Hip,
+                ref message,
+            } if message == "matmul_rhs_transposed failed with project status 272"
         ));
     }
 }

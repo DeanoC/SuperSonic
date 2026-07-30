@@ -1369,6 +1369,32 @@ mod tests {
     }
 
     #[test]
+    fn additional_cuda_fatal_statuses_poison_readiness_in_their_api_domain() {
+        for (api, status) in [
+            (gpu_hal::BackendApi::Runtime, 226),
+            (gpu_hal::BackendApi::Runtime, 721),
+            (gpu_hal::BackendApi::Runtime, 810),
+            (gpu_hal::BackendApi::Driver, 810),
+        ] {
+            let (backend, _) =
+                DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+            let state = test_state(InferenceSession::test_qwen36_adapter(
+                backend.with_prefill_gpu_status_in(gpu_hal::Backend::Cuda, api, status),
+            ));
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            run(state.clone(), vec![1], params(1), None, tx).unwrap_err();
+            assert!(
+                !state.is_ready(),
+                "CUDA {api:?} status {status} must poison readiness"
+            );
+
+            let (tx, _rx) = mpsc::unbounded_channel();
+            assert!(run(state, vec![1], params(1), None, tx).is_err());
+        }
+    }
+
+    #[test]
     fn cancellation_cleanup_reset_failure_loses_integrity() {
         let (tx, rx) = mpsc::unbounded_channel();
         let (backend, events) =

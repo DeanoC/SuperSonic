@@ -113,10 +113,16 @@ fn is_device_loss_status(backend: Backend, api: BackendApi, status: i32) -> bool
         Backend::Hip => status == 709,
         Backend::Cuda => match api {
             BackendApi::Runtime => {
-                matches!(status, 700 | 702 | 709 | 710 | 714..=719 | 911)
+                matches!(
+                    status,
+                    226 | 700 | 702 | 709 | 710 | 714..=719 | 721 | 810 | 911
+                )
             }
             BackendApi::Driver => {
-                matches!(status, 226 | 700 | 702 | 709 | 710 | 714..=719 | 721 | 911)
+                matches!(
+                    status,
+                    226 | 700 | 702 | 709 | 710 | 714..=719 | 721 | 810 | 911
+                )
             }
         },
         Backend::Metal => false,
@@ -188,18 +194,24 @@ mod tests {
 
     #[test]
     fn cuda_fatal_statuses_are_integrity_loss_in_their_native_domain() {
-        for api in [BackendApi::Runtime, BackendApi::Driver] {
-            for status in [700, 702, 709, 710, 714, 715, 716, 717, 718, 719, 911] {
-                let error =
-                    GpuError::backend_status_in(Backend::Cuda, api, "fatal operation", status);
-                assert!(
-                    error.is_device_lost(),
-                    "{api:?} status {status} must make the CUDA context unusable"
-                );
-            }
+        for status in [
+            226, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719, 721, 810, 911,
+        ] {
+            let error = GpuError::backend_status_in(
+                Backend::Cuda,
+                BackendApi::Runtime,
+                "runtime fatal operation",
+                status,
+            );
+            assert!(
+                error.is_device_lost(),
+                "runtime status {status} must make the CUDA process unusable"
+            );
         }
 
-        for status in [226, 721] {
+        for status in [
+            226, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719, 721, 810, 911,
+        ] {
             let error = GpuError::backend_status_in(
                 Backend::Cuda,
                 BackendApi::Driver,
