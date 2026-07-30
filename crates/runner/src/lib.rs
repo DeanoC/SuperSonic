@@ -24,14 +24,13 @@ pub mod gemma4_int4_engine;
 pub mod oracle;
 pub mod prefill_engine;
 pub mod profile;
-#[path = "qwen36_moe/decode.rs"]
-pub mod qwen36_moe_decode;
+pub use supersonic_runtime::qwen36_moe::decode as qwen36_moe_decode;
 #[path = "qwen36_moe/logits.rs"]
 pub mod qwen36_moe_logits;
 #[path = "qwen36_moe/mtp.rs"]
 pub mod qwen36_moe_mtp;
-#[path = "qwen36_moe/persistent_decode.rs"]
-pub mod qwen36_moe_persistent_decode;
+pub use supersonic_runtime::qwen36_moe::persistent_decode as qwen36_moe_persistent_decode;
+pub use supersonic_runtime::qwen36_moe::prefill as qwen36_moe_prefill;
 pub use supersonic_runtime::qwen36_moe::residency as qwen36_moe_residency;
 pub use supersonic_runtime::qwen36_moe::residency as qwen36_moe_residency_types;
 pub use supersonic_runtime::qwen36_moe::residency_pages as qwen36_moe_residency_pages;

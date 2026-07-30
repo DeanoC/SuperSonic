@@ -3,8 +3,8 @@
 //! Loads the multi-layer Python oracle's JSON payload (produced by
 //! `oracle/qwen36_moe_multilayer_oracle.py`), uploads each layer's BF16
 //! weights + initial linear-attn state to the GPU, runs the chained decode
-//! via [`runner::qwen36_moe_decode::run_chained_decode`], applies the host-
-//! side final RMSnorm + lm_head, and compares against the oracle's
+//! via [`supersonic_runtime::qwen36_moe::decode::run_chained_decode`], applies
+//! the host-side final RMSnorm + lm_head, and compares against the oracle's
 //! `intermediates_per_layer` + `final_hidden` + `logits` (cos_sim ≥ 0.999
 //! per the PR 4c acceptance criteria; same ≤0.05 max-abs envelope as the
 //! per-block tests).
@@ -30,15 +30,15 @@
 
 use base64::Engine;
 use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
-use runner::qwen36_moe_decode::run_chained_decode;
 use runner::qwen36_moe_logits::{bf16_bytes_to_f32, host_final_norm_lm_head};
-use runner::qwen36_moe_persistent_decode::PersistentScratch;
 use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
-use runner::qwen36_moe_types::{
+use serde_json::Value;
+use supersonic_runtime::qwen36_moe::decode::run_chained_decode;
+use supersonic_runtime::qwen36_moe::persistent_decode::{PersistentScratch, CACHE_POS_INHERIT};
+use supersonic_runtime::qwen36_moe::types::{
     is_full_attn_layer, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
     LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
 };
-use serde_json::Value;
 
 fn b64(input: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
@@ -642,7 +642,7 @@ fn multilayer_chained_decode_matches_oracle() {
 // Phase 3e: persistent decode megakernel parity test.
 //
 // Drives the production
-// `runner::qwen36_moe_persistent_decode::PersistentScratch` with the same
+// `supersonic_runtime::qwen36_moe::persistent_decode::PersistentScratch` with the same
 // fixtures the chained-decode test uses, then asserts the final hidden
 // matches the chained path nearly bit-for-bit. The two paths run the
 // IDENTICAL `__device__` phase functions (extracted in Phase 3a-3d) — only
@@ -745,7 +745,7 @@ fn multilayer_persistent_decode_matches_chained() {
             ordinal,
             &initial_hidden,
             position,
-            runner::qwen36_moe_persistent_decode::CACHE_POS_INHERIT,
+            CACHE_POS_INHERIT,
             None,
             true,
         )
@@ -778,7 +778,7 @@ fn multilayer_persistent_decode_matches_chained() {
             ordinal,
             &initial_hidden,
             position,
-            runner::qwen36_moe_persistent_decode::CACHE_POS_INHERIT,
+            CACHE_POS_INHERIT,
             |_phase, _layer, _topk| Ok(()),
         )
         .expect("PersistentScratch::run_sparse_with_expert_prefetch");
