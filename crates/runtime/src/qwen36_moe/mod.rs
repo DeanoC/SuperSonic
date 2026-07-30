@@ -11,6 +11,7 @@ pub mod config {
 pub mod decode_loop;
 pub mod residency;
 pub mod route_telemetry;
+pub mod source;
 pub mod speculative;
 pub mod state;
 pub mod types;

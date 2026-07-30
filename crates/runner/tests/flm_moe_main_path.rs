@@ -41,6 +41,12 @@ fn assert_moe_flm_main_path_contract(combined: &str) {
         "FLM weight mode was not reported:\n{combined}"
     );
     assert!(
+        combined.contains(
+            "[qwen36-moe] FLM direct plans: required=693 raw_dense=363 native_int4=330 bf16_fallback=0"
+        ),
+        "FLM direct-plan profile was not reported:\n{combined}"
+    );
+    assert!(
         combined.contains("loading weights from already-open FLM source")
             && combined.contains("(INT4 native FLM)"),
         "native FLM source load was not labeled as native INT4:\n{combined}"
@@ -82,6 +88,7 @@ fn moe_flm_main_path_output_contract_accepts_expected_logs() {
 [qwen36-moe] loading config from FLM runtime descriptor
 [qwen36-moe] loading tokenizer from FLM assets
 [qwen36-moe] FLM weight mode: INT4 native FLM
+[qwen36-moe] FLM direct plans: required=693 raw_dense=363 native_int4=330 bf16_fallback=0
 [qwen36-moe] loading weights from already-open FLM source at /tmp/qwen36-35b-a3b.flm (INT4 native FLM)
   Generated ids: [123]
 [result] prompt_tokens=1 generated_tokens=1 decode_ms=1 ms_per_step=1.0
