@@ -177,7 +177,7 @@ pub async fn create(
             "tool_choice=required is not supported",
         ));
     }
-    validate_tools(req.tools.as_ref())?;
+    let template_tools = normalize_response_tools_for_template(req.tools.as_ref())?;
     let json_object = response_format_json_object(response_format_value(&req))?;
 
     let max_tokens = req.max_output_tokens.unwrap_or(256);
@@ -189,7 +189,7 @@ pub async fn create(
                 &messages,
                 RenderOptions {
                     add_generation_prompt: true,
-                    tools: req.tools.clone(),
+                    tools: template_tools,
                     enable_thinking: reasoning_enabled(
                         req.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
                     ),
@@ -282,6 +282,50 @@ pub async fn create(
         );
         Ok(Json(stored).into_response())
     }
+}
+
+fn normalize_response_tools_for_template(tools: Option<&Value>) -> Result<Option<Value>, ApiError> {
+    let Some(tools) = tools else {
+        return Ok(None);
+    };
+    let Value::Array(items) = tools else {
+        return Err(ApiError::bad_request("tools must be an array"));
+    };
+
+    let mut normalized = Vec::with_capacity(items.len());
+    for item in items {
+        let typ = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if typ != "function" {
+            return Err(ApiError::bad_request(format!(
+                "unsupported tool type: {typ}"
+            )));
+        }
+
+        if item.get("function").is_some() {
+            validate_tools(Some(&Value::Array(vec![item.clone()])))?;
+            normalized.push(item.clone());
+            continue;
+        }
+
+        let Some(name) = item.get("name").and_then(Value::as_str) else {
+            return Err(ApiError::bad_request("function tool missing name"));
+        };
+        if name.is_empty() {
+            return Err(ApiError::bad_request(
+                "function tool name must not be empty",
+            ));
+        }
+        let Some(mut function) = item.as_object().cloned() else {
+            return Err(ApiError::bad_request("function tool must be an object"));
+        };
+        function.remove("type");
+        normalized.push(json!({
+            "type": "function",
+            "function": Value::Object(function),
+        }));
+    }
+
+    Ok(Some(Value::Array(normalized)))
 }
 
 pub async fn get(
@@ -735,6 +779,49 @@ fn delete_response(server_instance_id: u64, id: &str) -> bool {
 mod tests {
     use super::*;
     use crate::output::parse_assistant_output;
+
+    #[test]
+    fn flat_response_function_tool_normalizes_for_chat_template() {
+        let tools = json!([{
+            "type": "function",
+            "name": "lookup",
+            "description": "Look up a value",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }]);
+
+        let normalized = normalize_response_tools_for_template(Some(&tools))
+            .expect("valid Responses function tool")
+            .expect("normalized tools");
+
+        assert_eq!(normalized[0]["type"], "function");
+        assert_eq!(normalized[0]["function"]["name"], "lookup");
+        assert_eq!(normalized[0]["function"]["description"], "Look up a value");
+        assert_eq!(
+            normalized[0]["function"]["parameters"]["required"],
+            json!(["query"])
+        );
+        assert_eq!(normalized[0]["function"]["strict"], true);
+        assert!(normalized[0].get("name").is_none());
+    }
+
+    #[test]
+    fn nested_chat_style_function_tool_remains_compatible() {
+        let tools = json!([{
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}}
+        }]);
+
+        assert_eq!(
+            normalize_response_tools_for_template(Some(&tools)).unwrap(),
+            Some(tools)
+        );
+    }
 
     #[test]
     fn response_output_contains_reasoning_text_and_function_call() {

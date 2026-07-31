@@ -468,6 +468,43 @@ async fn mock_responses_previous_response_tool_loop_shape() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_accepts_flat_function_tool_schema() {
+    let h = spawn(
+        "<tool_call>\n<function=lookup>\n<parameter=query>\nweather\n</parameter>\n</function>\n</tool_call>",
+    )
+    .await;
+    let http = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "need weather",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up a value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }],
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("Responses request");
+    let status = http.status();
+    let body: Value = http.json().await.expect("Responses JSON");
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
+    assert_eq!(body["output"][0]["type"], "function_call");
+    assert_eq!(body["output"][0]["name"], "lookup");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_responses_store_is_scoped_per_server_instance() {
     let first = spawn("hello from first").await;
     let second = spawn("hello from second").await;
