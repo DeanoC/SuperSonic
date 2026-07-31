@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+use gpu_hal::{memset_zeros, set_backend, Backend, GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::qwen36_moe::{
     linear_step_launch, Qwen36MoeLinearStepInt4, Qwen36MoeLinearStepParams,
@@ -16,9 +16,13 @@ use supersonic_runtime::flm_model_source::{FlmModelSource, FlmModelSourceOptions
 use supersonic_runtime::qwen36_moe::layer_loader::{
     load_to_gpu, QWEN36_MOE_INT4_GROUP_SIZE, QWEN36_MOE_LOWBIT_NATIVE_INT4,
 };
+use supersonic_runtime::qwen36_moe::weights::dequant_int4_to_bf16_bytes;
 
 const LAYER_PREFIX: &str = "model.language_model.layers.0";
 const LINEAR_PREFIX: &str = "model.language_model.layers.0.linear_attn";
+const EMBEDDING_NAME: &str = "model.language_model.embed_tokens.weight";
+const KNOWN_BYTES_FIXTURE: &str =
+    include_str!("../../../oracle/fixtures/qwen36_native_int4_v1_known_bytes.json");
 const BOUNDARY_ORDER: [&str; 19] = [
     "embedding",
     "layer_input",
@@ -138,39 +142,18 @@ struct StageResult {
     recurrent_state: Vec<u8>,
 }
 
+struct RecurrenceResult {
+    initial_conv_state: Vec<u8>,
+    initial_recurrent_state: Vec<u8>,
+    conv_state_before_final: Vec<u8>,
+    recurrent_state_before_final: Vec<u8>,
+    final_stage: StageResult,
+}
+
 fn usize_field(value: &Value, key: &str) -> Result<usize> {
     Ok(value[key]
         .as_u64()
         .with_context(|| format!("missing integer {key}"))? as usize)
-}
-
-fn payload_bytes(payload: &Value, expected_dtype: &str) -> Result<(Vec<usize>, Vec<u8>)> {
-    let dtype = payload["dtype"].as_str().context("payload dtype")?;
-    if dtype != expected_dtype {
-        bail!("payload dtype {dtype} != {expected_dtype}");
-    }
-    let shape = payload["shape"]
-        .as_array()
-        .context("payload shape")?
-        .iter()
-        .map(|dim| {
-            dim.as_u64()
-                .map(|value| value as usize)
-                .context("payload shape dimension")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(payload["base64"].as_str().context("payload base64")?)
-        .context("decode payload")?;
-    let element_bytes = match dtype {
-        "bfloat16" => 2,
-        "float32" => 4,
-        _ => unreachable!(),
-    };
-    if bytes.len() != shape.iter().product::<usize>() * element_bytes {
-        bail!("payload byte length does not match its shape");
-    }
-    Ok((shape, bytes))
 }
 
 fn payload(dtype: &str, shape: &[usize], bytes: &[u8]) -> Value {
@@ -236,6 +219,239 @@ fn load_weights(source: &FlmModelSource, ordinal: usize) -> Result<LayerWeights>
         z_zero: load(&format!("{LINEAR_PREFIX}.in_proj_z.weight_int4_zero"))?,
         out_scale: load(&format!("{LINEAR_PREFIX}.out_proj.weight_int4_scale"))?,
         out_zero: load(&format!("{LINEAR_PREFIX}.out_proj.weight_int4_zero"))?,
+    })
+}
+
+fn hex_bytes(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        bail!("fixture hex must contain byte pairs");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).context("fixture hex is not ASCII")?;
+            u8::from_str_radix(pair, 16).context("invalid fixture hex byte")
+        })
+        .collect()
+}
+
+fn abi_validation_evidence() -> Result<Value> {
+    let fixture: Value =
+        serde_json::from_str(KNOWN_BYTES_FIXTURE).context("parse known-byte ABI fixture")?;
+    if fixture["schema"].as_str() != Some("qwen36-native-int4-known-bytes/v1") {
+        bail!("unexpected known-byte ABI fixture schema");
+    }
+    if !fixture["provenance"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no producer packer")
+    {
+        bail!("known-byte ABI fixture is not producer-independent");
+    }
+    let rows = fixture["logical_shape"][0]
+        .as_u64()
+        .context("fixture rows")? as usize;
+    let cols = fixture["logical_shape"][1]
+        .as_u64()
+        .context("fixture cols")? as usize;
+    let group_size = fixture["group_size"].as_u64().context("group size")? as usize;
+    let row_pattern = hex_bytes(
+        fixture["packed"]["row_pattern_hex"]
+            .as_str()
+            .context("row pattern")?,
+    )?;
+    let packed_row = row_pattern.repeat(
+        fixture["packed"]["pattern_repeats_per_row"]
+            .as_u64()
+            .context("pattern repeats")? as usize,
+    );
+    let packed = packed_row.repeat(
+        fixture["packed"]["row_repeats"]
+            .as_u64()
+            .context("row repeats")? as usize,
+    );
+    let scale = hex_bytes(
+        fixture["scale_bf16_le_hex"]
+            .as_str()
+            .context("scale bytes")?,
+    )?;
+    let zero = hex_bytes(fixture["zero_bf16_le_hex"].as_str().context("zero bytes")?)?;
+    let decoded = dequant_int4_to_bf16_bytes(&packed, &scale, &zero, rows, cols, group_size);
+    let expected_tiles = fixture["expected_bf16_bits_by_tile"]
+        .as_array()
+        .context("expected tile tables")?;
+    let mut production_decoder_match = true;
+    'rows: for row in 0..rows {
+        for col in 0..cols {
+            let tile = (row / group_size) * 2 + col / group_size;
+            let nibble = col % 16;
+            let expected = u16::from_str_radix(
+                expected_tiles[tile][nibble]
+                    .as_str()
+                    .context("expected BF16 bits")?,
+                16,
+            )
+            .context("invalid expected BF16 bits")?;
+            let offset = (row * cols + col) * 2;
+            let actual = u16::from_le_bytes([decoded[offset], decoded[offset + 1]]);
+            if actual != expected {
+                production_decoder_match = false;
+                break 'rows;
+            }
+        }
+    }
+    Ok(json!({
+        "fixture_schema": fixture["schema"],
+        "fixture_sha256": format!("{:x}", Sha256::digest(KNOWN_BYTES_FIXTURE.as_bytes())),
+        "production_decoder_match": production_decoder_match,
+    }))
+}
+
+fn artifact_input_sequence(
+    source: &FlmModelSource,
+    report: &Value,
+    geometry: Geometry,
+) -> Result<Vec<Vec<u8>>> {
+    let token_ids = report["prompt"]["transformers_token_ids"]
+        .as_array()
+        .context("prompt.transformers_token_ids")?;
+    if token_ids.len() != 322 {
+        bail!("D requires exactly 322 transformer token IDs");
+    }
+    let shape = source
+        .store
+        .shape(EMBEDDING_NAME)
+        .context("artifact embedding shape")?;
+    if shape.len() != 2 || shape[1] != geometry.hidden {
+        bail!(
+            "artifact embedding shape {:?} does not end in hidden={}",
+            shape,
+            geometry.hidden
+        );
+    }
+    let embedding = source
+        .store
+        .raw_bytes(EMBEDDING_NAME)
+        .context("artifact embedding raw BF16 bytes")?;
+    let row_bytes = geometry.hidden * 2;
+    if embedding.len() != shape[0] * row_bytes {
+        bail!("artifact embedding byte length contradicts its shape");
+    }
+    token_ids
+        .iter()
+        .enumerate()
+        .map(|(position, token)| {
+            let token = token
+                .as_u64()
+                .with_context(|| format!("token ID at position {position}"))?
+                as usize;
+            if token >= shape[0] {
+                bail!("token ID {token} at position {position} exceeds artifact vocab");
+            }
+            let start = token * row_bytes;
+            Ok(embedding[start..start + row_bytes].to_vec())
+        })
+        .collect()
+}
+
+fn run_production_recurrence(
+    geometry: Geometry,
+    inputs: &[Vec<u8>],
+    weights: &LayerWeights,
+) -> Result<RecurrenceResult> {
+    if inputs.len() != 322 {
+        bail!("production recurrence requires 322 inputs");
+    }
+    let ordinal = 0;
+    let mut conv_state = GpuBuffer::zeros(
+        ordinal,
+        ScalarType::BF16,
+        &[geometry.qkv_dim(), geometry.conv_kernel_dim - 1],
+    )?;
+    let mut recurrent_state = GpuBuffer::zeros(
+        ordinal,
+        ScalarType::F32,
+        &[geometry.recurrent_state_elems()],
+    )?;
+    let initial_conv_state = conv_state.to_host_bytes()?;
+    let initial_recurrent_state = recurrent_state.to_host_bytes()?;
+    if initial_conv_state.iter().any(|byte| *byte != 0)
+        || initial_recurrent_state.iter().any(|byte| *byte != 0)
+    {
+        bail!("GPU zero-state allocation published nonzero bytes");
+    }
+    let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geometry.output_elems()])?;
+    let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[geometry.workspace_floats()])?;
+    let mut sync = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])?;
+    let int4 = Qwen36MoeLinearStepInt4 {
+        group_size: QWEN36_MOE_INT4_GROUP_SIZE,
+        in_proj_qkv_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        in_proj_qkv_scale: weights.qkv_scale.as_ptr(),
+        in_proj_qkv_zero: weights.qkv_zero.as_ptr(),
+        in_proj_z_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        in_proj_z_scale: weights.z_scale.as_ptr(),
+        in_proj_z_zero: weights.z_zero.as_ptr(),
+        out_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        out_proj_scale: weights.out_scale.as_ptr(),
+        out_proj_zero: weights.out_zero.as_ptr(),
+    };
+    let mut state_before_final = None;
+    for (position, input_bytes) in inputs.iter().enumerate() {
+        if input_bytes.len() != geometry.hidden * 2 {
+            bail!("input {position} has the wrong BF16 byte length");
+        }
+        if position == inputs.len() - 1 {
+            state_before_final = Some((
+                conv_state.to_host_bytes()?,
+                recurrent_state.to_host_bytes()?,
+            ));
+        }
+        let input =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[geometry.hidden], input_bytes)?;
+        let pointers = Qwen36MoeLinearStepWeights {
+            input_hidden: input.as_ptr(),
+            input_norm_w: weights.input_norm.as_ptr(),
+            in_proj_qkv_w: weights.in_proj_qkv.as_ptr(),
+            in_proj_z_w: weights.in_proj_z.as_ptr(),
+            in_proj_a_w: weights.in_proj_a.as_ptr(),
+            in_proj_b_w: weights.in_proj_b.as_ptr(),
+            conv1d_w: weights.conv1d.as_ptr(),
+            conv1d_bias: std::ptr::null(),
+            dt_bias: weights.dt_bias.as_ptr(),
+            a_log: weights.a_log.as_ptr(),
+            norm_w: weights.norm.as_ptr(),
+            out_proj_w: weights.out_proj.as_ptr(),
+            conv_state: conv_state.as_mut_ptr(),
+            recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
+        };
+        memset_zeros(ordinal, sync.as_mut_ptr(), sync.len_bytes())
+            .with_context(|| format!("reset recurrence sync at position {position}"))?;
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            geometry.params(5),
+            &pointers,
+            &int4,
+            &mut output,
+            &mut workspace,
+            &mut sync,
+        )
+        .with_context(|| format!("production linear recurrence at position {position}"))?;
+    }
+    let (conv_state_before_final, recurrent_state_before_final) =
+        state_before_final.context("missing state before final position")?;
+    Ok(RecurrenceResult {
+        initial_conv_state,
+        initial_recurrent_state,
+        conv_state_before_final,
+        recurrent_state_before_final,
+        final_stage: StageResult {
+            output: output.to_host_bytes()?,
+            workspace: f32_values(&workspace.to_host_bytes()?),
+            conv_state: conv_state.to_host_bytes()?,
+            recurrent_state: recurrent_state.to_host_bytes()?,
+        },
     })
 }
 
@@ -356,7 +572,7 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
     let abc_path = PathBuf::from(abc_path);
     let abc_bytes = std::fs::read(&abc_path)?;
     let report: Value = serde_json::from_slice(&abc_bytes).context("parse A/B/C report")?;
-    if report["schema"].as_str() != Some("qwen36-layer0-mode-diagnostic/v1") {
+    if report["schema"].as_str() != Some("qwen36-layer0-mode-diagnostic/v2") {
         bail!("unexpected A/B/C report schema");
     }
     if report["prompt"]["token_count"].as_u64() != Some(322)
@@ -367,6 +583,7 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
     let execution_c = &report["executions"]["C"];
     if execution_c["mode"].as_str() != Some("recurrent")
         || execution_c["position"].as_u64() != Some(321)
+        || execution_c["positions_executed"].as_u64() != Some(322)
         || execution_c["initial_state"].as_str() != Some("zero")
     {
         bail!("C is not the required zero-state recurrent execution");
@@ -383,15 +600,6 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
         bail!("artifact SHA-256 no longer matches the A/B/C report");
     }
 
-    let (_, input_bytes) =
-        payload_bytes(&execution_c["boundary_payloads"]["layer_input"], "bfloat16")?;
-    let (_, conv_state_before) =
-        payload_bytes(&execution_c["state_before_final"]["conv_state"], "bfloat16")?;
-    let (_, recurrent_state_before) = payload_bytes(
-        &execution_c["state_before_final"]["recurrent_state"],
-        "float32",
-    )?;
-
     set_backend(Backend::Hip);
     let source = FlmModelSource::open_with_options(
         &artifact_path,
@@ -401,6 +609,16 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
         },
     )?;
     let weights = load_weights(&source, 0)?;
+    let abi_validation = abi_validation_evidence()?;
+    let input_rows = artifact_input_sequence(&source, &report, geometry)?;
+    let input_sequence_bytes = input_rows.concat();
+    let input_bytes = input_rows
+        .last()
+        .context("artifact input sequence is empty")?
+        .clone();
+    let recurrence = run_production_recurrence(geometry, &input_rows, &weights)?;
+    let conv_state_before = &recurrence.conv_state_before_final;
+    let recurrent_state_before = &recurrence.recurrent_state_before_final;
     let input = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[geometry.hidden], &input_bytes)?;
     let norm_weight = weights.input_norm.to_host_bytes()?;
     let conv_weight = weights.conv1d.to_host_bytes()?;
@@ -410,40 +628,40 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
         1,
         &input,
         &weights,
-        &conv_state_before,
-        &recurrent_state_before,
+        conv_state_before,
+        recurrent_state_before,
     )?;
     let stage2 = run_stage(
         geometry,
         2,
         &input,
         &weights,
-        &conv_state_before,
-        &recurrent_state_before,
+        conv_state_before,
+        recurrent_state_before,
     )?;
     let stage3 = run_stage(
         geometry,
         3,
         &input,
         &weights,
-        &conv_state_before,
-        &recurrent_state_before,
+        conv_state_before,
+        recurrent_state_before,
     )?;
     let stage4 = run_stage(
         geometry,
         4,
         &input,
         &weights,
-        &conv_state_before,
-        &recurrent_state_before,
+        conv_state_before,
+        recurrent_state_before,
     )?;
     let stage5 = run_stage(
         geometry,
         5,
         &input,
         &weights,
-        &conv_state_before,
-        &recurrent_state_before,
+        conv_state_before,
+        recurrent_state_before,
     )?;
 
     let qkv_dim = geometry.qkv_dim();
@@ -461,7 +679,7 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
     let core_offset = decay_offset + geometry.num_v_heads;
 
     let qkv_bytes = stage1.output[..qkv_dim * 2].to_vec();
-    let post_residual = stage5.output[..geometry.hidden * 2].to_vec();
+    let post_residual = recurrence.final_stage.output[..geometry.hidden * 2].to_vec();
     let input_values = bf16_values(&input_bytes);
     let post_values = bf16_values(&post_residual);
     let out_proj = bf16_bytes(
@@ -520,7 +738,7 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
         payload(
             "bfloat16",
             &[qkv_dim],
-            &conv_output(&qkv_bytes, &conv_state_before, &conv_weight, geometry),
+            &conv_output(&qkv_bytes, conv_state_before, &conv_weight, geometry),
         ),
     );
     boundaries.insert(
@@ -579,7 +797,7 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
                 geometry.head_k_dim,
                 geometry.head_v_dim,
             ],
-            &stage4.recurrent_state,
+            &recurrence.final_stage.recurrent_state,
         ),
     );
     boundaries.insert(
@@ -595,7 +813,7 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
         payload(
             "bfloat16",
             &[geometry.num_v_heads, geometry.head_v_dim],
-            &bf16_workspace(&stage5.workspace, core_offset, value_dim),
+            &bf16_workspace(&recurrence.final_stage.workspace, core_offset, value_dim),
         ),
     );
     boundaries.insert(
@@ -615,13 +833,20 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
         bail!("D boundary schema is incomplete");
     }
     if stage2.conv_state.len() != conv_state_before.len()
-        || stage5.conv_state.len() != conv_state_before.len()
+        || recurrence.final_stage.conv_state.len() != conv_state_before.len()
     {
         bail!("staged conv state shape changed");
     }
+    let stage2_matches_recurrence_conv_state =
+        stage2.conv_state == recurrence.final_stage.conv_state;
+    let stage4_matches_recurrence_state =
+        stage4.recurrent_state == recurrence.final_stage.recurrent_state;
+    let stage5_matches_recurrence_output = stage5.output == recurrence.final_stage.output
+        && stage5.conv_state == recurrence.final_stage.conv_state
+        && stage5.recurrent_state == recurrence.final_stage.recurrent_state;
 
     let result = json!({
-        "schema": "qwen36-layer0-supersonic-diagnostic/v1",
+        "schema": "qwen36-layer0-supersonic-diagnostic/v2",
         "source_abc": {
             "path": abc_path,
             "sha256": format!("{:x}", Sha256::digest(&abc_bytes)),
@@ -634,27 +859,90 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
             "profile": "supersonic",
             "payload_hashes_verified": true,
         },
+        "abi_validation": abi_validation,
         "execution": {
-            "label": "D_supersonic_flm_v1_isolated_stages",
+            "label": "D_supersonic_flm_v1_full_zero_state_recurrence",
             "mode": "recurrent",
             "position": 321,
+            "positions_executed": 322,
             "initial_state": "zero",
-            "layer_input_checksum": execution_c["layer_input_checksum"],
+            "layer_input_checksum": format!("{:x}", Sha256::digest(&input_bytes)),
+            "input_sequence_payload": payload(
+                "bfloat16",
+                &[322, geometry.hidden],
+                &input_sequence_bytes,
+            ),
+            "initial_state_payloads": {
+                "conv_state": payload(
+                    "bfloat16",
+                    &[geometry.qkv_dim(), geometry.conv_kernel_dim - 1],
+                    &recurrence.initial_conv_state,
+                ),
+                "recurrent_state": payload(
+                    "float32",
+                    &[
+                        geometry.num_v_heads,
+                        geometry.head_k_dim,
+                        geometry.head_v_dim,
+                    ],
+                    &recurrence.initial_recurrent_state,
+                ),
+            },
             "boundary_order": BOUNDARY_ORDER,
             "boundary_payloads": boundaries,
-            "state_before_final": execution_c["state_before_final"],
+            "state_before_final": {
+                "conv_state": payload(
+                    "bfloat16",
+                    &[geometry.qkv_dim(), geometry.conv_kernel_dim - 1],
+                    &recurrence.conv_state_before_final,
+                ),
+                "recurrent_state": payload(
+                    "float32",
+                    &[
+                        geometry.num_v_heads,
+                        geometry.head_k_dim,
+                        geometry.head_v_dim,
+                    ],
+                    &recurrence.recurrent_state_before_final,
+                ),
+            },
+            "state_after_final": {
+                "conv_state": payload(
+                    "bfloat16",
+                    &[geometry.qkv_dim(), geometry.conv_kernel_dim - 1],
+                    &recurrence.final_stage.conv_state,
+                ),
+                "recurrent_state": payload(
+                    "float32",
+                    &[
+                        geometry.num_v_heads,
+                        geometry.head_k_dim,
+                        geometry.head_v_dim,
+                    ],
+                    &recurrence.final_stage.recurrent_state,
+                ),
+            },
         },
         "capture_methods": {
             "input_rmsnorm": "host reconstruction of staged kernel BF16 formula",
-            "conv_output": "host reconstruction from stage1 qkv, C state, and FLM conv weights",
+            "conv_output": "host reconstruction from stage1 qkv, D recurrence state, and FLM conv weights",
             "out_proj": "BF16 residual difference; kernel publishes only post-residual",
-            "all_other_boundaries": "direct stage output, workspace, or mutated state",
+            "all_other_boundaries": "direct stage output, workspace, artifact input, or production-mutated state",
+        },
+        "recurrence": {
+            "production_stage": 5,
+            "positions_executed": 322,
+            "first_position": 0,
+            "final_position": 321,
+            "state_seed": "gpu_zero_buffers",
+            "input_source": "artifact_embedding_rows_from_prompt_token_ids",
         },
         "stages": {
             "executed": [1, 2, 3, 4, 5],
             "fresh_state_per_stage": true,
-            "stage2_conv_state_bytes": stage2.conv_state.len(),
-            "stage5_recurrent_state_bytes": stage5.recurrent_state.len(),
+            "stage2_matches_recurrence_conv_state": stage2_matches_recurrence_conv_state,
+            "stage4_matches_recurrence_state": stage4_matches_recurrence_state,
+            "stage5_matches_recurrence_output": stage5_matches_recurrence_output,
         },
     });
     if let Some(parent) = output_path.parent() {
