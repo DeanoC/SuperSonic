@@ -5,9 +5,9 @@
 //! weights + initial linear-attn state to the GPU, runs the chained decode
 //! via [`supersonic_runtime::qwen36_moe::decode::run_chained_decode`], applies
 //! the host-side final RMSnorm + lm_head, and compares against the oracle's
-//! `intermediates_per_layer` + `final_hidden` + `logits` (cos_sim ≥ 0.999
-//! per the PR 4c acceptance criteria; same ≤0.05 max-abs envelope as the
-//! per-block tests).
+//! `intermediates_per_layer` + `final_hidden` + `logits`. Local kernel
+//! stages retain their per-block envelopes. Chained handoffs use frozen
+//! per-layer cumulative budgets, and final logits retain cos_sim ≥ 0.999.
 //!
 //! The qualification fixture is tracked at
 //! `oracle/fixtures/qwen36_moe_multilayer_int4_v1.json` and is mandatory.
@@ -29,6 +29,7 @@
 
 use base64::Engine;
 use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
+use half::bf16;
 use kernel_ffi::qwen36_moe::{
     ffn_step_launch, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
 };
@@ -50,12 +51,73 @@ use supersonic_runtime::qwen36_moe::types::{
 };
 
 const TRACKED_MULTILAYER_ORACLE: &str = "../../oracle/fixtures/qwen36_moe_multilayer_int4_v1.json";
-// Four layers cross eight quantized attention/FFN residual boundaries. A
-// fixed 0.125 BF16 local-boundary budget gives a 1.0 worst-case chained cap.
-const CHAINED_HANDOFF_MAX_ABS_TOL: f32 = 8.0 * 0.125;
-const CHAINED_HANDOFF_COS_FLOOR: f64 = 0.999;
-const CHAINED_LOGITS_MAX_ABS_TOL: f32 = 1.0;
-const CHAINED_LOGITS_COS_FLOOR: f64 = 0.999;
+
+#[derive(Clone, Copy, Debug)]
+struct NumericalBudget {
+    max_abs: f32,
+    cosine_floor: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HandoffBoundary {
+    Attention,
+    Ffn,
+}
+
+// Candidate-independent cumulative budgets frozen from the accepted Round 3
+// qualification run. Maxima were rounded outward to nearby binary fractions
+// and cosine floors downward. They are constants rather than values derived
+// from the candidate under test, so additional accumulation still fails at
+// the first material handoff where it exceeds the observed envelope.
+//
+// Observed attention max_abs:
+//   [0.0234375, 0.15625, 0.2578125, 0.40625]
+// Observed FFN max_abs:
+//   [0.109375, 0.23828125, 0.4375, 0.4765625]
+const ATTENTION_HANDOFF_BUDGETS: [NumericalBudget; 4] = [
+    NumericalBudget {
+        max_abs: 0.03125,
+        cosine_floor: 0.9999,
+    },
+    NumericalBudget {
+        max_abs: 0.1875,
+        cosine_floor: 0.99975,
+    },
+    NumericalBudget {
+        max_abs: 0.3125,
+        cosine_floor: 0.9996,
+    },
+    NumericalBudget {
+        max_abs: 0.4375,
+        cosine_floor: 0.99945,
+    },
+];
+const FFN_HANDOFF_BUDGETS: [NumericalBudget; 4] = [
+    NumericalBudget {
+        max_abs: 0.125,
+        cosine_floor: 0.9998,
+    },
+    NumericalBudget {
+        max_abs: 0.25,
+        cosine_floor: 0.9997,
+    },
+    NumericalBudget {
+        max_abs: 0.5,
+        cosine_floor: 0.9995,
+    },
+    NumericalBudget {
+        max_abs: 0.5,
+        cosine_floor: 0.9994,
+    },
+];
+const EXACT_INPUT_LOGITS_BUDGET: NumericalBudget = NumericalBudget {
+    max_abs: 0.0625,
+    cosine_floor: 0.999,
+};
+const CHAINED_LOGITS_BUDGET: NumericalBudget = NumericalBudget {
+    max_abs: 0.25,
+    cosine_floor: 0.999,
+};
 
 fn tracked_multilayer_oracle_path() -> PathBuf {
     std::env::var_os("SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON")
@@ -560,14 +622,25 @@ fn assert_parity_bf16(label: &str, got: &[u8], want: &[u8], max_abs_tol: f32, co
     );
 }
 
-fn assert_chained_handoff_parity(label: &str, got: &[u8], want: &[u8]) {
-    assert_parity_bf16(
-        label,
-        got,
-        want,
-        CHAINED_HANDOFF_MAX_ABS_TOL,
-        CHAINED_HANDOFF_COS_FLOOR,
-    );
+fn handoff_budget(layer_idx: usize, boundary: HandoffBoundary) -> NumericalBudget {
+    let budgets = match boundary {
+        HandoffBoundary::Attention => &ATTENTION_HANDOFF_BUDGETS,
+        HandoffBoundary::Ffn => &FFN_HANDOFF_BUDGETS,
+    };
+    *budgets
+        .get(layer_idx)
+        .unwrap_or_else(|| panic!("missing {boundary:?} budget for layer {layer_idx}"))
+}
+
+fn assert_chained_handoff_parity(
+    label: &str,
+    layer_idx: usize,
+    boundary: HandoffBoundary,
+    got: &[u8],
+    want: &[u8],
+) {
+    let budget = handoff_budget(layer_idx, boundary);
+    assert_parity_bf16(label, got, want, budget.max_abs, budget.cosine_floor);
 }
 
 fn max_abs_delta_bf16(lhs: &[u8], rhs: &[u8]) -> f32 {
@@ -593,6 +666,31 @@ fn max_bf16_ulp(bytes: &[u8]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+fn corrupt_one_lane_from_adjacent(
+    handoff: &mut [u8],
+    reference: &[u8],
+    rejection_threshold: f32,
+) -> (usize, usize, f32, f32) {
+    assert_eq!(handoff.len(), reference.len(), "BF16 byte length mismatch");
+    let actual = bf16_bytes_to_f32(handoff);
+    let oracle = bf16_bytes_to_f32(reference);
+    let candidate = (0..actual.len())
+        .filter_map(|target| {
+            let source = (target + 1) % actual.len();
+            let lane_displacement = (actual[source] - actual[target]).abs();
+            let resulting_error = (actual[source] - oracle[target]).abs();
+            (lane_displacement >= 0.125
+                && lane_displacement <= 0.5
+                && resulting_error > rejection_threshold)
+                .then_some((target, source, lane_displacement, resulting_error))
+        })
+        .min_by(|left, right| left.3.total_cmp(&right.3))
+        .expect("runtime handoff has no bounded adjacent-lane corruption candidate");
+    let source_bits = bf16::from_f32(actual[candidate.1]).to_bits().to_le_bytes();
+    handoff[candidate.0 * 2..candidate.0 * 2 + 2].copy_from_slice(&source_bits);
+    candidate
+}
+
 #[test]
 fn tracked_multilayer_oracle_is_the_mandatory_default() {
     let path = tracked_multilayer_oracle_path();
@@ -613,20 +711,25 @@ fn tracked_multilayer_oracle_is_the_mandatory_default() {
 }
 
 #[test]
-fn chained_gate_rejects_corrupted_inter_layer_handoff() {
-    let oracle = [0x3f80u16, 0x4000, 0x4040, 0x4080]
-        .into_iter()
+fn chained_gate_rejects_single_lane_packing_scale_perturbation() {
+    let oracle = std::iter::repeat_n(0x3f80u16, 256)
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
     let mut corrupted_handoff = oracle.clone();
-    corrupted_handoff[0..2].copy_from_slice(&0x4180u16.to_le_bytes());
+    corrupted_handoff[73 * 2..73 * 2 + 2].copy_from_slice(&0x3fa0u16.to_le_bytes());
 
     let rejected = std::panic::catch_unwind(|| {
-        assert_chained_handoff_parity("corrupted inter-layer handoff", &corrupted_handoff, &oracle);
+        assert_chained_handoff_parity(
+            "single-lane packing-scale perturbation",
+            0,
+            HandoffBoundary::Ffn,
+            &corrupted_handoff,
+            &oracle,
+        );
     });
     assert!(
         rejected.is_err(),
-        "corrupted handoff passed the chained gate"
+        "single-lane packing-scale perturbation passed the chained gate"
     );
 }
 
@@ -924,11 +1027,12 @@ fn multilayer_chained_decode_matches_oracle() {
             max_abs_delta_bf16(&got_exact_input_residual, &want_exact_input_residual);
         let propagated_input_delta =
             max_abs_delta_bf16(&got_chained_input_residual, &got_exact_input_residual);
+        let ffn_budget = handoff_budget(li, HandoffBoundary::Ffn);
         eprintln!(
             "[parity layer {li} FFN diagnostics] exact_input_kernel_error={exact_input_kernel_error:.5e} \
              propagated_input_delta={propagated_input_delta:.5e} \
-             fixed_max_abs={CHAINED_HANDOFF_MAX_ABS_TOL:.5e} \
-             fixed_cos_floor={CHAINED_HANDOFF_COS_FLOOR:.7}"
+             fixed_max_abs={:.5e} fixed_cos_floor={:.7}",
+            ffn_budget.max_abs, ffn_budget.cosine_floor
         );
 
         let actual_layer_input = if li == 0 {
@@ -957,22 +1061,54 @@ fn multilayer_chained_decode_matches_oracle() {
         let exact_input_attn_error = max_abs_delta_bf16(&got_exact_input_attn, &want_attn);
         let propagated_attn_input_delta =
             max_abs_delta_bf16(&got_chained_input_attn, &got_exact_input_attn);
+        let attention_budget = handoff_budget(li, HandoffBoundary::Attention);
         eprintln!(
             "[parity layer {li} attention diagnostics] exact_input_kernel_error={exact_input_attn_error:.5e} \
              propagated_input_delta={propagated_attn_input_delta:.5e} \
-             fixed_max_abs={CHAINED_HANDOFF_MAX_ABS_TOL:.5e} \
-             fixed_cos_floor={CHAINED_HANDOFF_COS_FLOOR:.7}"
+             fixed_max_abs={:.5e} fixed_cos_floor={:.7}",
+            attention_budget.max_abs, attention_budget.cosine_floor
         );
         assert_chained_handoff_parity(
             &format!("layer {li} output_after_attn"),
+            li,
+            HandoffBoundary::Attention,
             &outputs.per_layer_attn_out[li],
             &want_attn,
         );
         assert_chained_handoff_parity(
             &format!("layer {li} output_after_ffn"),
+            li,
+            HandoffBoundary::Ffn,
             &outputs.per_layer_ffn_out[li],
             &want_ffn,
         );
+        if li == 0 {
+            let mut corrupted_handoff = outputs.per_layer_ffn_out[li].clone();
+            let (target, source, lane_displacement, resulting_error) =
+                corrupt_one_lane_from_adjacent(
+                    &mut corrupted_handoff,
+                    &want_ffn,
+                    ffn_budget.max_abs,
+                );
+            let rejected = std::panic::catch_unwind(|| {
+                assert_chained_handoff_parity(
+                    "layer 0 actual FFN handoff with adjacent-lane indexing fault",
+                    li,
+                    HandoffBoundary::Ffn,
+                    &corrupted_handoff,
+                    &want_ffn,
+                );
+            });
+            assert!(
+                rejected.is_err(),
+                "one-lane runtime handoff corruption passed the frozen layer-0 FFN budget"
+            );
+            eprintln!(
+                "[parity corruption negative] layer={li} boundary=ffn target_lane={target} \
+                 source_lane={source} lane_displacement={lane_displacement:.5e} \
+                 resulting_oracle_error={resulting_error:.5e} rejected=true"
+            );
+        }
         last_exact_input_residual = Some(got_exact_input_residual);
     }
 
@@ -1002,23 +1138,23 @@ fn multilayer_chained_decode_matches_oracle() {
         "exact-input logits",
         &exact_input_logits,
         &oracle_logits,
-        0.5,
-        0.999,
+        EXACT_INPUT_LOGITS_BUDGET.max_abs,
+        EXACT_INPUT_LOGITS_BUDGET.cosine_floor,
     );
     let exact_input_logit_error = max_abs_delta_bf16(&exact_input_logits, &oracle_logits);
     let propagated_logit_delta = max_abs_delta_bf16(&logits, &exact_input_logits);
     eprintln!(
         "[parity logits diagnostics] exact_input_kernel_error={exact_input_logit_error:.5e} \
          propagated_input_delta={propagated_logit_delta:.5e} \
-         fixed_max_abs={CHAINED_LOGITS_MAX_ABS_TOL:.5e} \
-         fixed_cos_floor={CHAINED_LOGITS_COS_FLOOR:.7}"
+         fixed_max_abs={:.5e} fixed_cos_floor={:.7}",
+        CHAINED_LOGITS_BUDGET.max_abs, CHAINED_LOGITS_BUDGET.cosine_floor
     );
     assert_parity_bf16(
         "chained logits",
         &logits,
         &oracle_logits,
-        CHAINED_LOGITS_MAX_ABS_TOL,
-        CHAINED_LOGITS_COS_FLOOR,
+        CHAINED_LOGITS_BUDGET.max_abs,
+        CHAINED_LOGITS_BUDGET.cosine_floor,
     );
 }
 
