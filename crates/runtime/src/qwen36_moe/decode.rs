@@ -47,6 +47,7 @@ use kernel_ffi::qwen36_moe::{
     Qwen36MoeLinearStepInt4, Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
 };
 
+use crate::qwen36_moe::layer_loader::ensure_legacy_int4_execution_supported;
 use crate::qwen36_moe::lm_head::bf16_bytes_to_f32;
 use crate::qwen36_moe::types::{
     AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, FullAttnKvCache,
@@ -2184,6 +2185,7 @@ fn run_chained_decode_impl_with_cache_pos(
             geom.num_layers,
         ));
     }
+    ensure_legacy_int4_execution_supported(layers, "chained decode")?;
 
     // Residual ping-pong. Two buffers, each sized [hidden] BF16. We index
     // them by `front` so the buffer the kernel reads is well-defined for

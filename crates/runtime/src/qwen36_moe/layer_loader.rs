@@ -420,6 +420,62 @@ pub fn classify_layer_weight_encoding(
     Ok(stack_encoding.unwrap_or(Qwen36LayerWeightEncoding::Bf16))
 }
 
+pub(crate) fn ensure_legacy_int4_execution_supported(
+    layers: &[LayerBuffers],
+    execution_path: &str,
+) -> Result<()> {
+    let reject_row_group =
+        |layer_idx: usize, projection: &str, sidecar: &LoadedInt4Sidecar| -> Result<()> {
+            if sidecar.view.kind == Int4StorageKind::RowGroupSymmetric {
+                return Err(anyhow!(
+                    "Qwen3.6 {execution_path} legacy execution does not support row-group INT4 \
+                     encoding 2 (layer {layer_idx} {projection}); descriptor-driven \
+                     row-group dequantization is required"
+                ));
+            }
+            Ok(())
+        };
+
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        match &layer.attn {
+            AttnLayerBuffers::Full { int4: Some(s), .. } => {
+                for (projection, sidecar) in [
+                    ("q_proj", &s.q_proj),
+                    ("k_proj", &s.k_proj),
+                    ("v_proj", &s.v_proj),
+                    ("o_proj", &s.o_proj),
+                ] {
+                    reject_row_group(layer_idx, projection, sidecar)?;
+                }
+            }
+            AttnLayerBuffers::Linear { int4: Some(s), .. } => {
+                for (projection, sidecar) in [
+                    ("linear_in_proj_qkv", &s.in_proj_qkv),
+                    ("linear_in_proj_z", &s.in_proj_z),
+                    ("linear_out_proj", &s.out_proj),
+                ] {
+                    reject_row_group(layer_idx, projection, sidecar)?;
+                }
+            }
+            AttnLayerBuffers::Full { int4: None, .. }
+            | AttnLayerBuffers::Linear { int4: None, .. } => {}
+        }
+
+        if let Some(s) = &layer.ffn.int4 {
+            for (projection, sidecar) in [
+                ("experts_gate_up", &s.gate_up_proj),
+                ("experts_down", &s.down_proj),
+                ("shared_expert_gate_proj", &s.shared_gate_proj),
+                ("shared_expert_up_proj", &s.shared_up_proj),
+                ("shared_expert_down_proj", &s.shared_down_proj),
+            ] {
+                reject_row_group(layer_idx, projection, sidecar)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ggml_lowbit_type_for_layout(store: &BakedStore, name: &str) -> Result<i32> {
     let layout = store_layout_qwen36(store, name)
         .ok_or_else(|| anyhow!("missing layout metadata for {name}"))?;
@@ -1450,7 +1506,7 @@ pub fn load_qwen36_layers(
 mod direct_load_tests {
     use super::*;
     use crate::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
-    use crate::qwen36_moe::decode::Qwen36ExecutionOptions;
+    use crate::qwen36_moe::decode::{run_chained_decode_fast, Qwen36ExecutionOptions};
     use crate::qwen36_moe::persistent_decode::{build_int4_weight_desc, validate_int4_sidecar_set};
     use crate::qwen36_moe::prefill::run_batched_prefill;
     use crate::qwen36_moe::residency::{MoeExpertResidencyConfig, MoeExpertResidencyManager};
@@ -1996,6 +2052,40 @@ mod direct_load_tests {
         .expect("runtime direct layer load")
     }
 
+    const ROW_GROUP_FLM_LOGICAL_NAME: &str = "semantic.row_group.weight";
+
+    fn load_row_group_flm_sidecar(store: &BakedStore) -> LoadedInt4Sidecar {
+        load_int4_projection_sidecar(
+            store,
+            0,
+            ROW_GROUP_FLM_LOGICAL_NAME,
+            "unused-row-group-scale-alias",
+            "unused-row-group-zero-alias",
+        )
+        .expect("load row-group sidecar through BakedStore storage view")
+    }
+
+    fn install_row_group_flm_sidecars(store: &BakedStore, loaded: &mut LoadedQwen36Layers) {
+        let layer = &mut loaded.layers_mut_before_persistent().unwrap()[0];
+        let AttnLayerBuffers::Full {
+            int4: Some(attn), ..
+        } = &mut layer.attn
+        else {
+            panic!("expected native-INT4 full-attention sidecars");
+        };
+        attn.q_proj = load_row_group_flm_sidecar(store);
+        attn.k_proj = load_row_group_flm_sidecar(store);
+        attn.v_proj = load_row_group_flm_sidecar(store);
+        attn.o_proj = load_row_group_flm_sidecar(store);
+
+        let ffn = layer.ffn.int4.as_mut().expect("native-INT4 FFN sidecars");
+        ffn.gate_up_proj = load_row_group_flm_sidecar(store);
+        ffn.down_proj = load_row_group_flm_sidecar(store);
+        ffn.shared_gate_proj = load_row_group_flm_sidecar(store);
+        ffn.shared_up_proj = load_row_group_flm_sidecar(store);
+        ffn.shared_down_proj = load_row_group_flm_sidecar(store);
+    }
+
     #[test]
     fn runtime_direct_load_owns_bf16_layers_and_kv_state() {
         let _backend_lock = GPU_BACKEND_TEST_LOCK
@@ -2161,6 +2251,70 @@ mod direct_load_tests {
                 .to_string()
                 .contains("mixes INT4 input group sizes"),
             "{mixed_group}"
+        );
+    }
+
+    #[test]
+    fn flm_row_group_geometry_reaches_descriptors_but_legacy_decode_rejects_before_launch() {
+        let _backend_lock = GPU_BACKEND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen36_row_group_rank3.flm");
+        let store = BakedStore::open_flm(&fixture).expect("open canonical row-group FLM fixture");
+        let storage_view = store
+            .int4_storage_view(ROW_GROUP_FLM_LOGICAL_NAME)
+            .expect("BakedStore row-group storage lookup");
+        assert_eq!(storage_view.kind, Int4StorageKind::RowGroupSymmetric);
+        assert_eq!(storage_view.logical_shape, [2, 4, 64]);
+
+        let mut loaded = load_direct(Qwen36WeightMode::Int4);
+        install_row_group_flm_sidecars(&store, &mut loaded);
+        assert_eq!(
+            classify_layer_weight_encoding(loaded.layers()).expect("compatibility classification"),
+            Qwen36LayerWeightEncoding::NativeInt4,
+            "the legacy compatibility classifier must not hide this regression"
+        );
+
+        let AttnLayerBuffers::Full {
+            int4: Some(attn), ..
+        } = &loaded.layers()[0].attn
+        else {
+            panic!("expected loaded full-attention INT4 sidecars");
+        };
+        let desc =
+            build_int4_weight_desc(&attn.q_proj).expect("build production-loaded descriptor");
+        assert_eq!(desc.packed_row_stride_bytes, 32);
+        assert_eq!(desc.packed_expert_stride_bytes, 128);
+        assert_eq!(desc.scale_row_stride_elements, 2);
+        assert_eq!(desc.scale_expert_stride_elements, 8);
+        assert_eq!(desc.input_group_size, 32);
+        assert_eq!(desc.output_group_size, 1);
+        assert_eq!(desc.implicit_zero_code, 8);
+        assert!(desc.zero.is_null());
+        assert_eq!(desc.encoding, 2);
+
+        let invalid_ordinal = usize::MAX;
+        let persistent_err = loaded
+            .enable_persistent(invalid_ordinal, &geom())
+            .expect_err("persistent legacy execution must reject row-group INT4");
+        let chained_err = match run_chained_decode_fast(
+            invalid_ordinal,
+            &geom(),
+            loaded.layers_mut_before_persistent().unwrap(),
+            &[0; 128 * 2],
+            0,
+            false,
+            &Qwen36ExecutionOptions::default(),
+        ) {
+            Ok(_) => panic!("chained legacy execution must reject row-group INT4"),
+            Err(err) => err,
+        };
+        assert!(
+            persistent_err.to_string().contains("row-group INT4")
+                && chained_err.to_string().contains("row-group INT4"),
+            "legacy paths did not reject row-group INT4 before device work:\n\
+             persistent: {persistent_err:#}\nchained: {chained_err:#}"
         );
     }
 

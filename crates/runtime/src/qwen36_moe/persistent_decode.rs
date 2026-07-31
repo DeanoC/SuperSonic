@@ -61,7 +61,10 @@ use crate::qwen36_moe::decode::{
     ffn_workspace_floats, full_attn_score_workspace_floats, full_attn_workspace_floats,
     linear_attn_workspace_floats, reset_sync_buf, Qwen36ExecutionOptions,
 };
-use crate::qwen36_moe::layer_loader::{classify_layer_weight_encoding, Qwen36LayerWeightEncoding};
+use crate::qwen36_moe::layer_loader::{
+    classify_layer_weight_encoding, ensure_legacy_int4_execution_supported,
+    Qwen36LayerWeightEncoding,
+};
 use crate::qwen36_moe::layers::{
     validate_persistent_embedding_request, validate_persistent_position_plan,
     PersistentEmbeddingMetadata, PersistentKvCapacity,
@@ -347,6 +350,7 @@ impl PersistentScratch {
                 geom.num_layers
             ));
         }
+        ensure_legacy_int4_execution_supported(layers, "persistent decode")?;
         let encoding = classify_layer_weight_encoding(layers)
             .context("classify Qwen3.6 persistent layer weight encoding")?;
         if !persistent_supports_encoding(encoding) {
