@@ -14,6 +14,7 @@
 // Int4ScaleDesc} from qwen36_moe.hip above.
 #include "qwen36_moe_persistent/persistent_decode.hip"
 
+#include <cstddef>
 #include <cstdlib>
 #include <cstdio>
 #ifndef SUPERSONIC_QWEN36_CUDA_BRIDGE
@@ -104,6 +105,37 @@ struct ScopedHipDevice {
 static_assert(sizeof(qwen36_moe::DecodeLayerDesc) == 344,
               "Qwen36MoeDecodeLayerDesc size drift — Rust side is pinned to 344 bytes; "
               "if you appended a field, update both sides in the same commit");
+
+using Qwen36Int4WeightDesc = qwen36_moe::Qwen36MoeInt4WeightDesc;
+using Qwen36Int4ScaleDesc = qwen36_moe::Int4ScaleDesc;
+
+static_assert(sizeof(Qwen36Int4WeightDesc) == 64);
+static_assert(alignof(Qwen36Int4WeightDesc) == 8);
+static_assert(offsetof(Qwen36Int4WeightDesc, scale) == 0);
+static_assert(offsetof(Qwen36Int4WeightDesc, zero) == 8);
+static_assert(offsetof(Qwen36Int4WeightDesc, packed_row_stride_bytes) == 16);
+static_assert(offsetof(Qwen36Int4WeightDesc, packed_expert_stride_bytes) == 24);
+static_assert(offsetof(Qwen36Int4WeightDesc, scale_row_stride_elements) == 32);
+static_assert(offsetof(Qwen36Int4WeightDesc, scale_expert_stride_elements) == 40);
+static_assert(offsetof(Qwen36Int4WeightDesc, input_group_size) == 48);
+static_assert(offsetof(Qwen36Int4WeightDesc, output_group_size) == 52);
+static_assert(offsetof(Qwen36Int4WeightDesc, implicit_zero_code) == 56);
+static_assert(offsetof(Qwen36Int4WeightDesc, encoding) == 60);
+
+static_assert(sizeof(Qwen36Int4ScaleDesc) == 768);
+static_assert(alignof(Qwen36Int4ScaleDesc) == 8);
+static_assert(offsetof(Qwen36Int4ScaleDesc, q_proj) == 0);
+static_assert(offsetof(Qwen36Int4ScaleDesc, k_proj) == 64);
+static_assert(offsetof(Qwen36Int4ScaleDesc, v_proj) == 128);
+static_assert(offsetof(Qwen36Int4ScaleDesc, o_proj) == 192);
+static_assert(offsetof(Qwen36Int4ScaleDesc, linear_in_proj_qkv) == 256);
+static_assert(offsetof(Qwen36Int4ScaleDesc, linear_in_proj_z) == 320);
+static_assert(offsetof(Qwen36Int4ScaleDesc, linear_out_proj) == 384);
+static_assert(offsetof(Qwen36Int4ScaleDesc, experts_gate_up) == 448);
+static_assert(offsetof(Qwen36Int4ScaleDesc, experts_down) == 512);
+static_assert(offsetof(Qwen36Int4ScaleDesc, shared_expert_gate_proj) == 576);
+static_assert(offsetof(Qwen36Int4ScaleDesc, shared_expert_up_proj) == 640);
+static_assert(offsetof(Qwen36Int4ScaleDesc, shared_expert_down_proj) == 704);
 
 static_assert(sizeof(qwen36_moe::KVCacheFp8Desc) == 16,
               "Qwen36MoeKVCacheFp8Desc layout drift — must be exactly 2 pointers");

@@ -1500,39 +1500,39 @@ fn emit_decode_batch_shared_parity_taps(
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
                     gate_up_proj_type: s.gate_up_proj_type,
-                    gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
+                    gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.gate_up_proj_zero.as_ptr()
+                        s.gate_up_proj.zero_ptr()
                     },
                     down_proj_type: s.down_proj_type,
-                    down_proj_scale: s.down_proj_scale.as_ptr(),
+                    down_proj_scale: s.down_proj.scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.down_proj_zero.as_ptr()
+                        s.down_proj.zero_ptr()
                     },
                     shared_gate_proj_type: s.shared_gate_proj_type,
-                    shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
+                    shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                     shared_gate_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_gate_proj_zero.as_ptr()
+                        s.shared_gate_proj.zero_ptr()
                     },
                     shared_up_proj_type: s.shared_up_proj_type,
-                    shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
+                    shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                     shared_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_up_proj_zero.as_ptr()
+                        s.shared_up_proj.zero_ptr()
                     },
                     shared_down_proj_type: s.shared_down_proj_type,
-                    shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
+                    shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                     shared_down_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_down_proj_zero.as_ptr()
+                        s.shared_down_proj.zero_ptr()
                     },
                 }
             }
@@ -1653,39 +1653,39 @@ fn emit_decode_batch_router_parity_taps(
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
                     gate_up_proj_type: s.gate_up_proj_type,
-                    gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
+                    gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.gate_up_proj_zero.as_ptr()
+                        s.gate_up_proj.zero_ptr()
                     },
                     down_proj_type: s.down_proj_type,
-                    down_proj_scale: s.down_proj_scale.as_ptr(),
+                    down_proj_scale: s.down_proj.scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.down_proj_zero.as_ptr()
+                        s.down_proj.zero_ptr()
                     },
                     shared_gate_proj_type: s.shared_gate_proj_type,
-                    shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
+                    shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                     shared_gate_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_gate_proj_zero.as_ptr()
+                        s.shared_gate_proj.zero_ptr()
                     },
                     shared_up_proj_type: s.shared_up_proj_type,
-                    shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
+                    shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                     shared_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_up_proj_zero.as_ptr()
+                        s.shared_up_proj.zero_ptr()
                     },
                     shared_down_proj_type: s.shared_down_proj_type,
-                    shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
+                    shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                     shared_down_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_down_proj_zero.as_ptr()
+                        s.shared_down_proj.zero_ptr()
                     },
                 }
             }
@@ -1817,39 +1817,39 @@ fn emit_decode_batch_routed_parity_taps(
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
                     gate_up_proj_type: s.gate_up_proj_type,
-                    gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
+                    gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.gate_up_proj_zero.as_ptr()
+                        s.gate_up_proj.zero_ptr()
                     },
                     down_proj_type: s.down_proj_type,
-                    down_proj_scale: s.down_proj_scale.as_ptr(),
+                    down_proj_scale: s.down_proj.scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.down_proj_zero.as_ptr()
+                        s.down_proj.zero_ptr()
                     },
                     shared_gate_proj_type: s.shared_gate_proj_type,
-                    shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
+                    shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                     shared_gate_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_gate_proj_zero.as_ptr()
+                        s.shared_gate_proj.zero_ptr()
                     },
                     shared_up_proj_type: s.shared_up_proj_type,
-                    shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
+                    shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                     shared_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_up_proj_zero.as_ptr()
+                        s.shared_up_proj.zero_ptr()
                     },
                     shared_down_proj_type: s.shared_down_proj_type,
-                    shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
+                    shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                     shared_down_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_down_proj_zero.as_ptr()
+                        s.shared_down_proj.zero_ptr()
                     },
                 }
             }
@@ -2410,39 +2410,39 @@ fn run_chained_decode_impl_with_cache_pos(
                     Qwen36MoeFfnStepInt4 {
                         group_size: s.group_size,
                         gate_up_proj_type: s.gate_up_proj_type,
-                        gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
+                        gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                         gate_up_proj_zero: if fp8 {
                             ptr::null()
                         } else {
-                            s.gate_up_proj_zero.as_ptr()
+                            s.gate_up_proj.zero_ptr()
                         },
                         down_proj_type: s.down_proj_type,
-                        down_proj_scale: s.down_proj_scale.as_ptr(),
+                        down_proj_scale: s.down_proj.scale.as_ptr(),
                         down_proj_zero: if fp8 {
                             ptr::null()
                         } else {
-                            s.down_proj_zero.as_ptr()
+                            s.down_proj.zero_ptr()
                         },
                         shared_gate_proj_type: s.shared_gate_proj_type,
-                        shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
+                        shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                         shared_gate_proj_zero: if fp8 {
                             ptr::null()
                         } else {
-                            s.shared_gate_proj_zero.as_ptr()
+                            s.shared_gate_proj.zero_ptr()
                         },
                         shared_up_proj_type: s.shared_up_proj_type,
-                        shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
+                        shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                         shared_up_proj_zero: if fp8 {
                             ptr::null()
                         } else {
-                            s.shared_up_proj_zero.as_ptr()
+                            s.shared_up_proj.zero_ptr()
                         },
                         shared_down_proj_type: s.shared_down_proj_type,
-                        shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
+                        shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                         shared_down_proj_zero: if fp8 {
                             ptr::null()
                         } else {
-                            s.shared_down_proj_zero.as_ptr()
+                            s.shared_down_proj.zero_ptr()
                         },
                     }
                 }
@@ -2510,32 +2510,32 @@ fn run_chained_decode_impl_with_cache_pos(
                         Qwen36MoeAttnStepInt4 {
                             group_size: s.group_size,
                             q_proj_type: s.q_proj_type,
-                            q_proj_scale: s.q_proj_scale.as_ptr(),
+                            q_proj_scale: s.q_proj.scale.as_ptr(),
                             q_proj_zero: if fp8 {
                                 ptr::null()
                             } else {
-                                s.q_proj_zero.as_ptr()
+                                s.q_proj.zero_ptr()
                             },
                             k_proj_type: s.k_proj_type,
-                            k_proj_scale: s.k_proj_scale.as_ptr(),
+                            k_proj_scale: s.k_proj.scale.as_ptr(),
                             k_proj_zero: if fp8 {
                                 ptr::null()
                             } else {
-                                s.k_proj_zero.as_ptr()
+                                s.k_proj.zero_ptr()
                             },
                             v_proj_type: s.v_proj_type,
-                            v_proj_scale: s.v_proj_scale.as_ptr(),
+                            v_proj_scale: s.v_proj.scale.as_ptr(),
                             v_proj_zero: if fp8 {
                                 ptr::null()
                             } else {
-                                s.v_proj_zero.as_ptr()
+                                s.v_proj.zero_ptr()
                             },
                             o_proj_type: s.o_proj_type,
-                            o_proj_scale: s.o_proj_scale.as_ptr(),
+                            o_proj_scale: s.o_proj.scale.as_ptr(),
                             o_proj_zero: if fp8 {
                                 ptr::null()
                             } else {
-                                s.o_proj_zero.as_ptr()
+                                s.o_proj.zero_ptr()
                             },
                         }
                     }
@@ -2716,25 +2716,25 @@ fn run_chained_decode_impl_with_cache_pos(
                         Qwen36MoeLinearStepInt4 {
                             group_size: s.group_size,
                             in_proj_qkv_type: s.in_proj_qkv_type,
-                            in_proj_qkv_scale: s.in_proj_qkv_scale.as_ptr(),
+                            in_proj_qkv_scale: s.in_proj_qkv.scale.as_ptr(),
                             in_proj_qkv_zero: if fp8 {
                                 ptr::null()
                             } else {
-                                s.in_proj_qkv_zero.as_ptr()
+                                s.in_proj_qkv.zero_ptr()
                             },
                             in_proj_z_type: s.in_proj_z_type,
-                            in_proj_z_scale: s.in_proj_z_scale.as_ptr(),
+                            in_proj_z_scale: s.in_proj_z.scale.as_ptr(),
                             in_proj_z_zero: if fp8 {
                                 ptr::null()
                             } else {
-                                s.in_proj_z_zero.as_ptr()
+                                s.in_proj_z.zero_ptr()
                             },
                             out_proj_type: s.out_proj_type,
-                            out_proj_scale: s.out_proj_scale.as_ptr(),
+                            out_proj_scale: s.out_proj.scale.as_ptr(),
                             out_proj_zero: if fp8 {
                                 ptr::null()
                             } else {
-                                s.out_proj_zero.as_ptr()
+                                s.out_proj.zero_ptr()
                             },
                         }
                     }
@@ -2884,39 +2884,39 @@ fn run_chained_decode_impl_with_cache_pos(
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
                     gate_up_proj_type: s.gate_up_proj_type,
-                    gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
+                    gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.gate_up_proj_zero.as_ptr()
+                        s.gate_up_proj.zero_ptr()
                     },
                     down_proj_type: s.down_proj_type,
-                    down_proj_scale: s.down_proj_scale.as_ptr(),
+                    down_proj_scale: s.down_proj.scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.down_proj_zero.as_ptr()
+                        s.down_proj.zero_ptr()
                     },
                     shared_gate_proj_type: s.shared_gate_proj_type,
-                    shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
+                    shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                     shared_gate_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_gate_proj_zero.as_ptr()
+                        s.shared_gate_proj.zero_ptr()
                     },
                     shared_up_proj_type: s.shared_up_proj_type,
-                    shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
+                    shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                     shared_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_up_proj_zero.as_ptr()
+                        s.shared_up_proj.zero_ptr()
                     },
                     shared_down_proj_type: s.shared_down_proj_type,
-                    shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
+                    shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                     shared_down_proj_zero: if fp8 {
                         ptr::null()
                     } else {
-                        s.shared_down_proj_zero.as_ptr()
+                        s.shared_down_proj.zero_ptr()
                     },
                 }
             }

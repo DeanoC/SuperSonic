@@ -30,9 +30,11 @@ use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, copy_h2d, sync, Backend, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
     persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeAttnStepParams,
-    Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc,
-    Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold, Qwen36MoePersistentMode,
+    Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc, Qwen36MoeInt4WeightDesc,
+    Qwen36MoeKVCacheFp8Desc, Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold,
+    Qwen36MoePersistentMode,
 };
+use model_store::store::Int4StorageKind;
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -66,7 +68,8 @@ use crate::qwen36_moe::layers::{
 };
 use crate::qwen36_moe::lm_head::bf16_bytes_to_f32;
 use crate::qwen36_moe::types::{
-    AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
+    AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers,
+    LoadedInt4Sidecar, MultiLayerGeom,
 };
 
 /// Pre-allocated scratch + cached descriptor arrays for the persistent
@@ -370,9 +373,10 @@ impl PersistentScratch {
             .collect();
         let descriptor_start = Instant::now();
         let descs = build_layer_descs(layers);
+        let int4_descs = build_int4_descs(layers)?;
         let layer_descs_dev =
             upload_descs(ordinal, &descs).context("upload layer descriptor array")?;
-        let int4_scales_dev = match build_int4_descs(layers) {
+        let int4_scales_dev = match int4_descs {
             Some(int4) => Some(upload_descs(ordinal, &int4).context("upload int4 scale descs")?),
             None => None,
         };
@@ -1212,9 +1216,100 @@ pub fn build_layer_descs(layers: &mut [LayerBuffers]) -> Vec<Qwen36MoeDecodeLaye
     descs
 }
 
+pub(crate) fn build_int4_weight_desc(
+    sidecar: &LoadedInt4Sidecar,
+) -> Result<Qwen36MoeInt4WeightDesc> {
+    let view = &sidecar.view;
+    let encoding = match view.kind {
+        Int4StorageKind::RowGroupSymmetric => {
+            if sidecar.zero.is_some()
+                || view.zero_tensor.is_some()
+                || view.implicit_zero_code != Some(8)
+            {
+                return Err(anyhow!(
+                    "row-group INT4 requires an implicit zero code of 8 and no zero plane"
+                ));
+            }
+            2
+        }
+        Int4StorageKind::TileV1 if sidecar.zero.is_some() => {
+            if view.zero_tensor.is_none() || view.implicit_zero_code.is_some() {
+                return Err(anyhow!(
+                    "tile-v1 INT4 requires an explicit zero plane and no implicit zero code"
+                ));
+            }
+            1
+        }
+        Int4StorageKind::TileV1 => {
+            if view.zero_tensor.is_some() || view.implicit_zero_code.is_some() {
+                return Err(anyhow!(
+                    "FP8 block storage requires no zero plane or implicit zero code"
+                ));
+            }
+            3
+        }
+    };
+    if view.group_size == 0 || view.output_group_size == 0 {
+        return Err(anyhow!("quantized storage group sizes must be nonzero"));
+    }
+    if view.packed_row_stride_bytes == 0 || view.scale_row_stride_elements == 0 {
+        return Err(anyhow!("quantized storage row strides must be nonzero"));
+    }
+    let input_group_size =
+        i32::try_from(view.group_size).context("quantized input group size does not fit c_int")?;
+    let output_group_size = i32::try_from(view.output_group_size)
+        .context("quantized output group size does not fit c_int")?;
+    Ok(Qwen36MoeInt4WeightDesc {
+        scale: sidecar.scale.as_ptr() as *const c_void,
+        zero: sidecar.zero_ptr(),
+        packed_row_stride_bytes: u64::try_from(view.packed_row_stride_bytes)
+            .context("packed row stride does not fit u64")?,
+        packed_expert_stride_bytes: u64::try_from(view.packed_expert_stride_bytes)
+            .context("packed expert stride does not fit u64")?,
+        scale_row_stride_elements: u64::try_from(view.scale_row_stride_elements)
+            .context("scale row stride does not fit u64")?,
+        scale_expert_stride_elements: u64::try_from(view.scale_expert_stride_elements)
+            .context("scale expert stride does not fit u64")?,
+        input_group_size,
+        output_group_size,
+        implicit_zero_code: view.implicit_zero_code.map(i32::from).unwrap_or(-1),
+        encoding,
+    })
+}
+
+pub(crate) fn validate_int4_sidecar_set(
+    layer_idx: usize,
+    sidecars: &[(&str, &LoadedInt4Sidecar)],
+) -> Result<()> {
+    let mut expected: Option<(i32, i32, &str)> = None;
+    for &(projection, sidecar) in sidecars {
+        let desc = build_int4_weight_desc(sidecar)
+            .with_context(|| format!("Qwen3.6 layer {layer_idx} {projection}"))?;
+        if let Some((encoding, group_size, first_projection)) = expected {
+            if desc.encoding != encoding {
+                return Err(anyhow!(
+                    "Qwen3.6 layer {layer_idx} mixes INT4 encodings: {first_projection} uses \
+                     {encoding}, but {projection} uses {}",
+                    desc.encoding
+                ));
+            }
+            if desc.input_group_size != group_size {
+                return Err(anyhow!(
+                    "Qwen3.6 layer {layer_idx} mixes INT4 input group sizes: {first_projection} \
+                     uses {group_size}, but {projection} uses {}",
+                    desc.input_group_size
+                ));
+            }
+        } else {
+            expected = Some((desc.encoding, desc.input_group_size, projection));
+        }
+    }
+    Ok(())
+}
+
 /// Build the parallel `Qwen36MoeInt4ScaleDesc[num_layers]`. Returns
 /// `None` when no layer carries INT4 sidecars (BF16 bake).
-pub fn build_int4_descs(layers: &[LayerBuffers]) -> Option<Vec<Qwen36MoeInt4ScaleDesc>> {
+pub fn build_int4_descs(layers: &[LayerBuffers]) -> Result<Option<Vec<Qwen36MoeInt4ScaleDesc>>> {
     let any_int4 = layers.iter().any(|l| {
         let attn_q = match &l.attn {
             AttnLayerBuffers::Full { int4, .. } => int4.is_some(),
@@ -1223,50 +1318,65 @@ pub fn build_int4_descs(layers: &[LayerBuffers]) -> Option<Vec<Qwen36MoeInt4Scal
         attn_q || l.ffn.int4.is_some()
     });
     if !any_int4 {
-        return None;
+        return Ok(None);
     }
     let mut int4 = Vec::with_capacity(layers.len());
-    for l in layers.iter() {
+    for (layer_idx, l) in layers.iter().enumerate() {
         let mut d = Qwen36MoeInt4ScaleDesc::default();
+        let attn_has_int4 = match &l.attn {
+            AttnLayerBuffers::Full { int4, .. } => int4.is_some(),
+            AttnLayerBuffers::Linear { int4, .. } => int4.is_some(),
+        };
+        if attn_has_int4 != l.ffn.int4.is_some() {
+            return Err(anyhow!(
+                "Qwen3.6 layer {layer_idx} must provide quantized geometry for both attention and FFN"
+            ));
+        }
+
+        let mut projections = Vec::new();
         match &l.attn {
             AttnLayerBuffers::Full { int4: Some(s), .. } => {
-                d.q_proj_scale = s.q_proj_scale.as_ptr() as *const c_void;
-                d.q_proj_zero = s.q_proj_zero.as_ptr() as *const c_void;
-                d.k_proj_scale = s.k_proj_scale.as_ptr() as *const c_void;
-                d.k_proj_zero = s.k_proj_zero.as_ptr() as *const c_void;
-                d.v_proj_scale = s.v_proj_scale.as_ptr() as *const c_void;
-                d.v_proj_zero = s.v_proj_zero.as_ptr() as *const c_void;
-                d.o_proj_scale = s.o_proj_scale.as_ptr() as *const c_void;
-                d.o_proj_zero = s.o_proj_zero.as_ptr() as *const c_void;
-                d.group_size = s.group_size;
+                projections.extend([
+                    ("q_proj", &s.q_proj),
+                    ("k_proj", &s.k_proj),
+                    ("v_proj", &s.v_proj),
+                    ("o_proj", &s.o_proj),
+                ]);
+                d.q_proj = build_int4_weight_desc(&s.q_proj)?;
+                d.k_proj = build_int4_weight_desc(&s.k_proj)?;
+                d.v_proj = build_int4_weight_desc(&s.v_proj)?;
+                d.o_proj = build_int4_weight_desc(&s.o_proj)?;
             }
             AttnLayerBuffers::Linear { int4: Some(s), .. } => {
-                d.linear_in_proj_qkv_scale = s.in_proj_qkv_scale.as_ptr() as *const c_void;
-                d.linear_in_proj_qkv_zero = s.in_proj_qkv_zero.as_ptr() as *const c_void;
-                d.linear_in_proj_z_scale = s.in_proj_z_scale.as_ptr() as *const c_void;
-                d.linear_in_proj_z_zero = s.in_proj_z_zero.as_ptr() as *const c_void;
-                d.linear_out_proj_scale = s.out_proj_scale.as_ptr() as *const c_void;
-                d.linear_out_proj_zero = s.out_proj_zero.as_ptr() as *const c_void;
-                d.group_size = s.group_size;
+                projections.extend([
+                    ("linear_in_proj_qkv", &s.in_proj_qkv),
+                    ("linear_in_proj_z", &s.in_proj_z),
+                    ("linear_out_proj", &s.out_proj),
+                ]);
+                d.linear_in_proj_qkv = build_int4_weight_desc(&s.in_proj_qkv)?;
+                d.linear_in_proj_z = build_int4_weight_desc(&s.in_proj_z)?;
+                d.linear_out_proj = build_int4_weight_desc(&s.out_proj)?;
             }
             _ => {}
         }
         if let Some(s) = &l.ffn.int4 {
-            d.experts_gate_up_scale = s.gate_up_proj_scale.as_ptr() as *const c_void;
-            d.experts_gate_up_zero = s.gate_up_proj_zero.as_ptr() as *const c_void;
-            d.experts_down_scale = s.down_proj_scale.as_ptr() as *const c_void;
-            d.experts_down_zero = s.down_proj_zero.as_ptr() as *const c_void;
-            d.shared_expert_gate_proj_scale = s.shared_gate_proj_scale.as_ptr() as *const c_void;
-            d.shared_expert_gate_proj_zero = s.shared_gate_proj_zero.as_ptr() as *const c_void;
-            d.shared_expert_up_proj_scale = s.shared_up_proj_scale.as_ptr() as *const c_void;
-            d.shared_expert_up_proj_zero = s.shared_up_proj_zero.as_ptr() as *const c_void;
-            d.shared_expert_down_proj_scale = s.shared_down_proj_scale.as_ptr() as *const c_void;
-            d.shared_expert_down_proj_zero = s.shared_down_proj_zero.as_ptr() as *const c_void;
-            d.group_size = s.group_size;
+            projections.extend([
+                ("experts_gate_up", &s.gate_up_proj),
+                ("experts_down", &s.down_proj),
+                ("shared_expert_gate_proj", &s.shared_gate_proj),
+                ("shared_expert_up_proj", &s.shared_up_proj),
+                ("shared_expert_down_proj", &s.shared_down_proj),
+            ]);
+            validate_int4_sidecar_set(layer_idx, &projections)?;
+            d.experts_gate_up = build_int4_weight_desc(&s.gate_up_proj)?;
+            d.experts_down = build_int4_weight_desc(&s.down_proj)?;
+            d.shared_expert_gate_proj = build_int4_weight_desc(&s.shared_gate_proj)?;
+            d.shared_expert_up_proj = build_int4_weight_desc(&s.shared_up_proj)?;
+            d.shared_expert_down_proj = build_int4_weight_desc(&s.shared_down_proj)?;
         }
         int4.push(d);
     }
-    Some(int4)
+    Ok(Some(int4))
 }
 
 /// Build the parallel `Qwen36MoeKVCacheFp8Desc[num_layers]`. Returns

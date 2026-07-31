@@ -4,6 +4,7 @@
 use std::ffi::c_void;
 
 use gpu_hal::{GpuBuffer, ScalarType};
+use model_store::store::Int4StorageView;
 
 /// Hybrid pattern: every 4th layer is full attention. Indices 3, 7, 11, ...
 /// are full; everything else is linear. Matches Qwen3.6-MoE 35B-A3B.
@@ -173,35 +174,43 @@ impl FullAttnKvCache {
     }
 }
 
+pub struct LoadedInt4Sidecar {
+    pub scale: GpuBuffer,
+    pub zero: Option<GpuBuffer>,
+    pub view: Int4StorageView,
+}
+
+impl LoadedInt4Sidecar {
+    pub fn zero_ptr(&self) -> *const c_void {
+        self.zero
+            .as_ref()
+            .map(GpuBuffer::as_ptr)
+            .unwrap_or(std::ptr::null())
+    }
+}
+
 /// INT4 sidecars for a full-attention layer.
 pub struct FullAttnInt4Sidecars {
     pub group_size: i32,
     pub q_proj_type: i32,
-    pub q_proj_scale: GpuBuffer,
-    pub q_proj_zero: GpuBuffer,
+    pub q_proj: LoadedInt4Sidecar,
     pub k_proj_type: i32,
-    pub k_proj_scale: GpuBuffer,
-    pub k_proj_zero: GpuBuffer,
+    pub k_proj: LoadedInt4Sidecar,
     pub v_proj_type: i32,
-    pub v_proj_scale: GpuBuffer,
-    pub v_proj_zero: GpuBuffer,
+    pub v_proj: LoadedInt4Sidecar,
     pub o_proj_type: i32,
-    pub o_proj_scale: GpuBuffer,
-    pub o_proj_zero: GpuBuffer,
+    pub o_proj: LoadedInt4Sidecar,
 }
 
 /// INT4 sidecars for a linear-attention layer.
 pub struct LinearAttnInt4Sidecars {
     pub group_size: i32,
     pub in_proj_qkv_type: i32,
-    pub in_proj_qkv_scale: GpuBuffer,
-    pub in_proj_qkv_zero: GpuBuffer,
+    pub in_proj_qkv: LoadedInt4Sidecar,
     pub in_proj_z_type: i32,
-    pub in_proj_z_scale: GpuBuffer,
-    pub in_proj_z_zero: GpuBuffer,
+    pub in_proj_z: LoadedInt4Sidecar,
     pub out_proj_type: i32,
-    pub out_proj_scale: GpuBuffer,
-    pub out_proj_zero: GpuBuffer,
+    pub out_proj: LoadedInt4Sidecar,
 }
 
 /// INT4 sidecars for an MoE FFN block. The router (`gate_w`) and scalar
@@ -209,20 +218,15 @@ pub struct LinearAttnInt4Sidecars {
 pub struct FfnInt4Sidecars {
     pub group_size: i32,
     pub gate_up_proj_type: i32,
-    pub gate_up_proj_scale: GpuBuffer,
-    pub gate_up_proj_zero: GpuBuffer,
+    pub gate_up_proj: LoadedInt4Sidecar,
     pub down_proj_type: i32,
-    pub down_proj_scale: GpuBuffer,
-    pub down_proj_zero: GpuBuffer,
+    pub down_proj: LoadedInt4Sidecar,
     pub shared_gate_proj_type: i32,
-    pub shared_gate_proj_scale: GpuBuffer,
-    pub shared_gate_proj_zero: GpuBuffer,
+    pub shared_gate_proj: LoadedInt4Sidecar,
     pub shared_up_proj_type: i32,
-    pub shared_up_proj_scale: GpuBuffer,
-    pub shared_up_proj_zero: GpuBuffer,
+    pub shared_up_proj: LoadedInt4Sidecar,
     pub shared_down_proj_type: i32,
-    pub shared_down_proj_scale: GpuBuffer,
-    pub shared_down_proj_zero: GpuBuffer,
+    pub shared_down_proj: LoadedInt4Sidecar,
 }
 
 /// GPU-resident weight pointer used by decode descriptors.

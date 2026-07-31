@@ -120,56 +120,87 @@ impl Default for Qwen36MoeDecodeLayerDesc {
     }
 }
 
-/// Parallel-struct to [`Qwen36MoeDecodeLayerDesc`] carrying INT4 GPTQ
-/// scale + zero pointers. When `--int4` is active, the main desc's `*_w`
-/// slots reinterpret as packed-u8 nibbles and the kernel reads the
-/// matching `*_scale` / `*_zero` from this struct.
-///
-/// Routers and scalar gates stay BF16 (`is_int4_target` excludes them);
-/// their fields here are unused but the struct keeps them at fixed offsets
-/// for ABI stability.
+/// Storage geometry for one quantized projection.
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoeInt4WeightDesc {
+    pub scale: *const c_void,
+    pub zero: *const c_void,
+    pub packed_row_stride_bytes: u64,
+    pub packed_expert_stride_bytes: u64,
+    pub scale_row_stride_elements: u64,
+    pub scale_expert_stride_elements: u64,
+    pub input_group_size: c_int,
+    pub output_group_size: c_int,
+    pub implicit_zero_code: c_int,
+    pub encoding: c_int,
+}
+
+unsafe impl Send for Qwen36MoeInt4WeightDesc {}
+unsafe impl Sync for Qwen36MoeInt4WeightDesc {}
+
+impl Default for Qwen36MoeInt4WeightDesc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Parallel-struct to [`Qwen36MoeDecodeLayerDesc`] carrying one explicit
+/// quantized-storage descriptor per projection. Projection order is ABI-fixed.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Qwen36MoeInt4ScaleDesc {
-    pub q_proj_scale: *const c_void,
-    pub q_proj_zero: *const c_void,
-    pub k_proj_scale: *const c_void,
-    pub k_proj_zero: *const c_void,
-    pub v_proj_scale: *const c_void,
-    pub v_proj_zero: *const c_void,
-    pub o_proj_scale: *const c_void,
-    pub o_proj_zero: *const c_void,
+    pub q_proj: Qwen36MoeInt4WeightDesc,
+    pub k_proj: Qwen36MoeInt4WeightDesc,
+    pub v_proj: Qwen36MoeInt4WeightDesc,
+    pub o_proj: Qwen36MoeInt4WeightDesc,
 
-    pub linear_in_proj_qkv_scale: *const c_void,
-    pub linear_in_proj_qkv_zero: *const c_void,
-    pub linear_in_proj_z_scale: *const c_void,
-    pub linear_in_proj_z_zero: *const c_void,
-    pub linear_out_proj_scale: *const c_void,
-    pub linear_out_proj_zero: *const c_void,
+    pub linear_in_proj_qkv: Qwen36MoeInt4WeightDesc,
+    pub linear_in_proj_z: Qwen36MoeInt4WeightDesc,
+    pub linear_out_proj: Qwen36MoeInt4WeightDesc,
 
-    pub experts_gate_up_scale: *const c_void,
-    pub experts_gate_up_zero: *const c_void,
-    pub experts_down_scale: *const c_void,
-    pub experts_down_zero: *const c_void,
+    pub experts_gate_up: Qwen36MoeInt4WeightDesc,
+    pub experts_down: Qwen36MoeInt4WeightDesc,
 
-    pub shared_expert_gate_proj_scale: *const c_void,
-    pub shared_expert_gate_proj_zero: *const c_void,
-    pub shared_expert_up_proj_scale: *const c_void,
-    pub shared_expert_up_proj_zero: *const c_void,
-    pub shared_expert_down_proj_scale: *const c_void,
-    pub shared_expert_down_proj_zero: *const c_void,
-
-    pub group_size: c_int,
+    pub shared_expert_gate_proj: Qwen36MoeInt4WeightDesc,
+    pub shared_expert_up_proj: Qwen36MoeInt4WeightDesc,
+    pub shared_expert_down_proj: Qwen36MoeInt4WeightDesc,
 }
 
 unsafe impl Send for Qwen36MoeInt4ScaleDesc {}
 unsafe impl Sync for Qwen36MoeInt4ScaleDesc {}
 
-impl Default for Qwen36MoeInt4ScaleDesc {
-    fn default() -> Self {
-        unsafe { std::mem::zeroed() }
-    }
-}
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+
+    assert!(size_of::<Qwen36MoeInt4WeightDesc>() == 64);
+    assert!(align_of::<Qwen36MoeInt4WeightDesc>() == 8);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, scale) == 0);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, zero) == 8);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, packed_row_stride_bytes) == 16);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, packed_expert_stride_bytes) == 24);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, scale_row_stride_elements) == 32);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, scale_expert_stride_elements) == 40);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, input_group_size) == 48);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, output_group_size) == 52);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, implicit_zero_code) == 56);
+    assert!(offset_of!(Qwen36MoeInt4WeightDesc, encoding) == 60);
+
+    assert!(size_of::<Qwen36MoeInt4ScaleDesc>() == 768);
+    assert!(align_of::<Qwen36MoeInt4ScaleDesc>() == 8);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, q_proj) == 0);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, k_proj) == 64);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, v_proj) == 128);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, o_proj) == 192);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, linear_in_proj_qkv) == 256);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, linear_in_proj_z) == 320);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, linear_out_proj) == 384);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, experts_gate_up) == 448);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, experts_down) == 512);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, shared_expert_gate_proj) == 576);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, shared_expert_up_proj) == 640);
+    assert!(offset_of!(Qwen36MoeInt4ScaleDesc, shared_expert_down_proj) == 704);
+};
 
 /// Per-layer KV cache FP8 scale pointers for Qwen3.6-MoE.
 ///
@@ -219,5 +250,63 @@ unsafe impl Sync for Qwen36MoeBatchSeqDesc {}
 impl Default for Qwen36MoeBatchSeqDesc {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
+    }
+}
+
+#[cfg(test)]
+mod qwen36_int4_weight_desc_layout_tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn qwen36_int4_weight_desc_matches_cpp_layout() {
+        assert_eq!(size_of::<Qwen36MoeInt4WeightDesc>(), 64);
+        assert_eq!(align_of::<Qwen36MoeInt4WeightDesc>(), 8);
+        assert_eq!(offset_of!(Qwen36MoeInt4WeightDesc, scale), 0);
+        assert_eq!(offset_of!(Qwen36MoeInt4WeightDesc, zero), 8);
+        assert_eq!(
+            offset_of!(Qwen36MoeInt4WeightDesc, packed_row_stride_bytes),
+            16
+        );
+        assert_eq!(
+            offset_of!(Qwen36MoeInt4WeightDesc, packed_expert_stride_bytes),
+            24
+        );
+        assert_eq!(
+            offset_of!(Qwen36MoeInt4WeightDesc, scale_row_stride_elements),
+            32
+        );
+        assert_eq!(
+            offset_of!(Qwen36MoeInt4WeightDesc, scale_expert_stride_elements),
+            40
+        );
+        assert_eq!(offset_of!(Qwen36MoeInt4WeightDesc, input_group_size), 48);
+        assert_eq!(offset_of!(Qwen36MoeInt4WeightDesc, output_group_size), 52);
+        assert_eq!(offset_of!(Qwen36MoeInt4WeightDesc, implicit_zero_code), 56);
+        assert_eq!(offset_of!(Qwen36MoeInt4WeightDesc, encoding), 60);
+
+        assert_eq!(size_of::<Qwen36MoeInt4ScaleDesc>(), 768);
+        assert_eq!(align_of::<Qwen36MoeInt4ScaleDesc>(), 8);
+        assert_eq!(offset_of!(Qwen36MoeInt4ScaleDesc, q_proj), 0);
+        assert_eq!(offset_of!(Qwen36MoeInt4ScaleDesc, k_proj), 64);
+        assert_eq!(offset_of!(Qwen36MoeInt4ScaleDesc, v_proj), 128);
+        assert_eq!(offset_of!(Qwen36MoeInt4ScaleDesc, o_proj), 192);
+        assert_eq!(offset_of!(Qwen36MoeInt4ScaleDesc, linear_in_proj_qkv), 256);
+        assert_eq!(offset_of!(Qwen36MoeInt4ScaleDesc, linear_in_proj_z), 320);
+        assert_eq!(offset_of!(Qwen36MoeInt4ScaleDesc, linear_out_proj), 384);
+        assert_eq!(offset_of!(Qwen36MoeInt4ScaleDesc, experts_gate_up), 448);
+        assert_eq!(offset_of!(Qwen36MoeInt4ScaleDesc, experts_down), 512);
+        assert_eq!(
+            offset_of!(Qwen36MoeInt4ScaleDesc, shared_expert_gate_proj),
+            576
+        );
+        assert_eq!(
+            offset_of!(Qwen36MoeInt4ScaleDesc, shared_expert_up_proj),
+            640
+        );
+        assert_eq!(
+            offset_of!(Qwen36MoeInt4ScaleDesc, shared_expert_down_proj),
+            704
+        );
     }
 }

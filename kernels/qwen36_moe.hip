@@ -143,44 +143,45 @@ struct DecodeLayerDesc {
     int   kv_shadow_window;  // rolling BF16 sidecar capacity in positions; 0 = disabled
 };
 
-// -- Int4 scale/zero parallel struct (mirror of Rust Qwen36MoeInt4ScaleDesc) -
-//
-// Phase 3e: read alongside DecodeLayerDesc by the persistent megakernel.
-// Each `*_scale` / `*_zero` pair is consulted independently per tensor — a
-// null `*_scale` keeps that tensor on the BF16 path. `group_size` applies
-// uniformly across all INT4 tensors in the descriptor; 0 disables INT4
-// entirely (matches the BF16 bake).
-struct Int4ScaleDesc {
-    const void* q_proj_scale;
-    const void* q_proj_zero;
-    const void* k_proj_scale;
-    const void* k_proj_zero;
-    const void* v_proj_scale;
-    const void* v_proj_zero;
-    const void* o_proj_scale;
-    const void* o_proj_zero;
-
-    const void* linear_in_proj_qkv_scale;
-    const void* linear_in_proj_qkv_zero;
-    const void* linear_in_proj_z_scale;
-    const void* linear_in_proj_z_zero;
-    const void* linear_out_proj_scale;
-    const void* linear_out_proj_zero;
-
-    const void* experts_gate_up_scale;
-    const void* experts_gate_up_zero;
-    const void* experts_down_scale;
-    const void* experts_down_zero;
-
-    const void* shared_expert_gate_proj_scale;
-    const void* shared_expert_gate_proj_zero;
-    const void* shared_expert_up_proj_scale;
-    const void* shared_expert_up_proj_zero;
-    const void* shared_expert_down_proj_scale;
-    const void* shared_expert_down_proj_zero;
-
-    int group_size;
+// -- Explicit quantized-weight geometry --------------------------------------
+struct Qwen36MoeInt4WeightDesc {
+    const void* scale;
+    const void* zero;
+    uint64_t    packed_row_stride_bytes;
+    uint64_t    packed_expert_stride_bytes;
+    uint64_t    scale_row_stride_elements;
+    uint64_t    scale_expert_stride_elements;
+    int         input_group_size;
+    int         output_group_size;
+    int         implicit_zero_code;
+    int         encoding;
 };
+
+// Parallel to DecodeLayerDesc. 0=none, 1=tile-v1,
+// 2=row-group-symmetric, 3=fp8-block.
+struct Int4ScaleDesc {
+    Qwen36MoeInt4WeightDesc q_proj;
+    Qwen36MoeInt4WeightDesc k_proj;
+    Qwen36MoeInt4WeightDesc v_proj;
+    Qwen36MoeInt4WeightDesc o_proj;
+
+    Qwen36MoeInt4WeightDesc linear_in_proj_qkv;
+    Qwen36MoeInt4WeightDesc linear_in_proj_z;
+    Qwen36MoeInt4WeightDesc linear_out_proj;
+
+    Qwen36MoeInt4WeightDesc experts_gate_up;
+    Qwen36MoeInt4WeightDesc experts_down;
+
+    Qwen36MoeInt4WeightDesc shared_expert_gate_proj;
+    Qwen36MoeInt4WeightDesc shared_expert_up_proj;
+    Qwen36MoeInt4WeightDesc shared_expert_down_proj;
+};
+
+__device__ inline int qwen36_legacy_quant_group_size(
+    const Qwen36MoeInt4WeightDesc& desc
+) {
+    return desc.encoding == 3 ? -desc.input_group_size : desc.input_group_size;
+}
 
 // -- KV cache FP8 scale parallel struct (mirror of Rust
 //    Qwen36MoeKVCacheFp8Desc). One entry per layer. Linear-attention

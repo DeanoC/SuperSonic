@@ -217,7 +217,8 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         const DecodeLayerDesc& d = layers[start_layer];
         const Int4ScaleDesc* i4 =
             (int4_scales != nullptr) ? &int4_scales[start_layer] : nullptr;
-        const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
+        const int i4_gs = (i4 != nullptr)
+            ? qwen36_legacy_quant_group_size(i4->experts_gate_up) : 0;
         const int ffn_stage = (mode == PERSISTENT_MODE_FFN_ONLY)
             ? 5
             : (mode - PERSISTENT_MODE_FFN_STAGE1 + 1);
@@ -237,16 +238,16 @@ __global__ void qwen36_moe_persistent_decode_kernel(
             static_cast<const T*>(d.shared_expert_down_proj_w),
             static_cast<const T*>(d.shared_expert_gate_w),
             i4_gs,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_scale)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_zero)     : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_scale)   : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_zero)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up.scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up.zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down.scale)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down.zero)     : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj.scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj.zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj.scale)   : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj.zero)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj.scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj.zero)  : nullptr,
             hidden_ping,
             ffn_topk_idx_scratch,
             workspace,
@@ -259,7 +260,8 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         const DecodeLayerDesc& d = layers[start_layer];
         const Int4ScaleDesc* i4 =
             (int4_scales != nullptr) ? &int4_scales[start_layer] : nullptr;
-        const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
+        const int i4_gs = (i4 != nullptr)
+            ? qwen36_legacy_quant_group_size(i4->linear_in_proj_qkv) : 0;
         const int linear_stage = mode - PERSISTENT_MODE_LINEAR_STAGE1 + 1;
 
         qwen36_moe_linear_step_device<T, USE_ATTN_WMMA>(
@@ -281,12 +283,12 @@ __global__ void qwen36_moe_persistent_decode_kernel(
             static_cast<T*>(d.linear_conv_state),
             static_cast<float*>(d.linear_recurrent_state),
             i4_gs,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_scale)   : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_zero)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_scale)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_zero)     : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv.scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv.zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z.scale)   : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z.zero)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj.scale)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj.zero)     : nullptr,
             hidden_pong,
             workspace,
             counters, barrier_counter, barrier_flag,
@@ -299,7 +301,8 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         const DecodeLayerDesc& d = layers[li];
         const Int4ScaleDesc* i4 =
             (int4_scales != nullptr) ? &int4_scales[li] : nullptr;
-        const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
+        const int i4_gs = (i4 != nullptr)
+            ? qwen36_legacy_quant_group_size(i4->experts_gate_up) : 0;
         const KVCacheFp8Desc* kv_fp8 =
             (kv_fp8_descs != nullptr) ? &kv_fp8_descs[li] : nullptr;
 
@@ -319,14 +322,14 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 static_cast<const T*>(d.k_norm_w),
                 static_cast<const T*>(d.o_proj_w),
                 i4_gs,
-                i4 ? static_cast<const hip_bfloat16*>(i4->q_proj_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->q_proj_zero)  : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->k_proj_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->k_proj_zero)  : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->v_proj_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->v_proj_zero)  : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->o_proj_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->o_proj_zero)  : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->q_proj.scale) : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->q_proj.zero)  : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->k_proj.scale) : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->k_proj.zero)  : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->v_proj.scale) : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->v_proj.zero)  : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->o_proj.scale) : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->o_proj.zero)  : nullptr,
                 out_buf,
                 workspace,
                 static_cast<T*>(d.kv_cache_k),
@@ -361,12 +364,12 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 static_cast<T*>(d.linear_conv_state),
                 static_cast<float*>(d.linear_recurrent_state),
                 i4_gs,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_zero)  : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_scale)   : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_zero)    : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_scale)    : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_zero)     : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv.scale) : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv.zero)  : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z.scale)   : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z.zero)    : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj.scale)    : nullptr,
+                i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj.zero)     : nullptr,
                 out_buf,
                 workspace,
                 counters, barrier_counter, barrier_flag);
@@ -407,16 +410,16 @@ __global__ void qwen36_moe_persistent_decode_kernel(
             static_cast<const T*>(d.shared_expert_down_proj_w),
             static_cast<const T*>(d.shared_expert_gate_w),
             i4_gs,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_scale)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_zero)     : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_scale)   : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_zero)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up.scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up.zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down.scale)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down.zero)     : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj.scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj.zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj.scale)   : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj.zero)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj.scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj.zero)  : nullptr,
             out_buf,
             ffn_topk_idx_scratch,
             workspace,

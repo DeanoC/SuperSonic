@@ -19,8 +19,9 @@ use crate::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep, Qwen36ChainStepO
 use crate::qwen36_moe::decode::Qwen36ExecutionOptions;
 use crate::qwen36_moe::geometry::build_multi_layer_geom;
 use crate::qwen36_moe::layer_loader::{
-    load_qwen36_layers, Qwen36LayerLoadStrategy, Qwen36LoadOptions,
-    Qwen36WeightMode as LayerWeightMode, SparseExpertLoadOptions,
+    classify_layer_weight_encoding, load_qwen36_layers, Qwen36LayerLoadStrategy,
+    Qwen36LayerWeightEncoding, Qwen36LoadOptions, Qwen36WeightMode as LayerWeightMode,
+    SparseExpertLoadOptions,
 };
 use crate::qwen36_moe::layers::LoadedQwen36Layers;
 use crate::qwen36_moe::lm_head::{
@@ -38,7 +39,8 @@ use crate::qwen36_moe::prefill::{
 use crate::qwen36_moe::route_telemetry::{MoeRouteTelemetry, MoeTransitionPredictor};
 use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver, Qwen36WeightMode};
 use crate::qwen36_moe::types::{
-    AttnLayerBuffers, ExpertRoute, FullAttnKvCache, LayerBuffers, MultiLayerGeom, PositionPair,
+    AttnLayerBuffers, ExpertRoute, FullAttnKvCache, LayerBuffers, LoadedInt4Sidecar,
+    MultiLayerGeom, PositionPair,
 };
 use crate::qwen36_moe::weights::{load_to_gpu, prepare_lm_head_bf16};
 use crate::qwen36_moe_config::{
@@ -2033,7 +2035,10 @@ fn validate_engine_pointer_ownership(layers: &mut LoadedQwen36Layers) -> Result<
     let owned = collect_owned_layer_pointers(layers.layers());
     let (live_layers, _, _) = layers.execution_parts();
     let descs = build_layer_descs(live_layers);
-    let int4_descs = build_int4_descs(live_layers);
+    let int4_descs = match classify_layer_weight_encoding(live_layers)? {
+        Qwen36LayerWeightEncoding::GgmlKBlock => None,
+        _ => build_int4_descs(live_layers)?,
+    };
     let kv_fp8_descs = build_kv_fp8_descs(live_layers);
     let descriptor_pointers =
         descriptor_pointer_view(&descs, int4_descs.as_deref(), kv_fp8_descs.as_deref());
@@ -2094,56 +2099,56 @@ fn descriptor_pointer_view(
     }
     for desc in int4_descs.into_iter().flatten() {
         pointers.extend([
-            ("q_proj_scale", desc.q_proj_scale as usize),
-            ("q_proj_zero", desc.q_proj_zero as usize),
-            ("k_proj_scale", desc.k_proj_scale as usize),
-            ("k_proj_zero", desc.k_proj_zero as usize),
-            ("v_proj_scale", desc.v_proj_scale as usize),
-            ("v_proj_zero", desc.v_proj_zero as usize),
-            ("o_proj_scale", desc.o_proj_scale as usize),
-            ("o_proj_zero", desc.o_proj_zero as usize),
+            ("q_proj_scale", desc.q_proj.scale as usize),
+            ("q_proj_zero", desc.q_proj.zero as usize),
+            ("k_proj_scale", desc.k_proj.scale as usize),
+            ("k_proj_zero", desc.k_proj.zero as usize),
+            ("v_proj_scale", desc.v_proj.scale as usize),
+            ("v_proj_zero", desc.v_proj.zero as usize),
+            ("o_proj_scale", desc.o_proj.scale as usize),
+            ("o_proj_zero", desc.o_proj.zero as usize),
             (
                 "linear_in_proj_qkv_scale",
-                desc.linear_in_proj_qkv_scale as usize,
+                desc.linear_in_proj_qkv.scale as usize,
             ),
             (
                 "linear_in_proj_qkv_zero",
-                desc.linear_in_proj_qkv_zero as usize,
+                desc.linear_in_proj_qkv.zero as usize,
             ),
             (
                 "linear_in_proj_z_scale",
-                desc.linear_in_proj_z_scale as usize,
+                desc.linear_in_proj_z.scale as usize,
             ),
-            ("linear_in_proj_z_zero", desc.linear_in_proj_z_zero as usize),
-            ("linear_out_proj_scale", desc.linear_out_proj_scale as usize),
-            ("linear_out_proj_zero", desc.linear_out_proj_zero as usize),
-            ("experts_gate_up_scale", desc.experts_gate_up_scale as usize),
-            ("experts_gate_up_zero", desc.experts_gate_up_zero as usize),
-            ("experts_down_scale", desc.experts_down_scale as usize),
-            ("experts_down_zero", desc.experts_down_zero as usize),
+            ("linear_in_proj_z_zero", desc.linear_in_proj_z.zero as usize),
+            ("linear_out_proj_scale", desc.linear_out_proj.scale as usize),
+            ("linear_out_proj_zero", desc.linear_out_proj.zero as usize),
+            ("experts_gate_up_scale", desc.experts_gate_up.scale as usize),
+            ("experts_gate_up_zero", desc.experts_gate_up.zero as usize),
+            ("experts_down_scale", desc.experts_down.scale as usize),
+            ("experts_down_zero", desc.experts_down.zero as usize),
             (
                 "shared_expert_gate_proj_scale",
-                desc.shared_expert_gate_proj_scale as usize,
+                desc.shared_expert_gate_proj.scale as usize,
             ),
             (
                 "shared_expert_gate_proj_zero",
-                desc.shared_expert_gate_proj_zero as usize,
+                desc.shared_expert_gate_proj.zero as usize,
             ),
             (
                 "shared_expert_up_proj_scale",
-                desc.shared_expert_up_proj_scale as usize,
+                desc.shared_expert_up_proj.scale as usize,
             ),
             (
                 "shared_expert_up_proj_zero",
-                desc.shared_expert_up_proj_zero as usize,
+                desc.shared_expert_up_proj.zero as usize,
             ),
             (
                 "shared_expert_down_proj_scale",
-                desc.shared_expert_down_proj_scale as usize,
+                desc.shared_expert_down_proj.scale as usize,
             ),
             (
                 "shared_expert_down_proj_zero",
-                desc.shared_expert_down_proj_zero as usize,
+                desc.shared_expert_down_proj.zero as usize,
             ),
         ]);
     }
@@ -2169,19 +2174,14 @@ fn collect_owned_layer_pointers(layers: &[LayerBuffers]) -> HashSet<usize> {
         insert_buffer_ptr(&mut pointers, &layer.ffn.shared_down_proj_w);
         insert_buffer_ptr(&mut pointers, &layer.ffn.shared_expert_gate_w);
         if let Some(sidecars) = &layer.ffn.int4 {
-            for buffer in [
-                &sidecars.gate_up_proj_scale,
-                &sidecars.gate_up_proj_zero,
-                &sidecars.down_proj_scale,
-                &sidecars.down_proj_zero,
-                &sidecars.shared_gate_proj_scale,
-                &sidecars.shared_gate_proj_zero,
-                &sidecars.shared_up_proj_scale,
-                &sidecars.shared_up_proj_zero,
-                &sidecars.shared_down_proj_scale,
-                &sidecars.shared_down_proj_zero,
+            for sidecar in [
+                &sidecars.gate_up_proj,
+                &sidecars.down_proj,
+                &sidecars.shared_gate_proj,
+                &sidecars.shared_up_proj,
+                &sidecars.shared_down_proj,
             ] {
-                insert_buffer_ptr(&mut pointers, buffer);
+                insert_int4_sidecar_ptrs(&mut pointers, sidecar);
             }
         }
     }
@@ -2213,17 +2213,13 @@ fn collect_attn_owned_pointers(attn: &AttnLayerBuffers, pointers: &mut HashSet<u
                 insert_buffer_ptr(pointers, buffer);
             }
             if let Some(sidecars) = int4 {
-                for buffer in [
-                    &sidecars.q_proj_scale,
-                    &sidecars.q_proj_zero,
-                    &sidecars.k_proj_scale,
-                    &sidecars.k_proj_zero,
-                    &sidecars.v_proj_scale,
-                    &sidecars.v_proj_zero,
-                    &sidecars.o_proj_scale,
-                    &sidecars.o_proj_zero,
+                for sidecar in [
+                    &sidecars.q_proj,
+                    &sidecars.k_proj,
+                    &sidecars.v_proj,
+                    &sidecars.o_proj,
                 ] {
-                    insert_buffer_ptr(pointers, buffer);
+                    insert_int4_sidecar_ptrs(pointers, sidecar);
                 }
             }
             if let Some(cache) = kv_cache {
@@ -2284,15 +2280,12 @@ fn collect_attn_owned_pointers(attn: &AttnLayerBuffers, pointers: &mut HashSet<u
                 insert_buffer_ptr(pointers, bias);
             }
             if let Some(sidecars) = int4 {
-                for buffer in [
-                    &sidecars.in_proj_qkv_scale,
-                    &sidecars.in_proj_qkv_zero,
-                    &sidecars.in_proj_z_scale,
-                    &sidecars.in_proj_z_zero,
-                    &sidecars.out_proj_scale,
-                    &sidecars.out_proj_zero,
+                for sidecar in [
+                    &sidecars.in_proj_qkv,
+                    &sidecars.in_proj_z,
+                    &sidecars.out_proj,
                 ] {
-                    insert_buffer_ptr(pointers, buffer);
+                    insert_int4_sidecar_ptrs(pointers, sidecar);
                 }
             }
         }
@@ -2301,6 +2294,13 @@ fn collect_attn_owned_pointers(attn: &AttnLayerBuffers, pointers: &mut HashSet<u
 
 fn insert_buffer_ptr(pointers: &mut HashSet<usize>, buffer: &GpuBuffer) {
     pointers.insert(buffer.as_ptr() as usize);
+}
+
+fn insert_int4_sidecar_ptrs(pointers: &mut HashSet<usize>, sidecar: &LoadedInt4Sidecar) {
+    insert_buffer_ptr(pointers, &sidecar.scale);
+    if let Some(zero) = &sidecar.zero {
+        insert_buffer_ptr(pointers, zero);
+    }
 }
 
 fn validate_descriptor_pointer_ownership(

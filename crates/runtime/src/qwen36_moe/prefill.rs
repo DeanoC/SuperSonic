@@ -1110,8 +1110,11 @@ fn process_full_attn_layer_batched(
         hidden,
         &scratch.x_norm,
         q_proj_w,
-        &int4.q_proj_scale,
-        &int4.q_proj_zero,
+        &int4.q_proj.scale,
+        int4.q_proj
+            .zero
+            .as_ref()
+            .context("q_proj requires an explicit INT4 zero plane")?,
         None,
         group_size,
         qtype,
@@ -1127,8 +1130,11 @@ fn process_full_attn_layer_batched(
         hidden,
         &scratch.x_norm,
         k_proj_w,
-        &int4.k_proj_scale,
-        &int4.k_proj_zero,
+        &int4.k_proj.scale,
+        int4.k_proj
+            .zero
+            .as_ref()
+            .context("k_proj requires an explicit INT4 zero plane")?,
         None,
         group_size,
         qtype,
@@ -1144,8 +1150,11 @@ fn process_full_attn_layer_batched(
         hidden,
         &scratch.x_norm,
         v_proj_w,
-        &int4.v_proj_scale,
-        &int4.v_proj_zero,
+        &int4.v_proj.scale,
+        int4.v_proj
+            .zero
+            .as_ref()
+            .context("v_proj requires an explicit INT4 zero plane")?,
         None,
         group_size,
         qtype,
@@ -1464,8 +1473,11 @@ fn process_full_attn_layer_batched(
         h * hd,
         &scratch.gated,
         o_proj_w,
-        &int4.o_proj_scale,
-        &int4.o_proj_zero,
+        &int4.o_proj.scale,
+        int4.o_proj
+            .zero
+            .as_ref()
+            .context("o_proj requires an explicit INT4 zero plane")?,
         None,
         group_size,
         qtype,
@@ -1541,25 +1553,25 @@ fn process_linear_attn_layer_pertoken(
             Qwen36MoeLinearStepInt4 {
                 group_size: s.group_size,
                 in_proj_qkv_type: s.in_proj_qkv_type,
-                in_proj_qkv_scale: s.in_proj_qkv_scale.as_ptr(),
+                in_proj_qkv_scale: s.in_proj_qkv.scale.as_ptr(),
                 in_proj_qkv_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.in_proj_qkv_zero.as_ptr()
+                    s.in_proj_qkv.zero_ptr()
                 },
                 in_proj_z_type: s.in_proj_z_type,
-                in_proj_z_scale: s.in_proj_z_scale.as_ptr(),
+                in_proj_z_scale: s.in_proj_z.scale.as_ptr(),
                 in_proj_z_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.in_proj_z_zero.as_ptr()
+                    s.in_proj_z.zero_ptr()
                 },
                 out_proj_type: s.out_proj_type,
-                out_proj_scale: s.out_proj_scale.as_ptr(),
+                out_proj_scale: s.out_proj.scale.as_ptr(),
                 out_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.out_proj_zero.as_ptr()
+                    s.out_proj.zero_ptr()
                 },
             }
         }
@@ -1691,32 +1703,32 @@ fn process_full_attn_layer_pertoken(
             Qwen36MoeAttnStepInt4 {
                 group_size: s.group_size,
                 q_proj_type: s.q_proj_type,
-                q_proj_scale: s.q_proj_scale.as_ptr(),
+                q_proj_scale: s.q_proj.scale.as_ptr(),
                 q_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.q_proj_zero.as_ptr()
+                    s.q_proj.zero_ptr()
                 },
                 k_proj_type: s.k_proj_type,
-                k_proj_scale: s.k_proj_scale.as_ptr(),
+                k_proj_scale: s.k_proj.scale.as_ptr(),
                 k_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.k_proj_zero.as_ptr()
+                    s.k_proj.zero_ptr()
                 },
                 v_proj_type: s.v_proj_type,
-                v_proj_scale: s.v_proj_scale.as_ptr(),
+                v_proj_scale: s.v_proj.scale.as_ptr(),
                 v_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.v_proj_zero.as_ptr()
+                    s.v_proj.zero_ptr()
                 },
                 o_proj_type: s.o_proj_type,
-                o_proj_scale: s.o_proj_scale.as_ptr(),
+                o_proj_scale: s.o_proj.scale.as_ptr(),
                 o_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.o_proj_zero.as_ptr()
+                    s.o_proj.zero_ptr()
                 },
             }
         }
@@ -1806,39 +1818,39 @@ fn process_ffn_pertoken(
             Qwen36MoeFfnStepInt4 {
                 group_size: s.group_size,
                 gate_up_proj_type: s.gate_up_proj_type,
-                gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
+                gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                 gate_up_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.gate_up_proj_zero.as_ptr()
+                    s.gate_up_proj.zero_ptr()
                 },
                 down_proj_type: s.down_proj_type,
-                down_proj_scale: s.down_proj_scale.as_ptr(),
+                down_proj_scale: s.down_proj.scale.as_ptr(),
                 down_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.down_proj_zero.as_ptr()
+                    s.down_proj.zero_ptr()
                 },
                 shared_gate_proj_type: s.shared_gate_proj_type,
-                shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
+                shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                 shared_gate_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.shared_gate_proj_zero.as_ptr()
+                    s.shared_gate_proj.zero_ptr()
                 },
                 shared_up_proj_type: s.shared_up_proj_type,
-                shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
+                shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                 shared_up_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.shared_up_proj_zero.as_ptr()
+                    s.shared_up_proj.zero_ptr()
                 },
                 shared_down_proj_type: s.shared_down_proj_type,
-                shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
+                shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                 shared_down_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
-                    s.shared_down_proj_zero.as_ptr()
+                    s.shared_down_proj.zero_ptr()
                 },
             }
         }
@@ -2262,11 +2274,11 @@ fn process_ffn_batched_grouped(
                 &scratch.topk_idx,
                 &scratch.topk_weight,
                 ffn.gate_up_proj_w.as_ptr(),
-                int4.gate_up_proj_scale.as_ptr(),
-                int4.gate_up_proj_zero.as_ptr(),
+                int4.gate_up_proj.scale.as_ptr(),
+                int4.gate_up_proj.zero_ptr(),
                 ffn.down_proj_w.as_ptr(),
-                int4.down_proj_scale.as_ptr(),
-                int4.down_proj_zero.as_ptr(),
+                int4.down_proj.scale.as_ptr(),
+                int4.down_proj.zero_ptr(),
                 &mut scratch.expert_mid,
                 &mut scratch.combined,
                 &execution.prefill_kernel,
@@ -2365,11 +2377,11 @@ fn process_ffn_batched_grouped(
                 &scratch.expert_offsets,
                 &scratch.permuted_token_idx,
                 gate_up_w_ptr,
-                int4.gate_up_proj_scale.as_ptr(),
-                int4.gate_up_proj_zero.as_ptr(),
+                int4.gate_up_proj.scale.as_ptr(),
+                int4.gate_up_proj.zero_ptr(),
                 down_w_ptr,
-                int4.down_proj_scale.as_ptr(),
-                int4.down_proj_zero.as_ptr(),
+                int4.down_proj.scale.as_ptr(),
+                int4.down_proj.zero_ptr(),
                 &mut scratch.expert_out,
                 &mut scratch.expert_counters,
             )
@@ -2423,8 +2435,11 @@ fn process_ffn_batched_grouped(
         hidden,
         &scratch.h_norm,
         &ffn.shared_gate_proj_w,
-        &int4.shared_gate_proj_scale,
-        &int4.shared_gate_proj_zero,
+        &int4.shared_gate_proj.scale,
+        int4.shared_gate_proj
+            .zero
+            .as_ref()
+            .context("shared_gate_proj requires an explicit INT4 zero plane")?,
         None,
         group_size,
         qtype,
@@ -2441,8 +2456,11 @@ fn process_ffn_batched_grouped(
         hidden,
         &scratch.h_norm,
         &ffn.shared_up_proj_w,
-        &int4.shared_up_proj_scale,
-        &int4.shared_up_proj_zero,
+        &int4.shared_up_proj.scale,
+        int4.shared_up_proj
+            .zero
+            .as_ref()
+            .context("shared_up_proj requires an explicit INT4 zero plane")?,
         None,
         group_size,
         qtype,
@@ -2477,8 +2495,11 @@ fn process_ffn_batched_grouped(
         shared_intermediate,
         &scratch.shared_silu_mul,
         &ffn.shared_down_proj_w,
-        &int4.shared_down_proj_scale,
-        &int4.shared_down_proj_zero,
+        &int4.shared_down_proj.scale,
+        int4.shared_down_proj
+            .zero
+            .as_ref()
+            .context("shared_down_proj requires an explicit INT4 zero plane")?,
         None,
         group_size,
         qtype,

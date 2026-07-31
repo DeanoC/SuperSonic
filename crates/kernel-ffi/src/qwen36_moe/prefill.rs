@@ -13779,9 +13779,9 @@ mod tests {
         );
 
         let int4_sz = size_of::<Qwen36MoeInt4ScaleDesc>();
-        assert!(
-            int4_sz >= 192 && int4_sz <= 256,
-            "Qwen36MoeInt4ScaleDesc size drift: got {int4_sz} bytes",
+        assert_eq!(
+            int4_sz, 768,
+            "Qwen36MoeInt4ScaleDesc size drift: got {int4_sz} bytes (expected 768)",
         );
 
         // Two raw pointers — pinned to match the C++ static_assert in
