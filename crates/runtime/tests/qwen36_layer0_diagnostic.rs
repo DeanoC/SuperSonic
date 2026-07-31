@@ -10,12 +10,15 @@ use kernel_ffi::qwen36_moe::{
     linear_step_launch, Qwen36MoeInt4WeightDesc, Qwen36MoeLinearStepInt4,
     Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
 };
+use model_store::store::{BakedStore, Int4StorageKind, Int4StorageView};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use supersonic_runtime::flm_model_source::{FlmModelSource, FlmModelSourceOptions};
 use supersonic_runtime::qwen36_moe::layer_loader::{
     load_to_gpu, QWEN36_MOE_INT4_GROUP_SIZE, QWEN36_MOE_LOWBIT_NATIVE_INT4,
 };
+use supersonic_runtime::qwen36_moe::persistent_decode::build_int4_weight_desc;
+use supersonic_runtime::qwen36_moe::types::LoadedInt4Sidecar;
 use supersonic_runtime::qwen36_moe::weights::dequant_int4_to_bf16_bytes;
 
 const LAYER_PREFIX: &str = "model.language_model.layers.0";
@@ -23,6 +26,8 @@ const LINEAR_PREFIX: &str = "model.language_model.layers.0.linear_attn";
 const EMBEDDING_NAME: &str = "model.language_model.embed_tokens.weight";
 const KNOWN_BYTES_FIXTURE: &str =
     include_str!("../../../oracle/fixtures/qwen36_native_int4_v1_known_bytes.json");
+const EXACT_PROMPT_SHA256: &str =
+    "540f92c1fe4446d0f9764de537a1a59603515b94de27b8ea0562420c5f8ffb8b";
 const BOUNDARY_ORDER: [&str; 19] = [
     "embedding",
     "layer_input",
@@ -127,12 +132,9 @@ struct LayerWeights {
     a_log: GpuBuffer,
     norm: GpuBuffer,
     out_proj: GpuBuffer,
-    qkv_scale: GpuBuffer,
-    qkv_zero: GpuBuffer,
-    z_scale: GpuBuffer,
-    z_zero: GpuBuffer,
-    out_scale: GpuBuffer,
-    out_zero: GpuBuffer,
+    qkv_int4: LoadedInt4Sidecar,
+    z_int4: LoadedInt4Sidecar,
+    out_int4: LoadedInt4Sidecar,
 }
 
 struct StageResult {
@@ -150,27 +152,107 @@ struct RecurrenceResult {
     final_stage: StageResult,
 }
 
-fn tile_v1_desc(
-    scale: &GpuBuffer,
-    zero: &GpuBuffer,
-    out_rows: usize,
-    in_cols: usize,
-) -> Qwen36MoeInt4WeightDesc {
-    let group_size = QWEN36_MOE_INT4_GROUP_SIZE as usize;
-    let packed_row_stride_bytes = in_cols / 2;
-    let scale_row_stride_elements = in_cols / group_size;
-    Qwen36MoeInt4WeightDesc {
-        scale: scale.as_ptr(),
-        zero: zero.as_ptr(),
-        packed_row_stride_bytes: packed_row_stride_bytes as u64,
-        packed_expert_stride_bytes: (out_rows * packed_row_stride_bytes) as u64,
-        scale_row_stride_elements: scale_row_stride_elements as u64,
-        scale_expert_stride_elements: ((out_rows / group_size) * scale_row_stride_elements) as u64,
-        input_group_size: QWEN36_MOE_INT4_GROUP_SIZE,
-        output_group_size: QWEN36_MOE_INT4_GROUP_SIZE,
-        implicit_zero_code: -1,
-        encoding: 1,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DescriptorContract {
+    encoding: i32,
+    input_group_size: i32,
+    output_group_size: i32,
+    implicit_zero_code: i32,
+    requires_zero: bool,
+    packed_row_stride_bytes: u64,
+    packed_expert_stride_bytes: u64,
+    scale_row_stride_elements: u64,
+    scale_expert_stride_elements: u64,
+}
+
+fn descriptor_contract(view: &Int4StorageView) -> Result<DescriptorContract> {
+    if !matches!(view.logical_shape.as_slice(), [_, _] | [_, _, _])
+        || view.logical_shape.contains(&0)
+    {
+        bail!(
+            "INT4 diagnostic view must have nonzero rank-2/rank-3 shape, got {:?}",
+            view.logical_shape
+        );
     }
+    let rows = view.logical_shape[view.logical_shape.len() - 2];
+    let cols = view.logical_shape[view.logical_shape.len() - 1];
+    let (encoding, requires_zero, implicit_zero_code) = match view.kind {
+        Int4StorageKind::RowGroupSymmetric => {
+            if view.group_size != 32
+                || view.output_group_size != 1
+                || view.zero_tensor.is_some()
+                || view.implicit_zero_code != Some(8)
+            {
+                bail!("encoding 2 requires null zero, G32/output-G1, and implicit code 8");
+            }
+            (2, false, 8)
+        }
+        Int4StorageKind::TileV1 => {
+            if view.group_size != QWEN36_MOE_INT4_GROUP_SIZE as usize
+                || view.output_group_size != QWEN36_MOE_INT4_GROUP_SIZE as usize
+                || view.zero_tensor.is_none()
+                || view.implicit_zero_code.is_some()
+            {
+                bail!("encoding 1 requires an explicit zero plane and G128 tiles");
+            }
+            (1, true, -1)
+        }
+    };
+    if cols % 2 != 0 || cols % view.group_size != 0 || rows % view.output_group_size != 0 {
+        bail!("INT4 diagnostic view shape is not group aligned");
+    }
+    let packed_row = cols / 2;
+    let scale_row = cols / view.group_size;
+    let packed_expert = rows
+        .checked_mul(packed_row)
+        .context("packed expert stride overflow")?;
+    let scale_expert = (rows / view.output_group_size)
+        .checked_mul(scale_row)
+        .context("scale expert stride overflow")?;
+    let rank3 = view.logical_shape.len() == 3;
+    let expected_packed_expert = rank3.then_some(packed_expert).unwrap_or(0);
+    let expected_scale_expert = rank3.then_some(scale_expert).unwrap_or(0);
+    if view.packed_row_stride_bytes != packed_row
+        || view.packed_expert_stride_bytes != expected_packed_expert
+        || view.scale_row_stride_elements != scale_row
+        || view.scale_expert_stride_elements != expected_scale_expert
+    {
+        bail!(
+            "INT4 diagnostic view has noncanonical row/expert strides: {:?}",
+            view
+        );
+    }
+    Ok(DescriptorContract {
+        encoding,
+        input_group_size: i32::try_from(view.group_size)?,
+        output_group_size: i32::try_from(view.output_group_size)?,
+        implicit_zero_code,
+        requires_zero,
+        packed_row_stride_bytes: u64::try_from(packed_row)?,
+        packed_expert_stride_bytes: u64::try_from(expected_packed_expert)?,
+        scale_row_stride_elements: u64::try_from(scale_row)?,
+        scale_expert_stride_elements: u64::try_from(expected_scale_expert)?,
+    })
+}
+
+fn build_diagnostic_descriptor(sidecar: &LoadedInt4Sidecar) -> Result<Qwen36MoeInt4WeightDesc> {
+    let contract = descriptor_contract(&sidecar.view)?;
+    let desc = build_int4_weight_desc(sidecar)?;
+    if desc.scale != sidecar.scale.as_ptr()
+        || desc.zero != sidecar.zero_ptr()
+        || desc.encoding != contract.encoding
+        || desc.input_group_size != contract.input_group_size
+        || desc.output_group_size != contract.output_group_size
+        || desc.implicit_zero_code != contract.implicit_zero_code
+        || desc.packed_row_stride_bytes != contract.packed_row_stride_bytes
+        || desc.packed_expert_stride_bytes != contract.packed_expert_stride_bytes
+        || desc.scale_row_stride_elements != contract.scale_row_stride_elements
+        || desc.scale_expert_stride_elements != contract.scale_expert_stride_elements
+        || contract.requires_zero != !desc.zero.is_null()
+    {
+        bail!("production INT4 descriptor contradicts its typed storage view");
+    }
+    Ok(desc)
 }
 
 fn usize_field(value: &Value, key: &str) -> Result<usize> {
@@ -222,27 +304,150 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn load_weights(source: &FlmModelSource, ordinal: usize) -> Result<LayerWeights> {
+fn validate_prompt_contract(report: &Value) -> Result<()> {
+    let prompt = &report["prompt"];
+    if prompt["sha256"].as_str() != Some(EXACT_PROMPT_SHA256)
+        || prompt["token_count"].as_u64() != Some(322)
+        || prompt["final_position"].as_u64() != Some(321)
+    {
+        bail!("D requires the pinned 322-token prompt fixture identity");
+    }
+    let token_ids = prompt["token_ids"].as_array().context("prompt.token_ids")?;
+    let transformers_ids = prompt["transformers_token_ids"]
+        .as_array()
+        .context("prompt.transformers_token_ids")?;
+    if token_ids.len() != 322 || transformers_ids.len() != 322 || token_ids != transformers_ids {
+        bail!("D requires identical 322-ID tokenizer sequences");
+    }
+    Ok(())
+}
+
+fn load_projection(
+    store: &BakedStore,
+    ordinal: usize,
+    name: &str,
+    expected_rows: usize,
+    expected_cols: usize,
+) -> Result<(GpuBuffer, LoadedInt4Sidecar)> {
+    let view = store
+        .int4_storage_view(name)
+        .with_context(|| format!("missing typed INT4 storage view for {name}"))?
+        .clone();
+    if view.logical_shape.as_slice() != [expected_rows, expected_cols] {
+        bail!(
+            "{name} logical shape {:?} != [{expected_rows}, {expected_cols}]",
+            view.logical_shape
+        );
+    }
+    descriptor_contract(&view).with_context(|| format!("validate {name} storage view"))?;
+    let packed = load_to_gpu(store, ordinal, &view.packed_tensor)?;
+    let scale = load_to_gpu(store, ordinal, &view.scale_tensor)?;
+    let zero = view
+        .zero_tensor
+        .as_deref()
+        .map(|zero_name| load_to_gpu(store, ordinal, zero_name))
+        .transpose()?;
+    let sidecar = LoadedInt4Sidecar { scale, zero, view };
+    build_diagnostic_descriptor(&sidecar)
+        .with_context(|| format!("build {name} production descriptor"))?;
+    Ok((packed, sidecar))
+}
+
+fn load_weights(
+    source: &FlmModelSource,
+    ordinal: usize,
+    geometry: Geometry,
+) -> Result<LayerWeights> {
     let store = &source.store;
     let load = |name: &str| load_to_gpu(store, ordinal, name);
+    let qkv_name = format!("{LINEAR_PREFIX}.in_proj_qkv.weight");
+    let z_name = format!("{LINEAR_PREFIX}.in_proj_z.weight");
+    let out_name = format!("{LINEAR_PREFIX}.out_proj.weight");
+    let (in_proj_qkv, qkv_int4) = load_projection(
+        store,
+        ordinal,
+        &qkv_name,
+        geometry.qkv_dim(),
+        geometry.hidden,
+    )?;
+    let (in_proj_z, z_int4) = load_projection(
+        store,
+        ordinal,
+        &z_name,
+        geometry.value_dim(),
+        geometry.hidden,
+    )?;
+    let (out_proj, out_int4) = load_projection(
+        store,
+        ordinal,
+        &out_name,
+        geometry.hidden,
+        geometry.value_dim(),
+    )?;
     Ok(LayerWeights {
         input_norm: load(&format!("{LAYER_PREFIX}.input_layernorm.weight"))?,
-        in_proj_qkv: load(&format!("{LINEAR_PREFIX}.in_proj_qkv.weight"))?,
-        in_proj_z: load(&format!("{LINEAR_PREFIX}.in_proj_z.weight"))?,
+        in_proj_qkv,
+        in_proj_z,
         in_proj_a: load(&format!("{LINEAR_PREFIX}.in_proj_a.weight"))?,
         in_proj_b: load(&format!("{LINEAR_PREFIX}.in_proj_b.weight"))?,
         conv1d: load(&format!("{LINEAR_PREFIX}.conv1d.weight"))?,
         dt_bias: load(&format!("{LINEAR_PREFIX}.dt_bias"))?,
         a_log: load(&format!("{LINEAR_PREFIX}.A_log"))?,
         norm: load(&format!("{LINEAR_PREFIX}.norm.weight"))?,
-        out_proj: load(&format!("{LINEAR_PREFIX}.out_proj.weight"))?,
-        qkv_scale: load(&format!("{LINEAR_PREFIX}.in_proj_qkv.weight_int4_scale"))?,
-        qkv_zero: load(&format!("{LINEAR_PREFIX}.in_proj_qkv.weight_int4_zero"))?,
-        z_scale: load(&format!("{LINEAR_PREFIX}.in_proj_z.weight_int4_scale"))?,
-        z_zero: load(&format!("{LINEAR_PREFIX}.in_proj_z.weight_int4_zero"))?,
-        out_scale: load(&format!("{LINEAR_PREFIX}.out_proj.weight_int4_scale"))?,
-        out_zero: load(&format!("{LINEAR_PREFIX}.out_proj.weight_int4_zero"))?,
+        out_proj,
+        qkv_int4,
+        z_int4,
+        out_int4,
     })
+}
+
+fn linear_int4(weights: &LayerWeights) -> Result<Qwen36MoeLinearStepInt4> {
+    let qkv = build_diagnostic_descriptor(&weights.qkv_int4)?;
+    let z = build_diagnostic_descriptor(&weights.z_int4)?;
+    let out = build_diagnostic_descriptor(&weights.out_int4)?;
+    let group_size = weights.qkv_int4.view.group_size;
+    if weights.z_int4.view.group_size != group_size
+        || weights.out_int4.view.group_size != group_size
+    {
+        bail!("linear-attention INT4 projections use mixed input group sizes");
+    }
+    Ok(Qwen36MoeLinearStepInt4 {
+        group_size: i32::try_from(group_size)?,
+        in_proj_qkv_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        in_proj_qkv: qkv,
+        in_proj_qkv_scale: weights.qkv_int4.scale.as_ptr(),
+        in_proj_qkv_zero: weights.qkv_int4.zero_ptr(),
+        in_proj_z_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        in_proj_z: z,
+        in_proj_z_scale: weights.z_int4.scale.as_ptr(),
+        in_proj_z_zero: weights.z_int4.zero_ptr(),
+        out_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        out_proj: out,
+        out_proj_scale: weights.out_int4.scale.as_ptr(),
+        out_proj_zero: weights.out_int4.zero_ptr(),
+    })
+}
+
+fn descriptor_evidence(sidecar: &LoadedInt4Sidecar) -> Result<Value> {
+    let desc = build_diagnostic_descriptor(sidecar)?;
+    Ok(json!({
+        "storage_kind": match sidecar.view.kind {
+            Int4StorageKind::TileV1 => "tile-v1",
+            Int4StorageKind::RowGroupSymmetric => "row-group-symmetric",
+        },
+        "logical_shape": sidecar.view.logical_shape,
+        "scale_tensor": sidecar.view.scale_tensor,
+        "zero_tensor": sidecar.view.zero_tensor,
+        "encoding": desc.encoding,
+        "zero_is_null": desc.zero.is_null(),
+        "packed_row_stride_bytes": desc.packed_row_stride_bytes,
+        "packed_expert_stride_bytes": desc.packed_expert_stride_bytes,
+        "scale_row_stride_elements": desc.scale_row_stride_elements,
+        "scale_expert_stride_elements": desc.scale_expert_stride_elements,
+        "input_group_size": desc.input_group_size,
+        "output_group_size": desc.output_group_size,
+        "implicit_zero_code": desc.implicit_zero_code,
+    }))
 }
 
 fn hex_bytes(value: &str) -> Result<Vec<u8>> {
@@ -407,36 +612,7 @@ fn run_production_recurrence(
     let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geometry.output_elems()])?;
     let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[geometry.workspace_floats()])?;
     let mut sync = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])?;
-    let int4 = Qwen36MoeLinearStepInt4 {
-        group_size: QWEN36_MOE_INT4_GROUP_SIZE,
-        in_proj_qkv_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
-        in_proj_qkv: tile_v1_desc(
-            &weights.qkv_scale,
-            &weights.qkv_zero,
-            geometry.qkv_dim(),
-            geometry.hidden,
-        ),
-        in_proj_qkv_scale: weights.qkv_scale.as_ptr(),
-        in_proj_qkv_zero: weights.qkv_zero.as_ptr(),
-        in_proj_z_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
-        in_proj_z: tile_v1_desc(
-            &weights.z_scale,
-            &weights.z_zero,
-            geometry.value_dim(),
-            geometry.hidden,
-        ),
-        in_proj_z_scale: weights.z_scale.as_ptr(),
-        in_proj_z_zero: weights.z_zero.as_ptr(),
-        out_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
-        out_proj: tile_v1_desc(
-            &weights.out_scale,
-            &weights.out_zero,
-            geometry.hidden,
-            geometry.value_dim(),
-        ),
-        out_proj_scale: weights.out_scale.as_ptr(),
-        out_proj_zero: weights.out_zero.as_ptr(),
-    };
+    let int4 = linear_int4(weights)?;
     let mut state_before_final = None;
     for (position, input_bytes) in inputs.iter().enumerate() {
         if input_bytes.len() != geometry.hidden * 2 {
@@ -536,36 +712,7 @@ fn run_stage(
         conv_state: conv_state.as_mut_ptr(),
         recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
     };
-    let int4 = Qwen36MoeLinearStepInt4 {
-        group_size: QWEN36_MOE_INT4_GROUP_SIZE,
-        in_proj_qkv_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
-        in_proj_qkv: tile_v1_desc(
-            &weights.qkv_scale,
-            &weights.qkv_zero,
-            geometry.qkv_dim(),
-            geometry.hidden,
-        ),
-        in_proj_qkv_scale: weights.qkv_scale.as_ptr(),
-        in_proj_qkv_zero: weights.qkv_zero.as_ptr(),
-        in_proj_z_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
-        in_proj_z: tile_v1_desc(
-            &weights.z_scale,
-            &weights.z_zero,
-            geometry.value_dim(),
-            geometry.hidden,
-        ),
-        in_proj_z_scale: weights.z_scale.as_ptr(),
-        in_proj_z_zero: weights.z_zero.as_ptr(),
-        out_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
-        out_proj: tile_v1_desc(
-            &weights.out_scale,
-            &weights.out_zero,
-            geometry.hidden,
-            geometry.value_dim(),
-        ),
-        out_proj_scale: weights.out_scale.as_ptr(),
-        out_proj_zero: weights.out_zero.as_ptr(),
-    };
+    let int4 = linear_int4(weights)?;
     linear_step_launch(
         ordinal,
         ScalarType::BF16,
@@ -618,6 +765,110 @@ fn bf16_workspace(workspace: &[f32], offset: usize, count: usize) -> Vec<u8> {
     bf16_bytes(workspace[offset..offset + count].iter().copied())
 }
 
+fn row_group_test_view() -> Int4StorageView {
+    Int4StorageView {
+        kind: Int4StorageKind::RowGroupSymmetric,
+        group_size: 32,
+        packed_tensor: "weight".into(),
+        scale_tensor: "weight_int4_scale".into(),
+        zero_tensor: None,
+        logical_shape: vec![2, 4, 64],
+        packed_row_stride_bytes: 32,
+        packed_expert_stride_bytes: 128,
+        scale_row_stride_elements: 2,
+        scale_expert_stride_elements: 8,
+        output_group_size: 1,
+        implicit_zero_code: Some(8),
+    }
+}
+
+#[test]
+fn diagnostic_descriptor_contract_supports_row_group_encoding2() {
+    let contract = descriptor_contract(&row_group_test_view()).expect("row-group contract");
+
+    assert_eq!(contract.encoding, 2);
+    assert_eq!(contract.input_group_size, 32);
+    assert_eq!(contract.output_group_size, 1);
+    assert_eq!(contract.implicit_zero_code, 8);
+    assert!(!contract.requires_zero);
+    assert_eq!(contract.packed_row_stride_bytes, 32);
+    assert_eq!(contract.packed_expert_stride_bytes, 128);
+    assert_eq!(contract.scale_row_stride_elements, 2);
+    assert_eq!(contract.scale_expert_stride_elements, 8);
+}
+
+#[test]
+fn diagnostic_descriptor_contract_retains_tile_v1_encoding1() {
+    let view = Int4StorageView {
+        kind: Int4StorageKind::TileV1,
+        group_size: 128,
+        packed_tensor: "weight".into(),
+        scale_tensor: "weight_int4_scale".into(),
+        zero_tensor: Some("weight_int4_zero".into()),
+        logical_shape: vec![256, 256],
+        packed_row_stride_bytes: 128,
+        packed_expert_stride_bytes: 0,
+        scale_row_stride_elements: 2,
+        scale_expert_stride_elements: 0,
+        output_group_size: 128,
+        implicit_zero_code: None,
+    };
+
+    let contract = descriptor_contract(&view).expect("tile-v1 contract");
+
+    assert_eq!(contract.encoding, 1);
+    assert_eq!(contract.input_group_size, 128);
+    assert_eq!(contract.output_group_size, 128);
+    assert_eq!(contract.implicit_zero_code, -1);
+    assert!(contract.requires_zero);
+}
+
+#[test]
+fn diagnostic_descriptor_contract_rejects_malformed_encoding2_views() {
+    let mut cases = Vec::new();
+    let mut wrong_group = row_group_test_view();
+    wrong_group.group_size = 64;
+    cases.push(wrong_group);
+    let mut wrong_output_group = row_group_test_view();
+    wrong_output_group.output_group_size = 32;
+    cases.push(wrong_output_group);
+    let mut wrong_zero = row_group_test_view();
+    wrong_zero.zero_tensor = Some("weight_int4_zero".into());
+    cases.push(wrong_zero);
+    let mut wrong_implicit = row_group_test_view();
+    wrong_implicit.implicit_zero_code = Some(7);
+    cases.push(wrong_implicit);
+    let mut wrong_packed_stride = row_group_test_view();
+    wrong_packed_stride.packed_expert_stride_bytes -= 1;
+    cases.push(wrong_packed_stride);
+    let mut wrong_scale_stride = row_group_test_view();
+    wrong_scale_stride.scale_expert_stride_elements -= 1;
+    cases.push(wrong_scale_stride);
+
+    for view in cases {
+        assert!(descriptor_contract(&view).is_err(), "accepted {view:?}");
+    }
+}
+
+#[test]
+fn diagnostic_prompt_contract_pins_fixture_hash_and_322_ids() {
+    let report = json!({
+        "prompt": {
+            "sha256": EXACT_PROMPT_SHA256,
+            "token_count": 322,
+            "final_position": 321,
+            "token_ids": vec![1; 322],
+            "transformers_token_ids": vec![1; 322],
+        }
+    });
+
+    validate_prompt_contract(&report).expect("exact prompt contract");
+
+    let mut wrong = report;
+    wrong["prompt"]["sha256"] = Value::String("wrong".into());
+    assert!(validate_prompt_contract(&wrong).is_err());
+}
+
 #[test]
 fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
     let Some(abc_path) = std::env::var_os("SUPERSONIC_QWEN36_LAYER0_ABC_JSON") else {
@@ -634,10 +885,17 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
     if report["schema"].as_str() != Some("qwen36-layer0-mode-diagnostic/v2") {
         bail!("unexpected A/B/C report schema");
     }
-    if report["prompt"]["token_count"].as_u64() != Some(322)
-        || report["prompt"]["final_position"].as_u64() != Some(321)
+    validate_prompt_contract(&report)?;
+    let prompt_path = PathBuf::from(
+        report["prompt"]["path"]
+            .as_str()
+            .context("prompt fixture path in A/B/C report")?,
+    );
+    let prompt_hash = sha256_file(&prompt_path)?;
+    if prompt_hash != EXACT_PROMPT_SHA256
+        || report["prompt"]["sha256"].as_str() != Some(&prompt_hash)
     {
-        bail!("D requires the exact 322-token prompt at final position 321");
+        bail!("durable prompt fixture no longer matches its pinned SHA-256");
     }
     let execution_c = &report["executions"]["C"];
     if execution_c["mode"].as_str() != Some("recurrent")
@@ -667,8 +925,13 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
             verify_block_hashes: true,
         },
     )?;
-    let weights = load_weights(&source, 0)?;
+    let weights = load_weights(&source, 0, geometry)?;
     let abi_validation = abi_validation_evidence()?;
+    let int4_storage_views = json!({
+        "in_proj_qkv": descriptor_evidence(&weights.qkv_int4)?,
+        "in_proj_z": descriptor_evidence(&weights.z_int4)?,
+        "out_proj": descriptor_evidence(&weights.out_int4)?,
+    });
     let input_rows = artifact_input_sequence(&source, &report, geometry)?;
     let input_sequence_bytes = input_rows.concat();
     let input_bytes = input_rows
@@ -987,6 +1250,12 @@ fn captures_real_flm_layer0_stages_from_mode_aligned_reference() -> Result<()> {
             "conv_output": "host reconstruction from stage1 qkv, D recurrence state, and FLM conv weights",
             "out_proj": "BF16 residual difference; kernel publishes only post-residual",
             "all_other_boundaries": "direct stage output, workspace, artifact input, or production-mutated state",
+            "prompt_fixture": {
+                "path": prompt_path,
+                "sha256": prompt_hash,
+                "token_count": 322,
+            },
+            "int4_storage_views": int4_storage_views,
         },
         "recurrence": {
             "production_stage": 5,
