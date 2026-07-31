@@ -1335,6 +1335,37 @@ fn build_stage3_int4_storage(
     index_entries: &HashMap<String, FlmIndexEntry>,
     insert_logical_aliases: bool,
 ) -> Result<(), Error> {
+    let mut staged_index = index.clone();
+    let mut staged_upload_views = upload_views.clone();
+    let mut staged_ct_int4_bf16_fallbacks = ct_int4_bf16_fallbacks.clone();
+    let mut staged_int4_storage_views = int4_storage_views.clone();
+
+    build_stage3_int4_storage_staged(
+        runtime,
+        &mut staged_index,
+        &mut staged_upload_views,
+        &mut staged_ct_int4_bf16_fallbacks,
+        &mut staged_int4_storage_views,
+        index_entries,
+        insert_logical_aliases,
+    )?;
+
+    *index = staged_index;
+    *upload_views = staged_upload_views;
+    *ct_int4_bf16_fallbacks = staged_ct_int4_bf16_fallbacks;
+    *int4_storage_views = staged_int4_storage_views;
+    Ok(())
+}
+
+fn build_stage3_int4_storage_staged(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index: &mut HashMap<String, TensorMeta>,
+    upload_views: &mut HashMap<String, TensorUploadView>,
+    ct_int4_bf16_fallbacks: &mut HashMap<String, CtSymInt4Bf16Fallback>,
+    int4_storage_views: &mut HashMap<String, Int4StorageView>,
+    index_entries: &HashMap<String, FlmIndexEntry>,
+    insert_logical_aliases: bool,
+) -> Result<(), Error> {
     let direct_plan: HashMap<(u32, u16), &crate::flm::FlmPlanStep> = runtime
         .plan_steps()
         .iter()
@@ -2762,6 +2793,60 @@ mod tests {
         payload: Vec<u8>,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestTensorMetaSnapshot {
+        name: String,
+        shape: Vec<usize>,
+        dtype: String,
+        layout: LayoutTag,
+        offset: u64,
+        byte_len: u64,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestStage3PublicationSnapshot {
+        index: Vec<TestTensorMetaSnapshot>,
+        upload_views: Vec<(String, TensorUploadView)>,
+        int4_storage_views: Vec<(String, Int4StorageView)>,
+    }
+
+    fn stage3_publication_snapshot(
+        index: &HashMap<String, TensorMeta>,
+        upload_views: &HashMap<String, TensorUploadView>,
+        int4_storage_views: &HashMap<String, Int4StorageView>,
+    ) -> TestStage3PublicationSnapshot {
+        let mut index = index
+            .values()
+            .map(|meta| TestTensorMetaSnapshot {
+                name: meta.name.clone(),
+                shape: meta.shape.clone(),
+                dtype: meta.dtype.clone(),
+                layout: meta.layout.clone(),
+                offset: meta.offset,
+                byte_len: meta.byte_len,
+            })
+            .collect::<Vec<_>>();
+        index.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let mut upload_views = upload_views
+            .iter()
+            .map(|(name, view)| (name.clone(), view.clone()))
+            .collect::<Vec<_>>();
+        upload_views.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut int4_storage_views = int4_storage_views
+            .iter()
+            .map(|(name, view)| (name.clone(), view.clone()))
+            .collect::<Vec<_>>();
+        int4_storage_views.sort_by(|left, right| left.0.cmp(&right.0));
+
+        TestStage3PublicationSnapshot {
+            index,
+            upload_views,
+            int4_storage_views,
+        }
+    }
+
     fn put_u16(buf: &mut [u8], off: usize, value: u16) {
         buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
     }
@@ -3415,6 +3500,47 @@ mod tests {
                 zero_name: "model.language_model.layers.0.mlp.experts.gate_up_proj_int4_zero",
             }
         }
+    }
+
+    fn test_native_int4_physical_index(
+        fixture: &TestNativeInt4Stage3,
+    ) -> HashMap<String, TensorMeta> {
+        let packed_len = (2 * 256 * 64) as u64;
+        HashMap::from([
+            (
+                fixture.packed_name.to_string(),
+                TensorMeta {
+                    name: fixture.packed_name.to_string(),
+                    shape: vec![2, 256, 64],
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 0,
+                    byte_len: packed_len,
+                },
+            ),
+            (
+                fixture.scale_name.to_string(),
+                TensorMeta {
+                    name: fixture.scale_name.to_string(),
+                    shape: vec![2, 2, 1],
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: packed_len,
+                    byte_len: 8,
+                },
+            ),
+            (
+                fixture.zero_name.to_string(),
+                TensorMeta {
+                    name: fixture.zero_name.to_string(),
+                    shape: vec![2, 2, 1],
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: packed_len + 8,
+                    byte_len: 8,
+                },
+            ),
+        ])
     }
 
     fn runtime_stage3_native_int4_storage_abi_section() -> Vec<u8> {
@@ -5518,6 +5644,192 @@ mod tests {
             "logical PACKED rebind must not commit before upload preflight"
         );
         assert_eq!(upload_views.get(fixture.logical_name), Some(&stale_upload));
+    }
+
+    #[test]
+    fn tile_v1_scale_alias_failure_rolls_back_all_publication_maps() {
+        let canonical = TestNativeInt4Stage3::canonical();
+        let fixture = TestNativeInt4Stage3 {
+            scale_name: "opaque/transaction-scale",
+            ..canonical
+        };
+        let runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_native_int4_stage3_fixture(&fixture),
+        )
+        .expect("parse tile-v1 runtime");
+        let mut index = test_native_int4_physical_index(&fixture);
+        let physical_scale = index.get(fixture.scale_name).unwrap().clone();
+        index.insert(
+            canonical.scale_name.to_string(),
+            TensorMeta {
+                name: canonical.scale_name.to_string(),
+                ..physical_scale
+            },
+        );
+        let mut upload_views = HashMap::new();
+        let mut fallbacks = HashMap::new();
+        let mut views = HashMap::new();
+        let before = stage3_publication_snapshot(&index, &upload_views, &views);
+
+        let err = build_stage3_int4_storage(
+            &runtime,
+            &mut index,
+            &mut upload_views,
+            &mut fallbacks,
+            &mut views,
+            &HashMap::new(),
+            true,
+        )
+        .expect_err("occupied generated SCALE alias must fail");
+
+        assert!(
+            err.to_string().contains("namespace collision"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &views),
+            before
+        );
+        assert!(
+            views.is_empty(),
+            "failed transaction must not publish a view"
+        );
+    }
+
+    #[test]
+    fn tile_v1_zero_alias_failure_rolls_back_logical_and_scale_publication() {
+        let canonical = TestNativeInt4Stage3::canonical();
+        let fixture = TestNativeInt4Stage3 {
+            zero_name: "opaque/transaction-zero",
+            ..canonical
+        };
+        let runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_native_int4_stage3_fixture(&fixture),
+        )
+        .expect("parse tile-v1 runtime");
+        let mut index = test_native_int4_physical_index(&fixture);
+        let physical_zero = index.get(fixture.zero_name).unwrap().clone();
+        index.insert(
+            canonical.zero_name.to_string(),
+            TensorMeta {
+                name: canonical.zero_name.to_string(),
+                ..physical_zero
+            },
+        );
+        let mut upload_views = HashMap::new();
+        let mut fallbacks = HashMap::new();
+        let mut views = HashMap::new();
+        let before = stage3_publication_snapshot(&index, &upload_views, &views);
+
+        let err = build_stage3_int4_storage(
+            &runtime,
+            &mut index,
+            &mut upload_views,
+            &mut fallbacks,
+            &mut views,
+            &HashMap::new(),
+            true,
+        )
+        .expect_err("occupied generated ZERO alias must fail");
+
+        assert!(
+            err.to_string().contains("namespace collision"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &views),
+            before
+        );
+        assert!(
+            views.is_empty(),
+            "failed transaction must not publish a view"
+        );
+    }
+
+    #[test]
+    fn row_group_scale_failure_rolls_back_candidate_logical_publication() {
+        let mut fixture = TestRowGroupStage3::rank2();
+        fixture.scale_index_codec = 7;
+        let runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_row_group_stage3_tables(&fixture),
+        )
+        .expect("parse row-group runtime");
+        let mut index = HashMap::from([
+            (
+                fixture.packed_name.to_string(),
+                TensorMeta {
+                    name: fixture.packed_name.to_string(),
+                    shape: vec![4, 32],
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 0,
+                    byte_len: 128,
+                },
+            ),
+            (
+                fixture.scale_name.to_string(),
+                TensorMeta {
+                    name: fixture.scale_name.to_string(),
+                    shape: vec![4, 1],
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 128,
+                    byte_len: 8,
+                },
+            ),
+        ]);
+        let index_entries = HashMap::from([
+            (
+                fixture.packed_name.to_string(),
+                FlmIndexEntry {
+                    name: fixture.packed_name.to_string(),
+                    shape: vec![4, 32],
+                    dtype: FLM_DTYPE_UINT8,
+                    codec: 10,
+                    file_offset: 0,
+                    stored_len: 128,
+                },
+            ),
+            (
+                fixture.scale_name.to_string(),
+                FlmIndexEntry {
+                    name: fixture.scale_name.to_string(),
+                    shape: vec![4, 1],
+                    dtype: FLM_DTYPE_BF16,
+                    codec: 7,
+                    file_offset: 128,
+                    stored_len: 8,
+                },
+            ),
+        ]);
+        let mut upload_views = HashMap::new();
+        let mut fallbacks = HashMap::new();
+        let mut views = HashMap::new();
+        let before = stage3_publication_snapshot(&index, &upload_views, &views);
+
+        let err = build_stage3_int4_storage(
+            &runtime,
+            &mut index,
+            &mut upload_views,
+            &mut fallbacks,
+            &mut views,
+            &index_entries,
+            true,
+        )
+        .expect_err("malformed row-group SCALE must fail transactionally");
+
+        assert!(
+            err.to_string().contains("scale plane"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &views),
+            before
+        );
+        assert!(
+            views.is_empty(),
+            "failed transaction must not publish a view"
+        );
     }
 
     #[test]
