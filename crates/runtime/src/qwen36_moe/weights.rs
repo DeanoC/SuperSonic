@@ -129,8 +129,41 @@ struct RowGroupInt4Layout {
     experts: usize,
     rows: usize,
     cols: usize,
-    expected_packed_bytes: usize,
-    expected_scale_elements: usize,
+    minimum_packed_bytes: usize,
+    minimum_scale_elements: usize,
+}
+
+fn checked_row_group_int4_plane_extent(
+    experts: usize,
+    rows: usize,
+    row_stride: usize,
+    expert_stride: usize,
+    logical_row_extent: usize,
+    rank: usize,
+    plane: &str,
+) -> Result<usize> {
+    let last_row_offset = rows
+        .checked_sub(1)
+        .and_then(|last_row| last_row.checked_mul(row_stride))
+        .ok_or_else(|| anyhow!("row-group INT4 {plane} row index overflows"))?;
+    let per_expert_extent = last_row_offset
+        .checked_add(logical_row_extent)
+        .ok_or_else(|| anyhow!("row-group INT4 {plane} row-plane size overflows"))?;
+
+    if rank == 2 {
+        return Ok(per_expert_extent);
+    }
+    if expert_stride < per_expert_extent {
+        anyhow::bail!(
+            "row-group INT4 {plane} expert stride {expert_stride} is shorter than the final logical row extent {per_expert_extent}"
+        );
+    }
+
+    experts
+        .checked_sub(1)
+        .and_then(|last_expert| last_expert.checked_mul(expert_stride))
+        .and_then(|last_expert_offset| last_expert_offset.checked_add(per_expert_extent))
+        .ok_or_else(|| anyhow!("row-group INT4 {plane} expert-plane size overflows"))
 }
 
 fn checked_row_group_int4_plane_layout(view: &Int4StorageView) -> Result<RowGroupInt4Layout> {
@@ -185,50 +218,62 @@ fn checked_row_group_int4_plane_layout(view: &Int4StorageView) -> Result<RowGrou
         );
     }
 
-    let packed_rows_per_expert = rows
-        .checked_mul(view.packed_row_stride_bytes)
-        .ok_or_else(|| anyhow!("row-group INT4 packed row-plane size overflows"))?;
-    let scale_rows_per_expert = rows
-        .checked_mul(view.scale_row_stride_elements)
-        .ok_or_else(|| anyhow!("row-group INT4 scale row-plane size overflows"))?;
-
-    let (expected_packed_bytes, expected_scale_elements) = if view.logical_shape.len() == 2 {
+    let (minimum_packed_bytes, minimum_scale_elements) = if view.logical_shape.len() == 2 {
         if view.packed_expert_stride_bytes != 0 || view.scale_expert_stride_elements != 0 {
             anyhow::bail!("rank-2 row-group INT4 view must not specify expert strides");
         }
-        (packed_rows_per_expert, scale_rows_per_expert)
-    } else {
-        if view.packed_expert_stride_bytes < packed_rows_per_expert {
-            anyhow::bail!(
-                "row-group INT4 packed expert stride {} is shorter than padded row plane {packed_rows_per_expert}",
-                view.packed_expert_stride_bytes
-            );
-        }
-        if view.scale_expert_stride_elements < scale_rows_per_expert {
-            anyhow::bail!(
-                "row-group INT4 scale expert stride {} is shorter than padded row plane {scale_rows_per_expert}",
-                view.scale_expert_stride_elements
-            );
-        }
         (
-            experts
-                .checked_mul(view.packed_expert_stride_bytes)
-                .ok_or_else(|| anyhow!("row-group INT4 packed expert-plane size overflows"))?,
-            experts
-                .checked_mul(view.scale_expert_stride_elements)
-                .ok_or_else(|| anyhow!("row-group INT4 scale expert-plane size overflows"))?,
+            checked_row_group_int4_plane_extent(
+                experts,
+                rows,
+                view.packed_row_stride_bytes,
+                view.packed_expert_stride_bytes,
+                logical_packed_row_bytes,
+                2,
+                "packed",
+            )?,
+            checked_row_group_int4_plane_extent(
+                experts,
+                rows,
+                view.scale_row_stride_elements,
+                view.scale_expert_stride_elements,
+                logical_scale_row_elements,
+                2,
+                "scale",
+            )?,
+        )
+    } else {
+        (
+            checked_row_group_int4_plane_extent(
+                experts,
+                rows,
+                view.packed_row_stride_bytes,
+                view.packed_expert_stride_bytes,
+                logical_packed_row_bytes,
+                3,
+                "packed",
+            )?,
+            checked_row_group_int4_plane_extent(
+                experts,
+                rows,
+                view.scale_row_stride_elements,
+                view.scale_expert_stride_elements,
+                logical_scale_row_elements,
+                3,
+                "scale",
+            )?,
         )
     };
 
-    if expected_packed_bytes == 0 || expected_scale_elements == 0 {
+    if minimum_packed_bytes == 0 || minimum_scale_elements == 0 {
         anyhow::bail!("row-group INT4 oracle requires nonempty packed and scale planes");
     }
     Ok(RowGroupInt4Layout {
         experts,
         rows,
         cols,
-        expected_packed_bytes,
-        expected_scale_elements,
+        minimum_packed_bytes,
+        minimum_scale_elements,
     })
 }
 
@@ -244,15 +289,15 @@ pub fn dequant_row_group_int4_to_bf16_bytes(
 ) -> Result<Vec<u8>> {
     let layout = checked_row_group_int4_plane_layout(view)?;
     let expected_scale_bytes = layout
-        .expected_scale_elements
+        .minimum_scale_elements
         .checked_mul(2)
         .ok_or_else(|| anyhow!("row-group INT4 BF16 scale byte size overflows"))?;
 
-    if packed.len() != layout.expected_packed_bytes {
+    if packed.len() < layout.minimum_packed_bytes {
         anyhow::bail!(
-            "row-group INT4 packed plane has {} bytes, expected {}",
+            "row-group INT4 packed plane has {} bytes, needs at least {}",
             packed.len(),
-            layout.expected_packed_bytes
+            layout.minimum_packed_bytes
         );
     }
     if scale_bf16.len() % 2 != 0 {
@@ -261,9 +306,9 @@ pub fn dequant_row_group_int4_to_bf16_bytes(
             scale_bf16.len()
         );
     }
-    if scale_bf16.len() != expected_scale_bytes {
+    if scale_bf16.len() < expected_scale_bytes {
         anyhow::bail!(
-            "row-group INT4 scale plane has {} bytes, expected {expected_scale_bytes}",
+            "row-group INT4 scale plane has {} bytes, needs at least {expected_scale_bytes}",
             scale_bf16.len()
         );
     }
