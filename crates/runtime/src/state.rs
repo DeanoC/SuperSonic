@@ -649,6 +649,8 @@ mod tests {
                 required_tensors: 693,
                 raw_dense: 363,
                 native_int4: 330,
+                row_group_int4: 330,
+                tile_int4_v1: 0,
                 bf16_fallback: 0,
             },
             transfer_backend: model_store::VirtualArenaTransferBackend::PageableH2d,

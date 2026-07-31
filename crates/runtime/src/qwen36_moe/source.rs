@@ -139,7 +139,10 @@ pub struct Qwen36MoeDirectProfile {
     /// also contains storage sidecars and compatibility/runtime assets.
     pub required_tensors: usize,
     pub raw_dense: usize,
+    /// Aggregate direct INT4 coverage across row-group and retained tile-v1 codecs.
     pub native_int4: usize,
+    pub row_group_int4: usize,
+    pub tile_int4_v1: usize,
     pub bf16_fallback: usize,
 }
 
@@ -147,8 +150,13 @@ impl fmt::Display for Qwen36MoeDirectProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "required={} raw_dense={} native_int4={} bf16_fallback={}",
-            self.required_tensors, self.raw_dense, self.native_int4, self.bf16_fallback
+            "required={} raw_dense={} native_int4={} row_group_int4={} tile_int4_v1={} bf16_fallback={}",
+            self.required_tensors,
+            self.raw_dense,
+            self.native_int4,
+            self.row_group_int4,
+            self.tile_int4_v1,
+            self.bf16_fallback
         )
     }
 }
@@ -254,8 +262,40 @@ where
     >,
     S: Into<String>,
 {
-    let mut native_int4_name: Option<String> = None;
-    let mut fallback_name: Option<String> = None;
+    let direct_profile = qwen36_moe_flm_direct_profile_from_required_plan_kinds(plans)?;
+    if direct_profile.native_int4 != direct_profile.row_group_int4 + direct_profile.tile_int4_v1 {
+        anyhow::bail!(
+            "Qwen3.6 MoE FLM direct profile native INT4 aggregate does not match codec-specific coverage"
+        );
+    }
+    if direct_profile.row_group_int4 == 0
+        || direct_profile.tile_int4_v1 != 0
+        || direct_profile.bf16_fallback != 0
+    {
+        anyhow::bail!(
+            "Qwen3.6 MoE first-class row-group INT4 direct plans require row_group_int4 > 0, tile_int4_v1 == 0, and bf16_fallback == 0; got {direct_profile}"
+        );
+    }
+
+    Ok(Qwen36MoeFlmWeightSelection {
+        mode: Qwen36WeightMode::Int4,
+        direct_profile,
+    })
+}
+
+fn qwen36_moe_flm_direct_profile_from_required_plan_kinds<I, S>(
+    plans: I,
+) -> Result<Qwen36MoeDirectProfile>
+where
+    I: IntoIterator<
+        Item = (
+            S,
+            RequiredFlmDirectWeightKind,
+            Option<FlmStage3DirectWeightKind>,
+        ),
+    >,
+    S: Into<String>,
+{
     let mut direct_profile = Qwen36MoeDirectProfile::default();
 
     for (name, expected, kind) in plans {
@@ -275,10 +315,17 @@ where
             }
             (
                 RequiredFlmDirectWeightKind::QuantizedProjection,
+                Some(FlmStage3DirectWeightKind::RowGroupInt4),
+            ) => {
+                direct_profile.native_int4 += 1;
+                direct_profile.row_group_int4 += 1;
+            }
+            (
+                RequiredFlmDirectWeightKind::QuantizedProjection,
                 Some(FlmStage3DirectWeightKind::NativeInt4),
             ) => {
-                native_int4_name.get_or_insert(name);
                 direct_profile.native_int4 += 1;
+                direct_profile.tile_int4_v1 += 1;
             }
             (
                 RequiredFlmDirectWeightKind::QuantizedProjection,
@@ -287,7 +334,6 @@ where
                     | FlmStage3DirectWeightKind::RawDense,
                 ),
             ) => {
-                fallback_name.get_or_insert(name);
                 direct_profile.bf16_fallback += 1;
             }
             (RequiredFlmDirectWeightKind::QuantizedProjection, None) => {
@@ -296,21 +342,12 @@ where
         }
     }
 
-    if let (Some(native), Some(fallback)) = (native_int4_name.as_ref(), fallback_name.as_ref()) {
-        return Err(anyhow!(
-            "mixed FLM direct projection modes: native INT4 example {native}; BF16 fallback example {fallback}"
-        ));
-    }
-
-    let mode = if native_int4_name.is_some() {
-        Qwen36WeightMode::Int4
-    } else {
-        Qwen36WeightMode::Bf16
-    };
-    Ok(Qwen36MoeFlmWeightSelection {
-        mode,
-        direct_profile,
-    })
+    assert_eq!(
+        direct_profile.native_int4,
+        direct_profile.row_group_int4 + direct_profile.tile_int4_v1,
+        "native INT4 aggregate must equal codec-specific direct coverage"
+    );
+    Ok(direct_profile)
 }
 
 #[cfg(test)]
@@ -399,6 +436,65 @@ mod tests {
     }
 
     #[test]
+    fn direct_profile_separates_row_group_and_legacy_tile_int4() {
+        let profile = qwen36_moe_flm_direct_profile_from_required_plan_kinds([
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                RequiredFlmDirectWeightKind::QuantizedProjection,
+                Some(FlmStage3DirectWeightKind::RowGroupInt4),
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                RequiredFlmDirectWeightKind::QuantizedProjection,
+                Some(FlmStage3DirectWeightKind::NativeInt4),
+            ),
+            (
+                "model.language_model.embed_tokens.weight",
+                RequiredFlmDirectWeightKind::RawDense,
+                Some(FlmStage3DirectWeightKind::RawDense),
+            ),
+        ])
+        .expect("diagnostic plan accounting must accept both supported INT4 codecs");
+
+        assert_eq!(profile.required_tensors, 3);
+        assert_eq!(profile.raw_dense, 1);
+        assert_eq!(profile.native_int4, 2);
+        assert_eq!(profile.row_group_int4, 1);
+        assert_eq!(profile.tile_int4_v1, 1);
+        assert_eq!(profile.bf16_fallback, 0);
+        assert_eq!(
+            profile.native_int4,
+            profile.row_group_int4 + profile.tile_int4_v1
+        );
+        assert_eq!(
+            profile.to_string(),
+            "required=3 raw_dense=1 native_int4=2 row_group_int4=1 tile_int4_v1=1 bf16_fallback=0"
+        );
+    }
+
+    #[test]
+    fn required_direct_plan_selection_accepts_only_pure_row_group_int4() {
+        let row_group = qwen36_moe_flm_weight_selection_from_required_plan_kinds([(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            RequiredFlmDirectWeightKind::QuantizedProjection,
+            Some(FlmStage3DirectWeightKind::RowGroupInt4),
+        )])
+        .expect("row-group-only direct plans must select the first-class INT4 path");
+        assert_eq!(row_group.mode, Qwen36WeightMode::Int4);
+        assert_eq!(row_group.direct_profile.row_group_int4, 1);
+        assert_eq!(row_group.direct_profile.tile_int4_v1, 0);
+        assert_eq!(row_group.direct_profile.bf16_fallback, 0);
+
+        let err = qwen36_moe_flm_weight_selection_from_required_plan_kinds([(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            RequiredFlmDirectWeightKind::QuantizedProjection,
+            Some(FlmStage3DirectWeightKind::NativeInt4),
+        )])
+        .expect_err("legacy tile INT4 must remain diagnostic-only");
+        assert!(err.to_string().contains("tile_int4_v1"), "{err}");
+    }
+
+    #[test]
     fn required_direct_plan_selection_reports_native_35b_a3b_profile() {
         let plans = qwen36_moe_required_flm_direct_weights(
             &config_35b_a3b(),
@@ -409,7 +505,7 @@ mod tests {
             let kind = match required.expected {
                 RequiredFlmDirectWeightKind::RawDense => FlmStage3DirectWeightKind::RawDense,
                 RequiredFlmDirectWeightKind::QuantizedProjection => {
-                    FlmStage3DirectWeightKind::NativeInt4
+                    FlmStage3DirectWeightKind::RowGroupInt4
                 }
             };
             (required.name, required.expected, Some(kind))
@@ -421,6 +517,8 @@ mod tests {
         let profile = selection.direct_profile;
 
         assert_eq!(profile.native_int4, 330);
+        assert_eq!(profile.row_group_int4, 330);
+        assert_eq!(profile.tile_int4_v1, 0);
         assert_eq!(profile.bf16_fallback, 0);
     }
 
@@ -438,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn required_direct_plan_selection_rejects_mixed_projection_modes() {
+    fn required_direct_plan_selection_rejects_tile_and_fallback_evidence() {
         let err = qwen36_moe_flm_weight_selection_from_required_plan_kinds([
             (
                 "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
@@ -454,20 +552,20 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert!(err.contains("mixed FLM direct projection modes"), "{err}");
+        assert!(err.contains("row_group_int4"), "{err}");
     }
 
     #[test]
-    fn required_direct_plan_selection_uses_bf16_for_complete_fallback_coverage() {
-        let selection = qwen36_moe_flm_weight_selection_from_required_plan_kinds([(
+    fn required_direct_plan_selection_rejects_bf16_fallback_coverage() {
+        let err = qwen36_moe_flm_weight_selection_from_required_plan_kinds([(
             "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
             RequiredFlmDirectWeightKind::QuantizedProjection,
             Some(FlmStage3DirectWeightKind::CtInt4Bf16Fallback),
         )])
-        .expect("complete BF16 fallback plans should be accepted");
+        .expect_err("BF16 fallback plans cannot select the first-class row-group path")
+        .to_string();
 
-        assert_eq!(selection.mode, Qwen36WeightMode::Bf16);
-        assert_eq!(selection.direct_profile.bf16_fallback, 1);
+        assert!(err.contains("bf16_fallback"), "{err}");
     }
 
     #[test]

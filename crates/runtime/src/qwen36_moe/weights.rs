@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use model_store::manifest::LayoutTag;
+use model_store::store::{Int4StorageKind, Int4StorageView};
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
 
@@ -121,6 +122,222 @@ fn f32_to_bf16_bits(x: f32) -> u16 {
     }
     let lsb = (bits >> 16) & 1;
     (bits.wrapping_add(0x7FFF + lsb) >> 16) as u16
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RowGroupInt4Layout {
+    experts: usize,
+    rows: usize,
+    cols: usize,
+    expected_packed_bytes: usize,
+    expected_scale_elements: usize,
+}
+
+fn checked_row_group_int4_plane_layout(view: &Int4StorageView) -> Result<RowGroupInt4Layout> {
+    if view.kind != Int4StorageKind::RowGroupSymmetric {
+        anyhow::bail!("row-group INT4 oracle requires RowGroupSymmetric storage view");
+    }
+    if view.group_size != 32 {
+        anyhow::bail!(
+            "row-group INT4 oracle requires group size 32, got {}",
+            view.group_size
+        );
+    }
+    if view.output_group_size != 1
+        || view.implicit_zero_code != Some(8)
+        || view.zero_tensor.is_some()
+    {
+        anyhow::bail!(
+            "row-group INT4 oracle requires output group size 1 and implicit zero code 8"
+        );
+    }
+
+    let (experts, rows, cols) = match view.logical_shape.as_slice() {
+        [rows, cols] => (1, *rows, *cols),
+        [experts, rows, cols] => (*experts, *rows, *cols),
+        shape => anyhow::bail!(
+            "row-group INT4 oracle requires rank-2 or rank-3 logical shape, got rank {}",
+            shape.len()
+        ),
+    };
+    if experts == 0 || rows == 0 || cols == 0 {
+        anyhow::bail!("row-group INT4 oracle requires nonzero logical dimensions");
+    }
+    if cols % 2 != 0 {
+        anyhow::bail!("row-group INT4 oracle requires an even final dimension, got {cols}");
+    }
+    if cols % view.group_size != 0 {
+        anyhow::bail!("row-group INT4 oracle requires final dimension divisible by 32, got {cols}");
+    }
+
+    let logical_packed_row_bytes = cols / 2;
+    let logical_scale_row_elements = cols / view.group_size;
+    if view.packed_row_stride_bytes < logical_packed_row_bytes {
+        anyhow::bail!(
+            "row-group INT4 packed row stride {} is shorter than logical row bytes {logical_packed_row_bytes}",
+            view.packed_row_stride_bytes
+        );
+    }
+    if view.scale_row_stride_elements < logical_scale_row_elements {
+        anyhow::bail!(
+            "row-group INT4 scale row stride {} is shorter than logical scale elements {logical_scale_row_elements}",
+            view.scale_row_stride_elements
+        );
+    }
+
+    let packed_rows_per_expert = rows
+        .checked_mul(view.packed_row_stride_bytes)
+        .ok_or_else(|| anyhow!("row-group INT4 packed row-plane size overflows"))?;
+    let scale_rows_per_expert = rows
+        .checked_mul(view.scale_row_stride_elements)
+        .ok_or_else(|| anyhow!("row-group INT4 scale row-plane size overflows"))?;
+
+    let (expected_packed_bytes, expected_scale_elements) = if view.logical_shape.len() == 2 {
+        if view.packed_expert_stride_bytes != 0 || view.scale_expert_stride_elements != 0 {
+            anyhow::bail!("rank-2 row-group INT4 view must not specify expert strides");
+        }
+        (packed_rows_per_expert, scale_rows_per_expert)
+    } else {
+        if view.packed_expert_stride_bytes < packed_rows_per_expert {
+            anyhow::bail!(
+                "row-group INT4 packed expert stride {} is shorter than padded row plane {packed_rows_per_expert}",
+                view.packed_expert_stride_bytes
+            );
+        }
+        if view.scale_expert_stride_elements < scale_rows_per_expert {
+            anyhow::bail!(
+                "row-group INT4 scale expert stride {} is shorter than padded row plane {scale_rows_per_expert}",
+                view.scale_expert_stride_elements
+            );
+        }
+        (
+            experts
+                .checked_mul(view.packed_expert_stride_bytes)
+                .ok_or_else(|| anyhow!("row-group INT4 packed expert-plane size overflows"))?,
+            experts
+                .checked_mul(view.scale_expert_stride_elements)
+                .ok_or_else(|| anyhow!("row-group INT4 scale expert-plane size overflows"))?,
+        )
+    };
+
+    if expected_packed_bytes == 0 || expected_scale_elements == 0 {
+        anyhow::bail!("row-group INT4 oracle requires nonempty packed and scale planes");
+    }
+    Ok(RowGroupInt4Layout {
+        experts,
+        rows,
+        cols,
+        expected_packed_bytes,
+        expected_scale_elements,
+    })
+}
+
+/// Decode a row-group G32 INT4 storage view for fixtures and diagnostics.
+///
+/// This CPU reference decoder is intentionally not used by the first-class
+/// Qwen loader, which keeps the packed plane and sidecars resident for direct
+/// GPU consumption.
+pub fn dequant_row_group_int4_to_bf16_bytes(
+    packed: &[u8],
+    scale_bf16: &[u8],
+    view: &Int4StorageView,
+) -> Result<Vec<u8>> {
+    let layout = checked_row_group_int4_plane_layout(view)?;
+    let expected_scale_bytes = layout
+        .expected_scale_elements
+        .checked_mul(2)
+        .ok_or_else(|| anyhow!("row-group INT4 BF16 scale byte size overflows"))?;
+
+    if packed.len() != layout.expected_packed_bytes {
+        anyhow::bail!(
+            "row-group INT4 packed plane has {} bytes, expected {}",
+            packed.len(),
+            layout.expected_packed_bytes
+        );
+    }
+    if scale_bf16.len() % 2 != 0 {
+        anyhow::bail!(
+            "row-group INT4 scale plane must be BF16-aligned, got {} bytes",
+            scale_bf16.len()
+        );
+    }
+    if scale_bf16.len() != expected_scale_bytes {
+        anyhow::bail!(
+            "row-group INT4 scale plane has {} bytes, expected {expected_scale_bytes}",
+            scale_bf16.len()
+        );
+    }
+
+    let output_elements = layout
+        .experts
+        .checked_mul(layout.rows)
+        .and_then(|elements| elements.checked_mul(layout.cols))
+        .ok_or_else(|| anyhow!("row-group INT4 output element count overflows"))?;
+    let output_bytes = output_elements
+        .checked_mul(2)
+        .ok_or_else(|| anyhow!("row-group INT4 output byte size overflows"))?;
+    let mut output = Vec::with_capacity(output_bytes);
+
+    for expert in 0..layout.experts {
+        let packed_expert_base = expert
+            .checked_mul(view.packed_expert_stride_bytes)
+            .ok_or_else(|| anyhow!("row-group INT4 packed expert index overflows"))?;
+        let scale_expert_base = expert
+            .checked_mul(view.scale_expert_stride_elements)
+            .ok_or_else(|| anyhow!("row-group INT4 scale expert index overflows"))?;
+        for row in 0..layout.rows {
+            let packed_row_offset = row
+                .checked_mul(view.packed_row_stride_bytes)
+                .ok_or_else(|| anyhow!("row-group INT4 packed row index overflows"))?;
+            let packed_row_base = packed_expert_base
+                .checked_add(packed_row_offset)
+                .ok_or_else(|| anyhow!("row-group INT4 packed index overflows"))?;
+            let scale_row_offset = row
+                .checked_mul(view.scale_row_stride_elements)
+                .ok_or_else(|| anyhow!("row-group INT4 scale row index overflows"))?;
+            let scale_row_base = scale_expert_base
+                .checked_add(scale_row_offset)
+                .ok_or_else(|| anyhow!("row-group INT4 scale index overflows"))?;
+
+            for col in 0..layout.cols {
+                let packed_index = packed_row_base
+                    .checked_add(col / 2)
+                    .ok_or_else(|| anyhow!("row-group INT4 packed element index overflows"))?;
+                let byte = *packed.get(packed_index).ok_or_else(|| {
+                    anyhow!("row-group INT4 packed element index exceeds validated plane")
+                })?;
+                let code = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 };
+                if !(1..=15).contains(&code) {
+                    anyhow::bail!(
+                        "row-group INT4 code {code} at expert={expert} row={row} col={col} is invalid; code 0 is reserved for padding"
+                    );
+                }
+
+                let scale_index = scale_row_base
+                    .checked_add(col / view.group_size)
+                    .ok_or_else(|| anyhow!("row-group INT4 scale element index overflows"))?;
+                let scale_byte_index = scale_index
+                    .checked_mul(2)
+                    .ok_or_else(|| anyhow!("row-group INT4 BF16 scale index overflows"))?;
+                let scale_second_byte = scale_byte_index
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("row-group INT4 BF16 scale index overflows"))?;
+                let scale = half::bf16::from_bits(u16::from_le_bytes([
+                    *scale_bf16.get(scale_byte_index).ok_or_else(|| {
+                        anyhow!("row-group INT4 scale index exceeds validated plane")
+                    })?,
+                    *scale_bf16.get(scale_second_byte).ok_or_else(|| {
+                        anyhow!("row-group INT4 scale index exceeds validated plane")
+                    })?,
+                ]))
+                .to_f32();
+                let value = (f32::from(code) - 8.0) * scale;
+                output.extend_from_slice(&f32_to_bf16_bits(value).to_le_bytes());
+            }
+        }
+    }
+    debug_assert_eq!(output.len(), output_bytes);
+    Ok(output)
 }
 
 pub fn dequant_int4_to_bf16_bytes(
