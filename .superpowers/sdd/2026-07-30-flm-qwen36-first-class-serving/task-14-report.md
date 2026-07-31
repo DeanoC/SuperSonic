@@ -879,3 +879,194 @@ The SuperSonic report commit follows this section.
 - The server has no logit/top-k response surface. The real route retains raw
   generated output; full top-k evidence comes from the same committed FLM
   engine through the CLI dump hook.
+
+## Fix Round 3
+
+This section supersedes the earlier sampled-mapping and chunk-only layer-0
+attribution. Work started from SuperSonic
+`5917e4eb371807609eadaeca715d1be0a4632d8c` and geo-quant
+`4d97c345f02c34f83702e779d7ea1aa491e6336f`.
+
+### Review-Finding Closure
+
+1. The independent native-INT4 oracle is now a tracked mandatory default:
+   `oracle/fixtures/qwen36_moe_multilayer_int4_v1.json`, size `16245453`,
+   SHA-256
+   `37f0cac419ae804f38a436c02e8d5b496fbd234d4cf31cef9c5251eb0ecfcbb0`.
+   Missing input is a hard failure. Chained handoff and final-logit gates use
+   candidate-independent fixed `max_abs <= 1.0` and `cosine >= 0.999`
+   thresholds. A corruption-negative changes an inter-layer handoff and
+   proves the fixed gate rejects it.
+2. Promotion authorization is the resolved canonical path value, not a
+   boolean. The staged file is parsed with
+   `profile="supersonic-qwen36-moe-native-int4"` and
+   `verify_payload_hashes=True`; errors and warnings reject promotion. The
+   prepared and completed ledger records the exact authorization and validator
+   result. A failed completed-ledger write rolls the canonical path back.
+   Tests cover invalid bytes, wrong path authorization, validator failure,
+   warnings, prepared-ledger failure, completed-ledger failure, and rollback
+   failure.
+3. The layer-0 diagnosis now aligns BF16 recurrent mode and serializes every
+   requested boundary. A/B measures chunk-versus-recurrent reference mode;
+   B/C measures source-BF16 versus independently decoded V1 weights; C/D
+   measures the independently decoded recurrent reference versus isolated
+   SuperSonic stages using the same input and state.
+4. The source mapping audit classifies all `330/330` native descriptors into
+   `12` semantic role/rank/shape families, with `0` unclassified. Every role
+   has deterministic early/middle/late coverage. The six audited rank-3
+   tensors check all `256` experts (`1536` expert instances total) with
+   boundary and interior tiles. Total coverage is `36` descriptors and
+   `3132/3132` tiles. Same-shape role-swap and previously non-sampled expert
+   permutation negatives are required tests.
+5. Partial/failure validation now checks the original evidence before any
+   normalization, recomputes child predicates and their aggregate conjunction,
+   and enforces exact final health/capability/metric schemas. Wrong expected,
+   status, finish, child/aggregate pass, contradiction, and extra-key
+   mutations are rejected.
+
+### Complete Mapping Audit
+
+```text
+/home/deano/projects/geo-quant/.venv-rocm/bin/python \
+  scripts/qwen36_flm_diagnostic.py \
+  --source /mnt/data/models/Qwen3.6-35B-A3B \
+  --artifact /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --prompt /tmp/task14-upstream-tool-prompt.txt \
+  --supersonic-repo /home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving \
+  --output /home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving/target/task14-fix3-native-mapping.json
+```
+
+Result: `all_pass=true`; descriptors `330/330`; roles `12`; sampled
+descriptors `36`; rank-3 sampled descriptors `6`; expert instances `1536`;
+tiles `3132`; unclassified descriptors `0`. Report SHA-256:
+`4a1c0faed219c3af2ff8ac189eb263dee19af307eefeb104147ce13429cafc89`.
+
+### Mandatory A/B/C/D Experiment
+
+The exact prompt has SHA-256
+`540f92c1fe4446d0f9764de537a1a59603515b94de27b8ea0562420c5f8ffb8b`,
+size `1459`, `322` tokenizer IDs, and final position `321`. Every execution
+uses that final layer input; recurrent executions start from zero state.
+
+```text
+HIP_VISIBLE_DEVICES=0 \
+/home/deano/projects/geo-quant/.venv-rocm/bin/python \
+  scripts/diagnose_qwen36_layer0_modes.py \
+  --model /mnt/data/models/Qwen3.6-35B-A3B \
+  --artifact /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --prompt /tmp/task14-upstream-tool-prompt.txt \
+  --output /home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving/target/task14-fix3-layer0-abc.json \
+  --supersonic-repo /home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving \
+  --expected-tokens 322 --device cuda:0
+```
+
+Result in `8.46s`:
+
+- A/B first differs at `in_proj_z`: `max_abs=0.03125`; final residual
+  `cosine=1.0`, `max_abs=0.00006103515625`. This separately establishes the
+  full-prompt chunk versus per-token recurrent implementation effect.
+- B/C first differs at `in_proj_qkv`: `cosine=0.9917200804`,
+  `max_abs=1.71875`; final residual `cosine=0.8562856317`,
+  `max_abs=0.2333984375`. The large earlier layer-0 delta is therefore
+  attributable to V1 INT4 quantization, not an uncontrolled execution-mode or
+  embedding difference.
+
+```text
+HIP_VISIBLE_DEVICES=0 \
+SUPERSONIC_QWEN36_LAYER0_ABC_JSON=/home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving/target/task14-fix3-layer0-abc.json \
+SUPERSONIC_QWEN36_LAYER0_D_OUTPUT=/home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving/target/task14-fix3-layer0-d.json \
+RUST_TEST_THREADS=1 cargo test -p supersonic-runtime \
+  --test qwen36_layer0_diagnostic -- --nocapture
+```
+
+Result: `1 passed` in `307.60s`. D verified the exact whole-file identity and
+all FLM payload hashes, restored C's pre-final conv/recurrent state independently
+for each stage, and executed stages `1..=5` on HIP.
+
+```text
+/home/deano/projects/geo-quant/.venv-rocm/bin/python \
+  scripts/compare_qwen36_layer0_abcd.py \
+  --abc /home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving/target/task14-fix3-layer0-abc.json \
+  --d /home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving/target/task14-fix3-layer0-d.json \
+  --output /home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving/target/task14-fix3-layer0-abcd-comparison.json
+```
+
+C/D has bit-exact embedding, layer input, and input RMSNorm. Its first
+difference is the INT4 `in_proj_qkv` reduction
+(`cosine=0.9999979138`, `max_abs=0.125`). Updated recurrent state has
+`cosine=1.0`, `max_abs=0.0275063515`; final residual has
+`cosine=0.9999921322`, `max_abs=0.000244140625`. All fixed comparison gates
+pass. The experiment does **not** justify a V2 FLM ABI or kernel-interface
+change; V1 storage/indexing is not implicated.
+
+Report SHA-256 values:
+
+```text
+ABC        0c9a12d80f837cc66856609b73035230753bf933ab0174fecd08c5018778772e
+D          028c0c6a3e1a7a59bd7af343e6892c9fad45d2c04354c9dd5b68dc8fea5c4e81
+comparison 261e220b33a6d229aadc0324306e5d525d4216202e5e9eb72011f1cb3962519c
+```
+
+Three values are not directly published by the staged kernel ABI and are
+explicitly labeled in D: input RMSNorm is reconstructed from the exact staged
+formula, pre-SiLU convolution output from stage-1 QKV plus C state and FLM
+conv weights, and `out_proj` from the BF16 post-residual difference. No ABI
+was changed to add diagnostic-only outputs.
+
+### Fix Round 3 Gates
+
+```text
+/home/deano/projects/geo-quant/.venv-rocm/bin/python -m pytest -q \
+  tests/test_qwen36_flm_diagnostic.py \
+  tests/test_promote_flm_artifact.py \
+  tests/test_capture_qwen36_bf16_states.py \
+  tests/test_compare_qwen36_prompt_states.py \
+  tests/test_qwen36_flm.py \
+  tests/test_diagnose_qwen36_layer0_modes.py \
+  tests/test_compare_qwen36_layer0_abcd.py
+# 155 passed in 3.84s
+
+python3 -m unittest -q tests.test_qwen36_flm_server_e2e
+# Ran 39 tests in 18.481s; OK
+
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+RUST_TEST_THREADS=1 cargo test -q -p runner \
+  --test qwen36_moe_multilayer_parity -- --nocapture
+# 4 passed in 0.74s; tracked fixture used by default; corruption rejected
+# final chained logits cosine=0.9994795
+
+HIP_VISIBLE_DEVICES=0 \
+SUPERSONIC_QWEN36_35B_A3B_DIR=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+RUST_TEST_THREADS=1 cargo test -q -p runner \
+  --test qwen36_moe_batched_prefill_parity \
+  qualified_hip_prefill_matches_per_token -- --nocapture
+# 1 passed in 9.76s; production default versus per-token is bit exact
+```
+
+The deterministic SDK tool continuations, exact failure schemas, endpoint
+transport, auth, cancellation, scheduler release, and single-load evidence
+remain green. The retained real-server semantic/tool gate remains red for
+legacy Completions quality, repeated reuse, observed reasoning, and both
+model-generated SDK tool loops; raw malformed model output remains evidence
+and is not converted into a fabricated call. Fix Round 3 changes
+qualification, promotion safety, and diagnosis, not model generation
+semantics. The optimized HIP batched-prefill lane also remains quarantined and
+opt-in; production default remains the qualified per-token path.
+
+### Fix Round 3 Commits
+
+SuperSonic:
+
+```text
+557ce9e test(qwen36): harden Task 14 evidence gates
+ecb5da9 test(qwen36): capture aligned layer zero HIP stages
+```
+
+geo-quant:
+
+```text
+d9828be fix(flm): make artifact promotion transactional
+e31fdec test(flm): audit every Qwen native mapping role
+127da8f test(flm): diagnose aligned Qwen layer zero modes
+```
