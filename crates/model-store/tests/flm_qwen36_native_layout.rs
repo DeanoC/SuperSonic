@@ -1,7 +1,10 @@
 use std::path::Path;
 
-use model_store::flm::ASSET_CHAT_TEMPLATE_UTF8;
+use model_store::flm::{
+    FlmStage3DirectWeightKind, ASSET_CHAT_TEMPLATE_UTF8, VALUE_FORMAT_SYM_INT4,
+};
 use model_store::manifest::LayoutTag;
+use model_store::store::Int4StorageKind;
 use model_store::{BakedStore, FlmLoadOptions};
 
 #[test]
@@ -42,6 +45,36 @@ fn qwen36_35b_native_flm_linear_attention_aliases_match_supersonic_runtime_layou
         1,
         "native runtime must contain exactly one chat template asset"
     );
+
+    for logical in runtime
+        .logical_tensors()
+        .iter()
+        .filter(|logical| logical.value_format_id == VALUE_FORMAT_SYM_INT4)
+    {
+        match runtime
+            .stage3_direct_weight_kind(&logical.name)
+            .expect("classify native INT4 storage")
+        {
+            Some(FlmStage3DirectWeightKind::NativeInt4) => {
+                let view = flm
+                    .int4_storage_view(&logical.name)
+                    .expect("tile-v1 storage view");
+                assert_eq!(view.kind, Int4StorageKind::TileV1);
+                assert!(view.zero_tensor.is_some());
+                assert_eq!(flm.layout(&logical.name), Some(&LayoutTag::Int4Quantized));
+            }
+            Some(FlmStage3DirectWeightKind::RowGroupInt4) => {
+                let view = flm
+                    .int4_storage_view(&logical.name)
+                    .expect("row-group storage view");
+                assert_eq!(view.kind, Int4StorageKind::RowGroupSymmetric);
+                assert_eq!(view.zero_tensor, None);
+                assert_eq!(view.implicit_zero_code, Some(8));
+                assert_eq!(flm.layout(&logical.name), Some(&LayoutTag::Int4RowGroup));
+            }
+            _ => {}
+        }
+    }
 
     for (name, expected_layout, expected_shape) in [
         (
