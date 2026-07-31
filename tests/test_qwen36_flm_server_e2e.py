@@ -148,7 +148,23 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             "backend": "HIP",
             "ready": True,
             "max_context": 4096,
+            "endpoints": [
+                "/v1/models",
+                "/v1/models/{model}",
+                "/v1/chat/completions",
+                "/v1/completions",
+                "/v1/tokenize",
+                "/v1/detokenize",
+                "/v1/responses",
+                "/health",
+                "/v1/health",
+                "/ready",
+                "/v1/ready",
+                "/v1/capabilities",
+                "/metrics",
+            ],
             "chat": True,
+            "completions": True,
             "responses": True,
             "streaming": True,
             "stream_usage": True,
@@ -159,6 +175,23 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 "queued_requests": 0,
                 "max_queued_requests": 32,
                 "queue_timeout_ms": 30_000,
+            },
+            "prefix_cache": {
+                "enabled": False,
+                "dir": "",
+                "min_tokens": 128,
+                "max_entries": 1,
+                "max_bytes": 1_000_000,
+                "resident_bytes": 0,
+                "entries": 0,
+                "hits": 0,
+                "misses": 0,
+                "cached_tokens": 0,
+                "evictions": 0,
+                "disk_writes": 0,
+                "disk_reads": 0,
+                "restore_failures": 0,
+                "admission_skips": 0,
             },
             "flm": {
                 "source": "flm",
@@ -173,6 +206,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 "transfer_backend": "pageable-h2d",
                 "source_bytes": 8_000_000_000,
                 "device_upload_bytes": 7_000_000_000,
+                "startup_seconds": 1.25,
                 "startup": {
                     "total_seconds": 1.25,
                     "exclusive_components": {
@@ -200,6 +234,20 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             },
         }
 
+    def valid_health(self):
+        capabilities = self.valid_capabilities()
+        return {
+            "status": "ok",
+            "ready": True,
+            "model": "qwen3.6-35b-a3b",
+            "max_context": 4096,
+            "active_requests": 0,
+            "queued_requests": 0,
+            "max_queued_requests": 32,
+            "prefix_cache_entries": 0,
+            "flm": copy.deepcopy(capabilities["flm"]),
+        }
+
     def valid_metrics_text(self):
         return "\n".join(
             [
@@ -207,6 +255,26 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 "supersonic_ready 1",
                 "supersonic_active_requests 0",
                 "supersonic_queued_requests 0",
+                "supersonic_generation_active 0",
+                "supersonic_generation_queued 0",
+                "supersonic_max_queued_requests 32",
+                "supersonic_queue_timeout_ms 30000",
+                "supersonic_max_context 4096",
+                "supersonic_prefix_cache_enabled 0",
+                "supersonic_prefix_cache_entries 0",
+                "supersonic_prefix_cache_resident_bytes 0",
+                "supersonic_prefix_cache_max_bytes 1000000",
+                "supersonic_prefix_cache_hits 0",
+                "supersonic_prefix_cache_misses 0",
+                "supersonic_prefix_cache_cached_tokens 0",
+                "supersonic_prefix_cache_evictions 0",
+                "supersonic_prefix_cache_disk_writes 0",
+                "supersonic_prefix_cache_disk_reads 0",
+                "supersonic_prefix_cache_restore_failures 0",
+                "supersonic_prefix_cache_admission_skips 0",
+                "supersonic_dflash_last_rounds 0",
+                "supersonic_dflash_last_accepted_total 0",
+                "supersonic_dflash_last_decode_ms 0",
                 "supersonic_model_loads_total 1",
                 "supersonic_flm_native_int4_direct_weights 330",
                 "supersonic_flm_bf16_fallback_weights 0",
@@ -890,11 +958,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 npm="npm",
                 out_json=out_json,
             )
-            health = {
-                "status": "ok",
-                "active_requests": 0,
-                "queued_requests": 0,
-            }
+            health = self.valid_health()
             with mock.patch.object(self.harness, "discover_inputs"):
                 with mock.patch.object(
                     self.harness,
@@ -1012,11 +1076,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 ],
             },
             "final": {
-                "health": {
-                    "status": "ok",
-                    "active_requests": 0,
-                    "queued_requests": 0,
-                },
+                "health": self.valid_health(),
                 "capabilities": self.valid_capabilities(),
                 "metrics": metrics,
                 "flm_evidence": before,
@@ -1073,6 +1133,61 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             lambda report: report["final"]["load_invariance"].update(
                 {"passed": "yes"}
             ),
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                report = self.valid_failure_report()
+                mutation(report)
+                with self.assertRaises(self.harness.PhaseError):
+                    self.harness.validate_failure_report(report)
+
+    def test_validate_failure_report_rejects_partial_semantic_contradictions(self):
+        def make_all_semantics_pass(report):
+            chat = report["completed"]["compat"]["semantic_quality"]["chat"]
+            chat["actual"] = "hello"
+            chat["passed"] = True
+
+        mutations = [
+            lambda report: report["completed"]["compat"]["semantic_quality"][
+                "chat"
+            ].update({"expected": "wrong"}),
+            lambda report: report["completed"]["compat"]["semantic_quality"][
+                "chat"
+            ].update({"finish_reason": "mystery"}),
+            lambda report: report["completed"]["compat"]["semantic_quality"][
+                "responses"
+            ].update({"status": "mystery"}),
+            lambda report: report["completed"]["compat"]["semantic_quality"][
+                "chat"
+            ].update({"passed": True}),
+            lambda report: (
+                make_all_semantics_pass(report),
+                report["completed"]["compat"]["semantic_quality"]["chat"].update(
+                    {"passed": False}
+                ),
+            ),
+            lambda report: report["completed"]["compat"]["semantic_quality"].update(
+                {"passed": True}
+            ),
+            lambda report: (
+                make_all_semantics_pass(report),
+                report["completed"]["compat"]["semantic_quality"].update(
+                    {"passed": False}
+                ),
+            ),
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                report = self.valid_failure_report()
+                mutation(report)
+                with self.assertRaises(self.harness.PhaseError):
+                    self.harness.validate_failure_report(report)
+
+    def test_validate_failure_report_rejects_extra_final_evidence_keys(self):
+        mutations = [
+            lambda report: report["final"]["health"].update({"extra": 0}),
+            lambda report: report["final"]["capabilities"].update({"extra": True}),
+            lambda report: report["final"]["metrics"].update({"extra_metric": 0}),
         ]
         for mutation in mutations:
             with self.subTest(mutation=mutation):

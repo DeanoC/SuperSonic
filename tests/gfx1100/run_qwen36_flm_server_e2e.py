@@ -2,7 +2,6 @@
 """Run the real Qwen3.6 FLM server through its OpenAI protocol surface."""
 
 import argparse
-import copy
 import contextlib
 import hashlib
 import json
@@ -41,6 +40,52 @@ PROCESS_GRACE_SECONDS = 5
 READY_POLL_SECONDS = 0.25
 HTTP_TIMEOUT_SECONDS = 5.0
 SMOKE_JSON_PREFIX = "SUPERSONIC_SMOKE_JSON="
+EXPECTED_ENDPOINTS = [
+    "/v1/models",
+    "/v1/models/{model}",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/tokenize",
+    "/v1/detokenize",
+    "/v1/responses",
+    "/health",
+    "/v1/health",
+    "/ready",
+    "/v1/ready",
+    "/v1/capabilities",
+    "/metrics",
+]
+FINAL_METRIC_KEYS = {
+    "supersonic_ready",
+    "supersonic_active_requests",
+    "supersonic_queued_requests",
+    "supersonic_generation_active",
+    "supersonic_generation_queued",
+    "supersonic_max_queued_requests",
+    "supersonic_queue_timeout_ms",
+    "supersonic_max_context",
+    "supersonic_prefix_cache_enabled",
+    "supersonic_prefix_cache_entries",
+    "supersonic_prefix_cache_resident_bytes",
+    "supersonic_prefix_cache_max_bytes",
+    "supersonic_prefix_cache_hits",
+    "supersonic_prefix_cache_misses",
+    "supersonic_prefix_cache_cached_tokens",
+    "supersonic_prefix_cache_evictions",
+    "supersonic_prefix_cache_disk_writes",
+    "supersonic_prefix_cache_disk_reads",
+    "supersonic_prefix_cache_restore_failures",
+    "supersonic_prefix_cache_admission_skips",
+    "supersonic_dflash_last_rounds",
+    "supersonic_dflash_last_accepted_total",
+    "supersonic_dflash_last_decode_ms",
+    "supersonic_model_loads_total",
+    "supersonic_flm_native_int4_direct_weights",
+    "supersonic_flm_bf16_fallback_weights",
+    "supersonic_flm_source_bytes",
+    "supersonic_flm_device_upload_bytes",
+    "supersonic_flm_startup_seconds",
+}
 
 
 class PhaseError(RuntimeError):
@@ -317,14 +362,167 @@ def _metric_int(
     return value
 
 
+def _validate_flm_payload_schema(value: object, label: str) -> dict[str, Any]:
+    flm = _exact_mapping(
+        value,
+        {
+            "source",
+            "file",
+            "architecture_id",
+            "model_id",
+            "storage_abi_ids",
+            "required_weights",
+            "raw_dense_weights",
+            "native_int4_direct_weights",
+            "bf16_fallback_weights",
+            "transfer_backend",
+            "source_bytes",
+            "device_upload_bytes",
+            "startup_seconds",
+            "startup",
+            "load_sequence",
+            "source_open_count",
+            "resident_allocation_count",
+            "features",
+        },
+        label,
+    )
+    for field in (
+        "architecture_id",
+        "model_id",
+        "required_weights",
+        "raw_dense_weights",
+        "native_int4_direct_weights",
+        "bf16_fallback_weights",
+        "source_bytes",
+        "device_upload_bytes",
+        "load_sequence",
+        "source_open_count",
+        "resident_allocation_count",
+    ):
+        _strict_int(flm[field], f"{label}.{field}")
+    storage_abis = flm["storage_abi_ids"]
+    if not isinstance(storage_abis, list) or not storage_abis:
+        raise PhaseError(f"{label}.storage_abi_ids must be a non-empty list")
+    for index, storage_abi in enumerate(storage_abis):
+        _strict_int(storage_abi, f"{label}.storage_abi_ids[{index}]")
+    _nonempty_string(flm["source"], f"{label}.source")
+    _nonempty_string(flm["file"], f"{label}.file")
+    _nonempty_string(flm["transfer_backend"], f"{label}.transfer_backend")
+
+    startup = _exact_mapping(
+        flm["startup"],
+        {"total_seconds", "exclusive_components"},
+        f"{label}.startup",
+    )
+    components = _exact_mapping(
+        startup["exclusive_components"],
+        {"source_open", "tokenizer_seconds", "descriptor_seconds"},
+        f"{label}.startup.exclusive_components",
+    )
+    source_open = _exact_mapping(
+        components["source_open"],
+        {"total_seconds", "exclusive_phases"},
+        f"{label}.startup.exclusive_components.source_open",
+    )
+    _exact_mapping(
+        source_open["exclusive_phases"],
+        {"store_open_seconds", "config_seconds", "direct_plan_seconds"},
+        f"{label}.startup.exclusive_components.source_open.exclusive_phases",
+    )
+    _validate_finite_tree(startup, f"{label}.startup")
+    _expect(
+        flm["startup_seconds"],
+        startup["total_seconds"],
+        f"{label}.startup_seconds",
+    )
+    features = _exact_mapping(
+        flm["features"],
+        {
+            "plain_prefill_decode",
+            "native_dflash_generate",
+            "prefix_snapshot",
+            "disk_prefix_snapshot",
+        },
+        f"{label}.features",
+    )
+    for field, enabled in features.items():
+        if not isinstance(enabled, bool):
+            raise PhaseError(f"{label}.features.{field} must be a boolean")
+    return flm
+
+
+def _validate_prefix_cache_schema(value: object, label: str) -> dict[str, Any]:
+    cache = _exact_mapping(
+        value,
+        {
+            "enabled",
+            "dir",
+            "min_tokens",
+            "max_entries",
+            "max_bytes",
+            "resident_bytes",
+            "entries",
+            "hits",
+            "misses",
+            "cached_tokens",
+            "evictions",
+            "disk_writes",
+            "disk_reads",
+            "restore_failures",
+            "admission_skips",
+        },
+        label,
+    )
+    if not isinstance(cache["enabled"], bool):
+        raise PhaseError(f"{label}.enabled must be a boolean")
+    if not isinstance(cache["dir"], str):
+        raise PhaseError(f"{label}.dir must be a string")
+    for field in set(cache) - {"enabled", "dir"}:
+        _strict_int(cache[field], f"{label}.{field}")
+    return cache
+
+
 def validate_flm_evidence(
     capabilities: dict[str, Any],
     metrics: dict[str, int | float],
 ) -> dict[str, Any]:
+    capabilities = _exact_mapping(
+        capabilities,
+        {
+            "model",
+            "family",
+            "backend",
+            "ready",
+            "max_context",
+            "endpoints",
+            "chat",
+            "completions",
+            "responses",
+            "streaming",
+            "stream_usage",
+            "tools",
+            "reasoning",
+            "scheduler",
+            "prefix_cache",
+            "flm",
+        },
+        "capabilities",
+    )
+    metrics = _exact_mapping(metrics, FINAL_METRIC_KEYS, "metrics")
     _expect(capabilities.get("model"), EXPECTED_MODEL, "capabilities model")
     _expect(capabilities.get("backend"), "HIP", "capabilities backend")
     _expect(capabilities.get("ready"), True, "capabilities ready")
-    for field in ("chat", "responses", "streaming", "stream_usage", "tools", "reasoning"):
+    _expect(capabilities["endpoints"], EXPECTED_ENDPOINTS, "capabilities endpoints")
+    for field in (
+        "chat",
+        "completions",
+        "responses",
+        "streaming",
+        "stream_usage",
+        "tools",
+        "reasoning",
+    ):
         _expect(capabilities.get(field), True, f"capabilities {field}")
 
     scheduler = _mapping(capabilities.get("scheduler"), "capabilities scheduler")
@@ -337,8 +535,12 @@ def validate_flm_evidence(
         _strict_int(scheduler.get(field), f"scheduler {field}")
     _expect(scheduler.get("active_requests"), 0, "scheduler active_requests")
     _expect(scheduler.get("queued_requests"), 0, "scheduler queued_requests")
+    _validate_prefix_cache_schema(
+        capabilities["prefix_cache"],
+        "capabilities prefix_cache",
+    )
 
-    flm = _mapping(capabilities.get("flm"), "capabilities flm")
+    flm = _validate_flm_payload_schema(capabilities.get("flm"), "capabilities flm")
     exact_fields = {
         "source": EXPECTED_SOURCE,
         "required_weights": EXPECTED_REQUIRED_WEIGHTS,
@@ -516,14 +718,9 @@ def _validate_canary(
     _expect(canary["passed"], True, f"{label}.passed")
 
 
-def validate_compat_report(report: dict[str, Any]) -> dict[str, Any]:
-    _exact_mapping(
-        report,
-        {"transport", "semantic_quality", "usage", "throughput"},
-        "compat report",
-    )
+def _validate_compat_transport(value: object) -> None:
     transport = _exact_mapping(
-        report["transport"],
+        value,
         {
             "auth",
             "models",
@@ -578,11 +775,55 @@ def validate_compat_report(report: dict[str, Any]) -> dict[str, Any]:
             keys,
             f"compat transport.{section}",
         )
-        for key, value in evidence.items():
+        for key, field_value in evidence.items():
             if key == "token_count":
-                _positive_int(value, "compat transport.tokenizer.token_count")
+                _positive_int(
+                    field_value,
+                    "compat transport.tokenizer.token_count",
+                )
             else:
-                _expect(value, True, f"compat transport.{section}.{key}")
+                _expect(field_value, True, f"compat transport.{section}.{key}")
+
+
+def _validate_compat_usage(value: object) -> None:
+    usage = _exact_mapping(
+        value,
+        {
+            "chat",
+            "chat_stream",
+            "completions",
+            "responses",
+            "responses_stream",
+            "repeated_request",
+        },
+        "compat usage",
+    )
+    for section, counts in usage.items():
+        _validate_usage(counts, f"compat usage.{section}")
+
+
+def _validate_compat_throughput(value: object) -> None:
+    throughput = _exact_mapping(
+        value,
+        {
+            "first_token_seconds",
+            "prefill_tokens_per_second",
+            "decode_tokens_per_second",
+        },
+        "compat throughput",
+    )
+    for key, field_value in throughput.items():
+        if _finite_number(field_value, f"compat throughput.{key}") <= 0:
+            raise PhaseError(f"compat throughput.{key} must be positive")
+
+
+def validate_compat_report(report: dict[str, Any]) -> dict[str, Any]:
+    _exact_mapping(
+        report,
+        {"transport", "semantic_quality", "usage", "throughput"},
+        "compat report",
+    )
+    _validate_compat_transport(report["transport"])
 
     semantics = _exact_mapping(
         report["semantic_quality"],
@@ -702,33 +943,8 @@ def validate_compat_report(report: dict[str, Any]) -> dict[str, Any]:
     _expect(reasoning["passed"], True, "semantic reasoning.passed")
     _expect(semantics["passed"], True, "semantic_quality.passed")
 
-    usage = _exact_mapping(
-        report["usage"],
-        {
-            "chat",
-            "chat_stream",
-            "completions",
-            "responses",
-            "responses_stream",
-            "repeated_request",
-        },
-        "compat usage",
-    )
-    for section, counts in usage.items():
-        _validate_usage(counts, f"compat usage.{section}")
-
-    throughput = _exact_mapping(
-        report["throughput"],
-        {
-            "first_token_seconds",
-            "prefill_tokens_per_second",
-            "decode_tokens_per_second",
-        },
-        "compat throughput",
-    )
-    for key, value in throughput.items():
-        if _finite_number(value, f"compat throughput.{key}") <= 0:
-            raise PhaseError(f"compat throughput.{key} must be positive")
+    _validate_compat_usage(report["usage"])
+    _validate_compat_throughput(report["throughput"])
     return report
 
 
@@ -1535,10 +1751,16 @@ def _validate_flm_snapshot(value: object, label: str) -> dict[str, Any]:
 
 
 def _validate_partial_compat_report(report: object) -> dict[str, Any]:
-    partial = _mapping(report, "partial compat report")
-    clone = copy.deepcopy(partial)
+    partial = _exact_mapping(
+        report,
+        {"transport", "semantic_quality", "usage", "throughput"},
+        "partial compat report",
+    )
+    _validate_compat_transport(partial["transport"])
+    _validate_compat_usage(partial["usage"])
+    _validate_compat_throughput(partial["throughput"])
     semantics = _exact_mapping(
-        clone.get("semantic_quality"),
+        partial["semantic_quality"],
         {
             "chat",
             "chat_stream",
@@ -1551,6 +1773,7 @@ def _validate_partial_compat_report(report: object) -> dict[str, Any]:
         },
         "partial compat semantic_quality",
     )
+    child_results = []
     for name, expected in (
         ("chat", "hello"),
         ("completions", "hello"),
@@ -1561,101 +1784,208 @@ def _validate_partial_compat_report(report: object) -> dict[str, Any]:
             {"expected", "actual", "finish_reason", "passed"},
             f"partial semantic {name}",
         )
+        _expect(
+            canary["expected"],
+            expected,
+            f"partial semantic {name}.expected",
+        )
         if not isinstance(canary["actual"], str):
             raise PhaseError(f"partial semantic {name}.actual must be a string")
-        _nonempty_string(
+        finish_reason = _nonempty_string(
             canary["finish_reason"],
             f"partial semantic {name}.finish_reason",
         )
-        _strict_bool(canary["passed"], f"partial semantic {name}.passed")
-        canary.update(
-            {
-                "expected": expected,
-                "actual": expected,
-                "finish_reason": "stop",
-                "passed": True,
-            }
+        if finish_reason not in {"stop", "length", "tool_calls", "content_filter"}:
+            raise PhaseError(
+                f"partial semantic {name}.finish_reason is unsupported: "
+                f"{finish_reason!r}"
+            )
+        passed = _strict_bool(
+            canary["passed"],
+            f"partial semantic {name}.passed",
         )
+        predicate = canary["actual"] == expected and finish_reason == "stop"
+        _expect(passed, predicate, f"partial semantic {name}.passed")
+        child_results.append(predicate)
 
-    chat_stream = _mapping(semantics["chat_stream"], "partial semantic chat_stream")
+    chat_stream = _exact_mapping(
+        semantics["chat_stream"],
+        {
+            "expected",
+            "actual",
+            "finish_reason",
+            "passed",
+            "terminal_count",
+            "terminal_last_before_usage",
+            "usage_last",
+        },
+        "partial semantic chat_stream",
+    )
+    _expect(
+        chat_stream["expected"],
+        "hello",
+        "partial semantic chat_stream.expected",
+    )
     if not isinstance(chat_stream.get("actual"), str):
         raise PhaseError("partial semantic chat_stream.actual must be a string")
-    _strict_int(
-        chat_stream.get("terminal_count"),
+    finish_reason = _nonempty_string(
+        chat_stream["finish_reason"],
+        "partial semantic chat_stream.finish_reason",
+    )
+    if finish_reason not in {"stop", "length", "tool_calls", "content_filter"}:
+        raise PhaseError(
+            "partial semantic chat_stream.finish_reason is unsupported: "
+            f"{finish_reason!r}"
+        )
+    terminal_count = _strict_int(
+        chat_stream["terminal_count"],
         "partial semantic chat_stream.terminal_count",
     )
-    for field in ("passed", "terminal_last_before_usage", "usage_last"):
-        _strict_bool(
-            chat_stream.get(field),
-            f"partial semantic chat_stream.{field}",
-        )
-    chat_stream.update(
-        {
-            "expected": "hello",
-            "actual": "hello",
-            "finish_reason": "stop",
-            "passed": True,
-            "terminal_count": 1,
-            "terminal_last_before_usage": True,
-            "usage_last": True,
-        }
+    terminal_before_usage = _strict_bool(
+        chat_stream["terminal_last_before_usage"],
+        "partial semantic chat_stream.terminal_last_before_usage",
     )
+    usage_last = _strict_bool(
+        chat_stream["usage_last"],
+        "partial semantic chat_stream.usage_last",
+    )
+    passed = _strict_bool(
+        chat_stream["passed"],
+        "partial semantic chat_stream.passed",
+    )
+    predicate = (
+        chat_stream["actual"] == "hello"
+        and finish_reason == "stop"
+        and terminal_count == 1
+        and terminal_before_usage
+        and usage_last
+    )
+    _expect(passed, predicate, "partial semantic chat_stream.passed")
+    child_results.append(predicate)
 
-    responses = _mapping(semantics["responses"], "partial semantic responses")
+    responses = _exact_mapping(
+        semantics["responses"],
+        {"expected", "actual", "status", "stored_roundtrip", "passed"},
+        "partial semantic responses",
+    )
+    _expect(
+        responses["expected"],
+        "hello",
+        "partial semantic responses.expected",
+    )
     if not isinstance(responses.get("actual"), str):
         raise PhaseError("partial semantic responses.actual must be a string")
-    for field in ("stored_roundtrip", "passed"):
-        _strict_bool(responses.get(field), f"partial semantic responses.{field}")
-    responses.update(
-        {
-            "expected": "hello",
-            "actual": "hello",
-            "status": "completed",
-            "stored_roundtrip": True,
-            "passed": True,
-        }
+    status = _nonempty_string(
+        responses["status"],
+        "partial semantic responses.status",
     )
+    if status not in {
+        "completed",
+        "incomplete",
+        "failed",
+        "cancelled",
+        "in_progress",
+        "queued",
+    }:
+        raise PhaseError(
+            f"partial semantic responses.status is unsupported: {status!r}"
+        )
+    stored_roundtrip = _strict_bool(
+        responses["stored_roundtrip"],
+        "partial semantic responses.stored_roundtrip",
+    )
+    passed = _strict_bool(
+        responses["passed"],
+        "partial semantic responses.passed",
+    )
+    predicate = (
+        responses["actual"] == "hello"
+        and status == "completed"
+        and stored_roundtrip
+    )
+    _expect(passed, predicate, "partial semantic responses.passed")
+    child_results.append(predicate)
 
-    responses_stream = _mapping(
+    responses_stream = _exact_mapping(
         semantics["responses_stream"],
+        {
+            "expected",
+            "actual",
+            "status",
+            "terminal_count",
+            "terminal_last",
+            "passed",
+        },
         "partial semantic responses_stream",
+    )
+    _expect(
+        responses_stream["expected"],
+        "hello",
+        "partial semantic responses_stream.expected",
     )
     if not isinstance(responses_stream.get("actual"), str):
         raise PhaseError("partial semantic responses_stream.actual must be a string")
-    _strict_int(
-        responses_stream.get("terminal_count"),
+    status = _nonempty_string(
+        responses_stream["status"],
+        "partial semantic responses_stream.status",
+    )
+    if status not in {
+        "completed",
+        "incomplete",
+        "failed",
+        "cancelled",
+        "in_progress",
+        "queued",
+    }:
+        raise PhaseError(
+            "partial semantic responses_stream.status is unsupported: "
+            f"{status!r}"
+        )
+    terminal_count = _strict_int(
+        responses_stream["terminal_count"],
         "partial semantic responses_stream.terminal_count",
     )
-    for field in ("terminal_last", "passed"):
-        _strict_bool(
-            responses_stream.get(field),
-            f"partial semantic responses_stream.{field}",
-        )
-    responses_stream.update(
-        {
-            "expected": "hello",
-            "actual": "hello",
-            "status": "completed",
-            "terminal_count": 1,
-            "terminal_last": True,
-            "passed": True,
-        }
+    terminal_last = _strict_bool(
+        responses_stream["terminal_last"],
+        "partial semantic responses_stream.terminal_last",
     )
+    passed = _strict_bool(
+        responses_stream["passed"],
+        "partial semantic responses_stream.passed",
+    )
+    predicate = (
+        responses_stream["actual"] == "hello"
+        and status == "completed"
+        and terminal_count == 1
+        and terminal_last
+    )
+    _expect(passed, predicate, "partial semantic responses_stream.passed")
+    child_results.append(predicate)
 
-    reasoning = _mapping(semantics["reasoning"], "partial semantic reasoning")
+    reasoning = _exact_mapping(
+        semantics["reasoning"],
+        {"accepted", "observed", "visible_think_tags", "passed"},
+        "partial semantic reasoning",
+    )
     for field in ("accepted", "observed", "visible_think_tags", "passed"):
         _strict_bool(reasoning.get(field), f"partial semantic reasoning.{field}")
-    reasoning.update(
-        {
-            "accepted": True,
-            "observed": True,
-            "visible_think_tags": False,
-            "passed": True,
-        }
+    predicate = (
+        reasoning["accepted"]
+        and reasoning["observed"]
+        and not reasoning["visible_think_tags"]
     )
-    _strict_bool(semantics["passed"], "partial semantic_quality.passed")
-    semantics["passed"] = True
-    validate_compat_report(clone)
+    _expect(reasoning["passed"], predicate, "partial semantic reasoning.passed")
+    child_results.append(predicate)
+
+    aggregate = _strict_bool(
+        semantics["passed"],
+        "partial semantic_quality.passed",
+    )
+    _expect(
+        aggregate,
+        all(child_results),
+        "partial semantic_quality.passed",
+    )
     return partial
 
 
@@ -1766,19 +2096,80 @@ def _validate_final_evidence(value: object, label: str) -> dict[str, Any]:
         raise PhaseError(f"{label}.collection_errors must be unique")
 
     if final["health"] is not None:
-        health = _mapping(final["health"], f"{label}.health")
-        _expect(health.get("status"), "ok", f"{label}.health.status")
-        for field in ("active_requests", "queued_requests"):
-            _strict_int(health.get(field), f"{label}.health.{field}")
-            _expect(health.get(field), 0, f"{label}.health.{field}")
+        health = _exact_mapping(
+            final["health"],
+            {
+                "status",
+                "ready",
+                "model",
+                "max_context",
+                "active_requests",
+                "queued_requests",
+                "max_queued_requests",
+                "prefix_cache_entries",
+                "flm",
+            },
+            f"{label}.health",
+        )
+        _expect(health["status"], "ok", f"{label}.health.status")
+        _expect(health["ready"], True, f"{label}.health.ready")
+        _expect(health["model"], EXPECTED_MODEL, f"{label}.health.model")
+        for field in (
+            "max_context",
+            "active_requests",
+            "queued_requests",
+            "max_queued_requests",
+            "prefix_cache_entries",
+        ):
+            _strict_int(health[field], f"{label}.health.{field}")
+        _expect(health["active_requests"], 0, f"{label}.health.active_requests")
+        _expect(health["queued_requests"], 0, f"{label}.health.queued_requests")
+        _validate_flm_payload_schema(health["flm"], f"{label}.health.flm")
+    else:
+        health = None
     metrics = final["metrics"]
     if metrics is not None:
-        metrics = _mapping(metrics, f"{label}.metrics")
+        metrics = _exact_mapping(metrics, FINAL_METRIC_KEYS, f"{label}.metrics")
         for name, metric in metrics.items():
             _finite_number(metric, f"{label}.metrics.{name}")
     capabilities = final["capabilities"]
     if capabilities is not None:
-        capabilities = _mapping(capabilities, f"{label}.capabilities")
+        capabilities = _exact_mapping(
+            capabilities,
+            {
+                "model",
+                "family",
+                "backend",
+                "ready",
+                "max_context",
+                "endpoints",
+                "chat",
+                "completions",
+                "responses",
+                "streaming",
+                "stream_usage",
+                "tools",
+                "reasoning",
+                "scheduler",
+                "prefix_cache",
+                "flm",
+            },
+            f"{label}.capabilities",
+        )
+        _validate_prefix_cache_schema(
+            capabilities["prefix_cache"],
+            f"{label}.capabilities.prefix_cache",
+        )
+        _validate_flm_payload_schema(
+            capabilities["flm"],
+            f"{label}.capabilities.flm",
+        )
+    if health is not None and capabilities is not None:
+        _expect(
+            health["flm"],
+            capabilities["flm"],
+            f"{label}.health.flm",
+        )
 
     if capabilities is not None and metrics is not None:
         if final["flm_evidence"] is None:

@@ -9,14 +9,13 @@
 //! per the PR 4c acceptance criteria; same ≤0.05 max-abs envelope as the
 //! per-block tests).
 //!
-//! Skipped silently when `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON` isn't
-//! set so CI / non-HIP machines stay green. To run locally:
+//! The qualification fixture is tracked at
+//! `oracle/fixtures/qwen36_moe_multilayer_int4_v1.json` and is mandatory.
+//! `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON` may override it for diagnostic
+//! runs, but the normal qualification command needs no environment variable:
 //!
 //! ```bash
-//! ~/venvs/rocm/bin/python oracle/qwen36_moe_multilayer_oracle.py \
-//!     --mode synthetic --state fresh --num-layers 4 --out /tmp/qwen36_ml.json
-//! SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml.json \
-//!   cargo test --release -p runner --test qwen36_moe_multilayer_parity \
+//! cargo test --release -p runner --test qwen36_moe_multilayer_parity \
 //!     -- --nocapture
 //! ```
 //!
@@ -37,6 +36,7 @@ use runner::qwen36_moe_logits::{bf16_bytes_to_f32, host_final_norm_lm_head};
 use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
 use serde_json::Value;
 use std::ffi::c_void;
+use std::path::PathBuf;
 use supersonic_runtime::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
 use supersonic_runtime::qwen36_moe::decode::{
     ffn_output_elems, ffn_workspace_floats, run_chained_decode, Qwen36ExecutionOptions,
@@ -48,6 +48,22 @@ use supersonic_runtime::qwen36_moe::types::{
     is_full_attn_layer, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
     LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, PositionPair, ResidentWeight,
 };
+
+const TRACKED_MULTILAYER_ORACLE: &str = "../../oracle/fixtures/qwen36_moe_multilayer_int4_v1.json";
+// Four layers cross eight quantized attention/FFN residual boundaries. A
+// fixed 0.125 BF16 local-boundary budget gives a 1.0 worst-case chained cap.
+const CHAINED_HANDOFF_MAX_ABS_TOL: f32 = 8.0 * 0.125;
+const CHAINED_HANDOFF_COS_FLOOR: f64 = 0.999;
+const CHAINED_LOGITS_MAX_ABS_TOL: f32 = 1.0;
+const CHAINED_LOGITS_COS_FLOOR: f64 = 0.999;
+
+fn tracked_multilayer_oracle_path() -> PathBuf {
+    std::env::var_os("SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TRACKED_MULTILAYER_ORACLE)
+        })
+}
 
 fn b64(input: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
@@ -544,6 +560,16 @@ fn assert_parity_bf16(label: &str, got: &[u8], want: &[u8], max_abs_tol: f32, co
     );
 }
 
+fn assert_chained_handoff_parity(label: &str, got: &[u8], want: &[u8]) {
+    assert_parity_bf16(
+        label,
+        got,
+        want,
+        CHAINED_HANDOFF_MAX_ABS_TOL,
+        CHAINED_HANDOFF_COS_FLOOR,
+    );
+}
+
 fn max_abs_delta_bf16(lhs: &[u8], rhs: &[u8]) -> f32 {
     assert_eq!(lhs.len(), rhs.len(), "BF16 delta byte length mismatch");
     bf16_bytes_to_f32(lhs)
@@ -567,25 +593,41 @@ fn max_bf16_ulp(bytes: &[u8]) -> f32 {
         .fold(0.0, f32::max)
 }
 
-fn l2_delta_bf16(lhs: &[u8], rhs: &[u8]) -> f64 {
-    assert_eq!(lhs.len(), rhs.len(), "BF16 delta byte length mismatch");
-    bf16_bytes_to_f32(lhs)
-        .into_iter()
-        .zip(bf16_bytes_to_f32(rhs))
-        .map(|(left, right)| {
-            let delta = (left - right) as f64;
-            delta * delta
-        })
-        .sum::<f64>()
-        .sqrt()
+#[test]
+fn tracked_multilayer_oracle_is_the_mandatory_default() {
+    let path = tracked_multilayer_oracle_path();
+    assert!(
+        path.is_file(),
+        "tracked multi-layer oracle fixture is missing: {}",
+        path.display()
+    );
+    let raw = std::fs::read_to_string(&path).expect("read tracked multi-layer oracle");
+    let json: Value = serde_json::from_str(&raw).expect("parse tracked multi-layer oracle");
+    assert_eq!(
+        json["schema"], "qwen36-moe-oracle-multilayer-int4-v1",
+        "qualification default must be the independent INT4 oracle"
+    );
+    assert_eq!(json["mode"], "synthetic");
+    assert_eq!(json["state"], "fresh");
+    assert_eq!(json["num_layers"], 4);
 }
 
-fn l2_norm_bf16(bytes: &[u8]) -> f64 {
-    bf16_bytes_to_f32(bytes)
+#[test]
+fn chained_gate_rejects_corrupted_inter_layer_handoff() {
+    let oracle = [0x3f80u16, 0x4000, 0x4040, 0x4080]
         .into_iter()
-        .map(|value| (value as f64).powi(2))
-        .sum::<f64>()
-        .sqrt()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let mut corrupted_handoff = oracle.clone();
+    corrupted_handoff[0..2].copy_from_slice(&0x4180u16.to_le_bytes());
+
+    let rejected = std::panic::catch_unwind(|| {
+        assert_chained_handoff_parity("corrupted inter-layer handoff", &corrupted_handoff, &oracle);
+    });
+    assert!(
+        rejected.is_err(),
+        "corrupted handoff passed the chained gate"
+    );
 }
 
 fn i32_bytes_to_vec(bytes: &[u8]) -> Vec<i32> {
@@ -687,17 +729,9 @@ fn multilayer_chained_decode_matches_oracle() {
         );
         return;
     }
-    let Ok(json_path) = std::env::var("SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON") else {
-        eprintln!(
-            "skip: SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON not set. Generate with \
-             `~/venvs/rocm/bin/python oracle/qwen36_moe_multilayer_oracle.py \
-             --mode synthetic --state fresh --num-layers 4 \
-             --out /tmp/qwen36_ml.json`."
-        );
-        return;
-    };
+    let json_path = tracked_multilayer_oracle_path();
     let raw = std::fs::read_to_string(&json_path)
-        .unwrap_or_else(|e| panic!("read multi-layer oracle json {json_path}: {e}"));
+        .unwrap_or_else(|e| panic!("read multi-layer oracle json {}: {e}", json_path.display()));
     let json: Value = serde_json::from_str(&raw).expect("parse multi-layer oracle json");
     let schema = json["schema"].as_str().unwrap_or("");
     let int4_mode = match schema {
@@ -890,20 +924,11 @@ fn multilayer_chained_decode_matches_oracle() {
             max_abs_delta_bf16(&got_exact_input_residual, &want_exact_input_residual);
         let propagated_input_delta =
             max_abs_delta_bf16(&got_chained_input_residual, &got_exact_input_residual);
-        let derived_ffn_bound = exact_input_kernel_error + propagated_input_delta + f32::EPSILON;
-        let derived_ffn_l2_error =
-            l2_delta_bf16(&got_exact_input_residual, &want_exact_input_residual)
-                + l2_delta_bf16(&got_chained_input_residual, &got_exact_input_residual);
-        let relative_l2_bound = derived_ffn_l2_error / l2_norm_bf16(&want_exact_input_residual);
-        let derived_ffn_cos_floor = if relative_l2_bound < 1.0 {
-            (1.0 - relative_l2_bound) / (1.0 + relative_l2_bound)
-        } else {
-            -1.0
-        };
         eprintln!(
-            "[parity layer {li} FFN derived bound] exact_input_kernel_error={exact_input_kernel_error:.5e} \
-             propagated_input_delta={propagated_input_delta:.5e} max_abs_bound={derived_ffn_bound:.5e} \
-             l2_bound={derived_ffn_l2_error:.5e} cos_floor={derived_ffn_cos_floor:.7}"
+            "[parity layer {li} FFN diagnostics] exact_input_kernel_error={exact_input_kernel_error:.5e} \
+             propagated_input_delta={propagated_input_delta:.5e} \
+             fixed_max_abs={CHAINED_HANDOFF_MAX_ABS_TOL:.5e} \
+             fixed_cos_floor={CHAINED_HANDOFF_COS_FLOOR:.7}"
         );
 
         let actual_layer_input = if li == 0 {
@@ -932,34 +957,21 @@ fn multilayer_chained_decode_matches_oracle() {
         let exact_input_attn_error = max_abs_delta_bf16(&got_exact_input_attn, &want_attn);
         let propagated_attn_input_delta =
             max_abs_delta_bf16(&got_chained_input_attn, &got_exact_input_attn);
-        let derived_attn_bound =
-            exact_input_attn_error + propagated_attn_input_delta + f32::EPSILON;
-        let derived_attn_l2_error = l2_delta_bf16(&got_exact_input_attn, &want_attn)
-            + l2_delta_bf16(&got_chained_input_attn, &got_exact_input_attn);
-        let relative_attn_l2_bound = derived_attn_l2_error / l2_norm_bf16(&want_attn);
-        let derived_attn_cos_floor = if relative_attn_l2_bound < 1.0 {
-            (1.0 - relative_attn_l2_bound) / (1.0 + relative_attn_l2_bound)
-        } else {
-            -1.0
-        };
         eprintln!(
-            "[parity layer {li} attention derived bound] exact_input_kernel_error={exact_input_attn_error:.5e} \
-             propagated_input_delta={propagated_attn_input_delta:.5e} max_abs_bound={derived_attn_bound:.5e} \
-             l2_bound={derived_attn_l2_error:.5e} cos_floor={derived_attn_cos_floor:.7}"
+            "[parity layer {li} attention diagnostics] exact_input_kernel_error={exact_input_attn_error:.5e} \
+             propagated_input_delta={propagated_attn_input_delta:.5e} \
+             fixed_max_abs={CHAINED_HANDOFF_MAX_ABS_TOL:.5e} \
+             fixed_cos_floor={CHAINED_HANDOFF_COS_FLOOR:.7}"
         );
-        assert_parity_bf16(
+        assert_chained_handoff_parity(
             &format!("layer {li} output_after_attn"),
             &outputs.per_layer_attn_out[li],
             &want_attn,
-            derived_attn_bound,
-            derived_attn_cos_floor,
         );
-        assert_parity_bf16(
+        assert_chained_handoff_parity(
             &format!("layer {li} output_after_ffn"),
             &outputs.per_layer_ffn_out[li],
             &want_ffn,
-            derived_ffn_bound,
-            derived_ffn_cos_floor,
         );
         last_exact_input_residual = Some(got_exact_input_residual);
     }
@@ -995,26 +1007,18 @@ fn multilayer_chained_decode_matches_oracle() {
     );
     let exact_input_logit_error = max_abs_delta_bf16(&exact_input_logits, &oracle_logits);
     let propagated_logit_delta = max_abs_delta_bf16(&logits, &exact_input_logits);
-    let derived_logit_bound = exact_input_logit_error + propagated_logit_delta + f32::EPSILON;
-    let derived_logit_l2_error = l2_delta_bf16(&exact_input_logits, &oracle_logits)
-        + l2_delta_bf16(&logits, &exact_input_logits);
-    let relative_logit_l2_bound = derived_logit_l2_error / l2_norm_bf16(&oracle_logits);
-    let derived_logit_cos_floor = if relative_logit_l2_bound < 1.0 {
-        (1.0 - relative_logit_l2_bound) / (1.0 + relative_logit_l2_bound)
-    } else {
-        -1.0
-    };
     eprintln!(
-        "[parity logits derived bound] exact_input_kernel_error={exact_input_logit_error:.5e} \
-         propagated_input_delta={propagated_logit_delta:.5e} max_abs_bound={derived_logit_bound:.5e} \
-         l2_bound={derived_logit_l2_error:.5e} cos_floor={derived_logit_cos_floor:.7}"
+        "[parity logits diagnostics] exact_input_kernel_error={exact_input_logit_error:.5e} \
+         propagated_input_delta={propagated_logit_delta:.5e} \
+         fixed_max_abs={CHAINED_LOGITS_MAX_ABS_TOL:.5e} \
+         fixed_cos_floor={CHAINED_LOGITS_COS_FLOOR:.7}"
     );
     assert_parity_bf16(
         "chained logits",
         &logits,
         &oracle_logits,
-        derived_logit_bound,
-        derived_logit_cos_floor,
+        CHAINED_LOGITS_MAX_ABS_TOL,
+        CHAINED_LOGITS_COS_FLOOR,
     );
 }
 
@@ -1040,15 +1044,7 @@ fn multilayer_persistent_decode_matches_chained() {
         eprintln!("skip: HIP backend not compiled");
         return;
     }
-    let Ok(json_path) = std::env::var("SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON") else {
-        eprintln!(
-            "skip: SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON not set. Generate with \
-             `~/venvs/rocm/bin/python oracle/qwen36_moe_multilayer_oracle.py \
-             --mode synthetic --state fresh --int4 --num-layers 4 \
-             --out /tmp/qwen36_ml.json`."
-        );
-        return;
-    };
+    let json_path = tracked_multilayer_oracle_path();
     let raw = std::fs::read_to_string(&json_path).expect("read multi-layer oracle json");
     let json: Value = serde_json::from_str(&raw).expect("parse multi-layer oracle json");
     let schema = json["schema"].as_str().unwrap_or("");
