@@ -231,13 +231,24 @@ fn hip_wmma_matches_scalar_for_varied_g32_operands() -> anyhow::Result<()> {
     set_backend(Backend::Hip);
     const ROWS: usize = 32;
     const COLS: usize = 128;
-    const SCALE_PATTERN: [u16; 4] = [0x3dcd, 0x3e80, 0x3f20, 0x3fc0];
+    const SCALE_PATTERNS: [[u16; 4]; 2] = [
+        [0x3dcd, 0x3e80, 0x3f20, 0x3fc0],
+        [0x3e40, 0x3ec0, 0x3f60, 0x3fe0],
+    ];
 
     let mut packed_bytes = Vec::with_capacity(ROWS * COLS / 2);
     for row in 0..ROWS {
+        let tile = row / 16;
+        let tile_row = row % 16;
         for byte_col in 0..COLS / 2 {
-            let low = ((row * 3 + byte_col * 5 + byte_col / 3 + 1) & 0x0f) as u8;
-            let mut high = ((row * 11 + byte_col * 7 + (byte_col % 5) * 3 + 6) & 0x0f) as u8;
+            let low = ((tile_row * 3 + byte_col * 5 + byte_col / 3 + tile * (byte_col % 7 + 3) + 1)
+                & 0x0f) as u8;
+            let mut high = ((tile_row * 11
+                + byte_col * 7
+                + (byte_col % 5) * 3
+                + tile * ((byte_col * 3) % 11 + 5)
+                + 6)
+                & 0x0f) as u8;
             if high == low {
                 high = (high + 9) & 0x0f;
             }
@@ -246,7 +257,9 @@ fn hip_wmma_matches_scalar_for_varied_g32_operands() -> anyhow::Result<()> {
     }
     let scale_bits: Vec<u16> = (0..ROWS)
         .flat_map(|row| {
-            (0..COLS / 32).map(move |group| SCALE_PATTERN[(row + group) % SCALE_PATTERN.len()])
+            let tile = row / 16;
+            let tile_row = row % 16;
+            (0..COLS / 32).map(move |group| SCALE_PATTERNS[tile][(tile_row + group) % 4])
         })
         .collect();
     let activation_bits: Vec<u16> = (0..COLS)
@@ -288,6 +301,24 @@ fn hip_wmma_matches_scalar_for_varied_g32_operands() -> anyhow::Result<()> {
     assert!(
         max_reference - min_reference > 20.0 && min_abs_reference > 0.5,
         "varied fixture outputs must be nondegenerate: min={min_reference} max={max_reference} min_abs={min_abs_reference}"
+    );
+    let min_tile_pair_delta = (0..16)
+        .map(|row| (host_reference[row] - host_reference[row + 16]).abs())
+        .fold(f32::INFINITY, f32::min);
+    assert!(
+        min_tile_pair_delta > 1.0,
+        "second-tile rows must differ materially from first-tile rows: min_delta={min_tile_pair_delta}"
+    );
+    let mut min_any_row_delta = f32::INFINITY;
+    for lhs in 0..ROWS {
+        for rhs in lhs + 1..ROWS {
+            min_any_row_delta =
+                min_any_row_delta.min((host_reference[lhs] - host_reference[rhs]).abs());
+        }
+    }
+    assert!(
+        min_any_row_delta > 5e-2,
+        "all expected row outputs must be distinct beyond parity tolerance: min_delta={min_any_row_delta}"
     );
 
     let packed =
@@ -333,7 +364,7 @@ fn hip_wmma_matches_scalar_for_varied_g32_operands() -> anyhow::Result<()> {
     }
     let cosine = dot / (scalar_sq.sqrt() * wmma_sq.sqrt() + 1e-30);
     println!(
-        "varied G32 WMMA parity: cosine={cosine:.8} max_abs={max_abs:.8e} scalar_host_max_abs={scalar_host_max_abs:.8e}"
+        "varied G32 WMMA parity: cosine={cosine:.8} max_abs={max_abs:.8e} scalar_host_max_abs={scalar_host_max_abs:.8e} min_tile_pair_delta={min_tile_pair_delta:.8e} min_any_row_delta={min_any_row_delta:.8e}"
     );
     assert!(
         scalar_host_max_abs <= 2e-2,
