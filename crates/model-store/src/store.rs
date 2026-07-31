@@ -2807,12 +2807,14 @@ mod tests {
     struct TestStage3PublicationSnapshot {
         index: Vec<TestTensorMetaSnapshot>,
         upload_views: Vec<(String, TensorUploadView)>,
+        ct_int4_bf16_fallbacks: Vec<(String, CtSymInt4Bf16Fallback)>,
         int4_storage_views: Vec<(String, Int4StorageView)>,
     }
 
     fn stage3_publication_snapshot(
         index: &HashMap<String, TensorMeta>,
         upload_views: &HashMap<String, TensorUploadView>,
+        ct_int4_bf16_fallbacks: &HashMap<String, CtSymInt4Bf16Fallback>,
         int4_storage_views: &HashMap<String, Int4StorageView>,
     ) -> TestStage3PublicationSnapshot {
         let mut index = index
@@ -2834,6 +2836,12 @@ mod tests {
             .collect::<Vec<_>>();
         upload_views.sort_by(|left, right| left.0.cmp(&right.0));
 
+        let mut ct_int4_bf16_fallbacks = ct_int4_bf16_fallbacks
+            .iter()
+            .map(|(name, fallback)| (name.clone(), fallback.clone()))
+            .collect::<Vec<_>>();
+        ct_int4_bf16_fallbacks.sort_by(|left, right| left.0.cmp(&right.0));
+
         let mut int4_storage_views = int4_storage_views
             .iter()
             .map(|(name, view)| (name.clone(), view.clone()))
@@ -2843,6 +2851,7 @@ mod tests {
         TestStage3PublicationSnapshot {
             index,
             upload_views,
+            ct_int4_bf16_fallbacks,
             int4_storage_views,
         }
     }
@@ -3676,6 +3685,106 @@ mod tests {
         out
     }
 
+    const TEST_CT_INT4_LOGICAL_NAME: &str = "model.language_model.layers.0.mlp.gate_proj.weight";
+    const TEST_CT_INT4_PACKED_NAME: &str = "storage/l0_gate_packed";
+    const TEST_CT_INT4_SCALE_NAME: &str = "storage/l0_gate_scale";
+    const TEST_CT_INT4_SHAPE_NAME: &str = "storage/l0_gate_shape";
+
+    fn merge_test_runtime_record_sections(
+        mut first: Vec<u8>,
+        mut second: Vec<u8>,
+        header_len: usize,
+        record_size: usize,
+        first_count: usize,
+        second_count: usize,
+        mut adjust_second: impl FnMut(&mut [u8], usize),
+    ) -> Vec<u8> {
+        assert_eq!(&first[..4], &second[..4]);
+        let first_records_end = header_len + first_count * record_size;
+        let second_records_end = header_len + second_count * record_size;
+        let first_pool_len = first.len() - first_records_end;
+        let second_pool_len = second.len() - second_records_end;
+
+        put_u32(&mut first, 4, (first_count + second_count) as u32);
+        if header_len == 12 {
+            put_u32(&mut first, 8, (first_pool_len + second_pool_len) as u32);
+        }
+        for record in second[header_len..second_records_end].chunks_exact_mut(record_size) {
+            adjust_second(record, first_pool_len);
+        }
+
+        let mut out = first[..header_len].to_vec();
+        out.extend_from_slice(&first[header_len..first_records_end]);
+        out.extend_from_slice(&second[header_len..second_records_end]);
+        out.extend_from_slice(&first[first_records_end..]);
+        out.extend_from_slice(&second[second_records_end..]);
+        out
+    }
+
+    fn add_test_record_name_pool_offset(record: &mut [u8], first_pool_len: usize) {
+        let name_offset = u32::from_le_bytes(record[4..8].try_into().unwrap());
+        put_u32(record, 4, name_offset + first_pool_len as u32);
+    }
+
+    fn runtime_stage3_ct_then_native_storage_abi_section() -> Vec<u8> {
+        merge_test_runtime_record_sections(
+            runtime_stage3_storage_abi_section(),
+            runtime_stage3_native_int4_storage_abi_section(),
+            12,
+            21,
+            1,
+            1,
+            |_, _| {},
+        )
+    }
+
+    fn runtime_stage3_ct_then_native_logical_tensor_section(
+        fixture: &TestNativeInt4Stage3,
+    ) -> Vec<u8> {
+        merge_test_runtime_record_sections(
+            runtime_stage3_logical_tensor_section(),
+            runtime_stage3_native_int4_logical_tensor_section(fixture),
+            12,
+            44,
+            1,
+            1,
+            |record, first_pool_len| {
+                put_u32(record, 0, 2);
+                add_test_record_name_pool_offset(record, first_pool_len);
+                put_u32(record, 34, 3);
+            },
+        )
+    }
+
+    fn runtime_stage3_ct_then_native_storage_binding_section(
+        fixture: &TestNativeInt4Stage3,
+    ) -> Vec<u8> {
+        merge_test_runtime_record_sections(
+            runtime_stage3_storage_binding_section(),
+            runtime_stage3_native_int4_storage_binding_section(fixture),
+            12,
+            20,
+            3,
+            3,
+            |record, first_pool_len| {
+                put_u32(record, 0, 2);
+                add_test_record_name_pool_offset(record, first_pool_len);
+            },
+        )
+    }
+
+    fn runtime_stage3_ct_then_native_plan_step_section() -> Vec<u8> {
+        merge_test_runtime_record_sections(
+            runtime_stage3_plan_step_section(),
+            runtime_stage3_native_int4_plan_step_section(),
+            8,
+            38,
+            2,
+            3,
+            |record, _| put_u32(record, 0, 2),
+        )
+    }
+
     const TEST_ROW_GROUP_LOGICAL_NAME: &str = "semantic.row_group.weight";
     const TEST_ROW_GROUP_PACKED_NAME: &str = "opaque/packed-plane";
     const TEST_ROW_GROUP_SCALE_NAME: &str = "opaque/scale-plane";
@@ -4016,6 +4125,49 @@ mod tests {
                 runtime_stage3_native_int4_storage_binding_section(fixture),
             ),
             (12u32, runtime_stage3_native_int4_plan_step_section()),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_ct_then_native_int4_stage3_tables(
+        fixture: &TestNativeInt4Stage3,
+    ) -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_ct_then_native_storage_abi_section()),
+            (
+                10u32,
+                runtime_stage3_ct_then_native_logical_tensor_section(fixture),
+            ),
+            (
+                11u32,
+                runtime_stage3_ct_then_native_storage_binding_section(fixture),
+            ),
+            (12u32, runtime_stage3_ct_then_native_plan_step_section()),
         ];
         let header_len = 16 + sections.len() * 12;
         let mut offset = header_len as u32;
@@ -5669,7 +5821,7 @@ mod tests {
         let mut upload_views = HashMap::new();
         let mut fallbacks = HashMap::new();
         let mut views = HashMap::new();
-        let before = stage3_publication_snapshot(&index, &upload_views, &views);
+        let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
 
         let err = build_stage3_int4_storage(
             &runtime,
@@ -5687,13 +5839,139 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(
-            stage3_publication_snapshot(&index, &upload_views, &views),
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
             before
         );
         assert!(
             views.is_empty(),
             "failed transaction must not publish a view"
         );
+    }
+
+    #[test]
+    fn mixed_ct_fallback_then_tile_scale_failure_rolls_back_every_publication_map() {
+        let canonical = TestNativeInt4Stage3::canonical();
+        let fixture = TestNativeInt4Stage3 {
+            scale_name: "opaque/mixed-transaction-scale",
+            ..canonical
+        };
+        let runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_ct_then_native_int4_stage3_tables(&fixture),
+        )
+        .expect("parse mixed CT and tile-v1 runtime");
+
+        let logical_order = runtime
+            .logical_tensors()
+            .iter()
+            .map(|logical| logical.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logical_order,
+            vec![TEST_CT_INT4_LOGICAL_NAME, fixture.logical_name],
+            "the CT fallback must be processed before the failing tile-v1 tensor"
+        );
+        assert_eq!(
+            runtime
+                .stage3_direct_weight_kind(TEST_CT_INT4_LOGICAL_NAME)
+                .expect("classify CT fallback"),
+            Some(crate::flm::FlmStage3DirectWeightKind::CtInt4Bf16Fallback)
+        );
+        assert_eq!(
+            runtime
+                .stage3_direct_weight_kind(fixture.logical_name)
+                .expect("classify tile-v1 tensor"),
+            Some(crate::flm::FlmStage3DirectWeightKind::NativeInt4)
+        );
+
+        let mut index = HashMap::from([
+            (
+                TEST_CT_INT4_PACKED_NAME.to_string(),
+                TensorMeta {
+                    name: TEST_CT_INT4_PACKED_NAME.to_string(),
+                    shape: vec![128, 8],
+                    dtype: "i32".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 0,
+                    byte_len: 128 * 8 * 4,
+                },
+            ),
+            (
+                TEST_CT_INT4_SCALE_NAME.to_string(),
+                TensorMeta {
+                    name: TEST_CT_INT4_SCALE_NAME.to_string(),
+                    shape: vec![128, 1],
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 4096,
+                    byte_len: 128 * 2,
+                },
+            ),
+            (
+                TEST_CT_INT4_SHAPE_NAME.to_string(),
+                TensorMeta {
+                    name: TEST_CT_INT4_SHAPE_NAME.to_string(),
+                    shape: vec![2],
+                    dtype: "i64".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 4352,
+                    byte_len: 16,
+                },
+            ),
+        ]);
+        let mut tile_index = test_native_int4_physical_index(&fixture);
+        for meta in tile_index.values_mut() {
+            meta.offset += 8192;
+        }
+        index.extend(tile_index);
+        let physical_scale = index.get(fixture.scale_name).unwrap().clone();
+        index.insert(
+            canonical.scale_name.to_string(),
+            TensorMeta {
+                name: canonical.scale_name.to_string(),
+                ..physical_scale
+            },
+        );
+
+        let existing_fallback = CtSymInt4Bf16Fallback {
+            packed_tensor: "preexisting/packed".to_string(),
+            scale_tensor: "preexisting/scale".to_string(),
+            shape: vec![1, 32],
+            group_size: 32,
+        };
+        let mut upload_views = HashMap::new();
+        let mut fallbacks = HashMap::from([(
+            "preexisting/fallback".to_string(),
+            existing_fallback.clone(),
+        )]);
+        let mut views = HashMap::new();
+        let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
+
+        let err = build_stage3_int4_storage(
+            &runtime,
+            &mut index,
+            &mut upload_views,
+            &mut fallbacks,
+            &mut views,
+            &HashMap::new(),
+            true,
+        )
+        .expect_err("later tile-v1 SCALE collision must roll back the earlier CT fallback");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("namespace collision") && message.contains(canonical.scale_name),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
+            before
+        );
+        assert_eq!(fallbacks.len(), 1);
+        assert_eq!(
+            fallbacks.get("preexisting/fallback"),
+            Some(&existing_fallback)
+        );
+        assert!(!fallbacks.contains_key(TEST_CT_INT4_LOGICAL_NAME));
     }
 
     #[test]
@@ -5719,7 +5997,7 @@ mod tests {
         let mut upload_views = HashMap::new();
         let mut fallbacks = HashMap::new();
         let mut views = HashMap::new();
-        let before = stage3_publication_snapshot(&index, &upload_views, &views);
+        let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
 
         let err = build_stage3_int4_storage(
             &runtime,
@@ -5737,7 +6015,7 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(
-            stage3_publication_snapshot(&index, &upload_views, &views),
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
             before
         );
         assert!(
@@ -5805,7 +6083,7 @@ mod tests {
         let mut upload_views = HashMap::new();
         let mut fallbacks = HashMap::new();
         let mut views = HashMap::new();
-        let before = stage3_publication_snapshot(&index, &upload_views, &views);
+        let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
 
         let err = build_stage3_int4_storage(
             &runtime,
@@ -5823,7 +6101,7 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(
-            stage3_publication_snapshot(&index, &upload_views, &views),
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
             before
         );
         assert!(
