@@ -15,6 +15,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -109,6 +110,63 @@ FINAL_METRIC_KEYS = {
 
 class PhaseError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class FlmProfileExpectations:
+    storage_abi_ids: tuple[int, ...]
+    row_group_int4: int
+    tile_int4_v1: int
+    native_int4: int
+    bf16_fallback: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.storage_abi_ids, tuple) or not self.storage_abi_ids:
+            raise PhaseError("expected storage_abi_ids must be a non-empty tuple")
+        if len(set(self.storage_abi_ids)) != len(self.storage_abi_ids):
+            raise PhaseError("expected storage_abi_ids must be unique")
+        for index, storage_abi_id in enumerate(self.storage_abi_ids):
+            if isinstance(storage_abi_id, bool) or not isinstance(storage_abi_id, int):
+                raise PhaseError(
+                    f"expected storage_abi_ids[{index}] must be an integer"
+                )
+            if storage_abi_id <= 0 or storage_abi_id > 0xFFFF:
+                raise PhaseError(
+                    f"expected storage_abi_ids[{index}] must be in 1..65535"
+                )
+        for field in (
+            "row_group_int4",
+            "tile_int4_v1",
+            "native_int4",
+            "bf16_fallback",
+        ):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise PhaseError(f"expected {field} must be an integer")
+            if value < 0:
+                raise PhaseError(f"expected {field} must be non-negative")
+        if self.native_int4 != self.row_group_int4 + self.tile_int4_v1:
+            raise PhaseError(
+                "expected native_int4 must equal row_group_int4 + tile_int4_v1"
+            )
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "storage_abi_ids": list(self.storage_abi_ids),
+            "row_group_int4": self.row_group_int4,
+            "tile_int4_v1": self.tile_int4_v1,
+            "native_int4": self.native_int4,
+            "bf16_fallback": self.bf16_fallback,
+        }
+
+
+LEGACY_FLM_PROFILE = FlmProfileExpectations(
+    storage_abi_ids=tuple(EXPECTED_STORAGE_ABI_IDS),
+    row_group_int4=0,
+    tile_int4_v1=EXPECTED_NATIVE_INT4,
+    native_int4=EXPECTED_NATIVE_INT4,
+    bf16_fallback=EXPECTED_BF16_FALLBACK,
+)
 
 
 class SdkSmokeFailure(PhaseError):
@@ -429,7 +487,12 @@ def _validate_startup_schema(value: object, label: str) -> dict[str, Any]:
     return startup
 
 
-def _validate_flm_payload_schema(value: object, label: str) -> dict[str, Any]:
+def _validate_flm_payload_schema(
+    value: object,
+    label: str,
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
+) -> dict[str, Any]:
     flm = _exact_mapping(
         value,
         {
@@ -459,8 +522,8 @@ def _validate_flm_payload_schema(value: object, label: str) -> dict[str, Any]:
         "model_id": EXPECTED_MODEL_ID,
         "required_weights": EXPECTED_REQUIRED_WEIGHTS,
         "raw_dense_weights": EXPECTED_RAW_DENSE_WEIGHTS,
-        "native_int4_direct_weights": EXPECTED_NATIVE_INT4,
-        "bf16_fallback_weights": EXPECTED_BF16_FALLBACK,
+        "native_int4_direct_weights": expected_profile.native_int4,
+        "bf16_fallback_weights": expected_profile.bf16_fallback,
         "load_sequence": 1,
         "source_open_count": 1,
     }
@@ -474,7 +537,7 @@ def _validate_flm_payload_schema(value: object, label: str) -> dict[str, Any]:
         _strict_int(storage_abi, f"{label}.storage_abi_ids[{index}]")
     _expect(
         storage_abis,
-        EXPECTED_STORAGE_ABI_IDS,
+        list(expected_profile.storage_abi_ids),
         f"{label}.storage_abi_ids",
     )
     _expect(flm["source"], EXPECTED_SOURCE, f"{label}.source")
@@ -604,6 +667,8 @@ def _validate_endpoints(value: object, label: str) -> list[str]:
 def _validate_capabilities_schema(
     value: object,
     label: str,
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
 ) -> dict[str, Any]:
     capabilities = _exact_mapping(
         value,
@@ -655,11 +720,20 @@ def _validate_capabilities_schema(
         capabilities["prefix_cache"],
         f"{label}.prefix_cache",
     )
-    _validate_flm_payload_schema(capabilities["flm"], f"{label}.flm")
+    _validate_flm_payload_schema(
+        capabilities["flm"],
+        f"{label}.flm",
+        expected_profile=expected_profile,
+    )
     return capabilities
 
 
-def _validate_health_schema(value: object, label: str) -> dict[str, Any]:
+def _validate_health_schema(
+    value: object,
+    label: str,
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
+) -> dict[str, Any]:
     health = _exact_mapping(
         value,
         {
@@ -689,7 +763,11 @@ def _validate_health_schema(value: object, label: str) -> dict[str, Any]:
     for field, expected in exact_integers.items():
         _strict_int(health[field], f"{label}.{field}")
         _expect(health[field], expected, f"{label}.{field}")
-    _validate_flm_payload_schema(health["flm"], f"{label}.flm")
+    _validate_flm_payload_schema(
+        health["flm"],
+        f"{label}.flm",
+        expected_profile=expected_profile,
+    )
     return health
 
 
@@ -699,6 +777,7 @@ def _validate_metrics_schema(
     *,
     capabilities: dict[str, Any] | None = None,
     health: dict[str, Any] | None = None,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
 ) -> dict[str, int | float]:
     metrics = _exact_mapping(value, FINAL_METRIC_KEYS, label)
     for name in FINAL_METRIC_KEYS - {"supersonic_flm_startup_seconds"}:
@@ -735,8 +814,8 @@ def _validate_metrics_schema(
         "supersonic_dflash_last_accepted_total": 0,
         "supersonic_dflash_last_decode_ms": 0,
         "supersonic_model_loads_total": 1,
-        "supersonic_flm_native_int4_direct_weights": EXPECTED_NATIVE_INT4,
-        "supersonic_flm_bf16_fallback_weights": EXPECTED_BF16_FALLBACK,
+        "supersonic_flm_native_int4_direct_weights": expected_profile.native_int4,
+        "supersonic_flm_bf16_fallback_weights": expected_profile.bf16_fallback,
     }
     for name, expected in exact_metrics.items():
         _expect(metrics[name], expected, f"{label}.{name}")
@@ -822,12 +901,19 @@ def _validate_metrics_schema(
 def validate_flm_evidence(
     capabilities: dict[str, Any],
     metrics: dict[str, int | float],
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
 ) -> dict[str, Any]:
-    capabilities = _validate_capabilities_schema(capabilities, "capabilities")
+    capabilities = _validate_capabilities_schema(
+        capabilities,
+        "capabilities",
+        expected_profile=expected_profile,
+    )
     metrics = _validate_metrics_schema(
         metrics,
         "metrics",
         capabilities=capabilities,
+        expected_profile=expected_profile,
     )
     flm = capabilities["flm"]
     scheduler = capabilities["scheduler"]
@@ -835,8 +921,9 @@ def validate_flm_evidence(
         "model": EXPECTED_MODEL,
         "source": EXPECTED_SOURCE,
         "load_sequence": 1,
-        "native_int4": EXPECTED_NATIVE_INT4,
-        "bf16_fallback": EXPECTED_BF16_FALLBACK,
+        "expected_flm_profile": expected_profile.as_json(),
+        "native_int4": expected_profile.native_int4,
+        "bf16_fallback": expected_profile.bf16_fallback,
         "model_loads_total": 1,
         "startup": flm["startup"],
         "transfer_backend": flm["transfer_backend"],
@@ -846,6 +933,39 @@ def validate_flm_evidence(
         "resident_allocation_count": flm["resident_allocation_count"],
         "scheduler": scheduler,
     }
+
+
+def _validate_flm_profile_snapshot(
+    value: object,
+    label: str,
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
+) -> dict[str, Any]:
+    profile = _exact_mapping(
+        value,
+        {
+            "storage_abi_ids",
+            "row_group_int4",
+            "tile_int4_v1",
+            "native_int4",
+            "bf16_fallback",
+        },
+        label,
+    )
+    storage_abi_ids = profile["storage_abi_ids"]
+    if not isinstance(storage_abi_ids, list):
+        raise PhaseError(f"{label}.storage_abi_ids must be a list")
+    for index, storage_abi_id in enumerate(storage_abi_ids):
+        _strict_int(storage_abi_id, f"{label}.storage_abi_ids[{index}]")
+    for field in (
+        "row_group_int4",
+        "tile_int4_v1",
+        "native_int4",
+        "bf16_fallback",
+    ):
+        _nonnegative_int(profile[field], f"{label}.{field}")
+    _expect(profile, expected_profile.as_json(), label)
+    return profile
 
 
 def validate_load_invariance(
@@ -1400,11 +1520,16 @@ def validate_agent_failure_report(report: dict[str, Any]) -> dict[str, Any]:
     return partial
 
 
-def validate_report(report: dict[str, Any]) -> dict[str, Any]:
+def validate_report(
+    report: dict[str, Any],
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
+) -> dict[str, Any]:
     expected_keys = {
         "model",
         "source",
         "load_sequence",
+        "expected_flm_profile",
         "native_int4",
         "bf16_fallback",
         "requests",
@@ -1418,10 +1543,15 @@ def validate_report(report: dict[str, Any]) -> dict[str, Any]:
         )
     _expect(report.get("model"), EXPECTED_MODEL, "report model")
     _expect(report.get("source"), EXPECTED_SOURCE, "report source")
+    _validate_flm_profile_snapshot(
+        report.get("expected_flm_profile"),
+        "report expected_flm_profile",
+        expected_profile=expected_profile,
+    )
     for field, expected in (
         ("load_sequence", 1),
-        ("native_int4", EXPECTED_NATIVE_INT4),
-        ("bf16_fallback", EXPECTED_BF16_FALLBACK),
+        ("native_int4", expected_profile.native_int4),
+        ("bf16_fallback", expected_profile.bf16_fallback),
     ):
         _strict_int(report.get(field), f"report {field}")
         _expect(report.get(field), expected, f"report {field}")
@@ -1792,6 +1922,7 @@ def build_report(
     *,
     ready_seconds: float,
     provenance: dict[str, Any],
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
 ) -> dict[str, Any]:
     startup = {
         "ready_seconds": ready_seconds,
@@ -1808,6 +1939,7 @@ def build_report(
         "model": EXPECTED_MODEL,
         "source": EXPECTED_SOURCE,
         "load_sequence": before["load_sequence"],
+        "expected_flm_profile": before["expected_flm_profile"],
         "native_int4": before["native_int4"],
         "bf16_fallback": before["bf16_fallback"],
         "requests": {
@@ -1821,7 +1953,7 @@ def build_report(
             "agent cancellation",
         ),
     }
-    return validate_report(report)
+    return validate_report(report, expected_profile=expected_profile)
 
 
 def write_report(path: Path, report: dict[str, Any]) -> None:
@@ -1877,6 +2009,8 @@ def collect_final_evidence(
     base_url: str,
     api_key: str,
     before: dict[str, Any] | None,
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
 ) -> dict[str, Any]:
     final = empty_final_evidence()
 
@@ -1905,6 +2039,7 @@ def collect_final_evidence(
             lambda: validate_flm_evidence(
                 final["capabilities"],
                 final["metrics"],
+                expected_profile=expected_profile,
             ),
         )
     if before is not None and final["flm_evidence"] is not None:
@@ -1931,13 +2066,19 @@ def _reject_nonfinite_json(value: object, label: str) -> None:
         raise PhaseError(f"{label} must be finite")
 
 
-def _validate_flm_snapshot(value: object, label: str) -> dict[str, Any]:
+def _validate_flm_snapshot(
+    value: object,
+    label: str,
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
+) -> dict[str, Any]:
     snapshot = _exact_mapping(
         value,
         {
             "model",
             "source",
             "load_sequence",
+            "expected_flm_profile",
             "native_int4",
             "bf16_fallback",
             "model_loads_total",
@@ -1953,10 +2094,15 @@ def _validate_flm_snapshot(value: object, label: str) -> dict[str, Any]:
     )
     _expect(snapshot["model"], EXPECTED_MODEL, f"{label}.model")
     _expect(snapshot["source"], EXPECTED_SOURCE, f"{label}.source")
+    _validate_flm_profile_snapshot(
+        snapshot["expected_flm_profile"],
+        f"{label}.expected_flm_profile",
+        expected_profile=expected_profile,
+    )
     for field, expected in (
         ("load_sequence", 1),
-        ("native_int4", EXPECTED_NATIVE_INT4),
-        ("bf16_fallback", EXPECTED_BF16_FALLBACK),
+        ("native_int4", expected_profile.native_int4),
+        ("bf16_fallback", expected_profile.bf16_fallback),
         ("model_loads_total", 1),
         ("source_open_count", 1),
     ):
@@ -2307,7 +2453,12 @@ def _validate_failure_provenance(
     return provenance
 
 
-def _validate_final_evidence(value: object, label: str) -> dict[str, Any]:
+def _validate_final_evidence(
+    value: object,
+    label: str,
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
+) -> dict[str, Any]:
     final = _exact_mapping(
         value,
         {
@@ -2332,6 +2483,7 @@ def _validate_final_evidence(value: object, label: str) -> dict[str, Any]:
         health = _validate_health_schema(
             final["health"],
             f"{label}.health",
+            expected_profile=expected_profile,
         )
     else:
         health = None
@@ -2341,6 +2493,7 @@ def _validate_final_evidence(value: object, label: str) -> dict[str, Any]:
         capabilities = _validate_capabilities_schema(
             capabilities,
             f"{label}.capabilities",
+            expected_profile=expected_profile,
         )
 
     metrics = final["metrics"]
@@ -2350,6 +2503,7 @@ def _validate_final_evidence(value: object, label: str) -> dict[str, Any]:
             f"{label}.metrics",
             capabilities=capabilities,
             health=health,
+            expected_profile=expected_profile,
         )
 
     if health is not None and capabilities is not None:
@@ -2379,6 +2533,7 @@ def _validate_final_evidence(value: object, label: str) -> dict[str, Any]:
             actual = _validate_flm_snapshot(
                 final["flm_evidence"],
                 f"{label}.flm_evidence",
+                expected_profile=expected_profile,
             )
         if actual is None:
             capabilities = None
@@ -2444,7 +2599,11 @@ def _validate_final_evidence(value: object, label: str) -> dict[str, Any]:
     return final
 
 
-def validate_failure_report(report: dict[str, Any]) -> dict[str, Any]:
+def validate_failure_report(
+    report: dict[str, Any],
+    *,
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
+) -> dict[str, Any]:
     failure = _exact_mapping(
         report,
         {
@@ -2493,6 +2652,7 @@ def validate_failure_report(report: dict[str, Any]) -> dict[str, Any]:
         _validate_flm_snapshot(
             completed["initial_evidence"],
             "failure completed.initial_evidence",
+            expected_profile=expected_profile,
         )
     if "compat" in completed:
         _validate_partial_compat_report(completed["compat"])
@@ -2557,7 +2717,11 @@ def validate_failure_report(report: dict[str, Any]) -> dict[str, Any]:
             raise PhaseError(
                 f"{phase_parts[0]} failure requires all completed protocol evidence"
             )
-    _validate_final_evidence(failure["final"], "failure final")
+    _validate_final_evidence(
+        failure["final"],
+        "failure final",
+        expected_profile=expected_profile,
+    )
     _reject_nonfinite_json(failure, "failure report")
     return report
 
@@ -2569,6 +2733,7 @@ def build_failure_report(
     provenance: dict[str, Any],
     completed: dict[str, Any],
     final: dict[str, Any],
+    expected_profile: FlmProfileExpectations = LEGACY_FLM_PROFILE,
 ) -> dict[str, Any]:
     report = {
         "schema_version": 1,
@@ -2582,7 +2747,7 @@ def build_failure_report(
         "completed": completed,
         "final": final,
     }
-    return validate_failure_report(report)
+    return validate_failure_report(report, expected_profile=expected_profile)
 
 
 def discover_inputs(args: argparse.Namespace) -> None:
@@ -2603,6 +2768,9 @@ def discover_inputs(args: argparse.Namespace) -> None:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    expected_profile = getattr(args, "flm_profile", LEGACY_FLM_PROFILE)
+    if not isinstance(expected_profile, FlmProfileExpectations):
+        raise PhaseError("args.flm_profile must be FlmProfileExpectations")
     clear_report_output(args.out_json)
     phase = "inputs"
     completed: dict[str, Any] = {}
@@ -2638,6 +2806,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 before = validate_flm_evidence(
                     fetch_json(base_url, "/v1/capabilities", args.api_key),
                     fetch_metrics(base_url, args.api_key),
+                    expected_profile=expected_profile,
                 )
                 completed["initial_evidence"] = before
 
@@ -2665,7 +2834,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 compat = protocol["compat"]
                 agent = protocol["agent"]
             finally:
-                final = collect_final_evidence(base_url, args.api_key, before)
+                final = collect_final_evidence(
+                    base_url,
+                    args.api_key,
+                    before,
+                    expected_profile=expected_profile,
+                )
 
             phase = "final_evidence"
             if final["collection_errors"]:
@@ -2685,6 +2859,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 agent,
                 ready_seconds=ready_seconds,
                 provenance=provenance,
+                expected_profile=expected_profile,
             )
             write_report(args.out_json, report)
             return report
@@ -2695,11 +2870,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             provenance=provenance,
             completed=completed,
             final=final,
+            expected_profile=expected_profile,
         )
         write_report(args.out_json, failure)
         if isinstance(exc, PhaseError):
             raise
         raise PhaseError(f"{phase} failed: {exc}") from exc
+
+
+def _nonnegative_cli_int(value: str) -> int:
+    if not value.isascii() or not value.isdecimal():
+        raise argparse.ArgumentTypeError("must be a non-negative decimal integer")
+    return int(value)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2719,6 +2901,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--openai-sdk-dir", type=Path, default=DEFAULT_OPENAI_SDK_DIR)
     parser.add_argument("--node", default="node")
     parser.add_argument("--npm", default="npm")
+    parser.add_argument(
+        "--expected-storage-abi-id",
+        type=_nonnegative_cli_int,
+        default=EXPECTED_STORAGE_ABI_IDS[0],
+    )
+    parser.add_argument(
+        "--expected-row-group-int4",
+        type=_nonnegative_cli_int,
+        default=0,
+    )
+    parser.add_argument(
+        "--expected-tile-int4-v1",
+        type=_nonnegative_cli_int,
+        default=EXPECTED_NATIVE_INT4,
+    )
+    parser.add_argument(
+        "--expected-native-int4",
+        type=_nonnegative_cli_int,
+        default=EXPECTED_NATIVE_INT4,
+    )
+    parser.add_argument(
+        "--expected-bf16-fallback",
+        type=_nonnegative_cli_int,
+        default=EXPECTED_BF16_FALLBACK,
+    )
     args = parser.parse_args(argv)
     args.no_download = True
     for field in (
@@ -2731,6 +2938,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{field.replace('_', '-')} must be positive")
     if args.max_context <= 0:
         parser.error("--max-context must be positive")
+    try:
+        args.flm_profile = FlmProfileExpectations(
+            storage_abi_ids=(args.expected_storage_abi_id,),
+            row_group_int4=args.expected_row_group_int4,
+            tile_int4_v1=args.expected_tile_int4_v1,
+            native_int4=args.expected_native_int4,
+            bf16_fallback=args.expected_bf16_fallback,
+        )
+    except PhaseError as exc:
+        parser.error(str(exc))
     return args
 
 

@@ -284,6 +284,20 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             ]
         )
 
+    def candidate_profile(self):
+        return self.harness.FlmProfileExpectations(
+            storage_abi_ids=(9,),
+            row_group_int4=330,
+            tile_int4_v1=0,
+            native_int4=330,
+            bf16_fallback=0,
+        )
+
+    def valid_candidate_capabilities(self):
+        capabilities = self.valid_capabilities()
+        capabilities["flm"]["storage_abi_ids"] = [9]
+        return capabilities
+
     def valid_usage(self):
         return {
             "prompt_tokens": 3,
@@ -468,6 +482,13 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             "model": "qwen3.6-35b-a3b",
             "source": "flm",
             "load_sequence": 1,
+            "expected_flm_profile": {
+                "storage_abi_ids": [8],
+                "row_group_int4": 0,
+                "tile_int4_v1": 330,
+                "native_int4": 330,
+                "bf16_fallback": 0,
+            },
             "native_int4": 330,
             "bf16_fallback": 0,
             "requests": {
@@ -785,6 +806,97 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                         f"supersonic_ready {value}\n"
                     )
 
+    def test_profile_expectation_cli_defaults_to_legacy_and_accepts_candidate(self):
+        legacy = self.harness.parse_args([])
+        self.assertEqual(
+            legacy.flm_profile,
+            self.harness.LEGACY_FLM_PROFILE,
+        )
+
+        candidate = self.harness.parse_args(
+            [
+                "--expected-storage-abi-id",
+                "9",
+                "--expected-row-group-int4",
+                "330",
+                "--expected-tile-int4-v1",
+                "0",
+                "--expected-native-int4",
+                "330",
+                "--expected-bf16-fallback",
+                "0",
+            ]
+        )
+        self.assertEqual(candidate.flm_profile, self.candidate_profile())
+
+    def test_profile_expectation_cli_rejects_malformed_counts(self):
+        for value in ("true", "330.5", "330x", "-1"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit):
+                    self.harness.parse_args(
+                        ["--expected-row-group-int4", value]
+                    )
+
+    def test_profile_expectations_reject_boolean_fractional_and_malformed_counts(self):
+        valid = {
+            "storage_abi_ids": (9,),
+            "row_group_int4": 330,
+            "tile_int4_v1": 0,
+            "native_int4": 330,
+            "bf16_fallback": 0,
+        }
+        for field, value in (
+            ("storage_abi_ids", (True,)),
+            ("storage_abi_ids", (9.0,)),
+            ("row_group_int4", True),
+            ("row_group_int4", 330.0),
+            ("tile_int4_v1", "0"),
+            ("native_int4", 330.5),
+            ("bf16_fallback", False),
+        ):
+            with self.subTest(field=field, value=value):
+                values = dict(valid)
+                values[field] = value
+                with self.assertRaises(self.harness.PhaseError):
+                    self.harness.FlmProfileExpectations(**values)
+
+    def test_candidate_profile_accepts_exact_abi9_g32_contract(self):
+        metrics = self.harness.parse_prometheus_metrics(self.valid_metrics_text())
+
+        snapshot = self.harness.validate_flm_evidence(
+            self.valid_candidate_capabilities(),
+            metrics,
+            expected_profile=self.candidate_profile(),
+        )
+
+        self.assertEqual(
+            snapshot["expected_flm_profile"],
+            {
+                "storage_abi_ids": [9],
+                "row_group_int4": 330,
+                "tile_int4_v1": 0,
+                "native_int4": 330,
+                "bf16_fallback": 0,
+            },
+        )
+        self.assertEqual(snapshot["native_int4"], 330)
+        self.assertEqual(snapshot["bf16_fallback"], 0)
+
+    def test_candidate_and_legacy_profiles_reject_crossed_storage_abis(self):
+        metrics = self.harness.parse_prometheus_metrics(self.valid_metrics_text())
+
+        with self.assertRaisesRegex(self.harness.PhaseError, "storage_abi_ids"):
+            self.harness.validate_flm_evidence(
+                self.valid_capabilities(),
+                metrics,
+                expected_profile=self.candidate_profile(),
+            )
+        with self.assertRaisesRegex(self.harness.PhaseError, "storage_abi_ids"):
+            self.harness.validate_flm_evidence(
+                self.valid_candidate_capabilities(),
+                metrics,
+            )
+
     def test_validate_flm_evidence_accepts_exact_capability_and_metrics(self):
         metrics = self.harness.parse_prometheus_metrics(self.valid_metrics_text())
 
@@ -799,6 +911,13 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 "model": "qwen3.6-35b-a3b",
                 "source": "flm",
                 "load_sequence": 1,
+                "expected_flm_profile": {
+                    "storage_abi_ids": [8],
+                    "row_group_int4": 0,
+                    "tile_int4_v1": 330,
+                    "native_int4": 330,
+                    "bf16_fallback": 0,
+                },
                 "native_int4": 330,
                 "bf16_fallback": 0,
                 "model_loads_total": 1,
@@ -1287,6 +1406,26 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         report = self.valid_failure_report()
         self.assertIs(self.harness.validate_failure_report(report), report)
 
+    def test_validate_failure_report_accepts_candidate_profile_contract(self):
+        report = self.valid_failure_report()
+        candidate = self.candidate_profile()
+        report["completed"]["initial_evidence"][
+            "expected_flm_profile"
+        ] = candidate.as_json()
+        report["final"]["flm_evidence"][
+            "expected_flm_profile"
+        ] = candidate.as_json()
+        report["final"]["health"]["flm"]["storage_abi_ids"] = [9]
+        report["final"]["capabilities"]["flm"]["storage_abi_ids"] = [9]
+
+        self.assertIs(
+            self.harness.validate_failure_report(
+                report,
+                expected_profile=candidate,
+            ),
+            report,
+        )
+
     def test_validate_failure_report_accepts_unclassified_protocol_exception(self):
         report = self.valid_failure_report()
         report["phase"] = "protocol"
@@ -1534,6 +1673,20 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         report = self.valid_report()
 
         self.assertIs(self.harness.validate_report(report), report)
+
+    def test_validate_report_persists_exact_candidate_profile_contract(self):
+        report = self.valid_report()
+        report["expected_flm_profile"] = self.candidate_profile().as_json()
+
+        self.assertIs(
+            self.harness.validate_report(
+                report,
+                expected_profile=self.candidate_profile(),
+            ),
+            report,
+        )
+        with self.assertRaisesRegex(self.harness.PhaseError, "expected_flm_profile"):
+            self.harness.validate_report(report)
 
     def test_validate_report_rejects_boolean_integer_and_nonfinite_numbers(self):
         mutations = [
