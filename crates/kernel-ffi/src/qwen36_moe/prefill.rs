@@ -14007,6 +14007,56 @@ mod tests {
         assert!(err.to_string().contains("same CUDA backend"), "{err}");
     }
 
+    #[test]
+    fn cuda_bridge_prelude_covers_shared_hip_runtime_identifiers() {
+        use std::collections::BTreeSet;
+
+        let bridge = include_str!("../../../../kernels/qwen36_moe_bridge.cpp");
+        let prelude = include_str!("../../../../kernels/qwen36_moe_cuda_prelude.cuh");
+        let cuda_translation_unit = include_str!("../../../../kernels/qwen36_moe_bridge_cuda.cu");
+
+        let hip_runtime_identifiers = bridge
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .filter(|token| {
+                token.starts_with("hip")
+                    && token
+                        .as_bytes()
+                        .get(3)
+                        .is_some_and(|ch| ch.is_ascii_uppercase())
+            })
+            .collect::<BTreeSet<_>>();
+        let missing_aliases = hip_runtime_identifiers
+            .iter()
+            .filter(|token| {
+                let object_macro = format!("#define {token} ");
+                let function_macro = format!("#define {token}(");
+                !prelude.lines().any(|line| {
+                    line.starts_with(&object_macro) || line.starts_with(&function_macro)
+                })
+            })
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing_aliases.is_empty(),
+            "shared Qwen3.6 bridge HIP identifiers missing CUDA aliases: {missing_aliases:?}"
+        );
+        assert!(
+            prelude.contains("using hip_bfloat16 = __nv_bfloat16;"),
+            "CUDA prelude must retain the shared bridge BF16 type alias"
+        );
+        let prelude_include = cuda_translation_unit
+            .find("#include \"qwen36_moe_cuda_prelude.cuh\"")
+            .expect("CUDA translation unit must include the compatibility prelude");
+        let bridge_include = cuda_translation_unit
+            .find("#include \"qwen36_moe_bridge.cpp\"")
+            .expect("CUDA translation unit must include the shared bridge");
+        assert!(
+            prelude_include < bridge_include,
+            "CUDA compatibility prelude must be included before the shared bridge"
+        );
+    }
+
     type ExplicitGroupedExpertNativeLauncher = unsafe fn(
         usize,
         usize,
