@@ -227,6 +227,124 @@ fn hip_wmma_matches_scalar_g32_matvec() -> anyhow::Result<()> {
 }
 
 #[test]
+fn hip_wmma_matches_scalar_for_varied_g32_operands() -> anyhow::Result<()> {
+    set_backend(Backend::Hip);
+    const ROWS: usize = 32;
+    const COLS: usize = 128;
+    const SCALE_PATTERN: [u16; 4] = [0x3dcd, 0x3e80, 0x3f20, 0x3fc0];
+
+    let mut packed_bytes = Vec::with_capacity(ROWS * COLS / 2);
+    for row in 0..ROWS {
+        for byte_col in 0..COLS / 2 {
+            let low = ((row * 3 + byte_col * 5 + byte_col / 3 + 1) & 0x0f) as u8;
+            let mut high = ((row * 11 + byte_col * 7 + (byte_col % 5) * 3 + 6) & 0x0f) as u8;
+            if high == low {
+                high = (high + 9) & 0x0f;
+            }
+            packed_bytes.push(low | (high << 4));
+        }
+    }
+    let scale_bits: Vec<u16> = (0..ROWS)
+        .flat_map(|row| {
+            (0..COLS / 32).map(move |group| SCALE_PATTERN[(row + group) % SCALE_PATTERN.len()])
+        })
+        .collect();
+    let activation_bits: Vec<u16> = (0..COLS)
+        .map(|col| {
+            let magnitude = (((col * 13 + 5) % 29) + 3) as f32 / 16.0;
+            let sign = if col % 5 == 0 || col % 11 == 3 {
+                -1.0
+            } else {
+                1.0
+            };
+            bf16::from_f32(sign * magnitude).to_bits()
+        })
+        .collect();
+
+    let mut host_reference = vec![0.0f32; ROWS];
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            let packed = packed_bytes[row * COLS / 2 + col / 2];
+            let code = if col & 1 == 0 {
+                packed & 0x0f
+            } else {
+                packed >> 4
+            };
+            let scale = f32::from(bf16::from_bits(scale_bits[row * 4 + col / 32]));
+            let weight = f32::from(bf16::from_f32((f32::from(code) - 8.0) * scale));
+            let activation = f32::from(bf16::from_bits(activation_bits[col]));
+            host_reference[row] += weight * activation;
+        }
+    }
+    let min_reference = host_reference.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_reference = host_reference
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_abs_reference = host_reference
+        .iter()
+        .map(|value| value.abs())
+        .fold(f32::INFINITY, f32::min);
+    assert!(
+        max_reference - min_reference > 20.0 && min_abs_reference > 0.5,
+        "varied fixture outputs must be nondegenerate: min={min_reference} max={max_reference} min_abs={min_abs_reference}"
+    );
+
+    let packed =
+        GpuBuffer::from_host_bytes(0, ScalarType::U8, &[packed_bytes.len()], &packed_bytes)?;
+    let scale = GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        &[scale_bits.len()],
+        &bf16_bytes(&scale_bits),
+    )?;
+    let activation =
+        GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[COLS], &bf16_bytes(&activation_bits))?;
+    let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[ROWS])?;
+    let mut wmma = GpuBuffer::zeros(0, ScalarType::F32, &[ROWS])?;
+    let desc = row_group_desc(&scale, COLS);
+
+    int4_descriptor_wmma_parity_launch(
+        0,
+        &packed,
+        &scale,
+        None,
+        &desc,
+        &activation,
+        ROWS as i32,
+        COLS as i32,
+        &mut scalar,
+        &mut wmma,
+    )?;
+
+    let scalar = f32_values(&scalar)?;
+    let wmma = f32_values(&wmma)?;
+    let mut dot = 0.0f64;
+    let mut scalar_sq = 0.0f64;
+    let mut wmma_sq = 0.0f64;
+    let mut max_abs = 0.0f32;
+    let mut scalar_host_max_abs = 0.0f32;
+    for ((&reference, &actual), &host) in scalar.iter().zip(&wmma).zip(&host_reference) {
+        dot += f64::from(reference) * f64::from(actual);
+        scalar_sq += f64::from(reference) * f64::from(reference);
+        wmma_sq += f64::from(actual) * f64::from(actual);
+        max_abs = max_abs.max((reference - actual).abs());
+        scalar_host_max_abs = scalar_host_max_abs.max((reference - host).abs());
+    }
+    let cosine = dot / (scalar_sq.sqrt() * wmma_sq.sqrt() + 1e-30);
+    println!(
+        "varied G32 WMMA parity: cosine={cosine:.8} max_abs={max_abs:.8e} scalar_host_max_abs={scalar_host_max_abs:.8e}"
+    );
+    assert!(
+        scalar_host_max_abs <= 2e-2,
+        "scalar host-reference max abs {scalar_host_max_abs:.8e} exceeds 2e-2"
+    );
+    assert!(cosine >= 0.99999, "WMMA cosine {cosine:.8} below 0.99999");
+    assert!(max_abs <= 2e-2, "WMMA max abs {max_abs:.8e} exceeds 2e-2");
+    Ok(())
+}
+
+#[test]
 fn descriptor_surface_keeps_fp8_encoding_distinct() -> anyhow::Result<()> {
     set_backend(Backend::Hip);
     let packed = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[16], &TASK2_PACKED)?;
