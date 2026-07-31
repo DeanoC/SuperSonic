@@ -16,9 +16,10 @@ from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH_SCRIPT = ROOT / "tests" / "gfx1100" / "bench_qwen36_he_supersonic.py"
-STRICT_PROFILE = "supersonic-qwen36-moe-native-int4"
+STRICT_PROFILE = "supersonic-qwen36-moe-row-group-int4"
 EXPECTED_RESOLVED_MODEL = "qwen3.6-35b-a3b"
 EXPECTED_FLM_WEIGHT_MODE = "INT4 native FLM"
+EXPECTED_ROW_GROUP_INT4_PROJECTIONS = 330
 DEFAULT_HF_SOURCE = Path("/mnt/data/models/Qwen3.6-35B-A3B")
 DEFAULT_GEOQUANT_ROOT = Path("/home/deano/projects/geo-quant")
 DEFAULT_GEOQUANT_PYTHON = Path(
@@ -76,7 +77,11 @@ def export_command(args: argparse.Namespace, output: Path) -> list[str]:
         "--bits",
         "4",
         "--group-size",
-        "128",
+        "32",
+        "--flm-int4-codec",
+        "row-group",
+        "--int4-recipe",
+        "mse",
         "--hf-compat-assets",
         "omit",
         "--flm-validate-profile",
@@ -371,6 +376,8 @@ def _canonical_direct_profile(
 def _direct_profile_field_label(field: object) -> str:
     return {
         "native_int4": "native INT4",
+        "row_group_int4": "row-group INT4",
+        "tile_int4_v1": "tile-v1 INT4",
         "bf16_fallback": "BF16 fallback",
     }.get(field, str(field))
 
@@ -503,8 +510,29 @@ def first_class_errors(
                     f"{_direct_profile_field_label(field)} direct profile field"
                 )
             if canonical_profile is not None:
-                if (canonical_profile.get("native_int4") or 0) <= 0:
-                    errors.append(f"row {index} has no native INT4 direct plans")
+                native_int4 = canonical_profile.get("native_int4")
+                row_group_int4 = canonical_profile.get("row_group_int4")
+                tile_int4_v1 = canonical_profile.get("tile_int4_v1")
+                if native_int4 != EXPECTED_ROW_GROUP_INT4_PROJECTIONS:
+                    errors.append(
+                        f"row {index} does not have exactly 330 native INT4 direct plans"
+                    )
+                if row_group_int4 != EXPECTED_ROW_GROUP_INT4_PROJECTIONS:
+                    errors.append(
+                        f"row {index} does not have exactly 330 row-group INT4 direct plans"
+                    )
+                if tile_int4_v1 != 0:
+                    errors.append(f"row {index} has tile-v1 INT4 direct plans")
+                if (
+                    native_int4 is not None
+                    and row_group_int4 is not None
+                    and tile_int4_v1 is not None
+                    and native_int4 != row_group_int4 + tile_int4_v1
+                ):
+                    errors.append(
+                        f"row {index} aggregate native INT4 direct plans do not equal "
+                        "row-group plus tile-v1 plans"
+                    )
                 bf16_fallback = canonical_profile.get("bf16_fallback")
                 if bf16_fallback is None or bf16_fallback != 0:
                     errors.append(f"row {index} has BF16 fallback direct plans")

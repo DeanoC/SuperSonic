@@ -52,7 +52,7 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
         values.update(overrides)
         return types.SimpleNamespace(**values)
 
-    def test_builds_strict_native_int4_export_command(self):
+    def test_builds_strict_row_group_int4_export_command(self):
         args = self.args()
         self.assertEqual(
             runner.export_command(args, Path("/models/output.partial.flm")),
@@ -69,11 +69,15 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
                 "--bits",
                 "4",
                 "--group-size",
-                "128",
+                "32",
+                "--flm-int4-codec",
+                "row-group",
+                "--int4-recipe",
+                "mse",
                 "--hf-compat-assets",
                 "omit",
                 "--flm-validate-profile",
-                "supersonic-qwen36-moe-native-int4",
+                "supersonic-qwen36-moe-row-group-int4",
             ],
         )
 
@@ -91,7 +95,7 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
                 "geoquant.formats.flm_validate",
                 "/models/output.flm",
                 "--profile",
-                "supersonic-qwen36-moe-native-int4",
+                "supersonic-qwen36-moe-row-group-int4",
                 "--verify-payload-hashes",
             ],
         )
@@ -362,6 +366,8 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
                     "required": 693,
                     "raw_dense": 363,
                     "native_int4": 330,
+                    "row_group_int4": 330,
+                    "tile_int4_v1": 0,
                     "bf16_fallback": 0,
                 }],
                 "flm_load_speed": {
@@ -384,6 +390,8 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
                     "required": 693,
                     "raw_dense": 363,
                     "native_int4": 330,
+                    "row_group_int4": 330,
+                    "tile_int4_v1": 0,
                     "bf16_fallback": 0,
                 },
             }],
@@ -508,11 +516,31 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
 
         self.assert_report_rejected(payload, "source_open_count=1")
 
-    def test_report_rejects_no_native_int4_direct_plans(self):
+    def test_report_rejects_noncanonical_native_int4_direct_plan_count(self):
         payload = self.valid_report()
-        payload["rows"][0]["flm_direct_profile"]["native_int4"] = 0
+        payload["rows"][0]["flm_direct_profile"]["native_int4"] = 329
 
-        self.assert_report_rejected(payload, "native INT4")
+        self.assert_report_rejected(payload, "exactly 330 native INT4")
+
+    def test_report_rejects_noncanonical_row_group_direct_plan_count(self):
+        payload = self.valid_report()
+        profile = payload["rows"][0]["flm_direct_profile"]
+        profile["native_int4"] = 329
+        profile["row_group_int4"] = 329
+
+        self.assert_report_rejected(payload, "exactly 330 row-group INT4")
+
+    def test_report_rejects_tile_v1_direct_plans(self):
+        payload = self.valid_report()
+        payload["rows"][0]["flm_direct_profile"]["tile_int4_v1"] = 1
+
+        self.assert_report_rejected(payload, "tile-v1 INT4")
+
+    def test_report_rejects_inconsistent_native_int4_aggregate(self):
+        payload = self.valid_report()
+        payload["rows"][0]["flm_direct_profile"]["native_int4"] = 331
+
+        self.assert_report_rejected(payload, "aggregate native INT4")
 
     def test_report_rejects_bf16_direct_plan_fallback(self):
         payload = self.valid_report()
@@ -546,6 +574,8 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
             "required": 693,
             "raw_dense": 363,
             "native_int4": 329,
+            "row_group_int4": 329,
+            "tile_int4_v1": 0,
             "bf16_fallback": 1,
         })
 
