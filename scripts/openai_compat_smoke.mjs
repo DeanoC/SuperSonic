@@ -27,33 +27,26 @@ function compact(value) {
   return JSON.stringify(value);
 }
 
-function visibleText(message) {
-  return [message?.content, message?.reasoning_content]
-    .filter((value) => typeof value === "string")
+function normalized(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function exactCanary(actual, finishReason, expected = "hello") {
+  return {
+    expected,
+    actual: normalized(actual),
+    finish_reason: finishReason,
+    passed: normalized(actual) === expected && finishReason === "stop",
+  };
+}
+
+function responseText(response) {
+  return (response?.output ?? [])
+    .filter((item) => item.type === "message")
+    .flatMap((item) => item.content ?? [])
+    .filter((part) => part.type === "output_text")
+    .map((part) => part.text ?? "")
     .join("");
-}
-
-function chatAssistantResult(message) {
-  return (
-    visibleText(message).trim().length > 0 ||
-    (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0)
-  );
-}
-
-function responseAssistantResult(response) {
-  return response?.output?.some((item) => {
-    if (item.type === "function_call") return true;
-    if (item.type === "reasoning") {
-      return Array.isArray(item.summary) && item.summary.join("").trim().length > 0;
-    }
-    if (item.type !== "message") return false;
-    return item.content?.some(
-      (part) =>
-        part.type === "output_text" &&
-        typeof part.text === "string" &&
-        part.text.trim().length > 0,
-    );
-  });
 }
 
 function validateUsage(usage, label) {
@@ -83,11 +76,25 @@ function validateUsage(usage, label) {
     `${label} total token count does not add up`,
     usage,
   );
-  return { promptTokens, completionTokens, totalTokens };
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+  };
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function fetchChecked(path, options = {}) {
-  const response = await fetch(`${rootURL}${path}`, {
+  const response = await fetchWithTimeout(`${rootURL}${path}`, {
     ...options,
     headers: {
       authorization: `Bearer ${apiKey}`,
@@ -106,18 +113,59 @@ async function fetchChecked(path, options = {}) {
   return body;
 }
 
-async function main() {
-  const unauthorized = await fetch(`${baseURL}/models`);
-  const unauthorizedBody = await unauthorized.json();
-  assert(unauthorized.status === 401, "missing auth must return HTTP 401", {
-    status: unauthorized.status,
-    body: unauthorizedBody,
+async function unauthorizedEvidence(path, authorization) {
+  const response = await fetchWithTimeout(`${rootURL}${path}`, {
+    headers: authorization ? { authorization } : {},
+  });
+  const text = await response.text();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = text;
+  }
+  assert(response.status === 401, `${path} must reject invalid auth`, {
+    status: response.status,
+    body,
   });
   assert(
-    unauthorizedBody?.error?.type === "authentication_error",
-    "missing auth must use the OpenAI authentication error envelope",
-    unauthorizedBody,
+    body?.error?.type === "authentication_error",
+    `${path} must use the authentication error envelope`,
+    body,
   );
+  return { status: response.status, error_type: body.error.type };
+}
+
+async function sdkWrongKeyEvidence() {
+  const wrongKeyClient = new OpenAI({
+    baseURL,
+    apiKey: "definitely-wrong",
+    timeout,
+  });
+  try {
+    await wrongKeyClient.models.list();
+    assert(false, "SDK model route accepted the wrong API key");
+  } catch (error) {
+    assert(error?.status === 401, "SDK wrong-key error was not HTTP 401", error);
+    assert(
+      error?.error?.type === "authentication_error",
+      "SDK wrong-key error did not preserve the authentication envelope",
+      error,
+    );
+    return { status: error.status, error_type: error.error.type };
+  }
+}
+
+async function main() {
+  const missingKey = await unauthorizedEvidence("/v1/models");
+  const wrongKey = await sdkWrongKeyEvidence();
+  const protectedRoutes = {};
+  for (const path of ["/health", "/ready", "/metrics", "/v1/capabilities"]) {
+    protectedRoutes[path] = await unauthorizedEvidence(
+      path,
+      "Bearer definitely-wrong",
+    );
+  }
 
   const models = await client.models.list();
   assert(
@@ -128,12 +176,11 @@ async function main() {
   const retrieved = await client.models.retrieve(model);
   assert(retrieved.id === model, "model retrieve returned the wrong id", retrieved);
 
-  const tokenText = "hello world";
   const tokenize = await fetchChecked("/v1/tokenize", {
     method: "POST",
     body: JSON.stringify({
       model,
-      input: tokenText,
+      input: "hello world",
       add_special_tokens: false,
     }),
   });
@@ -159,120 +206,172 @@ async function main() {
   const chat = await client.chat.completions.create({
     model,
     messages: [
-      { role: "developer", content: "Answer briefly." },
-      { role: "user", content: "Reply with the single word hello." },
+      { role: "developer", content: "Output exactly: hello" },
+      { role: "user", content: "Output exactly: hello" },
     ],
     max_completion_tokens: 8,
     temperature: 0,
   });
-  const chatMessage = chat.choices?.[0]?.message;
-  assert(chatAssistantResult(chatMessage), "Chat returned no assistant result", chat);
+  const chatChoice = chat.choices?.[0];
+  assert(chatChoice?.message, "Chat returned no choice", chat);
   const chatUsage = validateUsage(chat.usage, "Chat");
+  const chatSemantic = exactCanary(
+    chatChoice.message.content,
+    chatChoice.finish_reason,
+  );
 
   const streamStarted = performance.now();
   const chatStream = await client.chat.completions.create({
     model,
-    messages: [{ role: "user", content: "Reply with the single word hello." }],
+    messages: [{ role: "user", content: "Output exactly: hello" }],
     max_completion_tokens: 8,
     temperature: 0,
     stream: true,
     stream_options: { include_usage: true },
   });
   let firstTokenSeconds;
-  let sawChatDelta = false;
-  let sawChatTerminal = false;
+  let chatStreamText = "";
   let chatStreamUsage;
+  const chatStreamEvents = [];
   for await (const chunk of chatStream) {
     const choice = chunk.choices?.[0];
-    const delta = choice?.delta;
-    const substantive =
-      (typeof delta?.content === "string" && delta.content.length > 0) ||
-      (typeof delta?.reasoning_content === "string" &&
-        delta.reasoning_content.length > 0) ||
-      (Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0);
-    if (substantive) {
-      sawChatDelta = true;
+    const delta = choice?.delta?.content;
+    if (typeof delta === "string" && delta.length > 0) {
+      chatStreamText += delta;
       if (firstTokenSeconds === undefined) {
         firstTokenSeconds = (performance.now() - streamStarted) / 1000;
       }
     }
-    if (choice?.finish_reason) sawChatTerminal = true;
+    if (choice?.finish_reason !== null && choice?.finish_reason !== undefined) {
+      chatStreamEvents.push({
+        kind: "terminal",
+        finish_reason: choice.finish_reason,
+      });
+    } else if (chunk.usage) {
+      chatStreamEvents.push({ kind: "usage" });
+    } else {
+      chatStreamEvents.push({ kind: "delta" });
+    }
     if (chunk.usage) chatStreamUsage = chunk.usage;
   }
+  assert(firstTokenSeconds !== undefined, "Chat stream emitted no text delta");
   const streamSeconds = (performance.now() - streamStarted) / 1000;
-  assert(sawChatDelta, "Chat stream emitted no content, reasoning, or tool delta");
-  assert(sawChatTerminal, "Chat stream emitted no terminal finish_reason");
-  assert(chatStreamUsage, "Chat stream emitted no terminal usage chunk");
-  const normalizedChatStreamUsage = validateUsage(chatStreamUsage, "Chat stream");
+  const chatTerminalIndexes = chatStreamEvents
+    .map((event, index) => (event.kind === "terminal" ? index : -1))
+    .filter((index) => index >= 0);
+  const chatUsageIndexes = chatStreamEvents
+    .map((event, index) => (event.kind === "usage" ? index : -1))
+    .filter((index) => index >= 0);
+  assert(chatStreamUsage, "Chat stream emitted no terminal usage");
+  const chatStreamUsageCounts = validateUsage(chatStreamUsage, "Chat stream");
+  const chatStreamSemantic = {
+    ...exactCanary(
+      chatStreamText,
+      chatTerminalIndexes.length === 1
+        ? chatStreamEvents[chatTerminalIndexes[0]].finish_reason
+        : null,
+    ),
+    terminal_count: chatTerminalIndexes.length,
+    terminal_last_before_usage:
+      chatTerminalIndexes.length === 1 &&
+      chatUsageIndexes.length === 1 &&
+      chatTerminalIndexes[0] + 1 === chatUsageIndexes[0],
+    usage_last:
+      chatUsageIndexes.length === 1 &&
+      chatUsageIndexes[0] === chatStreamEvents.length - 1,
+  };
+  chatStreamSemantic.passed =
+    chatStreamSemantic.passed &&
+    chatStreamSemantic.terminal_count === 1 &&
+    chatStreamSemantic.terminal_last_before_usage &&
+    chatStreamSemantic.usage_last;
 
   const completion = await client.completions.create({
     model,
-    prompt: "Reply with hello.",
-    max_tokens: 4,
+    prompt: "Output exactly: hello",
+    max_tokens: 8,
     temperature: 0,
   });
-  assert(
-    typeof completion.choices?.[0]?.text === "string" &&
-      completion.choices[0].text.length > 0,
-    "legacy Completion returned no text",
-    completion,
+  const completionChoice = completion.choices?.[0];
+  assert(completionChoice, "legacy Completion returned no choice", completion);
+  const completionUsage = validateUsage(completion.usage, "Completion");
+  const completionSemantic = exactCanary(
+    completionChoice.text,
+    completionChoice.finish_reason,
   );
-  validateUsage(completion.usage, "Completion");
 
   const response = await client.responses.create({
     model,
-    input: "Reply with the single word hello.",
+    input: "Output exactly: hello",
     max_output_tokens: 8,
     temperature: 0,
   });
-  assert(response.status === "completed", "Responses create did not complete", response);
-  assert(
-    responseAssistantResult(response),
-    "Responses create returned no assistant result",
-    response,
-  );
   const responseUsage = validateUsage(response.usage, "Responses");
   const fetched = await client.responses.retrieve(response.id);
-  assert(fetched.id === response.id, "Responses retrieve returned the wrong id", {
-    created: response,
-    fetched,
-  });
+  const storedRoundtrip =
+    fetched.id === response.id && responseText(fetched) === responseText(response);
   const deleted = await client.responses.delete(response.id);
   assert(
     deleted.id === response.id && deleted.deleted === true,
     "Responses delete did not delete the created response",
     deleted,
   );
+  const responseSemantic = {
+    expected: "hello",
+    actual: normalized(responseText(response)),
+    status: response.status,
+    stored_roundtrip: storedRoundtrip,
+    passed:
+      normalized(responseText(response)) === "hello" &&
+      response.status === "completed" &&
+      storedRoundtrip,
+  };
 
   const responseStream = await client.responses.create({
     model,
-    input: "Reply with the single word hello.",
+    input: "Output exactly: hello",
     max_output_tokens: 8,
     temperature: 0,
     stream: true,
   });
-  let sawResponseDelta = false;
-  let sawResponseCompleted = false;
+  let responseStreamText = "";
+  const responseStreamEvents = [];
   let responseStreamUsage;
+  let responseStreamStatus;
   for await (const event of responseStream) {
+    responseStreamEvents.push(event.type);
     if (
       event.type === "response.output_text.delta" &&
-      typeof event.delta === "string" &&
-      event.delta.length > 0
+      typeof event.delta === "string"
     ) {
-      sawResponseDelta = true;
+      responseStreamText += event.delta;
     }
     if (event.type === "response.completed") {
-      sawResponseCompleted = true;
       responseStreamUsage = event.response?.usage;
+      responseStreamStatus = event.response?.status;
     }
   }
-  assert(sawResponseDelta, "Responses stream emitted no output_text delta");
-  assert(sawResponseCompleted, "Responses stream emitted no response.completed event");
-  const normalizedResponseStreamUsage = validateUsage(
+  const responseCompletedIndexes = responseStreamEvents
+    .map((type, index) => (type === "response.completed" ? index : -1))
+    .filter((index) => index >= 0);
+  const responseStreamUsageCounts = validateUsage(
     responseStreamUsage,
     "Responses stream",
   );
+  const responseStreamSemantic = {
+    expected: "hello",
+    actual: normalized(responseStreamText),
+    status: responseStreamStatus,
+    terminal_count: responseCompletedIndexes.length,
+    terminal_last:
+      responseCompletedIndexes.length === 1 &&
+      responseCompletedIndexes[0] === responseStreamEvents.length - 1,
+    passed:
+      normalized(responseStreamText) === "hello" &&
+      responseStreamStatus === "completed" &&
+      responseCompletedIndexes.length === 1 &&
+      responseCompletedIndexes[0] === responseStreamEvents.length - 1,
+  };
 
   const reasoning = await client.chat.completions.create({
     model,
@@ -287,16 +386,19 @@ async function main() {
     temperature: 0,
   });
   const reasoningMessage = reasoning.choices?.[0]?.message;
-  const reasoningText = reasoningMessage?.reasoning_content;
-  assert(
-    chatAssistantResult(reasoningMessage),
-    "reasoning request returned no assistant result",
-    reasoning,
-  );
+  const reasoningAccepted = Boolean(reasoningMessage);
   const reasoningObserved =
-    typeof reasoningText === "string" && reasoningText.trim().length > 0;
-  const visibleThinkTags = visibleText(reasoningMessage).includes("<think>");
-  assert(!visibleThinkTags, "reasoning leaked <think> tags into SDK fields", reasoning);
+    typeof reasoningMessage?.reasoning_content === "string" &&
+    reasoningMessage.reasoning_content.trim().length > 0;
+  const visibleThinkTags =
+    typeof reasoningMessage?.content === "string" &&
+    reasoningMessage.content.includes("<think>");
+  const reasoningSemantic = {
+    accepted: reasoningAccepted,
+    observed: reasoningObserved,
+    visible_think_tags: visibleThinkTags,
+    passed: reasoningAccepted && reasoningObserved && !visibleThinkTags,
+  };
 
   const repeated = await client.chat.completions.create({
     model,
@@ -304,59 +406,68 @@ async function main() {
     max_completion_tokens: 8,
     temperature: 0,
   });
-  assert(
-    chatAssistantResult(repeated.choices?.[0]?.message),
-    "repeated warm request returned no assistant result",
-    repeated,
+  const repeatedChoice = repeated.choices?.[0];
+  assert(repeatedChoice, "repeated Chat returned no choice", repeated);
+  const repeatedUsage = validateUsage(repeated.usage, "Repeated Chat");
+  const repeatedSemantic = exactCanary(
+    repeatedChoice.message?.content,
+    repeatedChoice.finish_reason,
+    "ready",
   );
-  validateUsage(repeated.usage, "Repeated Chat");
+
+  const semantics = {
+    chat: chatSemantic,
+    chat_stream: chatStreamSemantic,
+    completions: completionSemantic,
+    responses: responseSemantic,
+    responses_stream: responseStreamSemantic,
+    reasoning: reasoningSemantic,
+    repeated_request: repeatedSemantic,
+  };
+  semantics.passed = Object.values(semantics).every(
+    (section) => section && section.passed === true,
+  );
 
   const report = {
-    requests: {
-      auth: { unauthorized_status: unauthorized.status },
+    transport: {
+      auth: {
+        missing_key: missingKey,
+        wrong_key: wrongKey,
+        protected_routes: protectedRoutes,
+      },
       models: { listed: true, retrieved: true },
-      tokenizer: {
-        roundtrip: true,
-        token_count: tokenize.tokens.length,
-      },
-      chat: {
-        assistant_result: true,
-        finish_reason: chat.choices[0].finish_reason,
-      },
+      tokenizer: { roundtrip: true, token_count: tokenize.tokens.length },
+      chat: { received: true },
       chat_stream: {
-        saw_delta: sawChatDelta,
-        saw_terminal: sawChatTerminal,
-        saw_usage: Boolean(chatStreamUsage),
+        received_delta: chatStreamText.length > 0,
+        received_terminal: chatTerminalIndexes.length > 0,
+        received_usage: Boolean(chatStreamUsage),
       },
-      completions: { assistant_result: true },
-      responses: {
-        assistant_result: true,
-        stored_roundtrip: true,
-      },
+      completions: { received: true },
+      responses: { received: true, stored_roundtrip: storedRoundtrip },
       responses_stream: {
-        saw_delta: sawResponseDelta,
-        saw_completed: sawResponseCompleted,
+        received_delta: responseStreamText.length > 0,
+        received_terminal: responseCompletedIndexes.length > 0,
+        received_usage: Boolean(responseStreamUsage),
       },
-      reasoning: {
-        assistant_result: true,
-        request_accepted: true,
-        reasoning_observed: reasoningObserved,
-        visible_think_tags: visibleThinkTags,
-      },
-      usage_accounting: {
-        chat_valid: chatUsage.totalTokens > 0,
-        chat_stream_valid: normalizedChatStreamUsage.totalTokens > 0,
-        responses_valid: responseUsage.totalTokens > 0,
-        responses_stream_valid: normalizedResponseStreamUsage.totalTokens > 0,
-      },
-      repeated_request: { assistant_result: true },
+      reasoning: { request_accepted: reasoningAccepted },
+      repeated_request: { received: true },
+    },
+    semantic_quality: semantics,
+    usage: {
+      chat: chatUsage,
+      chat_stream: chatStreamUsageCounts,
+      completions: completionUsage,
+      responses: responseUsage,
+      responses_stream: responseStreamUsageCounts,
+      repeated_request: repeatedUsage,
     },
     throughput: {
       first_token_seconds: firstTokenSeconds,
       prefill_tokens_per_second:
-        normalizedChatStreamUsage.promptTokens / firstTokenSeconds,
+        chatStreamUsageCounts.prompt_tokens / firstTokenSeconds,
       decode_tokens_per_second:
-        normalizedChatStreamUsage.completionTokens /
+        chatStreamUsageCounts.completion_tokens /
         Math.max(streamSeconds - firstTokenSeconds, 0.000001),
     },
   };

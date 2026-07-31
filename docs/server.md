@@ -269,7 +269,7 @@ temporary directory and point it at `supersonic-serve`:
 tmpdir=$(mktemp -d /tmp/supersonic-openai-smoke.XXXXXX)
 cd "$tmpdir"
 npm init -y >/dev/null
-npm install openai@6 >/dev/null
+npm install openai@6.49.0 >/dev/null
 
 SUPERSONIC_BASE_URL=http://127.0.0.1:8080 \
 SUPERSONIC_API_KEY=secret \
@@ -280,18 +280,26 @@ SUPERSONIC_API_KEY=secret \
 node /path/to/SuperSonic/scripts/openai_agent_tool_smoke.mjs
 ```
 
-The compatibility smoke covers auth, model list/retrieve, tokenize/detokenize,
-Chat Completions, reasoning separation, terminal streaming usage, legacy
-Completions, Responses create/get/delete, streaming Responses terminal events,
-usage accounting, and a repeated warm request. The agent smoke requires a
-model-generated coding tool call and tool-result continuation through both
-Chat Completions and Responses. It then aborts a stream after the first delta
-and requires the authenticated health and metrics surfaces to report released
-active and queued work.
+The compatibility smoke covers missing and wrong-key auth, protected
+operational routes, model list/retrieve, tokenize/detokenize, exact `hello`
+canaries for Chat Completions, legacy Completions, Responses, and both
+reconstructed streams, terminal ordering and usage, Responses
+create/get/delete, and repeated warm requests. Transport compatibility and
+semantic quality are reported independently. Reasoning acceptance is also
+reported separately from observed reasoning and is not a green capability
+unless reasoning content is actually observed.
+
+The agent smoke requires exactly one model-generated `read_source_file` call
+with a nonempty call ID and exactly `{"path":"src/lib.rs"}`, no suffix text,
+and terminal tool state. It performs a terminal text-only continuation through
+both Chat Completions and Responses. Its cancellation gate observes a
+nonterminal stream delta, queues a second real request, awaits abort closure,
+completes the queued request, and requires authenticated health and metrics to
+report released active and queued work without a model reload.
 
 The 2026-06-28 production refactor validation ran this harness against
-`qwen3.6-27b` Q4KM-GPTQ DFlash on HIP at `127.0.0.1:8013`, using `openai@6`
-from a temporary npm directory. It passed model list/retrieve, Chat
+`qwen3.6-27b` Q4KM-GPTQ DFlash on HIP at `127.0.0.1:8013`, using the then-current
+`openai@6` from a temporary npm directory. It passed model list/retrieve, Chat
 Completions, streaming Chat Completions with usage, legacy Completions,
 Responses create/get/delete, `/tokenize`, and `/metrics`.
 

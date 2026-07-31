@@ -6,16 +6,27 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from tests.openai_sdk_fixture import (
+    API_KEY,
+    CHAT_CALL_ID,
+    MODEL,
+    RESPONSE_CALL_ID,
+    openai_sdk_fixture,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 HARNESS_PATH = ROOT / "tests" / "gfx1100" / "run_qwen36_flm_server_e2e.py"
+SDK_DIR = ROOT / "target" / "openai-sdk-smoke"
 
 
 def load_harness():
@@ -56,6 +67,37 @@ class FakeHttpResponse:
 
 
 class Qwen36FlmServerHarnessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        probe = subprocess.run(
+            ["npm", "list", "openai@6.49.0", "--depth=0", "--json"],
+            cwd=SDK_DIR if SDK_DIR.is_dir() else ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if probe.returncode != 0:
+            SDK_DIR.mkdir(parents=True, exist_ok=True)
+            install = subprocess.run(
+                [
+                    "npm",
+                    "install",
+                    "--no-audit",
+                    "--no-fund",
+                    "--prefix",
+                    str(SDK_DIR),
+                    "openai@6.49.0",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=300,
+            )
+            if install.returncode != 0:
+                raise RuntimeError(f"failed to install pinned OpenAI SDK: {install.stderr}")
+
     def setUp(self):
         self.harness = load_harness()
         self.args = SimpleNamespace(
@@ -71,6 +113,26 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             api_key="local",
             no_download=True,
             startup_timeout=900.0,
+        )
+
+    def run_sdk_fixture_script(self, script_name, base_url):
+        env = os.environ.copy()
+        env.update(
+            {
+                "SUPERSONIC_BASE_URL": base_url,
+                "SUPERSONIC_API_KEY": API_KEY,
+                "SUPERSONIC_SMOKE_MODEL": MODEL,
+                "SUPERSONIC_REQUEST_TIMEOUT_MS": "5000",
+            }
+        )
+        return subprocess.run(
+            ["node", str(ROOT / "scripts" / script_name)],
+            cwd=SDK_DIR,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
         )
 
     def valid_capabilities(self):
@@ -148,6 +210,185 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             ]
         )
 
+    def valid_usage(self):
+        return {
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "total_tokens": 4,
+        }
+
+    def valid_compat_report(self):
+        usage = self.valid_usage()
+        return {
+            "transport": {
+                "auth": {
+                    "missing_key": {
+                        "status": 401,
+                        "error_type": "authentication_error",
+                    },
+                    "wrong_key": {
+                        "status": 401,
+                        "error_type": "authentication_error",
+                    },
+                    "protected_routes": {
+                        path: {
+                            "status": 401,
+                            "error_type": "authentication_error",
+                        }
+                        for path in (
+                            "/health",
+                            "/ready",
+                            "/metrics",
+                            "/v1/capabilities",
+                        )
+                    },
+                },
+                "models": {"listed": True, "retrieved": True},
+                "tokenizer": {"roundtrip": True, "token_count": 2},
+                "chat": {"received": True},
+                "chat_stream": {
+                    "received_delta": True,
+                    "received_terminal": True,
+                    "received_usage": True,
+                },
+                "completions": {"received": True},
+                "responses": {"received": True, "stored_roundtrip": True},
+                "responses_stream": {
+                    "received_delta": True,
+                    "received_terminal": True,
+                    "received_usage": True,
+                },
+                "reasoning": {"request_accepted": True},
+                "repeated_request": {"received": True},
+            },
+            "semantic_quality": {
+                "chat": {
+                    "expected": "hello",
+                    "actual": "hello",
+                    "finish_reason": "stop",
+                    "passed": True,
+                },
+                "chat_stream": {
+                    "expected": "hello",
+                    "actual": "hello",
+                    "finish_reason": "stop",
+                    "passed": True,
+                    "terminal_count": 1,
+                    "terminal_last_before_usage": True,
+                    "usage_last": True,
+                },
+                "completions": {
+                    "expected": "hello",
+                    "actual": "hello",
+                    "finish_reason": "stop",
+                    "passed": True,
+                },
+                "responses": {
+                    "expected": "hello",
+                    "actual": "hello",
+                    "status": "completed",
+                    "stored_roundtrip": True,
+                    "passed": True,
+                },
+                "responses_stream": {
+                    "expected": "hello",
+                    "actual": "hello",
+                    "status": "completed",
+                    "terminal_count": 1,
+                    "terminal_last": True,
+                    "passed": True,
+                },
+                "reasoning": {
+                    "accepted": True,
+                    "observed": True,
+                    "visible_think_tags": False,
+                    "passed": True,
+                },
+                "repeated_request": {
+                    "expected": "ready",
+                    "actual": "ready",
+                    "finish_reason": "stop",
+                    "passed": True,
+                },
+                "passed": True,
+            },
+            "usage": {
+                section: dict(usage)
+                for section in (
+                    "chat",
+                    "chat_stream",
+                    "completions",
+                    "responses",
+                    "responses_stream",
+                    "repeated_request",
+                )
+            },
+            "throughput": {
+                "first_token_seconds": 0.5,
+                "prefill_tokens_per_second": 6.0,
+                "decode_tokens_per_second": 2.0,
+            },
+        }
+
+    def valid_cancellation(self):
+        return {
+            "nonterminal_delta": True,
+            "abort_closed": True,
+            "before": {
+                "active_requests": 1,
+                "queued_requests": 1,
+                "model_loads_total": 1,
+                "metric_active_requests": 1,
+                "metric_queued_requests": 1,
+            },
+            "after": {
+                "active_requests": 0,
+                "queued_requests": 0,
+                "model_loads_total": 1,
+                "metric_active_requests": 0,
+                "metric_queued_requests": 0,
+            },
+            "queued_request_completed": True,
+            "release_seconds": 0.25,
+        }
+
+    def valid_agent_report(self):
+        return {
+            "requests": {
+                "chat_tool_loop": {
+                    "call_count": 1,
+                    "valid_tool_call": True,
+                    "call_id": "call_chat",
+                    "tool_name": "read_source_file",
+                    "arguments": {"path": "src/lib.rs"},
+                    "finish_reason": "tool_calls",
+                    "suffix_content": "",
+                    "continuation": {
+                        "text": "file read",
+                        "finish_reason": "stop",
+                        "tool_call_count": 0,
+                    },
+                    "elapsed_seconds": 0.5,
+                },
+                "responses_tool_loop": {
+                    "call_count": 1,
+                    "valid_tool_call": True,
+                    "call_id": "call_response",
+                    "tool_name": "read_source_file",
+                    "arguments": {"path": "src/lib.rs"},
+                    "status": "completed",
+                    "suffix_content": "",
+                    "continuation": {
+                        "text": "file read",
+                        "status": "completed",
+                        "tool_call_count": 0,
+                    },
+                    "elapsed_seconds": 0.5,
+                },
+            },
+            "cancellation": self.valid_cancellation(),
+        }
+
     def valid_report(self):
         return {
             "model": "qwen3.6-35b-a3b",
@@ -156,39 +397,8 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             "native_int4": 330,
             "bf16_fallback": 0,
             "requests": {
-                "compat": {
-                    "auth": {"unauthorized_status": 401},
-                    "models": {"listed": True, "retrieved": True},
-                    "tokenizer": {"roundtrip": True},
-                    "chat": {"assistant_result": True},
-                    "chat_stream": {
-                        "saw_delta": True,
-                        "saw_terminal": True,
-                        "saw_usage": True,
-                    },
-                    "responses": {"assistant_result": True},
-                    "responses_stream": {
-                        "saw_delta": True,
-                        "saw_completed": True,
-                    },
-                    "reasoning": {
-                        "assistant_result": True,
-                        "request_accepted": True,
-                        "reasoning_observed": False,
-                        "visible_think_tags": False,
-                    },
-                    "usage_accounting": {
-                        "chat_valid": True,
-                        "chat_stream_valid": True,
-                        "responses_valid": True,
-                        "responses_stream_valid": True,
-                    },
-                    "repeated_request": {"assistant_result": True},
-                },
-                "agent": {
-                    "chat_tool_loop": {"assistant_result": True},
-                    "responses_tool_loop": {"assistant_result": True},
-                },
+                "compat": self.valid_compat_report(),
+                "agent": self.valid_agent_report(),
             },
             "startup": {
                 "ready_seconds": 2.0,
@@ -198,20 +408,21 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 "device_upload_bytes": 7_000_000_000,
                 "source_open_count": 1,
                 "resident_allocation_count": 42,
+                "exclusive_components": {},
+                "provenance": {
+                    "artifact": {
+                        "path": "/tmp/qwen.flm",
+                        "sha256": "a" * 64,
+                        "size_bytes": 8_000_000_000,
+                    },
+                    "sdk": {
+                        "package": "openai",
+                        "version": "6.49.0",
+                    },
+                },
             },
-            "throughput": {
-                "first_token_seconds": 0.5,
-                "prefill_tokens_per_second": 120.0,
-                "decode_tokens_per_second": 4.0,
-            },
-            "cancellation": {
-                "aborted_after_first_delta": True,
-                "saw_delta": True,
-                "scheduler_released": True,
-                "active_requests": 0,
-                "queued_requests": 0,
-                "release_seconds": 0.25,
-            },
+            "throughput": self.valid_compat_report()["throughput"],
+            "cancellation": self.valid_cancellation(),
         }
 
     def test_server_command_is_first_class_flm_only(self):
@@ -311,14 +522,19 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "server.log"
             with mock.patch.object(self.harness.os, "killpg") as killpg:
-                with self.harness.running_server(
-                    self.args,
-                    18765,
-                    log_path,
-                    popen_factory=popen_factory,
-                    readiness=lambda *_args, **_kwargs: {"ready": True},
-                ) as ready:
-                    self.assertTrue(ready["ready"])
+                with mock.patch.object(
+                    self.harness,
+                    "_process_group_exists",
+                    side_effect=[True, False],
+                ):
+                    with self.harness.running_server(
+                        self.args,
+                        18765,
+                        log_path,
+                        popen_factory=popen_factory,
+                        readiness=lambda *_args, **_kwargs: {"ready": True},
+                    ) as ready:
+                        self.assertTrue(ready["ready"])
 
         self.assertTrue(calls[0][1]["start_new_session"])
         self.assertEqual(calls[0][1]["stderr"], subprocess.STDOUT)
@@ -331,20 +547,106 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "server.log"
             with mock.patch.object(self.harness.os, "killpg") as killpg:
-                with self.assertRaisesRegex(self.harness.PhaseError, "not ready"):
-                    with self.harness.running_server(
-                        self.args,
-                        18765,
-                        log_path,
-                        popen_factory=lambda *_args, **_kwargs: process,
-                        readiness=mock.Mock(
-                            side_effect=self.harness.PhaseError("not ready")
-                        ),
-                    ):
-                        self.fail("server should not be yielded")
+                with mock.patch.object(
+                    self.harness,
+                    "_process_group_exists",
+                    side_effect=[True, False],
+                ):
+                    with self.assertRaisesRegex(self.harness.PhaseError, "not ready"):
+                        with self.harness.running_server(
+                            self.args,
+                            18765,
+                            log_path,
+                            popen_factory=lambda *_args, **_kwargs: process,
+                            readiness=mock.Mock(
+                                side_effect=self.harness.PhaseError("not ready")
+                            ),
+                        ):
+                            self.fail("server should not be yielded")
 
         killpg.assert_called_once_with(process.pid, signal.SIGTERM)
         self.assertEqual(process.communicate_calls, [self.harness.PROCESS_GRACE_SECONDS])
+
+    def wait_pid_file(self, path):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if path.exists() and path.read_text().strip():
+                return int(path.read_text().strip())
+            time.sleep(0.02)
+        self.fail(f"timed out waiting for pid file {path}")
+
+    def assert_process_gone(self, pid):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not Path(f"/proc/{pid}").exists():
+                return
+            time.sleep(0.02)
+        self.fail(f"process {pid} survived cleanup")
+
+    def test_process_group_cleanup_kills_descendant_after_leader_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "child.pid"
+            leader = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import subprocess,sys;"
+                        "p=subprocess.Popen([sys.executable,'-c',"
+                        "'import time;time.sleep(60)'],"
+                        "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+                        f"open({str(pid_file)!r},'w').write(str(p.pid))"
+                    ),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            child_pid = self.wait_pid_file(pid_file)
+            leader.wait(timeout=5)
+            with mock.patch.object(self.harness, "PROCESS_GRACE_SECONDS", 0.2):
+                self.harness._terminate_and_reap_process_group(leader)
+
+        try:
+            self.assert_process_gone(child_pid)
+        finally:
+            if Path(f"/proc/{child_pid}").exists():
+                os.kill(child_pid, signal.SIGKILL)
+
+    def test_process_group_cleanup_sigkills_resistant_leader_and_grandchild(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child_file = Path(tmp) / "child.pid"
+            leader = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import signal,subprocess,sys,time;"
+                        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                        "p=subprocess.Popen([sys.executable,'-c',"
+                        "'import signal,time;"
+                        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                        "time.sleep(60)'],"
+                        "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+                        f"open({str(child_file)!r},'w').write(str(p.pid));"
+                        "time.sleep(60)"
+                    ),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            child_pid = self.wait_pid_file(child_file)
+            with mock.patch.object(self.harness, "PROCESS_GRACE_SECONDS", 0.2):
+                self.harness._terminate_and_reap_process_group(leader)
+
+        try:
+            self.assert_process_gone(leader.pid)
+            self.assert_process_gone(child_pid)
+        finally:
+            for pid in (leader.pid, child_pid):
+                if Path(f"/proc/{pid}").exists():
+                    os.kill(pid, signal.SIGKILL)
 
     def test_parse_metrics_accepts_finite_scalar_samples(self):
         metrics = self.harness.parse_prometheus_metrics(self.valid_metrics_text())
@@ -457,6 +759,218 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 with self.assertRaises(self.harness.PhaseError):
                     self.harness.parse_smoke_output(invalid, "compat")
 
+    def test_sdk_probe_install_and_verification_are_bounded_and_exactly_pinned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(
+                node="node",
+                npm="npm",
+                openai_sdk_dir=Path(tmp),
+                sdk_probe_timeout=7.0,
+                sdk_install_timeout=11.0,
+            )
+            results = [
+                subprocess.CompletedProcess(
+                    [],
+                    1,
+                    '{"dependencies":{"openai":{"version":"6.48.0"}}}',
+                    "",
+                ),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    '{"dependencies":{"openai":{"version":"6.49.0"}}}',
+                    "",
+                ),
+            ]
+            with mock.patch.object(
+                self.harness,
+                "run_process",
+                side_effect=results,
+            ) as run_process:
+                with mock.patch.object(
+                    self.harness.subprocess,
+                    "run",
+                    side_effect=AssertionError("unbounded subprocess.run"),
+                ):
+                    sdk = self.harness.ensure_openai_sdk(args)
+
+        self.assertEqual(
+            sdk,
+            {
+                "directory": Path(tmp),
+                "package": "openai",
+                "version": "6.49.0",
+            },
+        )
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in run_process.call_args_list],
+            [7.0, 11.0, 7.0],
+        )
+        install_command = run_process.call_args_list[1].args[0]
+        self.assertIn("openai@6.49.0", install_command)
+
+    def test_run_supersedes_stale_success_with_phase_failure_and_final_evidence(self):
+        before = {
+            "model": MODEL,
+            "source": "flm",
+            "load_sequence": 1,
+            "native_int4": 330,
+            "bf16_fallback": 0,
+            "model_loads_total": 1,
+            "startup": {"total_seconds": 1.0, "exclusive_components": {}},
+            "transfer_backend": "pageable-h2d",
+            "source_bytes": 4,
+            "device_upload_bytes": 4,
+            "source_open_count": 1,
+            "resident_allocation_count": 1,
+            "scheduler": {"active_requests": 0, "queued_requests": 0},
+        }
+
+        @contextlib.contextmanager
+        def fake_server(*_args, **_kwargs):
+            yield {"ready": True}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            flm = tmp_path / "model.flm"
+            flm.write_bytes(b"flm\n")
+            out_json = tmp_path / "result.json"
+            out_json.write_text('{"status":"stale-success"}\n')
+            args = SimpleNamespace(
+                binary=tmp_path / "supersonic-serve",
+                flm=flm,
+                backend="hip",
+                device=0,
+                max_context=4096,
+                host="127.0.0.1",
+                api_key="local",
+                no_download=True,
+                startup_timeout=1.0,
+                request_timeout=1.0,
+                sdk_probe_timeout=1.0,
+                sdk_install_timeout=1.0,
+                openai_sdk_dir=tmp_path / "sdk",
+                node="node",
+                npm="npm",
+                out_json=out_json,
+            )
+            health = {
+                "status": "ok",
+                "active_requests": 0,
+                "queued_requests": 0,
+            }
+            metrics = {
+                "supersonic_active_requests": 0,
+                "supersonic_queued_requests": 0,
+                "supersonic_model_loads_total": 1,
+            }
+
+            with mock.patch.object(self.harness, "discover_inputs"):
+                with mock.patch.object(
+                    self.harness,
+                    "ensure_openai_sdk",
+                    return_value={
+                        "directory": tmp_path / "sdk",
+                        "package": "openai",
+                        "version": "6.49.0",
+                    },
+                ):
+                    with mock.patch.object(
+                        self.harness,
+                        "running_server",
+                        fake_server,
+                    ):
+                        with mock.patch.object(
+                            self.harness,
+                            "validate_flm_evidence",
+                            side_effect=[before, before],
+                        ):
+                            with mock.patch.object(
+                                self.harness,
+                                "fetch_json",
+                                side_effect=lambda _url, path, _key: (
+                                    health if path == "/health" else {"ready": True}
+                                ),
+                            ):
+                                with mock.patch.object(
+                                    self.harness,
+                                    "fetch_metrics",
+                                    return_value=metrics,
+                                ):
+                                    with mock.patch.object(
+                                        self.harness,
+                                        "run_sdk_smoke",
+                                        side_effect=[
+                                            self.valid_compat_report(),
+                                            self.harness.PhaseError(
+                                                "invalid real tool output"
+                                            ),
+                                        ],
+                                    ):
+                                        with self.assertRaisesRegex(
+                                            self.harness.PhaseError,
+                                            "invalid real tool output",
+                                        ):
+                                            self.harness.run(args)
+
+            failure = json.loads(out_json.read_text())
+
+        self.assertEqual(
+            set(failure),
+            {
+                "schema_version",
+                "status",
+                "phase",
+                "error",
+                "provenance",
+                "completed",
+                "final",
+            },
+        )
+        self.assertEqual(failure["status"], "failed")
+        self.assertEqual(failure["phase"], "agent")
+        self.assertIn("invalid real tool output", failure["error"]["message"])
+        self.assertEqual(failure["provenance"]["sdk"]["version"], "6.49.0")
+        self.assertEqual(len(failure["provenance"]["artifact"]["sha256"]), 64)
+        self.assertTrue(failure["completed"]["compat"]["semantic_quality"]["passed"])
+        self.assertEqual(failure["final"]["health"], health)
+        self.assertEqual(failure["final"]["metrics"], metrics)
+        self.assertTrue(failure["final"]["load_invariance"]["passed"])
+
+    def test_protocol_phases_continue_after_semantic_failure(self):
+        args = SimpleNamespace()
+        compat = self.valid_compat_report()
+        agent = self.valid_agent_report()
+        with mock.patch.object(
+            self.harness,
+            "run_sdk_smoke",
+            side_effect=[compat, agent],
+        ) as run_sdk_smoke:
+            with mock.patch.object(
+                self.harness,
+                "validate_compat_report",
+                side_effect=self.harness.PhaseError("semantic canary failed"),
+            ):
+                result = self.harness.run_protocol_phases(
+                    args,
+                    Path("/tmp/sdk"),
+                    "http://127.0.0.1:1234",
+                )
+
+        self.assertEqual(run_sdk_smoke.call_count, 2)
+        self.assertIs(result["compat"], compat)
+        self.assertIs(result["agent"], agent)
+        self.assertEqual(
+            result["failures"],
+            [
+                {
+                    "phase": "compat_semantic",
+                    "message": "semantic canary failed",
+                }
+            ],
+        )
+
     def test_validate_report_accepts_complete_structured_evidence(self):
         report = self.valid_report()
 
@@ -486,17 +1000,19 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
 
     def test_validate_report_rejects_missing_protocol_or_release_evidence(self):
         missing_paths = [
-            ("requests", "compat", "auth"),
-            ("requests", "compat", "chat"),
-            ("requests", "compat", "chat_stream"),
-            ("requests", "compat", "responses"),
-            ("requests", "compat", "responses_stream"),
-            ("requests", "compat", "reasoning"),
-            ("requests", "compat", "usage_accounting"),
-            ("requests", "compat", "repeated_request"),
-            ("requests", "agent", "chat_tool_loop"),
-            ("requests", "agent", "responses_tool_loop"),
-            ("cancellation", "scheduler_released"),
+            ("requests", "compat", "transport", "auth"),
+            ("requests", "compat", "semantic_quality", "chat"),
+            ("requests", "compat", "semantic_quality", "chat_stream"),
+            ("requests", "compat", "semantic_quality", "completions"),
+            ("requests", "compat", "semantic_quality", "responses"),
+            ("requests", "compat", "semantic_quality", "responses_stream"),
+            ("requests", "compat", "semantic_quality", "reasoning"),
+            ("requests", "compat", "usage", "completions"),
+            ("requests", "compat", "semantic_quality", "repeated_request"),
+            ("requests", "agent", "requests", "chat_tool_loop"),
+            ("requests", "agent", "requests", "responses_tool_loop"),
+            ("cancellation", "before"),
+            ("startup", "provenance"),
         ]
         for path in missing_paths:
             with self.subTest(path=path):
@@ -536,7 +1052,8 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             "Your entire response must be exactly one call",
             "cancellation_release",
             "raw",
-            "scheduler_released",
+            "queued_request_completed",
+            "abort_closed",
         ):
             with self.subTest(contract=contract):
                 self.assertIn(contract, source)
@@ -547,9 +1064,154 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         )
 
         self.assertLess(
-            source.index("const cancellationStream"),
-            source.index("const chatStarted"),
+            source.index("report.cancellation = await cancellationGate()"),
+            source.index("report.requests.chat_tool_loop = await chatToolLoop()"),
         )
+
+    def test_compat_script_executes_exact_semantics_with_official_sdk(self):
+        source = (ROOT / "scripts" / "openai_compat_smoke.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("wrongKeyClient.models.list()", source)
+
+        with openai_sdk_fixture() as (base_url, _state):
+            result = self.run_sdk_fixture_script(
+                "openai_compat_smoke.mjs",
+                base_url,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.harness.parse_smoke_output(result.stdout, "compat fixture")
+        self.assertEqual(
+            set(report),
+            {"transport", "semantic_quality", "usage", "throughput"},
+        )
+        semantics = report["semantic_quality"]
+        for section in ("chat", "chat_stream", "completions", "responses", "responses_stream"):
+            with self.subTest(section=section):
+                self.assertEqual(semantics[section]["expected"], "hello")
+                self.assertEqual(semantics[section]["actual"], "hello")
+                self.assertTrue(semantics[section]["passed"])
+        self.assertEqual(semantics["chat"]["finish_reason"], "stop")
+        self.assertEqual(semantics["chat_stream"]["finish_reason"], "stop")
+        self.assertEqual(semantics["chat_stream"]["terminal_count"], 1)
+        self.assertTrue(semantics["chat_stream"]["terminal_last_before_usage"])
+        self.assertTrue(semantics["chat_stream"]["usage_last"])
+        self.assertEqual(semantics["responses"]["status"], "completed")
+        self.assertTrue(semantics["responses"]["stored_roundtrip"])
+        self.assertEqual(semantics["responses_stream"]["status"], "completed")
+        self.assertEqual(semantics["responses_stream"]["terminal_count"], 1)
+        self.assertTrue(semantics["responses_stream"]["terminal_last"])
+        self.assertTrue(semantics["reasoning"]["accepted"])
+        self.assertTrue(semantics["reasoning"]["observed"])
+
+    def test_agent_script_executes_exact_tool_loops_and_contention_abort(self):
+        with openai_sdk_fixture() as (base_url, _state):
+            result = self.run_sdk_fixture_script(
+                "openai_agent_tool_smoke.mjs",
+                base_url,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.harness.parse_smoke_output(result.stdout, "agent fixture")
+        chat = report["requests"]["chat_tool_loop"]
+        self.assertEqual(chat["call_count"], 1)
+        self.assertEqual(chat["call_id"], CHAT_CALL_ID)
+        self.assertEqual(chat["tool_name"], "read_source_file")
+        self.assertEqual(chat["arguments"], {"path": "src/lib.rs"})
+        self.assertEqual(chat["finish_reason"], "tool_calls")
+        self.assertEqual(chat["suffix_content"], "")
+        self.assertEqual(chat["continuation"]["text"], "file read")
+        self.assertEqual(chat["continuation"]["finish_reason"], "stop")
+        self.assertEqual(chat["continuation"]["tool_call_count"], 0)
+
+        responses = report["requests"]["responses_tool_loop"]
+        self.assertEqual(responses["call_count"], 1)
+        self.assertEqual(responses["call_id"], RESPONSE_CALL_ID)
+        self.assertEqual(responses["tool_name"], "read_source_file")
+        self.assertEqual(responses["arguments"], {"path": "src/lib.rs"})
+        self.assertEqual(responses["status"], "completed")
+        self.assertEqual(responses["suffix_content"], "")
+        self.assertEqual(responses["continuation"]["text"], "file read")
+        self.assertEqual(responses["continuation"]["status"], "completed")
+        self.assertEqual(responses["continuation"]["tool_call_count"], 0)
+
+        cancellation = report["cancellation"]
+        self.assertTrue(cancellation["nonterminal_delta"])
+        self.assertTrue(cancellation["abort_closed"])
+        self.assertEqual(cancellation["before"]["active_requests"], 1)
+        self.assertEqual(cancellation["before"]["queued_requests"], 1)
+        self.assertEqual(cancellation["before"]["model_loads_total"], 1)
+        self.assertEqual(cancellation["after"]["active_requests"], 0)
+        self.assertEqual(cancellation["after"]["queued_requests"], 0)
+        self.assertEqual(cancellation["after"]["model_loads_total"], 1)
+        self.assertTrue(cancellation["queued_request_completed"])
+
+    def test_agent_script_preserves_malformed_raw_model_output(self):
+        with openai_sdk_fixture(malformed_agent=True) as (base_url, _state):
+            result = self.run_sdk_fixture_script(
+                "openai_agent_tool_smoke.mjs",
+                base_url,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Chat did not generate exactly one valid tool call",
+            result.stderr,
+        )
+        self.assertIn("src/lib.rs", result.stderr)
+        self.assertIn("trailing", result.stderr)
+        partial = self.harness.parse_smoke_output(
+            result.stdout,
+            "malformed agent fixture",
+        )
+        self.harness.validate_agent_failure_report(partial)
+        self.assertEqual(partial["failure"]["phase"], "chat_tool_loop")
+        self.assertIn("src/lib.rs", json.dumps(partial["failure"]["raw"]))
+        self.assertIn("trailing", json.dumps(partial["failure"]["raw"]))
+        self.assertTrue(partial["cancellation"]["nonterminal_delta"])
+        self.assertTrue(partial["cancellation"]["abort_closed"])
+
+    def test_run_protocol_phases_preserves_structured_agent_failure(self):
+        args = SimpleNamespace(
+            node="node",
+            api_key=API_KEY,
+            request_timeout=5.0,
+        )
+        with openai_sdk_fixture(malformed_agent=True) as (base_url, _state):
+            protocol = self.harness.run_protocol_phases(
+                args,
+                SDK_DIR,
+                base_url,
+            )
+
+        self.assertIsNotNone(protocol["compat"])
+        self.assertIsNotNone(protocol["agent"])
+        self.assertEqual(protocol["agent"]["failure"]["phase"], "chat_tool_loop")
+        self.assertTrue(protocol["agent"]["cancellation"]["queued_request_completed"])
+        self.assertEqual(
+            [failure["phase"] for failure in protocol["failures"]],
+            ["agent"],
+        )
+
+    def test_agent_failure_report_revalidates_completed_tool_loops(self):
+        agent = self.valid_agent_report()
+        partial = {
+            "requests": {
+                "chat_tool_loop": agent["requests"]["chat_tool_loop"],
+            },
+            "cancellation": agent["cancellation"],
+            "failure": {
+                "phase": "responses_tool_loop",
+                "message": "Responses continuation failed",
+                "raw": {"status": "incomplete"},
+            },
+        }
+        self.harness.validate_agent_failure_report(partial)
+
+        partial["requests"]["chat_tool_loop"]["call_count"] = 2
+        with self.assertRaises(self.harness.PhaseError):
+            self.harness.validate_agent_failure_report(partial)
 
 
 if __name__ == "__main__":

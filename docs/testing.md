@@ -120,9 +120,9 @@ partial file for diagnosis. The verifier invokes the SuperSonic subprocess
 with the FLM as `--model-dir` and does not pass an HF path to it.
 
 The persistent real-server gate starts `supersonic-serve` with `--flm-file` on
-an unused loopback port, installs `openai@6` under `target/` when needed, and
-runs the compatibility and coding-tool SDK smokes against the same resident
-process:
+an unused loopback port, installs exactly `openai@6.49.0` under `target/` when
+needed, records that version in provenance, and runs the compatibility and
+coding-tool SDK smokes against the same resident process:
 
 ```bash
 python3 tests/gfx1100/run_qwen36_flm_server_e2e.py \
@@ -133,13 +133,28 @@ python3 tests/gfx1100/run_qwen36_flm_server_e2e.py \
   --out-json target/qwen36_35b_a3b_flm_server_e2e.json
 ```
 
-The gate polls authenticated `/ready`, validates exact FLM load evidence, runs
-Chat Completions and Responses non-streaming and streaming requests, performs
-both tool-result continuations, aborts an in-flight stream, and waits for queue
-release. It rejects a changed load sequence or model-load count after repeated
-requests. The structured report records requests, startup and transfer
-evidence, client-observed first-token/prefill/decode rates, and cancellation
-state. The adjacent `.server.log` retains server startup and failure output.
+The compatibility gate reports transport separately from semantic quality. Its
+Chat, Completions, Responses, and reconstructed-stream canaries must normalize
+to exactly `hello`, stop normally, contain one final terminal event in protocol
+order, and report terminal usage. Reasoning acceptance and observation are
+separate; reasoning is not green unless content is observed without visible
+thinking tags. Missing and wrong keys are checked through the SDK and on every
+protected operational route.
+
+The agent gate performs exact one-call Chat and Responses tool loops, including
+call IDs, name, arguments, no suffix text, terminal state, and text-only
+continuations. Cancellation must first observe a nonterminal delta, place a
+second request in the queue, await abort closure, complete the queued request,
+and prove both health and metrics return to idle without reloading the model.
+The structured report uses an exact nested schema for raw usage, stored
+Responses round-trips, tool evidence, scheduler snapshots, timings, and
+artifact/SDK provenance.
+
+The harness removes any prior output before startup. On failure it atomically
+writes a phase-labelled failure report after collecting final health, metrics,
+and load evidence in the server cleanup path; the adjacent `.server.log`
+retains startup and request output. Process cleanup owns the complete process
+group and escalates surviving descendants to `SIGKILL`.
 
 Run its deterministic lifecycle and report contracts plus the real route
 protocol suite with:

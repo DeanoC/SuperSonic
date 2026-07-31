@@ -1006,8 +1006,8 @@ mod tests {
     use tokio::sync::{mpsc, Mutex};
 
     use super::{
-        finish_after_emitted_token, incremental_delta, run, spawn, FinishReason, GenEvent,
-        GenParams,
+        emit_generated_ids, finish_after_emitted_token, incremental_delta, run, spawn,
+        FinishReason, GenEvent, GenParams, GenerationStats, GenerationTelemetry,
     };
     use crate::prefix_cache::{CacheRequest, CacheRetention, PrefixCache, PrefixCacheConfig};
     use crate::qwen36_moe::engine::Qwen36MoePrefillBoundary;
@@ -1043,7 +1043,7 @@ mod tests {
 
     fn tokenizer() -> tokenizers::Tokenizer {
         tokenizers::Tokenizer::from_bytes(
-            r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"hello":1,"world":2},"unk_token":"[UNK]"}}"#,
+            r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"hello":1,"world":2,"<|im_end|>":3,"<|endoftext|>":4},"unk_token":"[UNK]"}}"#,
         )
         .expect("deterministic tokenizer")
     }
@@ -1195,6 +1195,39 @@ mod tests {
             Some(FinishReason::Length)
         ));
         assert!(finish_after_emitted_token(1, 2).is_none());
+    }
+
+    #[test]
+    fn qwen_generation_stops_on_either_eos_without_emitting_it() {
+        for eos_id in [3, 4] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let emitted = emit_generated_ids(
+                &tokenizer(),
+                &[3, 4],
+                &[1, eos_id, 2],
+                &params(8),
+                GenerationStats::token_counts(2, 0, 0),
+                &GenerationTelemetry::default(),
+                &tx,
+            );
+            assert!(emitted.is_ok(), "EOS generation events");
+
+            let mut text = String::new();
+            let mut terminal = None;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    GenEvent::Token(delta) => text.push_str(&delta),
+                    GenEvent::Done { reason, stats } => {
+                        terminal = Some((reason, stats));
+                    }
+                    GenEvent::Error(error) => panic!("unexpected error: {error}"),
+                }
+            }
+            let (reason, stats) = terminal.expect("terminal event");
+            assert_eq!(text, "hello");
+            assert!(matches!(reason, FinishReason::Stop));
+            assert_eq!(stats.completion_tokens, 1);
+        }
     }
 
     #[test]

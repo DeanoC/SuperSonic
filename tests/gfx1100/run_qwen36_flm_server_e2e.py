@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -34,6 +35,7 @@ EXPECTED_NATIVE_INT4 = 330
 EXPECTED_BF16_FALLBACK = 0
 EXPECTED_REQUIRED_WEIGHTS = 693
 EXPECTED_RAW_DENSE_WEIGHTS = 363
+OPENAI_SDK_VERSION = "6.49.0"
 PROCESS_GRACE_SECONDS = 5
 READY_POLL_SECONDS = 0.25
 HTTP_TIMEOUT_SECONDS = 5.0
@@ -42,6 +44,12 @@ SMOKE_JSON_PREFIX = "SUPERSONIC_SMOKE_JSON="
 
 class PhaseError(RuntimeError):
     pass
+
+
+class SdkSmokeFailure(PhaseError):
+    def __init__(self, message: str, report: dict[str, Any]):
+        super().__init__(message)
+        self.report = report
 
 
 def server_command(args: argparse.Namespace, port: int) -> list[str]:
@@ -84,24 +92,55 @@ def _log_tail(path: Path, limit: int = 16_384) -> str:
         return f"<unable to read server log: {exc}>"
 
 
-def _terminate_and_reap_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        process.communicate()
-        return
+def _process_group_exists(pgid: int) -> bool:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(pgid, 0)
     except ProcessLookupError:
-        pass
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(pgid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(pgid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def _reap_leader(
+    process: subprocess.Popen[str],
+    timeout: float,
+) -> bool:
     try:
-        process.communicate(timeout=PROCESS_GRACE_SECONDS)
-        return
+        process.communicate(timeout=timeout)
+        return True
     except subprocess.TimeoutExpired:
-        pass
+        return False
+
+
+def _terminate_and_reap_process_group(process: subprocess.Popen[str]) -> None:
+    pgid = process.pid
+    if _process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    leader_reaped = _reap_leader(process, PROCESS_GRACE_SECONDS)
+    group_gone = _wait_for_process_group_exit(pgid, PROCESS_GRACE_SECONDS)
+    if group_gone:
+        return
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    process.communicate()
+    if not leader_reaped:
+        _reap_leader(process, PROCESS_GRACE_SECONDS)
+    if not _wait_for_process_group_exit(pgid, PROCESS_GRACE_SECONDS):
+        raise PhaseError(f"process group {pgid} survived SIGKILL")
 
 
 def wait_for_ready(
@@ -413,6 +452,493 @@ def _require_true(report: dict[str, Any], *path: str) -> None:
     _expect(_path(report, *path), True, ".".join(path))
 
 
+def _exact_mapping(
+    value: object,
+    keys: set[str],
+    label: str,
+) -> dict[str, Any]:
+    mapping = _mapping(value, label)
+    if set(mapping) != keys:
+        raise PhaseError(
+            f"{label} keys must be {sorted(keys)}, got {sorted(mapping)}"
+        )
+    return mapping
+
+
+def _nonempty_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise PhaseError(f"{label} must be a non-empty string")
+    return value
+
+
+def _validate_usage(value: object, label: str) -> None:
+    usage = _exact_mapping(
+        value,
+        {"prompt_tokens", "completion_tokens", "total_tokens"},
+        label,
+    )
+    prompt = _positive_int(usage["prompt_tokens"], f"{label}.prompt_tokens")
+    completion = _positive_int(
+        usage["completion_tokens"],
+        f"{label}.completion_tokens",
+    )
+    total = _positive_int(usage["total_tokens"], f"{label}.total_tokens")
+    if total != prompt + completion:
+        raise PhaseError(f"{label}.total_tokens does not add up")
+
+
+def _validate_auth_result(value: object, label: str) -> None:
+    result = _exact_mapping(value, {"status", "error_type"}, label)
+    _strict_int(result["status"], f"{label}.status")
+    _expect(result["status"], 401, f"{label}.status")
+    _expect(
+        result["error_type"],
+        "authentication_error",
+        f"{label}.error_type",
+    )
+
+
+def _validate_canary(
+    value: object,
+    label: str,
+    *,
+    expected: str,
+) -> None:
+    canary = _exact_mapping(
+        value,
+        {"expected", "actual", "finish_reason", "passed"},
+        label,
+    )
+    _expect(canary["expected"], expected, f"{label}.expected")
+    _expect(canary["actual"], expected, f"{label}.actual")
+    _expect(canary["finish_reason"], "stop", f"{label}.finish_reason")
+    _expect(canary["passed"], True, f"{label}.passed")
+
+
+def validate_compat_report(report: dict[str, Any]) -> dict[str, Any]:
+    _exact_mapping(
+        report,
+        {"transport", "semantic_quality", "usage", "throughput"},
+        "compat report",
+    )
+    transport = _exact_mapping(
+        report["transport"],
+        {
+            "auth",
+            "models",
+            "tokenizer",
+            "chat",
+            "chat_stream",
+            "completions",
+            "responses",
+            "responses_stream",
+            "reasoning",
+            "repeated_request",
+        },
+        "compat transport",
+    )
+    auth = _exact_mapping(
+        transport["auth"],
+        {"missing_key", "wrong_key", "protected_routes"},
+        "compat transport.auth",
+    )
+    _validate_auth_result(auth["missing_key"], "compat auth.missing_key")
+    _validate_auth_result(auth["wrong_key"], "compat auth.wrong_key")
+    protected = _exact_mapping(
+        auth["protected_routes"],
+        {"/health", "/ready", "/metrics", "/v1/capabilities"},
+        "compat auth.protected_routes",
+    )
+    for path, evidence in protected.items():
+        _validate_auth_result(evidence, f"compat auth.protected_routes[{path}]")
+
+    transport_shapes = {
+        "models": {"listed", "retrieved"},
+        "tokenizer": {"roundtrip", "token_count"},
+        "chat": {"received"},
+        "chat_stream": {
+            "received_delta",
+            "received_terminal",
+            "received_usage",
+        },
+        "completions": {"received"},
+        "responses": {"received", "stored_roundtrip"},
+        "responses_stream": {
+            "received_delta",
+            "received_terminal",
+            "received_usage",
+        },
+        "reasoning": {"request_accepted"},
+        "repeated_request": {"received"},
+    }
+    for section, keys in transport_shapes.items():
+        evidence = _exact_mapping(
+            transport[section],
+            keys,
+            f"compat transport.{section}",
+        )
+        for key, value in evidence.items():
+            if key == "token_count":
+                _positive_int(value, "compat transport.tokenizer.token_count")
+            else:
+                _expect(value, True, f"compat transport.{section}.{key}")
+
+    semantics = _exact_mapping(
+        report["semantic_quality"],
+        {
+            "chat",
+            "chat_stream",
+            "completions",
+            "responses",
+            "responses_stream",
+            "reasoning",
+            "repeated_request",
+            "passed",
+        },
+        "compat semantic_quality",
+    )
+    _validate_canary(semantics["chat"], "semantic chat", expected="hello")
+    _validate_canary(
+        semantics["completions"],
+        "semantic completions",
+        expected="hello",
+    )
+    _validate_canary(
+        semantics["repeated_request"],
+        "semantic repeated_request",
+        expected="ready",
+    )
+
+    chat_stream = _exact_mapping(
+        semantics["chat_stream"],
+        {
+            "expected",
+            "actual",
+            "finish_reason",
+            "passed",
+            "terminal_count",
+            "terminal_last_before_usage",
+            "usage_last",
+        },
+        "semantic chat_stream",
+    )
+    for key, expected in (
+        ("expected", "hello"),
+        ("actual", "hello"),
+        ("finish_reason", "stop"),
+        ("passed", True),
+        ("terminal_count", 1),
+        ("terminal_last_before_usage", True),
+        ("usage_last", True),
+    ):
+        if key == "terminal_count":
+            _strict_int(chat_stream[key], f"semantic chat_stream.{key}")
+        _expect(chat_stream[key], expected, f"semantic chat_stream.{key}")
+
+    responses = _exact_mapping(
+        semantics["responses"],
+        {
+            "expected",
+            "actual",
+            "status",
+            "stored_roundtrip",
+            "passed",
+        },
+        "semantic responses",
+    )
+    for key, expected in (
+        ("expected", "hello"),
+        ("actual", "hello"),
+        ("status", "completed"),
+        ("stored_roundtrip", True),
+        ("passed", True),
+    ):
+        _expect(responses[key], expected, f"semantic responses.{key}")
+
+    responses_stream = _exact_mapping(
+        semantics["responses_stream"],
+        {
+            "expected",
+            "actual",
+            "status",
+            "terminal_count",
+            "terminal_last",
+            "passed",
+        },
+        "semantic responses_stream",
+    )
+    for key, expected in (
+        ("expected", "hello"),
+        ("actual", "hello"),
+        ("status", "completed"),
+        ("terminal_count", 1),
+        ("terminal_last", True),
+        ("passed", True),
+    ):
+        if key == "terminal_count":
+            _strict_int(
+                responses_stream[key],
+                "semantic responses_stream.terminal_count",
+            )
+        _expect(
+            responses_stream[key],
+            expected,
+            f"semantic responses_stream.{key}",
+        )
+
+    reasoning = _exact_mapping(
+        semantics["reasoning"],
+        {"accepted", "observed", "visible_think_tags", "passed"},
+        "semantic reasoning",
+    )
+    _expect(reasoning["accepted"], True, "semantic reasoning.accepted")
+    _expect(reasoning["observed"], True, "semantic reasoning.observed")
+    _expect(
+        reasoning["visible_think_tags"],
+        False,
+        "semantic reasoning.visible_think_tags",
+    )
+    _expect(reasoning["passed"], True, "semantic reasoning.passed")
+    _expect(semantics["passed"], True, "semantic_quality.passed")
+
+    usage = _exact_mapping(
+        report["usage"],
+        {
+            "chat",
+            "chat_stream",
+            "completions",
+            "responses",
+            "responses_stream",
+            "repeated_request",
+        },
+        "compat usage",
+    )
+    for section, counts in usage.items():
+        _validate_usage(counts, f"compat usage.{section}")
+
+    throughput = _exact_mapping(
+        report["throughput"],
+        {
+            "first_token_seconds",
+            "prefill_tokens_per_second",
+            "decode_tokens_per_second",
+        },
+        "compat throughput",
+    )
+    for key, value in throughput.items():
+        if _finite_number(value, f"compat throughput.{key}") <= 0:
+            raise PhaseError(f"compat throughput.{key} must be positive")
+    return report
+
+
+def _validate_scheduler_evidence(
+    value: object,
+    label: str,
+    *,
+    active: int,
+    queued: int,
+) -> None:
+    snapshot = _exact_mapping(
+        value,
+        {
+            "active_requests",
+            "queued_requests",
+            "model_loads_total",
+            "metric_active_requests",
+            "metric_queued_requests",
+        },
+        label,
+    )
+    expected = {
+        "active_requests": active,
+        "queued_requests": queued,
+        "model_loads_total": 1,
+        "metric_active_requests": active,
+        "metric_queued_requests": queued,
+    }
+    for key, expected_value in expected.items():
+        _strict_int(snapshot[key], f"{label}.{key}")
+        _expect(snapshot[key], expected_value, f"{label}.{key}")
+
+
+def validate_cancellation(value: object, label: str = "cancellation") -> dict[str, Any]:
+    cancellation = _exact_mapping(
+        value,
+        {
+            "nonterminal_delta",
+            "abort_closed",
+            "before",
+            "after",
+            "queued_request_completed",
+            "release_seconds",
+        },
+        label,
+    )
+    for key in ("nonterminal_delta", "abort_closed", "queued_request_completed"):
+        _expect(cancellation[key], True, f"{label}.{key}")
+    _validate_scheduler_evidence(
+        cancellation["before"],
+        f"{label}.before",
+        active=1,
+        queued=1,
+    )
+    _validate_scheduler_evidence(
+        cancellation["after"],
+        f"{label}.after",
+        active=0,
+        queued=0,
+    )
+    if _finite_number(cancellation["release_seconds"], f"{label}.release_seconds") < 0:
+        raise PhaseError(f"{label}.release_seconds must be non-negative")
+    return cancellation
+
+
+def _validate_agent_loop(name: str, value: object) -> dict[str, Any]:
+    loop_specs = {
+        "chat_tool_loop": {
+            "terminal_key": "finish_reason",
+            "terminal_value": "tool_calls",
+            "continuation_terminal_key": "finish_reason",
+            "continuation_terminal_value": "stop",
+        },
+        "responses_tool_loop": {
+            "terminal_key": "status",
+            "terminal_value": "completed",
+            "continuation_terminal_key": "status",
+            "continuation_terminal_value": "completed",
+        },
+    }
+    spec = loop_specs[name]
+    loop = _exact_mapping(
+        value,
+        {
+            "call_count",
+            "valid_tool_call",
+            "call_id",
+            "tool_name",
+            "arguments",
+            spec["terminal_key"],
+            "suffix_content",
+            "continuation",
+            "elapsed_seconds",
+        },
+        f"agent requests.{name}",
+    )
+    _strict_int(loop["call_count"], f"agent {name}.call_count")
+    _expect(loop["call_count"], 1, f"agent {name}.call_count")
+    _expect(loop["valid_tool_call"], True, f"agent {name}.valid_tool_call")
+    _nonempty_string(loop["call_id"], f"agent {name}.call_id")
+    _expect(
+        loop["tool_name"],
+        "read_source_file",
+        f"agent {name}.tool_name",
+    )
+    arguments = _exact_mapping(
+        loop["arguments"],
+        {"path"},
+        f"agent {name}.arguments",
+    )
+    _expect(
+        arguments["path"],
+        "src/lib.rs",
+        f"agent {name}.arguments.path",
+    )
+    _expect(
+        loop[spec["terminal_key"]],
+        spec["terminal_value"],
+        f"agent {name}.{spec['terminal_key']}",
+    )
+    _expect(loop["suffix_content"], "", f"agent {name}.suffix_content")
+    continuation = _exact_mapping(
+        loop["continuation"],
+        {
+            "text",
+            spec["continuation_terminal_key"],
+            "tool_call_count",
+        },
+        f"agent {name}.continuation",
+    )
+    _nonempty_string(
+        continuation["text"],
+        f"agent {name}.continuation.text",
+    )
+    _expect(
+        continuation[spec["continuation_terminal_key"]],
+        spec["continuation_terminal_value"],
+        f"agent {name}.continuation.{spec['continuation_terminal_key']}",
+    )
+    _strict_int(
+        continuation["tool_call_count"],
+        f"agent {name}.continuation.tool_call_count",
+    )
+    _expect(
+        continuation["tool_call_count"],
+        0,
+        f"agent {name}.continuation.tool_call_count",
+    )
+    if _finite_number(loop["elapsed_seconds"], f"agent {name}.elapsed_seconds") <= 0:
+        raise PhaseError(f"agent {name}.elapsed_seconds must be positive")
+    return loop
+
+
+def validate_agent_report(report: dict[str, Any]) -> dict[str, Any]:
+    _exact_mapping(report, {"requests", "cancellation"}, "agent report")
+    requests = _exact_mapping(
+        report["requests"],
+        {"chat_tool_loop", "responses_tool_loop"},
+        "agent requests",
+    )
+    for name, value in requests.items():
+        _validate_agent_loop(name, value)
+    validate_cancellation(report["cancellation"], "agent cancellation")
+    return report
+
+
+def validate_agent_failure_report(report: dict[str, Any]) -> dict[str, Any]:
+    partial = _exact_mapping(
+        report,
+        {"requests", "cancellation", "failure"},
+        "agent failure report",
+    )
+    failure = _exact_mapping(
+        partial["failure"],
+        {"phase", "message", "raw"},
+        "agent failure",
+    )
+    phase = failure["phase"]
+    if phase not in {"cancellation", "chat_tool_loop", "responses_tool_loop"}:
+        raise PhaseError(f"agent failure.phase is invalid: {phase!r}")
+    _nonempty_string(failure["message"], "agent failure.message")
+
+    requests = _mapping(partial["requests"], "agent failure.requests")
+    expected_request_keys = {
+        "cancellation": set(),
+        "chat_tool_loop": set(),
+        "responses_tool_loop": {"chat_tool_loop"},
+    }[phase]
+    if set(requests) != expected_request_keys:
+        raise PhaseError(
+            "agent failure.requests keys must be "
+            f"{sorted(expected_request_keys)}, got {sorted(requests)}"
+        )
+
+    if phase == "cancellation":
+        _expect(
+            partial["cancellation"],
+            None,
+            "agent failure.cancellation",
+        )
+    else:
+        validate_cancellation(
+            partial["cancellation"],
+            "agent failure.cancellation",
+        )
+        _mapping(failure["raw"], "agent failure.raw")
+        for name, value in requests.items():
+            _validate_agent_loop(name, value)
+    return partial
+
+
 def validate_report(report: dict[str, Any]) -> dict[str, Any]:
     expected_keys = {
         "model",
@@ -439,67 +965,33 @@ def validate_report(report: dict[str, Any]) -> dict[str, Any]:
         _strict_int(report.get(field), f"report {field}")
         _expect(report.get(field), expected, f"report {field}")
 
-    requests = _mapping(report.get("requests"), "report requests")
-    compat = _mapping(requests.get("compat"), "report requests.compat")
-    agent = _mapping(requests.get("agent"), "report requests.agent")
-    for section in (
-        "auth",
-        "models",
-        "tokenizer",
-        "chat",
-        "chat_stream",
-        "responses",
-        "responses_stream",
-        "reasoning",
-        "usage_accounting",
-        "repeated_request",
-    ):
-        _mapping(compat.get(section), f"report requests.compat.{section}")
-    for section in ("chat_tool_loop", "responses_tool_loop"):
-        _mapping(agent.get(section), f"report requests.agent.{section}")
-
-    unauthorized = _path(report, "requests", "compat", "auth", "unauthorized_status")
-    _strict_int(unauthorized, "auth unauthorized_status")
-    _expect(unauthorized, 401, "auth unauthorized_status")
-    true_paths = [
-        ("requests", "compat", "models", "listed"),
-        ("requests", "compat", "models", "retrieved"),
-        ("requests", "compat", "tokenizer", "roundtrip"),
-        ("requests", "compat", "chat", "assistant_result"),
-        ("requests", "compat", "chat_stream", "saw_delta"),
-        ("requests", "compat", "chat_stream", "saw_terminal"),
-        ("requests", "compat", "chat_stream", "saw_usage"),
-        ("requests", "compat", "responses", "assistant_result"),
-        ("requests", "compat", "responses_stream", "saw_delta"),
-        ("requests", "compat", "responses_stream", "saw_completed"),
-        ("requests", "compat", "reasoning", "assistant_result"),
-        ("requests", "compat", "reasoning", "request_accepted"),
-        ("requests", "compat", "usage_accounting", "chat_valid"),
-        ("requests", "compat", "usage_accounting", "chat_stream_valid"),
-        ("requests", "compat", "usage_accounting", "responses_valid"),
-        ("requests", "compat", "usage_accounting", "responses_stream_valid"),
-        ("requests", "compat", "repeated_request", "assistant_result"),
-        ("requests", "agent", "chat_tool_loop", "assistant_result"),
-        ("requests", "agent", "responses_tool_loop", "assistant_result"),
-    ]
-    for path in true_paths:
-        _require_true(report, *path)
-    reasoning_observed = _path(
-        report,
-        "requests",
-        "compat",
-        "reasoning",
-        "reasoning_observed",
+    requests = _exact_mapping(
+        report.get("requests"),
+        {"compat", "agent"},
+        "report requests",
     )
-    if not isinstance(reasoning_observed, bool):
-        raise PhaseError("reasoning reasoning_observed must be a boolean")
-    _expect(
-        _path(report, "requests", "compat", "reasoning", "visible_think_tags"),
-        False,
-        "reasoning visible_think_tags",
+    compat = validate_compat_report(
+        _mapping(requests["compat"], "report requests.compat")
+    )
+    agent = validate_agent_report(
+        _mapping(requests["agent"], "report requests.agent")
     )
 
-    startup = _mapping(report.get("startup"), "report startup")
+    startup = _exact_mapping(
+        report.get("startup"),
+        {
+            "ready_seconds",
+            "total_seconds",
+            "transfer_backend",
+            "source_bytes",
+            "device_upload_bytes",
+            "source_open_count",
+            "resident_allocation_count",
+            "exclusive_components",
+            "provenance",
+        },
+        "report startup",
+    )
     for field in (
         "source_bytes",
         "device_upload_bytes",
@@ -513,31 +1005,49 @@ def validate_report(report: dict[str, Any]) -> dict[str, Any]:
             raise PhaseError(f"startup {field} must be non-negative")
     if not isinstance(startup.get("transfer_backend"), str):
         raise PhaseError("startup transfer_backend must be a string")
+    _validate_finite_tree(
+        startup["exclusive_components"],
+        "startup exclusive_components",
+    )
+    provenance = _exact_mapping(
+        startup["provenance"],
+        {"artifact", "sdk"},
+        "startup provenance",
+    )
+    artifact = _exact_mapping(
+        provenance["artifact"],
+        {"path", "sha256", "size_bytes"},
+        "startup provenance.artifact",
+    )
+    _nonempty_string(artifact["path"], "startup provenance.artifact.path")
+    digest = _nonempty_string(
+        artifact["sha256"],
+        "startup provenance.artifact.sha256",
+    )
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise PhaseError("startup provenance.artifact.sha256 must be lowercase SHA-256")
+    _positive_int(
+        artifact["size_bytes"],
+        "startup provenance.artifact.size_bytes",
+    )
+    sdk = _exact_mapping(
+        provenance["sdk"],
+        {"package", "version"},
+        "startup provenance.sdk",
+    )
+    _expect(sdk["package"], "openai", "startup provenance.sdk.package")
+    _expect(
+        sdk["version"],
+        OPENAI_SDK_VERSION,
+        "startup provenance.sdk.version",
+    )
 
     throughput = _mapping(report.get("throughput"), "report throughput")
-    for field in (
-        "first_token_seconds",
-        "prefill_tokens_per_second",
-        "decode_tokens_per_second",
-    ):
-        if _finite_number(throughput.get(field), f"throughput {field}") <= 0:
-            raise PhaseError(f"throughput {field} must be positive")
-
-    cancellation = _mapping(report.get("cancellation"), "report cancellation")
-    for field in (
-        "aborted_after_first_delta",
-        "saw_delta",
-        "scheduler_released",
-    ):
-        _expect(cancellation.get(field), True, f"cancellation {field}")
-    for field in ("active_requests", "queued_requests"):
-        _strict_int(cancellation.get(field), f"cancellation {field}")
-        _expect(cancellation.get(field), 0, f"cancellation {field}")
-    if _finite_number(
-        cancellation.get("release_seconds"),
-        "cancellation release_seconds",
-    ) < 0:
-        raise PhaseError("cancellation release_seconds must be non-negative")
+    if throughput != compat["throughput"]:
+        raise PhaseError("report throughput must equal compat throughput evidence")
+    cancellation = validate_cancellation(report.get("cancellation"))
+    if cancellation != agent["cancellation"]:
+        raise PhaseError("report cancellation must equal agent cancellation evidence")
 
     def reject_nonfinite(value: object, label: str) -> None:
         if isinstance(value, dict):
@@ -608,6 +1118,7 @@ def run_process(
     env: dict[str, str] | None,
     timeout: float,
     phase: str,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     try:
         process = subprocess.Popen(
@@ -627,7 +1138,7 @@ def run_process(
         _terminate_and_reap_process_group(process)
         raise PhaseError(f"{phase} timed out after {timeout:g}s") from exc
     result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-    if result.returncode != 0:
+    if check and result.returncode != 0:
         raise PhaseError(
             f"{phase} failed with exit {result.returncode}\n"
             f"stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -635,23 +1146,49 @@ def run_process(
     return result
 
 
-def ensure_openai_sdk(args: argparse.Namespace) -> Path:
-    sdk_dir = args.openai_sdk_dir.resolve()
-    sdk_dir.mkdir(parents=True, exist_ok=True)
-    probe = subprocess.run(
+def _installed_openai_version(result: subprocess.CompletedProcess[str]) -> str | None:
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+        version = payload["dependencies"]["openai"]["version"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    return version if isinstance(version, str) else None
+
+
+def _sdk_probe(
+    args: argparse.Namespace,
+    sdk_dir: Path,
+    *,
+    phase: str,
+) -> subprocess.CompletedProcess[str]:
+    return run_process(
         [
-            args.node,
-            "-e",
-            "console.log(require.resolve('openai'))",
+            args.npm,
+            "list",
+            f"openai@{OPENAI_SDK_VERSION}",
+            "--depth=0",
+            "--json",
         ],
         cwd=sdk_dir,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        env=None,
+        timeout=args.sdk_probe_timeout,
+        phase=phase,
         check=False,
     )
-    if probe.returncode == 0:
-        return sdk_dir
+
+
+def ensure_openai_sdk(args: argparse.Namespace) -> dict[str, Any]:
+    sdk_dir = args.openai_sdk_dir.resolve()
+    sdk_dir.mkdir(parents=True, exist_ok=True)
+    probe = _sdk_probe(args, sdk_dir, phase="OpenAI SDK probe")
+    if _installed_openai_version(probe) == OPENAI_SDK_VERSION:
+        return {
+            "directory": sdk_dir,
+            "package": "openai",
+            "version": OPENAI_SDK_VERSION,
+        }
     run_process(
         [
             args.npm,
@@ -660,27 +1197,25 @@ def ensure_openai_sdk(args: argparse.Namespace) -> Path:
             "--no-fund",
             "--prefix",
             str(sdk_dir),
-            "openai@6",
+            f"openai@{OPENAI_SDK_VERSION}",
         ],
         cwd=ROOT,
         env=None,
         timeout=args.sdk_install_timeout,
         phase="OpenAI SDK install",
     )
-    verify = subprocess.run(
-        [args.node, "-e", "console.log(require.resolve('openai'))"],
-        cwd=sdk_dir,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if verify.returncode != 0:
+    verify = _sdk_probe(args, sdk_dir, phase="OpenAI SDK verification")
+    version = _installed_openai_version(verify)
+    if version != OPENAI_SDK_VERSION:
         raise PhaseError(
-            "OpenAI SDK install completed but the package cannot be resolved: "
-            f"{verify.stderr.strip()}"
+            "OpenAI SDK verification expected "
+            f"{OPENAI_SDK_VERSION}, got {version!r}: {verify.stderr.strip()}"
         )
-    return sdk_dir
+    return {
+        "directory": sdk_dir,
+        "package": "openai",
+        "version": version,
+    }
 
 
 def run_sdk_smoke(
@@ -707,11 +1242,81 @@ def run_sdk_smoke(
         env=env,
         timeout=args.request_timeout,
         phase=phase,
+        check=False,
     )
     if result.stderr.strip():
         print(result.stderr, file=sys.stderr, end="")
     print(result.stdout, end="")
-    return parse_smoke_output(result.stdout, phase)
+    try:
+        report = parse_smoke_output(result.stdout, phase)
+    except PhaseError as exc:
+        if result.returncode == 0:
+            raise
+        raise PhaseError(
+            f"{phase} failed with exit {result.returncode} and no valid "
+            f"structured report: {exc}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        ) from exc
+    if result.returncode != 0:
+        raise SdkSmokeFailure(
+            f"{phase} failed with exit {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            report,
+        )
+    return report
+
+
+def run_protocol_phases(
+    args: argparse.Namespace,
+    sdk_dir: Path,
+    base_url: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "compat": None,
+        "agent": None,
+        "failures": [],
+    }
+    try:
+        compat = run_sdk_smoke(
+            args,
+            COMPAT_SCRIPT,
+            sdk_dir,
+            base_url,
+            "OpenAI compatibility",
+        )
+        result["compat"] = compat
+        try:
+            validate_compat_report(compat)
+        except PhaseError as exc:
+            result["failures"].append(
+                {"phase": "compat_semantic", "message": str(exc)}
+            )
+    except PhaseError as exc:
+        result["failures"].append(
+            {"phase": "compat_transport", "message": str(exc)}
+        )
+
+    try:
+        agent = run_sdk_smoke(
+            args,
+            AGENT_SCRIPT,
+            sdk_dir,
+            base_url,
+            "OpenAI agent tool",
+        )
+        result["agent"] = agent
+        try:
+            validate_agent_report(agent)
+        except PhaseError as exc:
+            result["failures"].append(
+                {"phase": "agent_protocol", "message": str(exc)}
+            )
+    except SdkSmokeFailure as exc:
+        result["agent"] = validate_agent_failure_report(exc.report)
+        result["failures"].append({"phase": "agent", "message": str(exc)})
+    except PhaseError as exc:
+        result["failures"].append({"phase": "agent", "message": str(exc)})
+    return result
 
 
 def build_report(
@@ -720,6 +1325,7 @@ def build_report(
     agent: dict[str, Any],
     *,
     ready_seconds: float,
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     startup = {
         "ready_seconds": ready_seconds,
@@ -730,6 +1336,7 @@ def build_report(
         "source_open_count": before["source_open_count"],
         "resident_allocation_count": before["resident_allocation_count"],
         "exclusive_components": before["startup"].get("exclusive_components", {}),
+        "provenance": provenance,
     }
     report = {
         "model": EXPECTED_MODEL,
@@ -738,8 +1345,8 @@ def build_report(
         "native_int4": before["native_int4"],
         "bf16_fallback": before["bf16_fallback"],
         "requests": {
-            "compat": _mapping(compat.get("requests"), "compat requests"),
-            "agent": _mapping(agent.get("requests"), "agent requests"),
+            "compat": validate_compat_report(compat),
+            "agent": validate_agent_report(agent),
         },
         "startup": startup,
         "throughput": _mapping(compat.get("throughput"), "compat throughput"),
@@ -764,6 +1371,111 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
         raise PhaseError(f"report write failed for {path}: {exc}") from exc
 
 
+def clear_report_output(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+        for partial in path.parent.glob(f".{path.name}.partial-*"):
+            partial.unlink(missing_ok=True)
+    except OSError as exc:
+        raise PhaseError(f"could not clear prior report {path}: {exc}") from exc
+
+
+def artifact_provenance(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            while chunk := handle.read(8 * 1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise PhaseError(f"artifact provenance failed for {path}: {exc}") from exc
+    return {
+        "path": str(path.resolve()),
+        "sha256": digest.hexdigest(),
+        "size_bytes": size,
+    }
+
+
+def empty_final_evidence() -> dict[str, Any]:
+    return {
+        "health": None,
+        "capabilities": None,
+        "metrics": None,
+        "flm_evidence": None,
+        "load_invariance": {"passed": False, "error": "not collected"},
+        "collection_errors": [],
+    }
+
+
+def collect_final_evidence(
+    base_url: str,
+    api_key: str,
+    before: dict[str, Any] | None,
+) -> dict[str, Any]:
+    final = empty_final_evidence()
+
+    def collect(label: str, operation: Callable[[], Any]) -> Any:
+        try:
+            return operation()
+        except Exception as exc:
+            final["collection_errors"].append(f"{label}: {exc}")
+            return None
+
+    final["health"] = collect(
+        "health",
+        lambda: fetch_json(base_url, "/health", api_key),
+    )
+    final["capabilities"] = collect(
+        "capabilities",
+        lambda: fetch_json(base_url, "/v1/capabilities", api_key),
+    )
+    final["metrics"] = collect(
+        "metrics",
+        lambda: fetch_metrics(base_url, api_key),
+    )
+    if final["capabilities"] is not None and final["metrics"] is not None:
+        final["flm_evidence"] = collect(
+            "FLM evidence",
+            lambda: validate_flm_evidence(
+                final["capabilities"],
+                final["metrics"],
+            ),
+        )
+    if before is not None and final["flm_evidence"] is not None:
+        try:
+            validate_load_invariance(before, final["flm_evidence"])
+            final["load_invariance"] = {"passed": True, "error": None}
+        except PhaseError as exc:
+            final["load_invariance"] = {
+                "passed": False,
+                "error": str(exc),
+            }
+            final["collection_errors"].append(f"load invariance: {exc}")
+    return final
+
+
+def build_failure_report(
+    *,
+    phase: str,
+    error: Exception,
+    provenance: dict[str, Any],
+    completed: dict[str, Any],
+    final: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "status": "failed",
+        "phase": phase,
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error),
+        },
+        "provenance": provenance,
+        "completed": completed,
+        "final": final,
+    }
+
+
 def discover_inputs(args: argparse.Namespace) -> None:
     for path, label in (
         (args.binary, "server binary"),
@@ -782,45 +1494,103 @@ def discover_inputs(args: argparse.Namespace) -> None:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    discover_inputs(args)
-    sdk_dir = ensure_openai_sdk(args)
-    port = allocate_loopback_port()
-    base_url = f"http://{args.host}:{port}"
-    log_path = args.out_json.with_suffix(".server.log")
-    startup_begin = time.monotonic()
-    with running_server(args, port, log_path):
-        ready_seconds = time.monotonic() - startup_begin
-        before = validate_flm_evidence(
-            fetch_json(base_url, "/v1/capabilities", args.api_key),
-            fetch_metrics(base_url, args.api_key),
+    clear_report_output(args.out_json)
+    phase = "inputs"
+    completed: dict[str, Any] = {}
+    final = empty_final_evidence()
+    provenance: dict[str, Any] = {
+        "artifact": {
+            "path": str(args.flm.resolve()),
+            "sha256": None,
+            "size_bytes": None,
+        },
+        "sdk": None,
+    }
+    before: dict[str, Any] | None = None
+    try:
+        discover_inputs(args)
+        provenance["artifact"] = artifact_provenance(args.flm)
+
+        phase = "sdk"
+        sdk = ensure_openai_sdk(args)
+        provenance["sdk"] = {
+            "package": sdk["package"],
+            "version": sdk["version"],
+        }
+
+        port = allocate_loopback_port()
+        base_url = f"http://{args.host}:{port}"
+        log_path = args.out_json.with_suffix(".server.log")
+        startup_begin = time.monotonic()
+        with running_server(args, port, log_path):
+            ready_seconds = time.monotonic() - startup_begin
+            try:
+                phase = "initial_evidence"
+                before = validate_flm_evidence(
+                    fetch_json(base_url, "/v1/capabilities", args.api_key),
+                    fetch_metrics(base_url, args.api_key),
+                )
+                completed["initial_evidence"] = before
+
+                phase = "protocol"
+                protocol = run_protocol_phases(
+                    args,
+                    sdk["directory"],
+                    base_url,
+                )
+                if protocol["compat"] is not None:
+                    completed["compat"] = protocol["compat"]
+                if protocol["agent"] is not None:
+                    completed["agent"] = protocol["agent"]
+                if protocol["failures"]:
+                    completed["phase_failures"] = protocol["failures"]
+                    phase = "+".join(
+                        failure["phase"] for failure in protocol["failures"]
+                    )
+                    raise PhaseError(
+                        "; ".join(
+                            f"{failure['phase']}: {failure['message']}"
+                            for failure in protocol["failures"]
+                        )
+                    )
+                compat = protocol["compat"]
+                agent = protocol["agent"]
+            finally:
+                final = collect_final_evidence(base_url, args.api_key, before)
+
+            phase = "final_evidence"
+            if final["collection_errors"]:
+                raise PhaseError(
+                    "final evidence failed: "
+                    + "; ".join(final["collection_errors"])
+                )
+            if not final["load_invariance"]["passed"]:
+                raise PhaseError(
+                    "final load invariant failed: "
+                    f"{final['load_invariance']['error']}"
+                )
+            phase = "report"
+            report = build_report(
+                before,
+                compat,
+                agent,
+                ready_seconds=ready_seconds,
+                provenance=provenance,
+            )
+            write_report(args.out_json, report)
+            return report
+    except Exception as exc:
+        failure = build_failure_report(
+            phase=phase,
+            error=exc,
+            provenance=provenance,
+            completed=completed,
+            final=final,
         )
-        compat = run_sdk_smoke(
-            args,
-            COMPAT_SCRIPT,
-            sdk_dir,
-            base_url,
-            "OpenAI compatibility",
-        )
-        agent = run_sdk_smoke(
-            args,
-            AGENT_SCRIPT,
-            sdk_dir,
-            base_url,
-            "OpenAI agent tool",
-        )
-        after = validate_flm_evidence(
-            fetch_json(base_url, "/v1/capabilities", args.api_key),
-            fetch_metrics(base_url, args.api_key),
-        )
-        validate_load_invariance(before, after)
-        report = build_report(
-            before,
-            compat,
-            agent,
-            ready_seconds=ready_seconds,
-        )
-        write_report(args.out_json, report)
-        return report
+        write_report(args.out_json, failure)
+        if isinstance(exc, PhaseError):
+            raise
+        raise PhaseError(f"{phase} failed: {exc}") from exc
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -835,13 +1605,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out-json", type=Path, default=DEFAULT_OUT_JSON)
     parser.add_argument("--startup-timeout", type=float, default=1200.0)
     parser.add_argument("--request-timeout", type=float, default=1200.0)
+    parser.add_argument("--sdk-probe-timeout", type=float, default=30.0)
     parser.add_argument("--sdk-install-timeout", type=float, default=300.0)
     parser.add_argument("--openai-sdk-dir", type=Path, default=DEFAULT_OPENAI_SDK_DIR)
     parser.add_argument("--node", default="node")
     parser.add_argument("--npm", default="npm")
     args = parser.parse_args(argv)
     args.no_download = True
-    for field in ("startup_timeout", "request_timeout", "sdk_install_timeout"):
+    for field in (
+        "startup_timeout",
+        "request_timeout",
+        "sdk_probe_timeout",
+        "sdk_install_timeout",
+    ):
         if getattr(args, field) <= 0:
             parser.error(f"--{field.replace('_', '-')} must be positive")
     if args.max_context <= 0:
