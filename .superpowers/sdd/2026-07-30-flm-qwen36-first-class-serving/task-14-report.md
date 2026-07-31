@@ -1089,3 +1089,210 @@ d9828be fix(flm): make artifact promotion transactional
 e31fdec test(flm): audit every Qwen native mapping role
 127da8f test(flm): diagnose aligned Qwen layer zero modes
 ```
+
+## Fix Round 4 (Escalation Round)
+
+### Reviewer-Finding Closure
+
+1. Promotion now uses durable recovery records across the artifact and ledger
+   replacements. Recovery runs before a new promotion, and rollback state is
+   made durable before restoring or removing the canonical file. The injected
+   case where the real second ledger replacement and directory fsync complete
+   and the writer then raises is covered. Every prepared, canonical-replaced,
+   complete-ledger, rollback-ledger, canonical-restore, and cleanup failure
+   leaves a recoverable record; the 21-test matrix proves that the eventual
+   canonical digest and terminal ledger digest agree.
+2. Final failure evidence now validates exact nested key sets and concrete
+   types for capabilities, scheduler, endpoint strings/content, FLM feature
+   flags/profile values, prefix cache, health, and metrics. Cross-field checks
+   bind backend/family/readiness, scheduler values, FLM counts and source
+   bytes, prefix-cache values, and `supersonic_ready`. The 42-test harness
+   includes nested extra/missing keys, wrong types, unsupported enum/profile
+   values, and health/metric contradictions.
+3. Both repositories carry byte-identical hand-authored native-INT4 fixtures,
+   SHA-256
+   `ed9de90ffde302816b864a960325c5eb5a20cceb968d0b755fac0f126f363562`.
+   The fixtures do not invoke a producer packer and pin even/low plus odd/high
+   nibble order, BF16 scale and zero, affine dequantization, 128-by-128 tile
+   indexing, and packed row-major layout. Geo's independent decoder and
+   SuperSonic's production decoder both match the expected bytes.
+4. Production D now starts conv/recurrent state at zero and executes the same
+   322 token positions as C before collecting stages 1 through 5 at position
+   321. It no longer imports C state. D publishes actual input rows, initial,
+   pre-final, and post-final states and all material boundaries. The comparator
+   derives diagnosis from failed ABI/input/state/boundary evidence rather than
+   a named first-divergence shortcut.
+5. The tracked four-layer HIP oracle replaces the universal `1.0` handoff
+   bound with frozen candidate-independent cumulative budgets. Attention
+   max-absolute budgets are `0.03125, 0.1875, 0.3125, 0.4375`; FFN budgets are
+   `0.125, 0.25, 0.5, 0.5`, each with a fixed cosine floor. Chained logits
+   require max-absolute error at most `0.25` and cosine at least `0.999`.
+   A one-lane packing-scale perturbation and an adjacent-lane mutation of the
+   actual layer-0 FFN handoff are both rejected.
+
+### Full Zero-State Production Recurrence
+
+The authoritative D run used:
+
+```text
+HIP_VISIBLE_DEVICES=0 \
+SUPERSONIC_QWEN36_LAYER0_ABC_JSON=target/task14-fix4-layer0-abc.json \
+SUPERSONIC_QWEN36_LAYER0_D_OUTPUT=target/task14-fix4-layer0-d.json \
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+RUST_TEST_THREADS=1 cargo test -p supersonic-runtime \
+  --test qwen36_layer0_diagnostic -- --nocapture
+```
+
+Result: `1 passed` in `301.55s`. Contracts are all true: exact 322 prompt
+tokens, zero initial state in metadata and payloads, all positions executed,
+all five stages executed, same final input/position/mode/artifact, strict
+payload hashes, and internal recurrence/stage consistency.
+
+C/D input sequence, embedding, layer input, input RMSNorm, initial conv state,
+and initial recurrent state are exact. Before the final position, conv state
+has max-absolute error `0.125`, cosine `0.9999988675`; recurrent state has
+`0.073674202`, cosine `1.0`. After it, conv state has `0.125`, cosine
+`0.9999975562`; recurrent state has `0.066298485`, cosine `1.0`.
+
+Every material boundary passes its fixed gate:
+
+```text
+in_proj_qkv       max_abs=0.125000000  cosine=0.9999979138
+in_proj_z         max_abs=0.062500000  cosine=0.9999973774
+in_proj_a/b       max_abs=0            cosine=1.0
+conv_output       max_abs=0.062500000  cosine=0.9999974370
+q                 max_abs=0.000488281  cosine=0.9999910593
+k                 max_abs=0.003906250  cosine=0.9999895692
+v                 max_abs=0.062500000  cosine=0.9999977946
+beta/decay        max_abs=0            cosine=1.0
+recurrent_state   max_abs=0.066298485  cosine=1.0
+core_output       max_abs=0.007812500  cosine=0.9999926090
+gated_rmsnorm     max_abs=0.001098633  cosine=0.9999692440
+out_proj          max_abs=0.000366211  cosine=0.9999650717
+final_residual    max_abs=0.000244141  cosine=0.9999883175
+```
+
+The 33 focused diagnostic/comparator tests mutate every one of the 19
+boundaries plus input and initial/pre-final/post-final state evidence just
+beyond its own fixed budget; every mutation is rejected. The comparison
+concludes `aggregate_pass=true`, `abi_fault_detected=false`,
+`runtime_recurrence_fault_detected=false`, `quantization_causal=false`, and
+`v2_abi_change_justified=false`.
+
+Evidence SHA-256:
+
+```text
+ABC        9657d04b764b06040ed38222910d085ca43898dcf73a2f45a89244dc6752b7e5
+D          4de28406b7f82bb337c03bdfd1af3d6d5c0e41a8c41ba02c0311a1ee7afe7f69
+comparison be63e560a441c80dad4718374f7e1683fa3a8d8b7cb12f8435ed04daee7b1856
+```
+
+### V1 Higher-Fidelity Counterfactual
+
+Geo's opt-in `asymmetric-minmax` producer changes only V1 packed values and
+the existing BF16 scale/zero planes. Codec, nibble order, packed layout,
+storage ABI, and direct runtime views are unchanged. The direct HIP scalar,
+vector, and WMMA paths consume arbitrary stored zero points as
+`(nibble - zero) * scale`.
+
+The new noncanonical artifact is:
+
+```text
+/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-asymmetric-minmax-task14.flm
+size    22871543808
+sha256  7ee7685648d730848e89e4324316f95fdbfabaa23eb5995bffea461951437078
+```
+
+Independent strict validation passed with `1704` tensors, `0` warnings, and
+all payload hashes. The complete source audit passed all `330/330`
+descriptors, 12 roles, 36 sampled descriptors, 1536 expert instances, and
+3132 tiles with exact packed/scale/zero reproduction. Mapping report SHA-256:
+`785f0c6744c1691d17576fce14c72a46ea363ddb8f420f3717bf905a61b182e7`.
+
+Against BF16 at layer 0, the intervention improves the implicated projections:
+
+```text
+                             canonical symmetric       asymmetric-minmax
+in_proj_qkv cosine/max_abs   0.9917200804 / 1.71875    0.9946790934 / 1.123046875
+in_proj_z cosine/max_abs     0.9959808588 / 0.84375    0.9972299337 / 0.71875
+out_proj cosine/max_abs      0.6139400601 / 0.233154   0.7970134020 / 0.021484375
+```
+
+The recurrent result is mixed: state cosine improves
+`0.9873093367 -> 0.9879645109` and L2 falls
+`17.583963 -> 17.141451`, while max-absolute error rises
+`2.483526 -> 3.409720`. Layer-0 report SHA-256:
+`4591762cb71dd0c4a198fe5c6e5b8dc8b76ecf49780a947fa9f10486b1f06d1f`.
+
+The real rebuilt persistent server did not recover semantics or tool use.
+Streamed Chat emitted no text delta, and the coding-tool request returned
+plain content `"WCT"` with `finish_reason="stop"` instead of one protocol
+tool call. Cancellation contention and scheduler release passed; final health
+is `ok`, readiness is true, native INT4 is `330`, BF16 fallback is `0`,
+`model_loads_total=1`, active/queued values are `0/0`, and
+`collection_errors=[]`. The exact failure report validates at
+`phase=compat_transport+agent`; SHA-256:
+`689408e2b6955898d0a5c14d28fd18121682606fc9483aa9aef360745abdd67c`.
+
+This counterfactual improves local quantization fidelity but does not restore
+model semantics. Therefore quantization is **not established as causal**.
+The independent ABI and full recurrence evidence also do not identify a V1
+layout/runtime defect. No V2 ABI change is justified. The counterfactual was
+not promoted; the canonical artifact remains SHA-256
+`eb7a58444c3ca057512aca47723a8a4872f2fb1292a801af725f07931033052c`.
+
+### Fix Round 4 Verification
+
+```text
+geo focused deterministic suite                  196 passed in 4.11s
+promotion transaction failure matrix              21 passed in 0.59s
+recurrence comparator/adversarial suite            33 passed in 0.84s
+SuperSonic exact server-evidence suite              42 passed in 18.478s
+production known-byte decoder                       1 passed
+tracked four-layer HIP oracle                       4 passed in 0.75s
+qualified HIP production-prefill parity             1 passed in 11.10s
+full zero-state 322-position production recurrence  1 passed in 301.55s
+strict counterfactual artifact validation            OK; 1704 tensors, 0 warnings
+real counterfactual semantic/tool gate               RED; compat_transport+agent
+```
+
+The HIP oracle observed attention handoff max errors
+`0.0234375, 0.15625, 0.2578125, 0.40625` and FFN errors
+`0.109375, 0.23828125, 0.4375, 0.4765625`. Final chained logits remain
+max-absolute `0.21875`, cosine `0.9994795`. Replacing layer-0 FFN lane 220
+with adjacent lane 221 creates displacement `0.171875` and oracle error
+`0.140625`, exceeding the fixed `0.125` budget; a one-lane packing-scale
+perturbation creates `0.25` error and is also rejected.
+
+### Fix Round 4 Commits
+
+SuperSonic implementation/documentation head before this retained report:
+`a8c5e7776c203a709d7ad7133cab5389a895d766`
+
+```text
+9b180bb test(flm): enforce exact final evidence contract
+5cad5fe test(qwen36): freeze cumulative oracle budgets
+38b3f09 test(qwen36): pin native int4 known-byte ABI
+fe9d5db test(qwen36): run full zero-state layer recurrence
+a8c5e77 docs(qwen36): record Round 4 evidence budgets
+```
+
+geo-quant head:
+`84151b5640b5f2ec5fce7370b3b4735c7b39c76e`
+
+```text
+6230a94 fix(flm): recover promotion journal failures
+aa1bcfa test(flm): add independent native int4 ABI bytes
+20a1aa8 test(flm): gate full zero-state recurrence evidence
+475e11b feat(flm): add V1 quantization counterfactual
+84151b5 docs(flm): document V1 quality counterfactual
+```
+
+### Remaining Red Gate
+
+The product goal remains red: neither the canonical symmetric artifact nor
+the higher-fidelity V1 counterfactual produces qualified real model semantics
+and valid Chat/Responses coding-tool behavior. Transport, integrity, ABI,
+recurrence, lifecycle, scheduler, cancellation, evidence, and oracle gates
+are green. The failed semantic/tool gate is retained rather than weakened or
+normalized.
