@@ -46,6 +46,12 @@ fn qwen36_35b_native_flm_linear_attention_aliases_match_supersonic_runtime_layou
         "native runtime must contain exactly one chat template asset"
     );
 
+    let declares_row_group_codec = runtime
+        .codecs()
+        .iter()
+        .any(|codec| codec.semantic_id as u16 == model_store::flm::CODEC_ROW_GROUP_INT4_BF16_SYM);
+    let mut row_group_views = 0usize;
+
     for logical in runtime
         .logical_tensors()
         .iter()
@@ -64,6 +70,7 @@ fn qwen36_35b_native_flm_linear_attention_aliases_match_supersonic_runtime_layou
                 assert_eq!(flm.layout(&logical.name), Some(&LayoutTag::Int4Quantized));
             }
             Some(FlmStage3DirectWeightKind::RowGroupInt4) => {
+                row_group_views += 1;
                 let view = flm
                     .int4_storage_view(&logical.name)
                     .expect("row-group storage view");
@@ -74,6 +81,17 @@ fn qwen36_35b_native_flm_linear_attention_aliases_match_supersonic_runtime_layou
             }
             _ => {}
         }
+    }
+    if declares_row_group_codec {
+        assert!(
+            row_group_views > 0,
+            "an artifact declaring semantic codec 11 must expose at least one typed row-group view"
+        );
+    } else {
+        assert_eq!(
+            row_group_views, 0,
+            "legacy canonical artifacts without semantic codec 11 must not claim row-group coverage"
+        );
     }
 
     for (name, expected_layout, expected_shape) in [
