@@ -682,6 +682,38 @@ async fn mock_chat_stream_buffers_reasoning_and_includes_usage() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_chat_stream_drops_tool_call_preamble() {
+    let h = spawn_chunks(&[
+        "I need to call lookup.\n",
+        "<tool_call><function=lookup></function></tool_call>",
+    ])
+    .await;
+    let response = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "stream": true,
+            "max_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let events = collect_sse(response).await;
+    let content = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+        .collect::<String>();
+    assert_eq!(content, "");
+    assert!(events.iter().any(|event| {
+        event["choices"][0]["finish_reason"] == "tool_calls"
+            && event["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "lookup"
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_chat_stream_parses_prefilled_reasoning() {
     let h = spawn_chunks(&["plan from ", "prefill</think>\nvisible", " answer"]).await;
     let response = h
@@ -781,6 +813,40 @@ async fn mock_responses_stream_emits_expected_events() {
     assert!(body.contains("event: response.output_item.done"));
     assert!(body.contains("event: response.completed"));
     assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_stream_drops_tool_call_preamble() {
+    let h = spawn_chunks(&[
+        "I need to call lookup.\n",
+        "<tool_call><function=lookup></function></tool_call>",
+    ])
+    .await;
+    let response = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "hi",
+            "tools": [{"type": "function", "name": "lookup"}],
+            "stream": true,
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let events = collect_sse(response).await;
+    let content = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_text.delta")
+        .filter_map(|event| event["delta"].as_str())
+        .collect::<String>();
+    assert_eq!(content, "");
+    assert!(events.iter().any(|event| {
+        event["type"] == "response.output_item.done"
+            && event["item"]["type"] == "function_call"
+            && event["item"]["name"] == "lookup"
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

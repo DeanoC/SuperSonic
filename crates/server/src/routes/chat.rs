@@ -64,6 +64,10 @@ pub async fn completions(
         )
         .map_err(|e| ApiError::bad_request(format!("chat template render failed: {e}")))?;
     let output_context = AssistantOutputParseContext::from_rendered_prompt(&prompt_text);
+    let tool_capable = req
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.as_array().is_some_and(|items| !items.is_empty()));
 
     let params = GenParams {
         temperature: req.temperature.unwrap_or(1.0),
@@ -89,7 +93,15 @@ pub async fn completions(
             req.prompt_cache_retention.as_deref(),
         );
         let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
-        let stream = chat_sse_stream(rx, id, created, model, include_usage, output_context);
+        let stream = chat_sse_stream(
+            rx,
+            id,
+            created,
+            model,
+            include_usage,
+            output_context,
+            tool_capable,
+        );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
@@ -186,6 +198,7 @@ fn chat_sse_stream(
     model: String,
     include_usage: bool,
     output_context: AssistantOutputParseContext,
+    tool_capable: bool,
 ) -> impl Stream<Item = sse::SseEvent> {
     let role_chunk = ChatStreamChunk {
         id: id.clone(),
@@ -212,6 +225,7 @@ fn chat_sse_stream(
         created,
         include_usage,
         output_context,
+        tool_capable,
     );
     stream::once(async move { Ok(role_event) }).chain(body)
 }
@@ -223,6 +237,7 @@ fn parsed_chat_events(
     created: u64,
     include_usage: bool,
     output_context: AssistantOutputParseContext,
+    tool_capable: bool,
 ) -> impl Stream<Item = sse::SseEvent> {
     async_stream::stream! {
         let mut raw = String::new();
@@ -240,6 +255,7 @@ fn parsed_chat_events(
                         &parsed,
                         &mut emitted_reasoning,
                         &mut emitted_content,
+                        !tool_capable,
                     ) {
                         yield Ok(sse::json_event(&chat_chunk(
                             &id,
@@ -253,10 +269,12 @@ fn parsed_chat_events(
                 }
                 generate::GenEvent::Done { reason, stats } => {
                     let parsed = parse_assistant_output_with_context(&raw, output_context);
+                    let emit_content = parsed.tool_calls.is_none();
                     for delta in output_deltas(
                         &parsed,
                         &mut emitted_reasoning,
                         &mut emitted_content,
+                        emit_content,
                     ) {
                         yield Ok(sse::json_event(&chat_chunk(
                             &id,
@@ -308,6 +326,7 @@ fn output_deltas(
     parsed: &AssistantOutput,
     emitted_reasoning: &mut String,
     emitted_content: &mut String,
+    emit_content: bool,
 ) -> Vec<ChatStreamDelta> {
     let mut deltas = Vec::new();
     if let Some(reasoning) = parsed.reasoning_content.as_ref() {
@@ -323,15 +342,17 @@ fn output_deltas(
             }
         }
     }
-    if let Some(delta) = parsed.content.strip_prefix(emitted_content.as_str()) {
-        if !delta.is_empty() {
-            *emitted_content = parsed.content.clone();
-            deltas.push(ChatStreamDelta {
-                role: None,
-                content: Some(delta.to_string()),
-                reasoning_content: None,
-                tool_calls: None,
-            });
+    if emit_content {
+        if let Some(delta) = parsed.content.strip_prefix(emitted_content.as_str()) {
+            if !delta.is_empty() {
+                *emitted_content = parsed.content.clone();
+                deltas.push(ChatStreamDelta {
+                    role: None,
+                    content: Some(delta.to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                });
+            }
         }
     }
     deltas
@@ -368,7 +389,7 @@ fn finish_reason(default: &'static str, parsed: &AssistantOutput) -> &'static st
 }
 
 fn message_content(parsed: &AssistantOutput) -> Option<String> {
-    if parsed.tool_calls.is_some() && parsed.content.trim().is_empty() {
+    if parsed.tool_calls.is_some() {
         None
     } else {
         Some(parsed.content.clone())
@@ -573,6 +594,8 @@ pub(crate) fn content_to_text(value: &Value) -> Result<String, ApiError> {
 mod tests {
     use serde_json::json;
 
+    use crate::output::parse_assistant_output;
+
     use super::*;
 
     #[test]
@@ -722,6 +745,25 @@ mod tests {
                 .as_str()
                 .unwrap(),
             "weather"
+        );
+    }
+
+    #[test]
+    fn valid_tool_calls_suppress_assistant_preamble() {
+        let parsed = parse_assistant_output(
+            "I need to call lookup.\n<tool_call><function=lookup></function></tool_call>",
+        );
+        assert!(parsed.tool_calls.is_some());
+        assert_eq!(message_content(&parsed), None);
+    }
+
+    #[test]
+    fn malformed_tool_call_does_not_suppress_text() {
+        let parsed = parse_assistant_output("I need to call lookup.\n<tool_call>incomplete");
+        assert!(parsed.tool_calls.is_none());
+        assert_eq!(
+            message_content(&parsed).as_deref(),
+            Some(parsed.content.as_str())
         );
     }
 }

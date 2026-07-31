@@ -214,6 +214,10 @@ pub async fn create(
     } else {
         AssistantOutputParseContext::default()
     };
+    let tool_capable = req
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.as_array().is_some_and(|items| !items.is_empty()));
 
     let id = next_response_id(state.server_instance_id);
     let created_at = crate::ids::epoch_secs();
@@ -254,6 +258,7 @@ pub async fn create(
             response_cache_key,
             output_context,
             messages,
+            tool_capable,
         );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
@@ -365,6 +370,7 @@ fn response_sse_stream(
     cache_key: Option<String>,
     output_context: AssistantOutputParseContext,
     input_messages: Vec<ChatMessage>,
+    tool_capable: bool,
 ) -> impl Stream<Item = super::sse::SseEvent> {
     async_stream::stream! {
         yield Ok(Event::default()
@@ -395,16 +401,18 @@ fn response_sse_stream(
                             }
                         }
                     }
-                    if let Some(delta) = parsed.content.strip_prefix(&emitted) {
-                        if !delta.is_empty() {
-                            emitted = parsed.content.clone();
-                            yield Ok(Event::default()
-                                .event("response.output_text.delta")
-                                .data(json!({
-                                    "type": "response.output_text.delta",
-                                    "response_id": id,
-                                    "delta": delta,
-                                }).to_string()));
+                    if !tool_capable {
+                        if let Some(delta) = parsed.content.strip_prefix(&emitted) {
+                            if !delta.is_empty() {
+                                emitted = parsed.content.clone();
+                                yield Ok(Event::default()
+                                    .event("response.output_text.delta")
+                                    .data(json!({
+                                        "type": "response.output_text.delta",
+                                        "response_id": id,
+                                        "delta": delta,
+                                    }).to_string()));
+                            }
                         }
                     }
                 }
@@ -418,16 +426,18 @@ fn response_sse_stream(
                             }
                         }
                     }
-                    if let Some(delta) = parsed.content.strip_prefix(&emitted) {
-                        if !delta.is_empty() {
-                            emitted = parsed.content.clone();
-                            yield Ok(Event::default()
-                                .event("response.output_text.delta")
-                                .data(json!({
-                                    "type": "response.output_text.delta",
-                                    "response_id": id,
-                                    "delta": delta,
-                                }).to_string()));
+                    if parsed.tool_calls.is_none() {
+                        if let Some(delta) = parsed.content.strip_prefix(&emitted) {
+                            if !delta.is_empty() {
+                                emitted = parsed.content.clone();
+                                yield Ok(Event::default()
+                                    .event("response.output_text.delta")
+                                    .data(json!({
+                                        "type": "response.output_text.delta",
+                                        "response_id": id,
+                                        "delta": delta,
+                                    }).to_string()));
+                            }
                         }
                     }
                     let stored = build_response(
@@ -684,6 +694,7 @@ fn build_response(
     cache_key: Option<String>,
     input_messages: Vec<ChatMessage>,
 ) -> StoredResponse {
+    let has_tool_calls = parsed.tool_calls.is_some();
     let mut output = Vec::new();
     if let Some(reasoning) = parsed.reasoning_content {
         output.push(ResponseOutputItem::Reasoning {
@@ -691,7 +702,7 @@ fn build_response(
             summary: vec![reasoning],
         });
     }
-    if !parsed.content.trim().is_empty() {
+    if !has_tool_calls && !parsed.content.trim().is_empty() {
         output.push(ResponseOutputItem::Message {
             id: format!("{id}-msg"),
             role: "assistant",
@@ -853,11 +864,11 @@ mod tests {
             resp.output[0],
             ResponseOutputItem::Reasoning { .. }
         ));
-        assert!(matches!(resp.output[1], ResponseOutputItem::Message { .. }));
         assert!(matches!(
-            resp.output[2],
+            resp.output[1],
             ResponseOutputItem::FunctionCall { .. }
         ));
+        assert_eq!(resp.output.len(), 2);
         assert!(
             serde_json::to_value(&resp)
                 .unwrap()
