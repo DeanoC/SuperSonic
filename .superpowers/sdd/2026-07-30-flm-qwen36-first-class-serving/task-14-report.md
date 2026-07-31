@@ -224,3 +224,385 @@ Commit message:
   extraction is covered by the Rust route tests.
 - The server suite emits existing kernel/backend compiler warnings unrelated
   to the owned Task 14 files.
+
+# Fix Round 1
+
+Status: **HARNESS/EOS COMPLETE; REAL MODEL SEMANTIC GATE BLOCKED**
+
+This section supersedes the earlier real compatibility and cancellation
+claims above. The first implementation proved route activity but accepted
+semantically broken output. Fix Round 1 separates transport from model quality,
+retains structured evidence on failure, and leaves the real semantic/tool gate
+red.
+
+## Requirements
+
+The round implemented all requested harness corrections:
+
+1. Chat, legacy Completions, Responses, and both reconstructed streams now
+   require exact normalized canaries, normal terminal state, exact terminal
+   event uniqueness/order, and terminal usage. Transport and semantic quality
+   are separate report sections.
+2. The actual `openai@6.49.0` SDK scripts run against a deterministic
+   OpenAI-shaped HTTP/SSE fixture. It covers canonical Chat and Responses tool
+   loops, malformed raw output, and a real stream abort with queued contention.
+3. Success uses exact nested report schemas for protocol, raw usage, stored
+   Responses round-trip, tools, cancellation, timings, artifact digest, and
+   SDK version. A run removes stale output first and atomically writes a
+   phase-labelled failure report after final health/metrics collection.
+4. Server and bounded child commands own process groups. Cleanup independently
+   waits for group disappearance and escalates surviving descendants to
+   `SIGKILL`; real leader/grandchild tests cover early leader exit and
+   SIGTERM-resistant descendants.
+5. Cancellation requires a nonterminal delta, a real queued second request,
+   observed active/queued state in both health and metrics, awaited abort
+   closure, queued-request completion, and idle after-state without reload.
+6. Reasoning acceptance and observation are separate, unobserved reasoning is
+   red, missing/wrong-key auth covers the official SDK and all protected
+   operational routes, and the exact SDK version is pinned and reported.
+7. Qwen generation metadata now merges `generation_config.json` EOS IDs and
+   strictly requires `[248046, 248044]`. SuperSonic tests prove either EOS
+   stops generation and is not emitted as content.
+8. A distinct FLM was generated and fully validated before an explicit,
+   digest-guarded canonical replacement.
+9. The exact upstream tool prompt was run through BF16 reference inference,
+   FLM optimized and legacy CLI paths, and the real server. First-token
+   evidence localizes divergence to generated position zero. No XML parser
+   weakening or arbitrary JSON tool-call synthesis was made.
+
+## Files
+
+SuperSonic:
+
+- `tests/openai_sdk_fixture.py`
+- `tests/test_qwen36_flm_server_e2e.py`
+- `tests/gfx1100/run_qwen36_flm_server_e2e.py`
+- `scripts/openai_compat_smoke.mjs`
+- `scripts/openai_agent_tool_smoke.mjs`
+- `crates/runtime/src/generate.rs` (generation test only)
+- `docs/server.md`
+- `docs/testing.md`
+
+geo-quant:
+
+- `geoquant/formats/qwen36_flm_runtime.py`
+- `geoquant/formats/flm_validate.py`
+- `tests/test_qwen36_flm.py`
+
+Evidence retained under `target/` includes:
+
+- `qwen36_35b_a3b_flm_server_e2e.json`
+- `qwen36_35b_a3b_flm_eos_regeneration.json`
+- `task14-fix1-bf16-reference-tool.json`
+- `task14-fix1-first-token-comparison.json`
+- `task14-fix1-server-exact-prompt.json`
+- `task14-fix1-native-int4-quality.json`
+- `task14-fix1-flm-cli-tool-exact.stdout.log`
+- `task14-fix1-flm-cli-tool-legacy.stdout.log`
+- deterministic, server, parity, and validator logs prefixed
+  `task14-fix1-`.
+
+## RED Evidence
+
+- The original real compatibility script accepted malformed `length` output
+  as success, including a requested single-word response beginning
+  `hql\ndhestn\n`.
+- New deterministic SDK execution initially failed because there was no
+  HTTP/SSE fixture and no executable tool-continuation coverage.
+- The malformed-agent fixture initially emitted no structured failure marker,
+  and `run_protocol_phases` discarded partial cancellation/raw evidence.
+- The partial-report mutation
+  `chat_tool_loop.call_count = 2` initially passed
+  `validate_agent_failure_report`; the new test failed with
+  `PhaseError not raised`.
+- The official-SDK wrong-key mechanism canary initially failed because
+  `wrongKeyClient.models.list()` did not exist; wrong-key evidence used raw
+  fetch.
+- The real descendant cleanup tests exposed the old early return after leader
+  exit and the missing SIGKILL escalation for a resistant grandchild.
+- geo-quant's producer emitted only `(248044,)`, and its native Qwen validator
+  accepted incorrect EOS metadata before the new strict tests.
+- The canonical real semantic/tool run remains intentionally RED after the
+  harness fixes; details are recorded below.
+
+## GREEN Evidence
+
+Deterministic protocol/lifecycle:
+
+```text
+python3 -m unittest -q tests.test_qwen36_flm_server_e2e
+Ran 29 tests in 5.513s
+OK
+```
+
+This executes both real SDK scripts against the fixture, including canonical
+Chat and Responses call/result loops, malformed raw output, stream abort,
+queued contention, process-group cleanup, stale-report replacement, exact
+nested validation, SDK pin/install bounds, and phase continuation.
+
+Syntax and formatting:
+
+```text
+node --check scripts/openai_compat_smoke.mjs
+node --check scripts/openai_agent_tool_smoke.mjs
+python3 -m py_compile tests/openai_sdk_fixture.py \
+  tests/gfx1100/run_qwen36_flm_server_e2e.py \
+  tests/test_qwen36_flm_server_e2e.py
+rustfmt --edition 2021 --check crates/runtime/src/generate.rs
+```
+
+All passed. Repository-wide `cargo fmt --all -- --check` remains red only on
+pre-existing formatting in `crates/gpu-hal/build.rs` and
+`crates/runner/src/bin/int4_test.rs`; those unrelated files were not changed.
+
+Rust route/runtime:
+
+```text
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+  cargo test -q -p server
+```
+
+Passed `46` tests (`26 + 3 + 1 + 16`) with no failures.
+
+```text
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+  cargo test -q -p supersonic-runtime \
+  qwen_generation_stops_on_either_eos_without_emitting_it
+```
+
+Passed `1`; both IDs produce `FinishReason::Stop`, emit only preceding
+`hello`, and account for one completion token.
+
+geo-quant:
+
+```text
+/home/deano/projects/geo-quant/.venv-rocm/bin/python \
+  -m pytest -q tests/test_qwen36_flm.py
+125 passed in 3.28s
+```
+
+Numerical parity:
+
+```text
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+RUST_TEST_THREADS=1 \
+  cargo test -q -p supersonic-runtime \
+  public_batched_prefill_native_int4_matches_pertoken_across_dense_and_split_chunks \
+  -- --nocapture
+```
+
+Passed `1`.
+
+```text
+SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=\
+/home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving/target/\
+task14-fix1-qwen36-int4-oracle.json \
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+RUST_TEST_THREADS=1 \
+  cargo test -q -p runner --test qwen36_moe_multilayer_parity \
+  multilayer_persistent_decode_matches_chained -- --nocapture
+```
+
+Passed `1` against the fresh synthetic native-INT4 oracle. Final hidden and
+segmented state matched exactly; folded LM-head cosine was
+`0.9999968`.
+
+```text
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+  cargo test -q -p runner qwen36_moe_logits
+```
+
+Passed `4`.
+
+## Artifact Evidence
+
+Previous canonical:
+
+```text
+/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm
+sha256 aabe9176b2e7bb7be478fbb20165e692ed4032764a38b5e771968d493b9c4225
+```
+
+Distinct regenerated artifact:
+
+```text
+/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-eos-20260731.flm
+size 22871543808
+sha256 eb7a58444c3ca057512aca47723a8a4872f2fb1292a801af725f07931033052c
+```
+
+The first-class regeneration E2E passed, direct profile remained
+`required=693 raw_dense=363 native_int4=330 bf16_fallback=0`, and its
+one-token real decode passed. The distinct file was validated before
+replacement. Replacement required the literal `--overwrite-artifact` guard,
+copied to a staging path, verified the staged digest, atomically renamed it,
+and verified the canonical digest afterward.
+
+Current canonical and retained distinct artifact are separate files
+(inodes `14024808` and `14024803`) with the same size and digest above.
+
+Final canonical full-payload validation:
+
+```text
+/home/deano/projects/geo-quant/.venv-rocm/bin/python \
+  -m geoquant.formats.flm_validate \
+  /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --profile supersonic-qwen36-moe-native-int4 \
+  --verify-payload-hashes
+[flm-validate] OK ... tensors=1704 warnings=0
+```
+
+The strict profile verifies exact EOS IDs `(248046, 248044)`.
+
+## Real Protocol Evidence
+
+Exact command:
+
+```text
+python3 tests/gfx1100/run_qwen36_flm_server_e2e.py \
+  --flm /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --binary /home/deano/projects/SuperSonicBase/target/release/supersonic-serve \
+  --device 0 --max-context 4096 \
+  --out-json target/qwen36_35b_a3b_flm_server_e2e.json
+```
+
+Expected exit: `1`. The atomic report records:
+
+- `status=failed`, `phase=compat_semantic+agent`
+- artifact digest `eb7a5844...033052c`
+- official SDK `openai 6.49.0`
+- transport/auth/storage/usage evidence completed
+- exact non-stream Chat `hello`, `stop` passed
+- Chat stream reconstructed `hello\n00:12:`, `length` failed
+- legacy Completions returned `, \u4e94\n\nh1,`, `length` failed
+- Responses and Responses stream reconstructed `hello\n00:12:` and failed
+  semantic equality while retaining `completed`, stored round-trip, one
+  final terminal event, and usage
+- reasoning `accepted=true`, `observed=false`, `passed=false`
+- repeated request returned `gnrnt` plus unrelated text, `length`, and failed
+- cancellation observed one active and one queued request in health and
+  metrics, a nonterminal delta, abort closure, queued completion, and final
+  active/queued zero with model loads unchanged at one
+- raw Chat tool output began `{"path": "src/lib.rs"}}`, continued with
+  malformed text, and exhausted `128` tokens with `finish_reason=length`
+- final health remained ready and idle, final metrics were idle,
+  `collection_errors=[]`, and load invariance passed
+- process-group cleanup left no server process
+
+The route/transport harness is green; semantic quality and model-generated
+tool calls are explicitly red.
+
+## Reference Diagnosis
+
+The upstream HF/Jinja prompt has SHA-256
+`540f92c1fe4446d0f9764de537a1a59603515b94de27b8ea0562420c5f8ffb8b`
+and tokenizes to exactly `322` IDs. Prompt head/tail IDs in
+`task14-fix1-first-token-comparison.json` match between the reference and FLM
+CLI paths.
+
+BF16 reference first-token top 10:
+
+```text
+248058 <tool_call> 25.625
+851    read        20.125
+24960  (read       16.375
+1301    read       15.6875
+248046 <|im_end|>  15.5625
+27864  -read       15.5
+40     I           15.375
+3989   .read       14.9375
+86779  =read       14.6875
+71093  triple-tick 14.4375
+```
+
+The BF16 greedy first token is canonical `<tool_call>` (`248058`). The
+reference used genuine `Qwen3_5MoeForConditionalGeneration` BF16 inference
+across two HIP devices with CPU offload and took `191.86` seconds. Its later
+tokens are not used as a quality oracle because the environment lacked the
+model's optimized linear-attention dependencies; only the plausible,
+decisive first-token boundary is used here.
+
+FLM optimized first-token top 10:
+
+```text
+50 14.375; 36 13.9375; 51 13.3125; 34 13.25; 43 13.25;
+1 12.9375; 49 12.8125; 760 12.5; 47 12.375; 58 12.3125
+```
+
+FLM legacy per-token prefill also selected ID `50`; its top 10 began:
+
+```text
+50 15.625; 58 14.3125; 51 14.0; 47 13.5; 36 13.375;
+12 13.25; 16 13.125; 40 12.9375; 49 12.8125; 33 12.75
+```
+
+Optimized versus legacy full-logit cosine is `0.9563320071`, max absolute
+difference is `5.76953125`, and only `1736 / 248320` values are exact.
+Both paths nevertheless have the same incorrect top-1, ruling out optimized
+prefill as the sole cause.
+
+The real server replayed the same raw 322-token prompt through
+`/v1/completions` with `temperature=0`, returned text `S`, one completion
+token, and `finish_reason=length`; the CLI identifies `S` as token ID `50`.
+The server API has no top-k/logit diagnostic surface, so its independent
+observable evidence is top-1 only; the full top-k is captured from the same
+FLM engine through the CLI diagnostic hook.
+
+Reference top-1 `248058` and FLM/server top-1 `50` diverge at generated
+position zero. Teacher forcing therefore stops at zero performed steps:
+there is no later position to search for the first divergence.
+
+Synthetic kernel/runtime parity is green, and an actual canonical-artifact
+payload comparison proves the representative
+`layers.3.self_attn.q_proj.weight` packed bytes and BF16 scale/zero sidecars
+match the current producer exactly. Its current native 128x128 tile-scale
+quality against source BF16 is:
+
+```text
+cosine=0.9593526721
+relative_rmse=0.2964433730
+rmse=0.0048467377
+source_rms=0.0163496248
+max_abs_error=0.0244140625
+```
+
+A conventional per-row group-128 counterfactual on the same matrix gives
+`cosine=0.9919335842` and `relative_rmse=0.1297728270`. The producer comment,
+runtime sidecar shape, CPU dequantizer, and HIP kernels all intentionally use
+one scale per 128x128 tile. Evidence therefore localizes the remaining
+pre-parser failure to model-level accuracy under the current native-INT4
+format contract, not artifact corruption, server transformation, XML parsing,
+or only one optimized prefill path.
+
+## Commits
+
+SuperSonic implementation:
+
+```text
+e730c7ef98c27e4f0ea68bc5119081112e99c4f6
+test(server): harden Qwen3.6 protocol harness
+```
+
+geo-quant EOS producer/validator:
+
+```text
+b6ce7cde1a0256084b0dda6181193a489cc94ed9
+fix(flm): merge canonical Qwen generation EOS ids
+```
+
+The report commit follows this section.
+
+## Concerns / Blocker
+
+- EOS handling is fixed and validated, but the regenerated canonical artifact
+  still fails real semantic and tool-call gates at the first generated token.
+- The remaining repair requires a higher-fidelity native-INT4 ABI/export and
+  matching CPU/HIP consumers (for example, per-row group-128 sidecars), then
+  full artifact regeneration and parity/semantic qualification. That
+  cross-kernel format migration is outside the Task 14 harness-owned surface
+  and was not attempted as an unreviewed ABI change.
+- The server does not expose independent top-k logits. Server top-1 is captured
+  directly; full top-k comes from the identical FLM engine's CLI hook.
+- Repository-wide formatting remains red only in unrelated pre-existing files
+  named above. Changed Rust code is rustfmt-clean.
+- Existing backend/compiler warnings remain unrelated to this round.
