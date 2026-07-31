@@ -31,6 +31,21 @@ fn test_template() -> Arc<chat_template::ChatTemplate> {
     .expect("test chat template")
 }
 
+fn user_history_template() -> Arc<chat_template::ChatTemplate> {
+    chat_template::ChatTemplate::from_template_source(
+        r#"{%- if messages[0].role != "user" -%}
+{{- raise_exception('No user query found in messages.') -}}
+{%- endif -%}
+{%- for message in messages -%}
+<|im_start|>{{ message.role }}
+{{ message.content }}<|im_end|>
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|im_start|>assistant
+{%- endif -%}"#,
+    )
+    .expect("user-history chat template")
+}
+
 fn test_state_with_mock(mock_generation: MockGeneration) -> Arc<ServerState> {
     test_state_with_scheduler(mock_generation, GenerationScheduler::new(32, 30_000))
 }
@@ -502,6 +517,64 @@ async fn mock_responses_accepts_flat_function_tool_schema() {
     assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
     assert_eq!(body["output"][0]["type"], "function_call");
     assert_eq!(body["output"][0]["name"], "lookup");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_previous_id_preserves_original_user_history() {
+    let mut state = test_state_with_mock(MockGeneration::text(
+        "<tool_call>\n<function=lookup>\n<parameter=query>\nweather\n</parameter>\n</function>\n</tool_call>",
+    ));
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .chat_template = Some(user_history_template());
+    let h = spawn_with_state(state).await;
+    let tools = json!([{
+        "type": "function",
+        "name": "lookup",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        }
+    }]);
+    let first: Value = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "need weather",
+            "tools": tools,
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("first response")
+        .json()
+        .await
+        .expect("first JSON");
+    let call_id = first["output"][0]["call_id"].as_str().expect("call id");
+
+    let second_http = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "previous_response_id": first["id"],
+            "input": [{
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "{\"forecast\":\"sunny\"}"
+            }],
+            "tools": tools,
+            "max_output_tokens": 4
+        }))
+        .send()
+        .await
+        .expect("second response");
+    let status = second_http.status();
+    let body: Value = second_http.json().await.expect("second JSON");
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

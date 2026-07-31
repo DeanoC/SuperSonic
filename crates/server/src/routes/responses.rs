@@ -82,6 +82,8 @@ pub struct StoredResponse {
     pub usage: Usage,
     #[serde(skip_serializing)]
     pub cache_key: Option<String>,
+    #[serde(skip_serializing)]
+    input_messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,6 +253,7 @@ pub async fn create(
             state.response_store_max_entries,
             response_cache_key,
             output_context,
+            messages,
         );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
@@ -273,6 +276,7 @@ pub async fn create(
             parsed,
             usage(&result.stats),
             response_cache_key,
+            messages,
         );
         insert_response(
             state.server_instance_id,
@@ -360,6 +364,7 @@ fn response_sse_stream(
     response_store_max_entries: usize,
     cache_key: Option<String>,
     output_context: AssistantOutputParseContext,
+    input_messages: Vec<ChatMessage>,
 ) -> impl Stream<Item = super::sse::SseEvent> {
     async_stream::stream! {
         yield Ok(Event::default()
@@ -432,6 +437,7 @@ fn response_sse_stream(
                         parsed,
                         usage(&stats),
                         cache_key.clone(),
+                        input_messages.clone(),
                     );
                     insert_response(
                         server_instance_id,
@@ -509,6 +515,7 @@ fn response_messages(
     if let Some(id) = req.previous_response_id.as_ref() {
         let prev = get_response(server_instance_id, id)
             .ok_or_else(|| ApiError::bad_request("unknown previous_response_id"))?;
+        messages.extend(prev.input_messages.clone());
         append_previous_response_messages(&mut messages, &prev);
     }
     if let Some(instructions) = req.instructions.as_ref() {
@@ -675,6 +682,7 @@ fn build_response(
     parsed: AssistantOutput,
     usage: Usage,
     cache_key: Option<String>,
+    input_messages: Vec<ChatMessage>,
 ) -> StoredResponse {
     let mut output = Vec::new();
     if let Some(reasoning) = parsed.reasoning_content {
@@ -705,6 +713,7 @@ fn build_response(
         output,
         usage,
         cache_key,
+        input_messages,
     }
 }
 
@@ -838,6 +847,7 @@ mod tests {
                 prompt_tokens_details: None,
             },
             Some("thread-cache".to_string()),
+            Vec::new(),
         );
         assert!(matches!(
             resp.output[0],
@@ -848,6 +858,13 @@ mod tests {
             resp.output[2],
             ResponseOutputItem::FunctionCall { .. }
         ));
+        assert!(
+            serde_json::to_value(&resp)
+                .unwrap()
+                .get("input_messages")
+                .is_none(),
+            "stored input history must not change Responses JSON"
+        );
     }
 
     #[test]
@@ -1062,6 +1079,7 @@ mod tests {
                 prompt_tokens_details: None,
             },
             cache_key: cache_key.map(ToOwned::to_owned),
+            input_messages: Vec::new(),
         }
     }
 }
