@@ -80,6 +80,8 @@ FLM_DIRECT_PROFILE_RE = re.compile(
     r"required=(?P<required>\d+)\s+"
     r"raw_dense=(?P<raw_dense>\d+)\s+"
     r"native_int4=(?P<native_int4>\d+)\s+"
+    r"row_group_int4=(?P<row_group_int4>\d+)\s+"
+    r"tile_int4_v1=(?P<tile_int4_v1>\d+)\s+"
     r"bf16_fallback=(?P<bf16_fallback>\d+)"
 )
 FLM_READY_RE = re.compile(
@@ -262,6 +264,8 @@ def parse_flm_direct_profile(text: str) -> dict[str, int] | None:
         "required": int(match.group("required")),
         "raw_dense": int(match.group("raw_dense")),
         "native_int4": int(match.group("native_int4")),
+        "row_group_int4": int(match.group("row_group_int4")),
+        "tile_int4_v1": int(match.group("tile_int4_v1")),
         "bf16_fallback": int(match.group("bf16_fallback")),
     }
 

@@ -162,7 +162,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         output = (
             "[qwen36-moe] FLM weight mode: INT4 native FLM\n"
             "[qwen36-moe] FLM direct plans: required=693 raw_dense=363 "
-            "native_int4=330 bf16_fallback=0\n"
+            "native_int4=330 row_group_int4=330 tile_int4_v1=0 "
+            "bf16_fallback=0\n"
             "[FLM runtime weights] ready-for-decode: YES "
             "(source=/tmp/qwen36.flm)\n"
             "[qwen36-moe] runtime engine ready: "
@@ -176,6 +177,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "required": 693,
                 "raw_dense": 363,
                 "native_int4": 330,
+                "row_group_int4": 330,
+                "tile_int4_v1": 0,
                 "bf16_fallback": 0,
             },
         )
@@ -620,6 +623,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                     "required": 693,
                     "raw_dense": 363,
                     "native_int4": 330,
+                    "row_group_int4": 330,
+                    "tile_int4_v1": 0,
                     "bf16_fallback": 0,
                 },
             },
@@ -646,6 +651,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                     "required": 693,
                     "raw_dense": 363,
                     "native_int4": 330,
+                    "row_group_int4": 330,
+                    "tile_int4_v1": 0,
                     "bf16_fallback": 0,
                 }
             ],
@@ -874,7 +881,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "[flm] inferred model qwen3.6-35b-a3b from runtime descriptor\n"
                 "[qwen36-moe] FLM weight mode: INT4 native FLM\n"
                 "[qwen36-moe] FLM direct plans: required=693 raw_dense=363 "
-                "native_int4=330 bf16_fallback=0\n"
+                "native_int4=330 row_group_int4=330 tile_int4_v1=0 "
+                "bf16_fallback=0\n"
                 "[FLM runtime weights] ready-for-decode: YES "
                 "(source=/tmp/qwen36.flm)\n"
                 "[qwen36-moe startup-timings] flm_source_open_ms=123.456 "
@@ -935,6 +943,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "required": 693,
                 "raw_dense": 363,
                 "native_int4": 330,
+                "row_group_int4": 330,
+                "tile_int4_v1": 0,
                 "bf16_fallback": 0,
             },
         )
