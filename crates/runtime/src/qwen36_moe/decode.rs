@@ -59,6 +59,9 @@ pub type Qwen36DiagnosticObserver = dyn Fn(&str) + Send + Sync + 'static;
 pub struct Qwen36BatchedPrefillOptions {
     pub attention: bool,
     pub grouped_ffn: bool,
+    /// Diagnostic opt-in for the HIP native-INT4 path whose real-model
+    /// optimized/legacy logit parity gate is not yet qualified.
+    pub enable_unqualified_hip_native_int4: bool,
     pub metal_split_qgate: bool,
     pub metal_full_attn_tmajor: bool,
     pub metal_full_attn_vec: bool,
@@ -73,6 +76,7 @@ impl Default for Qwen36BatchedPrefillOptions {
         Self {
             attention: true,
             grouped_ffn: true,
+            enable_unqualified_hip_native_int4: false,
             metal_split_qgate: false,
             metal_full_attn_tmajor: false,
             metal_full_attn_vec: true,

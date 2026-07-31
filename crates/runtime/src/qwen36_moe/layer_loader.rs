@@ -2270,6 +2270,9 @@ mod direct_load_tests {
         optimized_options.batched_prefill.attention = true;
         optimized_options.batched_prefill.grouped_ffn = true;
         optimized_options
+            .batched_prefill
+            .enable_unqualified_hip_native_int4 = true;
+        optimized_options
             .diagnostics
             .capture_prefill_boundary_hidden = true;
         optimized_options.diagnostics.route_profile =

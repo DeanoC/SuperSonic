@@ -1,11 +1,9 @@
-//! End-to-end parity gate for the Qwen 3.6 MoE batched-Q prefill path.
+//! End-to-end parity gate for qualified Qwen 3.6 MoE HIP prefill dispatch.
 //!
-//! M13: batched prefill is now the default for Qwen 3.6 MoE. This test
-//! runs `supersonic` twice on the same prompt — once with the LEGACY
-//! per-token persistent-decode prefill loop forced via
-//! `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0`, once with the default
-//! (no env vars set, batched path active) — and compares the dumped
-//! post-prefill last-token logits.
+//! The HIP native-INT4 batched path remains available behind
+//! `SUPERSONIC_QWEN36_ENABLE_HIP_OPTIMIZED_PREFILL=1`, but its real-model
+//! `0.999 + argmax` gate is red. Default dispatch must therefore reproduce
+//! the explicit per-token owner exactly.
 //!
 //! Subprocess-spawn pattern lives at:
 //!   crates/runner/tests/specprefill_qwen36_moe_cosine_parity.rs
@@ -47,36 +45,8 @@ fn run_supersonic_capture_logits(
         .collect()
 }
 
-fn cossim(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a
-        .iter()
-        .zip(b)
-        .map(|(x, y)| f64::from(*x) * f64::from(*y))
-        .sum();
-    let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
-    }
-}
-
-fn argmax(v: &[f32]) -> usize {
-    v.iter()
-        .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
-            if x > a.1 {
-                (i, x)
-            } else {
-                a
-            }
-        })
-        .0
-}
-
 #[test]
-fn batched_prefill_matches_per_token() {
+fn qualified_hip_prefill_matches_per_token() {
     if !gpu_hal::is_backend_compiled(Backend::Hip) {
         eprintln!("skipped: HIP backend not compiled");
         return;
@@ -107,48 +77,20 @@ fn batched_prefill_matches_per_token() {
         "1",
     ];
 
-    // M13: explicitly disable all three stages to get the LEGACY per-token
-    // persistent-decode behavior (the pre-PR path).
-    let baseline = run_supersonic_capture_logits(
-        &common,
-        &[
-            ("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", "0"),
-            ("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN", "0"),
-            ("SUPERSONIC_QWEN36_MOE_GROUPED_FFN", "0"),
-        ],
-    )
-    .expect("baseline (per-token, env=0 forced)");
-    // No env vars set → the new default: batched prefill + batched attn +
-    // grouped FFN all active.
-    let batched = run_supersonic_capture_logits(&common, &[]).expect("batched (default)");
+    let baseline =
+        run_supersonic_capture_logits(&common, &[("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", "0")])
+            .expect("baseline (per-token, env=0 forced)");
+    let qualified = run_supersonic_capture_logits(&common, &[]).expect("qualified HIP default");
 
     assert_eq!(
         baseline.len(),
-        batched.len(),
-        "logits length mismatch: baseline={} batched={}",
+        qualified.len(),
+        "logits length mismatch: baseline={} qualified={}",
         baseline.len(),
-        batched.len()
-    );
-
-    let cs = cossim(&baseline, &batched);
-    let am_b = argmax(&baseline);
-    let am_n = argmax(&batched);
-
-    // Bar matches the codebase's INT4/BF16 noise floor for "different
-    // fused-op shapes, same math" parity. cossim >= 0.999 is what
-    // qwen36_moe_kv_fp8_parity uses for KV-FP8 vs BF16-KV; the M6.2
-    // batched path lands ~0.9996 because the prefill primitives BF16-round
-    // at slightly different points than the per-token persistent megakernel
-    // (q_norm/k_norm intermediates, sigmoid·gate, RoPE table interpolation).
-    // Argmax must still match — that's the load-bearing bar for greedy decode.
-    assert!(
-        cs >= 0.999,
-        "cossim {:.6} < 0.999 (per-token vs batched diverged beyond INT4/BF16 noise)",
-        cs
+        qualified.len()
     );
     assert_eq!(
-        am_b, am_n,
-        "argmax mismatch: per-token={} batched={}",
-        am_b, am_n
+        baseline, qualified,
+        "qualified HIP default must be bit-exact to explicit per-token prefill"
     );
 }

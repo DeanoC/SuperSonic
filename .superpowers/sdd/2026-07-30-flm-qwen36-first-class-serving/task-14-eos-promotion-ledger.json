@@ -1,0 +1,49 @@
+{
+  "artifacts": {
+    "final": {
+      "path": "/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm",
+      "sha256": "eb7a58444c3ca057512aca47723a8a4872f2fb1292a801af725f07931033052c",
+      "size": 22871543808
+    },
+    "new": {
+      "path": "/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-eos-20260731.flm",
+      "sha256": "eb7a58444c3ca057512aca47723a8a4872f2fb1292a801af725f07931033052c",
+      "size": 22871543808
+    },
+    "old": null,
+    "stage": null
+  },
+  "authorization": null,
+  "evidence_status": "retroactive-partial",
+  "method": null,
+  "schema": "flm-canonical-promotion/v1",
+  "timestamps": {
+    "completed_utc": null,
+    "recorded_utc": "2026-07-31T02:16:38.363464Z",
+    "started_utc": null
+  },
+  "tool_identity": {
+    "command": [
+      "scripts/promote_flm_artifact.py",
+      "--source",
+      "/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-eos-20260731.flm",
+      "--canonical",
+      "/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm",
+      "--ledger",
+      "/home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving/.superpowers/sdd/2026-07-30-flm-qwen36-first-class-serving/task-14-eos-promotion-ledger.json",
+      "--record-existing",
+      "--supersonic-repo",
+      "/home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving"
+    ],
+    "geo_quant": {
+      "dirty": false,
+      "path": "/home/deano/projects/geo-quant/.worktrees/flm-qwen36-serving",
+      "revision": "8b8ce774c264f32258eb015e3baf8bf10a76581d"
+    },
+    "supersonic": {
+      "dirty": true,
+      "path": "/home/deano/projects/SuperSonicBase/.worktree/flm-qwen36-serving",
+      "revision": "06925163085b36a0d502796c43a69026dcf67f0d"
+    }
+  }
+}

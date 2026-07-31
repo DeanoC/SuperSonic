@@ -95,6 +95,7 @@ from qwen36_moe_linear_oracle import (
 )
 from qwen36_moe_ffn_oracle import (
     INT4_FFN_TARGETS,                                                   # noqa: F401
+    b64_i32,
     load_block_from_checkpoint as load_ffn_block_from_checkpoint,
     quantize_int4_ffn_weights,
     reference_moe_ffn_block,
@@ -316,6 +317,12 @@ def run_multilayer_decode(
             "layer_idx": layer_idx,
             "kind": kind,
             "output_after_attn": h_after_attn,
+            "ffn_topk_idx": ffn_out["topk_idx"],
+            "ffn_topk_weights": ffn_out["topk_weights"],
+            "ffn_shared_out": ffn_out["shared_out"],
+            "ffn_expert_stack": ffn_out["expert_stack"],
+            "ffn_moe_out": ffn_out["moe_out"],
+            "ffn_output_hidden_exact_input": ffn_out["output_hidden"],
             "output_after_ffn": h_after_ffn,
         })
         h = h_after_ffn
@@ -578,6 +585,14 @@ def main() -> None:
             "layer_idx": item["layer_idx"],
             "kind": item["kind"],
             "output_after_attn": encode(item["output_after_attn"]),
+            "ffn_topk_idx": b64_i32(item["ffn_topk_idx"]),
+            "ffn_topk_weights": encode(item["ffn_topk_weights"]),
+            "ffn_shared_out": encode(item["ffn_shared_out"]),
+            "ffn_expert_stack": encode(item["ffn_expert_stack"]),
+            "ffn_moe_out": encode(item["ffn_moe_out"]),
+            "ffn_output_hidden_exact_input": encode(
+                item["ffn_output_hidden_exact_input"]
+            ),
             "output_after_ffn": encode(item["output_after_ffn"]),
         }
         for item in intermediates

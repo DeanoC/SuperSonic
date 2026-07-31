@@ -30,12 +30,17 @@
 
 use base64::Engine;
 use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
+use kernel_ffi::qwen36_moe::{
+    ffn_step_launch, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
+};
 use runner::qwen36_moe_logits::{bf16_bytes_to_f32, host_final_norm_lm_head};
 use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
 use serde_json::Value;
 use std::ffi::c_void;
 use supersonic_runtime::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
-use supersonic_runtime::qwen36_moe::decode::{run_chained_decode, Qwen36ExecutionOptions};
+use supersonic_runtime::qwen36_moe::decode::{
+    ffn_output_elems, ffn_workspace_floats, run_chained_decode, Qwen36ExecutionOptions,
+};
 use supersonic_runtime::qwen36_moe::layer_loader::Qwen36WeightMode;
 use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
 use supersonic_runtime::qwen36_moe::persistent_decode::{LmHeadFold, CACHE_POS_INHERIT};
@@ -447,6 +452,55 @@ fn build_ffn_layer(
     }
 }
 
+fn build_layers(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    weights_per_layer: &[Value],
+    int4_per_layer: Option<&Vec<Value>>,
+    int4_group_size: i32,
+) -> Vec<LayerBuffers> {
+    weights_per_layer
+        .iter()
+        .enumerate()
+        .map(|(li, layer_json)| {
+            let attn_w = &layer_json["attn"];
+            let ffn_w = &layer_json["ffn"];
+            let attn_int4 = int4_per_layer.map(|layers| &layers[li]["attn"]);
+            let ffn_int4 = int4_per_layer.map(|layers| &layers[li]["ffn"]);
+            let attn = if is_full_attn_layer(li as i32) {
+                build_full_attn_layer(ordinal, geom, attn_w, attn_int4, int4_group_size)
+            } else {
+                build_linear_attn_layer(ordinal, geom, attn_w, attn_int4, int4_group_size)
+            };
+            let ffn = build_ffn_layer(ordinal, geom, ffn_w, ffn_int4, int4_group_size);
+            LayerBuffers { attn, ffn }
+        })
+        .collect()
+}
+
+fn run_isolated_attention(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layer: &mut LayerBuffers,
+    input_hidden: &[u8],
+    position: i32,
+) -> Vec<u8> {
+    let mut single_geom = *geom;
+    single_geom.num_layers = 1;
+    run_chained_decode(
+        ordinal,
+        &single_geom,
+        std::slice::from_mut(layer),
+        input_hidden,
+        position,
+    )
+    .expect("isolated attention chain")
+    .per_layer_attn_out
+    .into_iter()
+    .next()
+    .expect("isolated attention output")
+}
+
 /// Identical envelope to the per-block parity tests: cos_sim against the
 /// oracle's BF16 buffer, plus a max |delta| tolerance. Per the plan, the
 /// final logits parity gate is `cos_sim ≥ 0.999`. Per-layer hiddens get a
@@ -488,6 +542,140 @@ fn assert_parity_bf16(label: &str, got: &[u8], want: &[u8], max_abs_tol: f32, co
         cos_sim >= cos_sim_floor,
         "{label}: cos_sim {cos_sim:.7} below floor {cos_sim_floor}"
     );
+}
+
+fn max_abs_delta_bf16(lhs: &[u8], rhs: &[u8]) -> f32 {
+    assert_eq!(lhs.len(), rhs.len(), "BF16 delta byte length mismatch");
+    bf16_bytes_to_f32(lhs)
+        .into_iter()
+        .zip(bf16_bytes_to_f32(rhs))
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f32::max)
+}
+
+fn max_bf16_ulp(bytes: &[u8]) -> f32 {
+    bf16_bytes_to_f32(bytes)
+        .into_iter()
+        .map(|value| {
+            let magnitude = value.abs();
+            if magnitude == 0.0 {
+                2.0f32.powi(-133)
+            } else {
+                2.0f32.powi(magnitude.log2().floor() as i32 - 7)
+            }
+        })
+        .fold(0.0, f32::max)
+}
+
+fn l2_delta_bf16(lhs: &[u8], rhs: &[u8]) -> f64 {
+    assert_eq!(lhs.len(), rhs.len(), "BF16 delta byte length mismatch");
+    bf16_bytes_to_f32(lhs)
+        .into_iter()
+        .zip(bf16_bytes_to_f32(rhs))
+        .map(|(left, right)| {
+            let delta = (left - right) as f64;
+            delta * delta
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn l2_norm_bf16(bytes: &[u8]) -> f64 {
+    bf16_bytes_to_f32(bytes)
+        .into_iter()
+        .map(|value| (value as f64).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn i32_bytes_to_vec(bytes: &[u8]) -> Vec<i32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("four-byte i32")))
+        .collect()
+}
+
+fn run_isolated_ffn_stage(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layer_idx: usize,
+    ffn: &FfnLayerBuffers,
+    input_hidden: &[u8],
+    stage: i32,
+) -> (Vec<u8>, Vec<i32>) {
+    let hidden = geom.hidden as usize;
+    let input = upload_bf16(ordinal, &[hidden], input_hidden, "isolated FFN input");
+    let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_output_elems(geom)])
+        .expect("alloc isolated FFN output");
+    let mut output_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[geom.top_k as usize])
+        .expect("alloc isolated FFN route output");
+    let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_workspace_floats(geom)])
+        .expect("alloc isolated FFN workspace");
+    let mut sync_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc isolated FFN sync");
+    let weights = Qwen36MoeFfnStepWeights {
+        input_hidden: input.as_ptr(),
+        post_attn_norm_w: ffn.post_attn_norm_w.as_ptr(),
+        gate_w: ffn.gate_w.as_ptr(),
+        gate_up_proj_w: ffn.gate_up_proj_w.as_ptr(),
+        down_proj_w: ffn.down_proj_w.as_ptr(),
+        shared_gate_proj_w: ffn.shared_gate_proj_w.as_ptr(),
+        shared_up_proj_w: ffn.shared_up_proj_w.as_ptr(),
+        shared_down_proj_w: ffn.shared_down_proj_w.as_ptr(),
+        shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
+    };
+    let int4 = ffn
+        .int4
+        .as_ref()
+        .map_or_else(Qwen36MoeFfnStepInt4::disabled, |sidecars| {
+            Qwen36MoeFfnStepInt4 {
+                group_size: sidecars.group_size,
+                gate_up_proj_type: sidecars.gate_up_proj_type,
+                gate_up_proj_scale: sidecars.gate_up_proj_scale.as_ptr(),
+                gate_up_proj_zero: sidecars.gate_up_proj_zero.as_ptr(),
+                down_proj_type: sidecars.down_proj_type,
+                down_proj_scale: sidecars.down_proj_scale.as_ptr(),
+                down_proj_zero: sidecars.down_proj_zero.as_ptr(),
+                shared_gate_proj_type: sidecars.shared_gate_proj_type,
+                shared_gate_proj_scale: sidecars.shared_gate_proj_scale.as_ptr(),
+                shared_gate_proj_zero: sidecars.shared_gate_proj_zero.as_ptr(),
+                shared_up_proj_type: sidecars.shared_up_proj_type,
+                shared_up_proj_scale: sidecars.shared_up_proj_scale.as_ptr(),
+                shared_up_proj_zero: sidecars.shared_up_proj_zero.as_ptr(),
+                shared_down_proj_type: sidecars.shared_down_proj_type,
+                shared_down_proj_scale: sidecars.shared_down_proj_scale.as_ptr(),
+                shared_down_proj_zero: sidecars.shared_down_proj_zero.as_ptr(),
+            }
+        });
+    ffn_step_launch(
+        ordinal,
+        ScalarType::BF16,
+        Qwen36MoeFfnStepParams {
+            stage,
+            layer_idx: layer_idx as i32,
+            hidden: geom.hidden,
+            num_experts: geom.num_experts,
+            moe_intermediate: geom.moe_intermediate,
+            shared_intermediate: geom.shared_intermediate,
+            top_k: geom.top_k,
+            rms_norm_eps: geom.rms_norm_eps,
+        },
+        &weights,
+        &int4,
+        &mut output,
+        &mut output_idx,
+        &mut workspace,
+        &mut sync_buf,
+    )
+    .unwrap_or_else(|error| panic!("isolated FFN layer {layer_idx} stage {stage}: {error}"));
+
+    let output_bytes = output
+        .to_host_bytes()
+        .expect("download isolated FFN output");
+    let idx_bytes = output_idx
+        .to_host_bytes()
+        .expect("download isolated FFN routes");
+    (output_bytes, i32_bytes_to_vec(&idx_bytes))
 }
 
 #[test]
@@ -554,20 +742,27 @@ fn multilayer_chained_decode_matches_oracle() {
         None
     };
 
-    let mut layers: Vec<LayerBuffers> = Vec::with_capacity(geom.num_layers as usize);
-    for (li, layer_json) in weights_per_layer.iter().enumerate() {
-        let attn_w = &layer_json["attn"];
-        let ffn_w = &layer_json["ffn"];
-        let attn_int4 = int4_per_layer.map(|v| &v[li]["attn"]);
-        let ffn_int4 = int4_per_layer.map(|v| &v[li]["ffn"]);
-        let attn = if is_full_attn_layer(li as i32) {
-            build_full_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
-        } else {
-            build_linear_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
-        };
-        let ffn = build_ffn_layer(ordinal, &geom, ffn_w, ffn_int4, int4_group_size);
-        layers.push(LayerBuffers { attn, ffn });
-    }
+    let mut layers = build_layers(
+        ordinal,
+        &geom,
+        weights_per_layer,
+        int4_per_layer,
+        int4_group_size,
+    );
+    let mut exact_input_attn_layers = build_layers(
+        ordinal,
+        &geom,
+        weights_per_layer,
+        int4_per_layer,
+        int4_group_size,
+    );
+    let mut chained_input_attn_layers = build_layers(
+        ordinal,
+        &geom,
+        weights_per_layer,
+        int4_per_layer,
+        int4_group_size,
+    );
 
     let initial_hidden = b64_field(&json, "input_hidden");
     let final_norm_w = b64_field(&json, "final_norm_w");
@@ -577,26 +772,9 @@ fn multilayer_chained_decode_matches_oracle() {
     let outputs = run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, position)
         .expect("chained decode");
 
-    // Per-layer parity. Tighter floor (0.9999) — no vocab-wide reduction
-    // to absorb noise.
-    // BF16 rounding noise compounds through residuals — every layer's matvec
-    // adds ~1 ULP per output channel, and N-layer chains see roughly N×
-    // the single-block max_abs and a few-times-N drop in cos_sim. The
-    // PR 4c acceptance criterion (cos_sim ≥ 0.999 on the final logits)
-    // is the real structural-correctness gate; per-layer envelopes are
-    // outlier sanity checks scaled with depth so the 4th residual being
-    // 4× noisier than the 1st doesn't false-positive.
-    let max_abs_envelope = |li: usize| -> f32 {
-        // Single-block stage-5 tests use 0.05; allow that much per layer
-        // of compounding (capped at 0.5 so a real divergence still trips).
-        (0.05 * (li as f32 + 1.0) * 1.5).min(0.5)
-    };
-    // Drop per-layer cos_sim floor by ~5e-5 per layer of depth — matches
-    // the observed drift on the synthetic 4-layer fixture (0.9999937 at
-    // layer 0 down to ~0.99988 at layer 3) with headroom. Still tight
-    // enough that any real bug (e.g. wrong layer kind, swapped weight
-    // pointer) trips it by orders of magnitude.
-    let cos_sim_floor = |li: usize| -> f64 { (0.9999 - 5e-5 * li as f64).max(0.999) };
+    // Each local block is gated against an exact-input oracle. The chained
+    // checks then use triangle-inequality max/L2 bounds from that local
+    // error plus the measured propagation of the preceding residual.
     let inters = json["intermediates_per_layer"]
         .as_array()
         .expect("intermediates_per_layer array");
@@ -605,25 +783,185 @@ fn multilayer_chained_decode_matches_oracle() {
         geom.num_layers as usize,
         "intermediates length mismatch"
     );
+    let mut last_exact_input_residual = None;
     for (li, item) in inters.iter().enumerate() {
+        let oracle_layer_input = if li == 0 {
+            initial_hidden.clone()
+        } else {
+            b64_field(&inters[li - 1], "output_after_ffn")
+        };
         let want_attn = b64_field(item, "output_after_attn");
         let want_ffn = b64_field(item, "output_after_ffn");
-        let envelope = max_abs_envelope(li);
-        let floor = cos_sim_floor(li);
+        let want_topk_idx = i32_bytes_to_vec(&b64_field(item, "ffn_topk_idx"));
+        let want_topk_weights = b64_field(item, "ffn_topk_weights");
+        let want_shared = b64_field(item, "ffn_shared_out");
+        let want_expert_stack = b64_field(item, "ffn_expert_stack");
+        let want_routed = b64_field(item, "ffn_moe_out");
+        let want_exact_input_residual = b64_field(item, "ffn_output_hidden_exact_input");
+
+        let (route_weights, got_topk_idx) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 1);
+        assert_eq!(
+            got_topk_idx, want_topk_idx,
+            "layer {li} isolated FFN route indices differ"
+        );
+        assert_parity_bf16(
+            &format!("layer {li} isolated FFN route weights"),
+            &route_weights[..geom.top_k as usize * 2],
+            &want_topk_weights,
+            0.01,
+            0.9999,
+        );
+        let (chained_route_weights, got_chained_topk_idx) = run_isolated_ffn_stage(
+            ordinal,
+            &geom,
+            li,
+            &layers[li].ffn,
+            &outputs.per_layer_attn_out[li],
+            1,
+        );
+        assert_eq!(
+            got_chained_topk_idx, want_topk_idx,
+            "layer {li} chained-input FFN route indices differ"
+        );
+        let chained_route_weight_delta = max_abs_delta_bf16(
+            &chained_route_weights[..geom.top_k as usize * 2],
+            &route_weights[..geom.top_k as usize * 2],
+        );
+        eprintln!(
+            "[parity layer {li} FFN route propagation] max_abs={chained_route_weight_delta:.5e}"
+        );
+        let (got_shared, _) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 2);
+        assert_parity_bf16(
+            &format!("layer {li} isolated FFN shared"),
+            &got_shared,
+            &want_shared,
+            0.05,
+            0.999,
+        );
+        let isolated_shared_error = max_abs_delta_bf16(&got_shared, &want_shared);
+        let (got_expert0, _) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 3);
+        assert_parity_bf16(
+            &format!("layer {li} isolated FFN expert 0"),
+            &got_expert0,
+            &want_expert_stack[..geom.hidden as usize * 2],
+            0.05,
+            0.999,
+        );
+        let (got_routed, _) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 4);
+        assert_parity_bf16(
+            &format!("layer {li} isolated FFN routed"),
+            &got_routed,
+            &want_routed,
+            0.05,
+            0.999,
+        );
+        let isolated_routed_error = max_abs_delta_bf16(&got_routed, &want_routed);
+        let (got_exact_input_residual, _) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 5);
+        let isolated_residual_bound = isolated_shared_error
+            + isolated_routed_error
+            + 0.5 * max_bf16_ulp(&got_shared)
+            + 0.5 * max_bf16_ulp(&got_routed)
+            + max_bf16_ulp(&want_exact_input_residual);
+        assert_parity_bf16(
+            &format!("layer {li} isolated FFN residual"),
+            &got_exact_input_residual,
+            &want_exact_input_residual,
+            isolated_residual_bound,
+            0.999,
+        );
+        let (got_chained_input_residual, _) = run_isolated_ffn_stage(
+            ordinal,
+            &geom,
+            li,
+            &layers[li].ffn,
+            &outputs.per_layer_attn_out[li],
+            5,
+        );
+        assert_eq!(
+            got_chained_input_residual, outputs.per_layer_ffn_out[li],
+            "layer {li} chained FFN output is not reproducible from its captured input"
+        );
+        let exact_input_kernel_error =
+            max_abs_delta_bf16(&got_exact_input_residual, &want_exact_input_residual);
+        let propagated_input_delta =
+            max_abs_delta_bf16(&got_chained_input_residual, &got_exact_input_residual);
+        let derived_ffn_bound = exact_input_kernel_error + propagated_input_delta + f32::EPSILON;
+        let derived_ffn_l2_error =
+            l2_delta_bf16(&got_exact_input_residual, &want_exact_input_residual)
+                + l2_delta_bf16(&got_chained_input_residual, &got_exact_input_residual);
+        let relative_l2_bound = derived_ffn_l2_error / l2_norm_bf16(&want_exact_input_residual);
+        let derived_ffn_cos_floor = if relative_l2_bound < 1.0 {
+            (1.0 - relative_l2_bound) / (1.0 + relative_l2_bound)
+        } else {
+            -1.0
+        };
+        eprintln!(
+            "[parity layer {li} FFN derived bound] exact_input_kernel_error={exact_input_kernel_error:.5e} \
+             propagated_input_delta={propagated_input_delta:.5e} max_abs_bound={derived_ffn_bound:.5e} \
+             l2_bound={derived_ffn_l2_error:.5e} cos_floor={derived_ffn_cos_floor:.7}"
+        );
+
+        let actual_layer_input = if li == 0 {
+            initial_hidden.clone()
+        } else {
+            outputs.per_layer_ffn_out[li - 1].clone()
+        };
+        let got_exact_input_attn = run_isolated_attention(
+            ordinal,
+            &geom,
+            &mut exact_input_attn_layers[li],
+            &oracle_layer_input,
+            position,
+        );
+        let got_chained_input_attn = run_isolated_attention(
+            ordinal,
+            &geom,
+            &mut chained_input_attn_layers[li],
+            &actual_layer_input,
+            position,
+        );
+        assert_eq!(
+            got_chained_input_attn, outputs.per_layer_attn_out[li],
+            "layer {li} chained attention output is not reproducible from its captured input"
+        );
+        let exact_input_attn_error = max_abs_delta_bf16(&got_exact_input_attn, &want_attn);
+        let propagated_attn_input_delta =
+            max_abs_delta_bf16(&got_chained_input_attn, &got_exact_input_attn);
+        let derived_attn_bound =
+            exact_input_attn_error + propagated_attn_input_delta + f32::EPSILON;
+        let derived_attn_l2_error = l2_delta_bf16(&got_exact_input_attn, &want_attn)
+            + l2_delta_bf16(&got_chained_input_attn, &got_exact_input_attn);
+        let relative_attn_l2_bound = derived_attn_l2_error / l2_norm_bf16(&want_attn);
+        let derived_attn_cos_floor = if relative_attn_l2_bound < 1.0 {
+            (1.0 - relative_attn_l2_bound) / (1.0 + relative_attn_l2_bound)
+        } else {
+            -1.0
+        };
+        eprintln!(
+            "[parity layer {li} attention derived bound] exact_input_kernel_error={exact_input_attn_error:.5e} \
+             propagated_input_delta={propagated_attn_input_delta:.5e} max_abs_bound={derived_attn_bound:.5e} \
+             l2_bound={derived_attn_l2_error:.5e} cos_floor={derived_attn_cos_floor:.7}"
+        );
         assert_parity_bf16(
             &format!("layer {li} output_after_attn"),
             &outputs.per_layer_attn_out[li],
             &want_attn,
-            envelope,
-            floor,
+            derived_attn_bound,
+            derived_attn_cos_floor,
         );
         assert_parity_bf16(
             &format!("layer {li} output_after_ffn"),
             &outputs.per_layer_ffn_out[li],
             &want_ffn,
-            envelope,
-            floor,
+            derived_ffn_bound,
+            derived_ffn_cos_floor,
         );
+        last_exact_input_residual = Some(got_exact_input_residual);
     }
 
     // The kernel-side residual is covered by the per-layer last-FFN check
@@ -640,7 +978,44 @@ fn multilayer_chained_decode_matches_oracle() {
         geom.vocab as usize,
         geom.rms_norm_eps,
     );
-    assert_parity_bf16("logits", &logits, &oracle_logits, 0.5, 0.999);
+    let exact_input_logits = host_final_norm_lm_head(
+        &last_exact_input_residual.expect("last exact-input residual"),
+        &final_norm_w,
+        &lm_head_w,
+        geom.hidden as usize,
+        geom.vocab as usize,
+        geom.rms_norm_eps,
+    );
+    assert_parity_bf16(
+        "exact-input logits",
+        &exact_input_logits,
+        &oracle_logits,
+        0.5,
+        0.999,
+    );
+    let exact_input_logit_error = max_abs_delta_bf16(&exact_input_logits, &oracle_logits);
+    let propagated_logit_delta = max_abs_delta_bf16(&logits, &exact_input_logits);
+    let derived_logit_bound = exact_input_logit_error + propagated_logit_delta + f32::EPSILON;
+    let derived_logit_l2_error = l2_delta_bf16(&exact_input_logits, &oracle_logits)
+        + l2_delta_bf16(&logits, &exact_input_logits);
+    let relative_logit_l2_bound = derived_logit_l2_error / l2_norm_bf16(&oracle_logits);
+    let derived_logit_cos_floor = if relative_logit_l2_bound < 1.0 {
+        (1.0 - relative_logit_l2_bound) / (1.0 + relative_logit_l2_bound)
+    } else {
+        -1.0
+    };
+    eprintln!(
+        "[parity logits derived bound] exact_input_kernel_error={exact_input_logit_error:.5e} \
+         propagated_input_delta={propagated_logit_delta:.5e} max_abs_bound={derived_logit_bound:.5e} \
+         l2_bound={derived_logit_l2_error:.5e} cos_floor={derived_logit_cos_floor:.7}"
+    );
+    assert_parity_bf16(
+        "chained logits",
+        &logits,
+        &oracle_logits,
+        derived_logit_bound,
+        derived_logit_cos_floor,
+    );
 }
 
 // =============================================================================

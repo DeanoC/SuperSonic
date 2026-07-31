@@ -74,6 +74,8 @@ pub(crate) fn execution_options_from_environment() -> Qwen36ExecutionOptions {
 
     options.batched_prefill.attention = value_bool("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN", true);
     options.batched_prefill.grouped_ffn = value_bool("SUPERSONIC_QWEN36_MOE_GROUPED_FFN", true);
+    options.batched_prefill.enable_unqualified_hip_native_int4 =
+        value_bool("SUPERSONIC_QWEN36_ENABLE_HIP_OPTIMIZED_PREFILL", false);
     options.batched_prefill.metal_split_qgate =
         value_bool("SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE", false);
     options.batched_prefill.metal_full_attn_tmajor =

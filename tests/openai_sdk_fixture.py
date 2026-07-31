@@ -8,7 +8,7 @@ import threading
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 MODEL = "qwen3.6-35b-a3b"
@@ -16,6 +16,34 @@ API_KEY = "local"
 CHAT_CALL_ID = "call_chat_fixture"
 RESPONSE_CALL_ID = "call_response_fixture"
 RESPONSE_ID = "resp_fixture"
+CODING_PROMPT = (
+    "Your entire response must be exactly one call to read_source_file "
+    "with path src/lib.rs. Do not write natural language before or after the call."
+)
+TOOL_OUTPUT = json.dumps(
+    {
+        "path": "src/lib.rs",
+        "contents": "pub fn protocol_ready() -> bool { true }\n",
+    },
+    separators=(",", ":"),
+)
+FUNCTION_DEFINITION = {
+    "name": "read_source_file",
+    "description": "Read a UTF-8 source file from the current coding workspace.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative source path to read.",
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+}
+CHAT_TOOL = {"type": "function", "function": FUNCTION_DEFINITION}
+RESPONSES_TOOL = {"type": "function", **FUNCTION_DEFINITION}
 
 
 def _usage(prompt: int = 3, completion: int = 1) -> dict[str, int]:
@@ -95,15 +123,94 @@ def _message_output(text: str) -> dict[str, object]:
     }
 
 
+def _expected_chat_initial() -> dict[str, object]:
+    return {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": CODING_PROMPT}],
+        "tools": [CHAT_TOOL],
+        "tool_choice": "auto",
+        "max_completion_tokens": 128,
+        "temperature": 0,
+    }
+
+
+def _expected_chat_continuation() -> dict[str, object]:
+    return {
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": CODING_PROMPT},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": CHAT_CALL_ID,
+                        "type": "function",
+                        "function": {
+                            "name": "read_source_file",
+                            "arguments": '{"path":"src/lib.rs"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": CHAT_CALL_ID,
+                "content": TOOL_OUTPUT,
+            },
+        ],
+        "tools": [CHAT_TOOL],
+        "tool_choice": "auto",
+        "max_completion_tokens": 64,
+        "temperature": 0,
+    }
+
+
+def _expected_responses_initial() -> dict[str, object]:
+    return {
+        "model": MODEL,
+        "input": CODING_PROMPT,
+        "tools": [RESPONSES_TOOL],
+        "tool_choice": "auto",
+        "max_output_tokens": 128,
+        "temperature": 0,
+    }
+
+
+def _expected_responses_continuation() -> dict[str, object]:
+    return {
+        "model": MODEL,
+        "previous_response_id": RESPONSE_ID,
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": RESPONSE_CALL_ID,
+                "output": TOOL_OUTPUT,
+            }
+        ],
+        "tools": [RESPONSES_TOOL],
+        "tool_choice": "auto",
+        "max_output_tokens": 64,
+        "temperature": 0,
+    }
+
+
 class FixtureState:
-    def __init__(self, *, malformed_agent: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        malformed_agent: bool = False,
+        body_mutator: Callable[[str, dict[str, object]], dict[str, object]]
+        | None = None,
+    ) -> None:
         self.malformed_agent = malformed_agent
+        self.body_mutator = body_mutator
         self.lock = threading.Lock()
         self.cancel_active = 0
         self.cancel_queued = 0
         self.cancel_released = threading.Event()
         self.stored_response = _response_object([_message_output("hello")])
-        self.requests: list[tuple[str, str]] = []
+        self.requests: list[dict[str, object]] = []
 
     def scheduler(self) -> tuple[int, int]:
         with self.lock:
@@ -173,7 +280,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def do_GET(self) -> None:
-        self.server.state.requests.append(("GET", self.path))
+        self.server.state.requests.append(
+            {"method": "GET", "path": self.path, "body": None}
+        )
         if not self._authorized():
             return
         if self.path == "/v1/models":
@@ -248,7 +357,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": {"message": "not found", "type": "not_found"}})
 
     def do_DELETE(self) -> None:
-        self.server.state.requests.append(("DELETE", self.path))
+        self.server.state.requests.append(
+            {"method": "DELETE", "path": self.path, "body": None}
+        )
         if not self._authorized():
             return
         if self.path == f"/v1/responses/{RESPONSE_ID}":
@@ -260,10 +371,14 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": {"message": "not found", "type": "not_found"}})
 
     def do_POST(self) -> None:
-        self.server.state.requests.append(("POST", self.path))
         if not self._authorized():
             return
         body = self._body()
+        if self.server.state.body_mutator is not None:
+            body = self.server.state.body_mutator(self.path, body)
+        self.server.state.requests.append(
+            {"method": "POST", "path": self.path, "body": body}
+        )
         if self.path == "/v1/tokenize":
             self._json(200, {"tokens": [10, 11]})
             return
@@ -314,12 +429,14 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._chat_stream()
             return
         if "read_source_file" in prompt:
-            has_tool_result = any(
-                isinstance(message, dict) and message.get("role") == "tool"
-                for message in messages
-            )
-            if has_tool_result:
+            if len(messages) == 3:
+                if body != _expected_chat_continuation():
+                    self._invalid_fixture_request("Chat continuation body")
+                    return
                 self._json(200, _chat_response("file read", finish_reason="stop"))
+                return
+            if body != _expected_chat_initial():
+                self._invalid_fixture_request("Chat initial body")
                 return
             if self.server.state.malformed_agent:
                 self._json(
@@ -459,7 +576,18 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         previous_id = body.get("previous_response_id")
         input_value = body.get("input")
-        if previous_id:
+        is_tool_output = (
+            isinstance(input_value, list)
+            and any(
+                isinstance(item, dict)
+                and item.get("type") == "function_call_output"
+                for item in input_value
+            )
+        )
+        if previous_id or is_tool_output:
+            if body != _expected_responses_continuation():
+                self._invalid_fixture_request("Responses continuation body")
+                return
             response = _response_object(
                 [_message_output("file read")],
                 response_id="resp_tool_final_fixture",
@@ -467,6 +595,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._json(200, response)
             return
         if isinstance(input_value, str) and "read_source_file" in input_value:
+            if body != _expected_responses_initial():
+                self._invalid_fixture_request("Responses initial body")
+                return
             if self.server.state.malformed_agent:
                 self._json(
                     200,
@@ -492,6 +623,19 @@ class FixtureHandler(BaseHTTPRequestHandler):
         response = _response_object([_message_output("hello")])
         self.server.state.stored_response = response
         self._json(200, response)
+
+    def _invalid_fixture_request(self, label: str) -> None:
+        self._json(
+            400,
+            {
+                "error": {
+                    "message": f"invalid fixture request: {label}",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "invalid_fixture_request",
+                }
+            },
+        )
 
     def _responses_stream(self) -> None:
         self._sse_start()
@@ -561,8 +705,13 @@ class FixtureHandler(BaseHTTPRequestHandler):
 def openai_sdk_fixture(
     *,
     malformed_agent: bool = False,
+    body_mutator: Callable[[str, dict[str, object]], dict[str, object]]
+    | None = None,
 ) -> Iterator[tuple[str, FixtureState]]:
-    state = FixtureState(malformed_agent=malformed_agent)
+    state = FixtureState(
+        malformed_agent=malformed_agent,
+        body_mutator=body_mutator,
+    )
     server = FixtureServer(("127.0.0.1", 0), state)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

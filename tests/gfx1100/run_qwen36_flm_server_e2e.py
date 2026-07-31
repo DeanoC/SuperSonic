@@ -2,6 +2,7 @@
 """Run the real Qwen3.6 FLM server through its OpenAI protocol surface."""
 
 import argparse
+import copy
 import contextlib
 import hashlib
 import json
@@ -1132,11 +1133,16 @@ def run_process(
         )
     except OSError as exc:
         raise PhaseError(f"{phase} failed to start: {exc}") from exc
+    timeout_error: subprocess.TimeoutExpired | None = None
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        timeout_error = exc
+        stdout, stderr = "", ""
+    finally:
         _terminate_and_reap_process_group(process)
-        raise PhaseError(f"{phase} timed out after {timeout:g}s") from exc
+    if timeout_error is not None:
+        raise PhaseError(f"{phase} timed out after {timeout:g}s") from timeout_error
     result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if check and result.returncode != 0:
         raise PhaseError(
@@ -1454,6 +1460,520 @@ def collect_final_evidence(
     return final
 
 
+def _strict_bool(value: object, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise PhaseError(f"{label} must be a boolean")
+    return value
+
+
+def _reject_nonfinite_json(value: object, label: str) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _reject_nonfinite_json(child, f"{label}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_nonfinite_json(child, f"{label}[{index}]")
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise PhaseError(f"{label} must be finite")
+
+
+def _validate_flm_snapshot(value: object, label: str) -> dict[str, Any]:
+    snapshot = _exact_mapping(
+        value,
+        {
+            "model",
+            "source",
+            "load_sequence",
+            "native_int4",
+            "bf16_fallback",
+            "model_loads_total",
+            "startup",
+            "transfer_backend",
+            "source_bytes",
+            "device_upload_bytes",
+            "source_open_count",
+            "resident_allocation_count",
+            "scheduler",
+        },
+        label,
+    )
+    _expect(snapshot["model"], EXPECTED_MODEL, f"{label}.model")
+    _expect(snapshot["source"], EXPECTED_SOURCE, f"{label}.source")
+    for field, expected in (
+        ("load_sequence", 1),
+        ("native_int4", EXPECTED_NATIVE_INT4),
+        ("bf16_fallback", EXPECTED_BF16_FALLBACK),
+        ("model_loads_total", 1),
+        ("source_open_count", 1),
+    ):
+        _strict_int(snapshot[field], f"{label}.{field}")
+        _expect(snapshot[field], expected, f"{label}.{field}")
+    for field in (
+        "source_bytes",
+        "device_upload_bytes",
+        "resident_allocation_count",
+    ):
+        _positive_int(snapshot[field], f"{label}.{field}")
+    _nonempty_string(snapshot["transfer_backend"], f"{label}.transfer_backend")
+    startup = _mapping(snapshot["startup"], f"{label}.startup")
+    _validate_finite_tree(startup, f"{label}.startup")
+    scheduler = _exact_mapping(
+        snapshot["scheduler"],
+        {
+            "active_requests",
+            "queued_requests",
+            "max_queued_requests",
+            "queue_timeout_ms",
+        },
+        f"{label}.scheduler",
+    )
+    for field in scheduler:
+        _strict_int(scheduler[field], f"{label}.scheduler.{field}")
+    _expect(scheduler["active_requests"], 0, f"{label}.scheduler.active_requests")
+    _expect(scheduler["queued_requests"], 0, f"{label}.scheduler.queued_requests")
+    return snapshot
+
+
+def _validate_partial_compat_report(report: object) -> dict[str, Any]:
+    partial = _mapping(report, "partial compat report")
+    clone = copy.deepcopy(partial)
+    semantics = _exact_mapping(
+        clone.get("semantic_quality"),
+        {
+            "chat",
+            "chat_stream",
+            "completions",
+            "responses",
+            "responses_stream",
+            "reasoning",
+            "repeated_request",
+            "passed",
+        },
+        "partial compat semantic_quality",
+    )
+    for name, expected in (
+        ("chat", "hello"),
+        ("completions", "hello"),
+        ("repeated_request", "ready"),
+    ):
+        canary = _exact_mapping(
+            semantics[name],
+            {"expected", "actual", "finish_reason", "passed"},
+            f"partial semantic {name}",
+        )
+        if not isinstance(canary["actual"], str):
+            raise PhaseError(f"partial semantic {name}.actual must be a string")
+        _nonempty_string(
+            canary["finish_reason"],
+            f"partial semantic {name}.finish_reason",
+        )
+        _strict_bool(canary["passed"], f"partial semantic {name}.passed")
+        canary.update(
+            {
+                "expected": expected,
+                "actual": expected,
+                "finish_reason": "stop",
+                "passed": True,
+            }
+        )
+
+    chat_stream = _mapping(semantics["chat_stream"], "partial semantic chat_stream")
+    if not isinstance(chat_stream.get("actual"), str):
+        raise PhaseError("partial semantic chat_stream.actual must be a string")
+    _strict_int(
+        chat_stream.get("terminal_count"),
+        "partial semantic chat_stream.terminal_count",
+    )
+    for field in ("passed", "terminal_last_before_usage", "usage_last"):
+        _strict_bool(
+            chat_stream.get(field),
+            f"partial semantic chat_stream.{field}",
+        )
+    chat_stream.update(
+        {
+            "expected": "hello",
+            "actual": "hello",
+            "finish_reason": "stop",
+            "passed": True,
+            "terminal_count": 1,
+            "terminal_last_before_usage": True,
+            "usage_last": True,
+        }
+    )
+
+    responses = _mapping(semantics["responses"], "partial semantic responses")
+    if not isinstance(responses.get("actual"), str):
+        raise PhaseError("partial semantic responses.actual must be a string")
+    for field in ("stored_roundtrip", "passed"):
+        _strict_bool(responses.get(field), f"partial semantic responses.{field}")
+    responses.update(
+        {
+            "expected": "hello",
+            "actual": "hello",
+            "status": "completed",
+            "stored_roundtrip": True,
+            "passed": True,
+        }
+    )
+
+    responses_stream = _mapping(
+        semantics["responses_stream"],
+        "partial semantic responses_stream",
+    )
+    if not isinstance(responses_stream.get("actual"), str):
+        raise PhaseError("partial semantic responses_stream.actual must be a string")
+    _strict_int(
+        responses_stream.get("terminal_count"),
+        "partial semantic responses_stream.terminal_count",
+    )
+    for field in ("terminal_last", "passed"):
+        _strict_bool(
+            responses_stream.get(field),
+            f"partial semantic responses_stream.{field}",
+        )
+    responses_stream.update(
+        {
+            "expected": "hello",
+            "actual": "hello",
+            "status": "completed",
+            "terminal_count": 1,
+            "terminal_last": True,
+            "passed": True,
+        }
+    )
+
+    reasoning = _mapping(semantics["reasoning"], "partial semantic reasoning")
+    for field in ("accepted", "observed", "visible_think_tags", "passed"):
+        _strict_bool(reasoning.get(field), f"partial semantic reasoning.{field}")
+    reasoning.update(
+        {
+            "accepted": True,
+            "observed": True,
+            "visible_think_tags": False,
+            "passed": True,
+        }
+    )
+    _strict_bool(semantics["passed"], "partial semantic_quality.passed")
+    semantics["passed"] = True
+    validate_compat_report(clone)
+    return partial
+
+
+def _validate_failure_phase(phase: object) -> list[str]:
+    value = _nonempty_string(phase, "failure phase")
+    base_phases = {
+        "inputs",
+        "sdk",
+        "initial_evidence",
+        "protocol",
+        "final_evidence",
+        "report",
+    }
+    if value in base_phases:
+        return [value]
+    parts = value.split("+")
+    allowed = {
+        "compat_transport",
+        "compat_semantic",
+        "agent_protocol",
+        "agent",
+    }
+    if any(part not in allowed for part in parts):
+        raise PhaseError(f"failure phase grammar is invalid: {value!r}")
+    if len(parts) != len(set(parts)):
+        raise PhaseError("failure phase components must be unique")
+    order = ["compat_transport", "compat_semantic", "agent_protocol", "agent"]
+    if parts != sorted(parts, key=order.index):
+        raise PhaseError("failure phase components are not in execution order")
+    if len(set(parts) & {"compat_transport", "compat_semantic"}) > 1:
+        raise PhaseError("failure phase has conflicting compatibility components")
+    if len(set(parts) & {"agent_protocol", "agent"}) > 1:
+        raise PhaseError("failure phase has conflicting agent components")
+    return parts
+
+
+def _validate_failure_provenance(
+    value: object,
+    *,
+    phase_parts: list[str],
+) -> dict[str, Any]:
+    provenance = _exact_mapping(
+        value,
+        {"artifact", "sdk"},
+        "failure provenance",
+    )
+    artifact = _exact_mapping(
+        provenance["artifact"],
+        {"path", "sha256", "size_bytes"},
+        "failure provenance.artifact",
+    )
+    _nonempty_string(artifact["path"], "failure provenance.artifact.path")
+    inputs_phase = phase_parts == ["inputs"]
+    if inputs_phase:
+        _expect(artifact["sha256"], None, "failure provenance.artifact.sha256")
+        _expect(
+            artifact["size_bytes"],
+            None,
+            "failure provenance.artifact.size_bytes",
+        )
+    else:
+        digest = _nonempty_string(
+            artifact["sha256"],
+            "failure provenance.artifact.sha256",
+        )
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise PhaseError("failure provenance artifact digest is not SHA-256")
+        _positive_int(
+            artifact["size_bytes"],
+            "failure provenance.artifact.size_bytes",
+        )
+    if phase_parts in (["inputs"], ["sdk"]):
+        _expect(provenance["sdk"], None, "failure provenance.sdk")
+    else:
+        sdk = _exact_mapping(
+            provenance["sdk"],
+            {"package", "version"},
+            "failure provenance.sdk",
+        )
+        _expect(sdk["package"], "openai", "failure provenance.sdk.package")
+        _expect(
+            sdk["version"],
+            OPENAI_SDK_VERSION,
+            "failure provenance.sdk.version",
+        )
+    return provenance
+
+
+def _validate_final_evidence(value: object, label: str) -> dict[str, Any]:
+    final = _exact_mapping(
+        value,
+        {
+            "health",
+            "capabilities",
+            "metrics",
+            "flm_evidence",
+            "load_invariance",
+            "collection_errors",
+        },
+        label,
+    )
+    errors = final["collection_errors"]
+    if not isinstance(errors, list):
+        raise PhaseError(f"{label}.collection_errors must be a list")
+    for index, error in enumerate(errors):
+        _nonempty_string(error, f"{label}.collection_errors[{index}]")
+    if len(errors) != len(set(errors)):
+        raise PhaseError(f"{label}.collection_errors must be unique")
+
+    if final["health"] is not None:
+        health = _mapping(final["health"], f"{label}.health")
+        _expect(health.get("status"), "ok", f"{label}.health.status")
+        for field in ("active_requests", "queued_requests"):
+            _strict_int(health.get(field), f"{label}.health.{field}")
+            _expect(health.get(field), 0, f"{label}.health.{field}")
+    metrics = final["metrics"]
+    if metrics is not None:
+        metrics = _mapping(metrics, f"{label}.metrics")
+        for name, metric in metrics.items():
+            _finite_number(metric, f"{label}.metrics.{name}")
+    capabilities = final["capabilities"]
+    if capabilities is not None:
+        capabilities = _mapping(capabilities, f"{label}.capabilities")
+
+    if capabilities is not None and metrics is not None:
+        if final["flm_evidence"] is None:
+            if not any(error.startswith("FLM evidence:") for error in errors):
+                raise PhaseError(
+                    f"{label}.flm_evidence may be null only with an FLM evidence error"
+                )
+            actual = None
+        else:
+            actual = _validate_flm_snapshot(
+                final["flm_evidence"],
+                f"{label}.flm_evidence",
+            )
+        if actual is None:
+            capabilities = None
+            metrics = None
+        else:
+            _expect(
+                capabilities.get("model"),
+                actual["model"],
+                f"{label}.capabilities.model",
+            )
+    if capabilities is not None and metrics is not None:
+        actual = _mapping(final["flm_evidence"], f"{label}.flm_evidence")
+        flm = _mapping(capabilities.get("flm"), f"{label}.capabilities.flm")
+        for field, snapshot_field in (
+            ("source", "source"),
+            ("load_sequence", "load_sequence"),
+            ("native_int4_direct_weights", "native_int4"),
+            ("bf16_fallback_weights", "bf16_fallback"),
+            ("source_bytes", "source_bytes"),
+            ("device_upload_bytes", "device_upload_bytes"),
+            ("source_open_count", "source_open_count"),
+            ("resident_allocation_count", "resident_allocation_count"),
+            ("transfer_backend", "transfer_backend"),
+        ):
+            _expect(
+                flm.get(field),
+                actual[snapshot_field],
+                f"{label}.capabilities.flm.{field}",
+            )
+        for metric_name, expected in (
+            ("supersonic_model_loads_total", actual["model_loads_total"]),
+            ("supersonic_active_requests", 0),
+            ("supersonic_queued_requests", 0),
+            (
+                "supersonic_flm_native_int4_direct_weights",
+                actual["native_int4"],
+            ),
+            ("supersonic_flm_bf16_fallback_weights", actual["bf16_fallback"]),
+            ("supersonic_flm_source_bytes", actual["source_bytes"]),
+            (
+                "supersonic_flm_device_upload_bytes",
+                actual["device_upload_bytes"],
+            ),
+        ):
+            _expect(
+                metrics.get(metric_name),
+                expected,
+                f"{label}.metrics.{metric_name}",
+            )
+    else:
+        _expect(final["flm_evidence"], None, f"{label}.flm_evidence")
+
+    load = _exact_mapping(
+        final["load_invariance"],
+        {"passed", "error"},
+        f"{label}.load_invariance",
+    )
+    passed = _strict_bool(load["passed"], f"{label}.load_invariance.passed")
+    if passed:
+        _expect(load["error"], None, f"{label}.load_invariance.error")
+    else:
+        _nonempty_string(load["error"], f"{label}.load_invariance.error")
+    return final
+
+
+def validate_failure_report(report: dict[str, Any]) -> dict[str, Any]:
+    failure = _exact_mapping(
+        report,
+        {
+            "schema_version",
+            "status",
+            "phase",
+            "error",
+            "provenance",
+            "completed",
+            "final",
+        },
+        "failure report",
+    )
+    _strict_int(failure["schema_version"], "failure schema_version")
+    _expect(failure["schema_version"], 1, "failure schema_version")
+    _expect(failure["status"], "failed", "failure status")
+    phase_parts = _validate_failure_phase(failure["phase"])
+    error = _exact_mapping(
+        failure["error"],
+        {"type", "message"},
+        "failure error",
+    )
+    _nonempty_string(error["type"], "failure error.type")
+    _nonempty_string(error["message"], "failure error.message")
+    _validate_failure_provenance(
+        failure["provenance"],
+        phase_parts=phase_parts,
+    )
+
+    completed = _mapping(failure["completed"], "failure completed")
+    allowed_completed = {
+        "initial_evidence",
+        "compat",
+        "agent",
+        "phase_failures",
+    }
+    if not set(completed) <= allowed_completed:
+        raise PhaseError(
+            "failure completed has unsupported keys: "
+            f"{sorted(set(completed) - allowed_completed)}"
+        )
+    pre_protocol = phase_parts[0] in {"inputs", "sdk", "initial_evidence"}
+    if pre_protocol and completed:
+        raise PhaseError("pre-protocol failure cannot contain completed evidence")
+    if "initial_evidence" in completed:
+        _validate_flm_snapshot(
+            completed["initial_evidence"],
+            "failure completed.initial_evidence",
+        )
+    if "compat" in completed:
+        _validate_partial_compat_report(completed["compat"])
+    if "agent" in completed:
+        agent = _mapping(completed["agent"], "failure completed.agent")
+        if "failure" in agent:
+            validate_agent_failure_report(agent)
+        else:
+            validate_agent_report(agent)
+
+    protocol_parts = [
+        part
+        for part in phase_parts
+        if part
+        in {
+            "compat_transport",
+            "compat_semantic",
+            "agent_protocol",
+            "agent",
+        }
+    ]
+    if protocol_parts:
+        if "initial_evidence" not in completed:
+            raise PhaseError("protocol failure requires initial_evidence")
+        phase_failures = completed.get("phase_failures")
+        if not isinstance(phase_failures, list):
+            raise PhaseError("protocol failure requires phase_failures list")
+        observed = []
+        for index, item in enumerate(phase_failures):
+            entry = _exact_mapping(
+                item,
+                {"phase", "message"},
+                f"failure completed.phase_failures[{index}]",
+            )
+            phase = _nonempty_string(
+                entry["phase"],
+                f"failure completed.phase_failures[{index}].phase",
+            )
+            _nonempty_string(
+                entry["message"],
+                f"failure completed.phase_failures[{index}].message",
+            )
+            observed.append(phase)
+        if observed != protocol_parts:
+            raise PhaseError(
+                "failure phase_failures must exactly match phase grammar: "
+                f"{observed!r} != {protocol_parts!r}"
+            )
+        if len(observed) != len(set(observed)):
+            raise PhaseError("failure phase_failures must be unique")
+        if "compat_semantic" in protocol_parts and "compat" not in completed:
+            raise PhaseError("compat_semantic failure requires partial compat evidence")
+        if "compat_transport" in protocol_parts and "compat" in completed:
+            raise PhaseError("compat_transport failure cannot claim compat completion")
+    elif "phase_failures" in completed:
+        raise PhaseError("non-protocol failure cannot contain phase_failures")
+
+    if phase_parts == ["protocol"] and set(completed) != {"initial_evidence"}:
+        raise PhaseError("unclassified protocol failure requires only initial_evidence")
+    if phase_parts in (["final_evidence"], ["report"]):
+        if set(completed) != {"initial_evidence", "compat", "agent"}:
+            raise PhaseError(
+                f"{phase_parts[0]} failure requires all completed protocol evidence"
+            )
+    _validate_final_evidence(failure["final"], "failure final")
+    _reject_nonfinite_json(failure, "failure report")
+    return report
+
+
 def build_failure_report(
     *,
     phase: str,
@@ -1462,7 +1982,7 @@ def build_failure_report(
     completed: dict[str, Any],
     final: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    report = {
         "schema_version": 1,
         "status": "failed",
         "phase": phase,
@@ -1474,6 +1994,7 @@ def build_failure_report(
         "completed": completed,
         "final": final,
     }
+    return validate_failure_report(report)
 
 
 def discover_inputs(args: argparse.Namespace) -> None:

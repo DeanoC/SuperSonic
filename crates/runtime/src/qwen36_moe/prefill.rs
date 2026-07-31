@@ -137,8 +137,13 @@ pub type PrefillTokenCallback<'a> = PrefillFallbackTokenCallback<'a>;
 pub type PrefillProgressCallback<'a> =
     dyn FnMut(&BatchedPrefillTimings, usize, usize, Duration) + 'a;
 
-fn optimized_prefill_supports_encoding(encoding: Qwen36LayerWeightEncoding) -> bool {
+fn optimized_prefill_supports_encoding(
+    encoding: Qwen36LayerWeightEncoding,
+    backend: Backend,
+    enable_unqualified_hip_native_int4: bool,
+) -> bool {
     encoding == Qwen36LayerWeightEncoding::NativeInt4
+        && (backend != Backend::Hip || enable_unqualified_hip_native_int4)
 }
 
 fn full_attn_kv_capacities(layers: &[LayerBuffers]) -> Vec<(usize, usize)> {
@@ -496,7 +501,11 @@ fn run_batched_prefill_impl(
     let batched_attn_enabled = execution.batched_prefill.attention;
     let sparse_residency_active = loaded_layers.has_sparse_expert_residency();
     let supports_batched = batched_attn_enabled
-        && supports_batched_path(loaded_layers.layers(), sparse_residency_active)?;
+        && supports_batched_path(
+            loaded_layers.layers(),
+            sparse_residency_active,
+            execution.batched_prefill.enable_unqualified_hip_native_int4,
+        )?;
     if !supports_batched
         && execution.diagnostics.capture_prefill_boundary_hidden
         && token_callback.is_some()
@@ -615,13 +624,23 @@ fn run_batched_prefill_impl(
 ///   tensors upfront; per-step expert prefetch must run via `run_chain_step`
 ///   before FFN compute to page in any non-resident routed experts. The
 ///   batched FFN bypasses that hook, so it would read non-resident memory.
-fn supports_batched_path(layers: &[LayerBuffers], sparse_residency_active: bool) -> Result<bool> {
+/// - **HIP native INT4 without an explicit diagnostic opt-in** — the exact
+///   prompt real-model gate currently changes both logits and greedy argmax.
+fn supports_batched_path(
+    layers: &[LayerBuffers],
+    sparse_residency_active: bool,
+    enable_unqualified_hip_native_int4: bool,
+) -> Result<bool> {
     if sparse_residency_active {
         return Ok(false);
     }
     let encoding = classify_layer_weight_encoding(layers)
         .context("classify Qwen3.6 prefill layer weight encoding")?;
-    if !optimized_prefill_supports_encoding(encoding) {
+    if !optimized_prefill_supports_encoding(
+        encoding,
+        gpu_hal::current_backend(),
+        enable_unqualified_hip_native_int4,
+    ) {
         return Ok(false);
     }
     for l in layers {
@@ -2657,11 +2676,13 @@ impl Qwen36PrefillWorkspace {
         geom: &MultiLayerGeom,
         loaded_layers: &LoadedQwen36Layers,
         max_context_len: usize,
+        enable_unqualified_hip_native_int4: bool,
     ) -> Result<Option<Self>> {
         if max_context_len <= 1
             || !supports_batched_path(
                 loaded_layers.layers(),
                 loaded_layers.has_sparse_expert_residency(),
+                enable_unqualified_hip_native_int4,
             )?
         {
             return Ok(None);
@@ -2903,18 +2924,36 @@ mod orchestration_tests {
     }
 
     #[test]
-    fn optimized_prefill_mode_requires_complete_native_int4() {
+    fn optimized_prefill_mode_requires_complete_native_int4_and_qualified_hip() {
+        assert!(!optimized_prefill_supports_encoding(
+            Qwen36LayerWeightEncoding::NativeInt4,
+            Backend::Hip,
+            false,
+        ));
         assert!(optimized_prefill_supports_encoding(
-            Qwen36LayerWeightEncoding::NativeInt4
+            Qwen36LayerWeightEncoding::NativeInt4,
+            Backend::Hip,
+            true,
         ));
         assert!(!optimized_prefill_supports_encoding(
-            Qwen36LayerWeightEncoding::Bf16
+            Qwen36LayerWeightEncoding::Bf16,
+            Backend::Hip,
+            true,
         ));
         assert!(!optimized_prefill_supports_encoding(
-            Qwen36LayerWeightEncoding::GgmlKBlock
+            Qwen36LayerWeightEncoding::GgmlKBlock,
+            Backend::Hip,
+            true,
         ));
         assert!(!optimized_prefill_supports_encoding(
-            Qwen36LayerWeightEncoding::Fp8
+            Qwen36LayerWeightEncoding::Fp8,
+            Backend::Hip,
+            true,
+        ));
+        assert!(optimized_prefill_supports_encoding(
+            Qwen36LayerWeightEncoding::NativeInt4,
+            Backend::Metal,
+            false,
         ));
     }
 

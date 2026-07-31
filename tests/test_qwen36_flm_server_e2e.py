@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import importlib.util
 import json
 import math
@@ -18,8 +19,13 @@ from unittest import mock
 from tests.openai_sdk_fixture import (
     API_KEY,
     CHAT_CALL_ID,
+    CHAT_TOOL,
+    CODING_PROMPT,
     MODEL,
     RESPONSE_CALL_ID,
+    RESPONSE_ID,
+    RESPONSES_TOOL,
+    TOOL_OUTPUT,
     openai_sdk_fixture,
 )
 
@@ -648,6 +654,47 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 if Path(f"/proc/{pid}").exists():
                     os.kill(pid, signal.SIGKILL)
 
+    def run_process_with_detached_child(self, *, exit_code):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "child.pid"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess,sys;"
+                    "p=subprocess.Popen([sys.executable,'-c',"
+                    "'import time;time.sleep(60)'],"
+                    "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                    "stderr=subprocess.DEVNULL);"
+                    f"open({str(pid_file)!r},'w').write(str(p.pid));"
+                    f"sys.exit({exit_code})"
+                ),
+            ]
+            with mock.patch.object(self.harness, "PROCESS_GRACE_SECONDS", 0.2):
+                result = self.harness.run_process(
+                    command,
+                    cwd=Path(tmp),
+                    env=None,
+                    timeout=5,
+                    phase="child cleanup probe",
+                    check=False,
+                )
+            child_pid = self.wait_pid_file(pid_file)
+        try:
+            self.assert_process_gone(child_pid)
+        finally:
+            if Path(f"/proc/{child_pid}").exists():
+                os.kill(child_pid, signal.SIGKILL)
+        return result
+
+    def test_run_process_reaps_child_after_zero_exit(self):
+        result = self.run_process_with_detached_child(exit_code=0)
+        self.assertEqual(result.returncode, 0)
+
+    def test_run_process_reaps_child_after_nonzero_exit(self):
+        result = self.run_process_with_detached_child(exit_code=17)
+        self.assertEqual(result.returncode, 17)
+
     def test_parse_metrics_accepts_finite_scalar_samples(self):
         metrics = self.harness.parse_prometheus_metrics(self.valid_metrics_text())
 
@@ -811,21 +858,9 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         self.assertIn("openai@6.49.0", install_command)
 
     def test_run_supersedes_stale_success_with_phase_failure_and_final_evidence(self):
-        before = {
-            "model": MODEL,
-            "source": "flm",
-            "load_sequence": 1,
-            "native_int4": 330,
-            "bf16_fallback": 0,
-            "model_loads_total": 1,
-            "startup": {"total_seconds": 1.0, "exclusive_components": {}},
-            "transfer_backend": "pageable-h2d",
-            "source_bytes": 4,
-            "device_upload_bytes": 4,
-            "source_open_count": 1,
-            "resident_allocation_count": 1,
-            "scheduler": {"active_requests": 0, "queued_requests": 0},
-        }
+        capabilities = self.valid_capabilities()
+        metrics = self.harness.parse_prometheus_metrics(self.valid_metrics_text())
+        before = self.harness.validate_flm_evidence(capabilities, metrics)
 
         @contextlib.contextmanager
         def fake_server(*_args, **_kwargs):
@@ -860,12 +895,6 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 "active_requests": 0,
                 "queued_requests": 0,
             }
-            metrics = {
-                "supersonic_active_requests": 0,
-                "supersonic_queued_requests": 0,
-                "supersonic_model_loads_total": 1,
-            }
-
             with mock.patch.object(self.harness, "discover_inputs"):
                 with mock.patch.object(
                     self.harness,
@@ -890,7 +919,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                                 self.harness,
                                 "fetch_json",
                                 side_effect=lambda _url, path, _key: (
-                                    health if path == "/health" else {"ready": True}
+                                    health if path == "/health" else capabilities
                                 ),
                             ):
                                 with mock.patch.object(
@@ -937,6 +966,146 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         self.assertEqual(failure["final"]["health"], health)
         self.assertEqual(failure["final"]["metrics"], metrics)
         self.assertTrue(failure["final"]["load_invariance"]["passed"])
+
+    def valid_failure_report(self):
+        metrics = self.harness.parse_prometheus_metrics(self.valid_metrics_text())
+        before = self.harness.validate_flm_evidence(
+            self.valid_capabilities(),
+            metrics,
+        )
+        compat = self.valid_compat_report()
+        compat["semantic_quality"]["chat"]["actual"] = "wrong"
+        compat["semantic_quality"]["chat"]["passed"] = False
+        compat["semantic_quality"]["passed"] = False
+        agent = {
+            "requests": {},
+            "cancellation": self.valid_agent_report()["cancellation"],
+            "failure": {
+                "phase": "chat_tool_loop",
+                "message": "raw model output was not a tool call",
+                "raw": {"content": '{"path":"src/lib.rs"} trailing'},
+            },
+        }
+        return {
+            "schema_version": 1,
+            "status": "failed",
+            "phase": "compat_semantic+agent",
+            "error": {
+                "type": "PhaseError",
+                "message": "compat and agent failed",
+            },
+            "provenance": {
+                "artifact": {
+                    "path": "/tmp/model.flm",
+                    "sha256": "a" * 64,
+                    "size_bytes": 123,
+                },
+                "sdk": {"package": "openai", "version": "6.49.0"},
+            },
+            "completed": {
+                "initial_evidence": before,
+                "compat": compat,
+                "agent": agent,
+                "phase_failures": [
+                    {"phase": "compat_semantic", "message": "chat was wrong"},
+                    {"phase": "agent", "message": "tool call was malformed"},
+                ],
+            },
+            "final": {
+                "health": {
+                    "status": "ok",
+                    "active_requests": 0,
+                    "queued_requests": 0,
+                },
+                "capabilities": self.valid_capabilities(),
+                "metrics": metrics,
+                "flm_evidence": before,
+                "load_invariance": {"passed": True, "error": None},
+                "collection_errors": [],
+            },
+        }
+
+    def test_validate_failure_report_accepts_exact_partial_protocol_evidence(self):
+        report = self.valid_failure_report()
+        self.assertIs(self.harness.validate_failure_report(report), report)
+
+    def test_validate_failure_report_accepts_unclassified_protocol_exception(self):
+        report = self.valid_failure_report()
+        report["phase"] = "protocol"
+        report["completed"] = {
+            "initial_evidence": report["completed"]["initial_evidence"]
+        }
+
+        self.assertIs(self.harness.validate_failure_report(report), report)
+
+    def test_validate_failure_report_accepts_final_flm_crosscheck_failure(self):
+        report = self.valid_failure_report()
+        report["phase"] = "final_evidence"
+        report["completed"].pop("phase_failures")
+        report["completed"]["compat"]["semantic_quality"]["chat"]["actual"] = "hello"
+        report["completed"]["compat"]["semantic_quality"]["chat"]["passed"] = True
+        report["completed"]["compat"]["semantic_quality"]["passed"] = True
+        report["completed"]["agent"] = self.valid_agent_report()
+        report["final"]["flm_evidence"] = None
+        report["final"]["load_invariance"] = {
+            "passed": False,
+            "error": "FLM evidence unavailable",
+        }
+        report["final"]["collection_errors"] = [
+            "FLM evidence: model source mismatch"
+        ]
+
+        self.assertIs(self.harness.validate_failure_report(report), report)
+
+    def test_validate_failure_report_rejects_nested_schema_and_type_mutations(self):
+        mutations = [
+            lambda report: report["error"].pop("type"),
+            lambda report: report["error"].update({"extra": True}),
+            lambda report: report["provenance"]["artifact"].update(
+                {"size_bytes": True}
+            ),
+            lambda report: report["completed"]["phase_failures"].append(
+                {"phase": "agent", "message": "duplicate"}
+            ),
+            lambda report: report["final"]["metrics"].update(
+                {"supersonic_ready": math.nan}
+            ),
+            lambda report: report["final"]["load_invariance"].update(
+                {"passed": "yes"}
+            ),
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                report = self.valid_failure_report()
+                mutation(report)
+                with self.assertRaises(self.harness.PhaseError):
+                    self.harness.validate_failure_report(report)
+
+    def test_validate_failure_report_rejects_phase_inconsistent_evidence(self):
+        cases = [
+            ("sdk", lambda report: report["provenance"].update({"sdk": None})),
+            (
+                "inputs",
+                lambda report: report["completed"].update(
+                    {"initial_evidence": report["final"]["flm_evidence"]}
+                ),
+            ),
+            (
+                "compat_semantic+agent",
+                lambda report: report["completed"]["phase_failures"].reverse(),
+            ),
+            (
+                "compat_semantic+unknown",
+                lambda _report: None,
+            ),
+        ]
+        for phase, mutation in cases:
+            with self.subTest(phase=phase):
+                report = self.valid_failure_report()
+                report["phase"] = phase
+                mutation(report)
+                with self.assertRaises(self.harness.PhaseError):
+                    self.harness.validate_failure_report(report)
 
     def test_protocol_phases_continue_after_semantic_failure(self):
         args = SimpleNamespace()
@@ -1106,7 +1275,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         self.assertTrue(semantics["reasoning"]["observed"])
 
     def test_agent_script_executes_exact_tool_loops_and_contention_abort(self):
-        with openai_sdk_fixture() as (base_url, _state):
+        with openai_sdk_fixture() as (base_url, state):
             result = self.run_sdk_fixture_script(
                 "openai_agent_tool_smoke.mjs",
                 base_url,
@@ -1146,6 +1315,180 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         self.assertEqual(cancellation["after"]["queued_requests"], 0)
         self.assertEqual(cancellation["after"]["model_loads_total"], 1)
         self.assertTrue(cancellation["queued_request_completed"])
+
+        tool_output = json.dumps(
+            {
+                "path": "src/lib.rs",
+                "contents": "pub fn protocol_ready() -> bool { true }\n",
+            },
+            separators=(",", ":"),
+        )
+        chat_bodies = [
+            request["body"]
+            for request in state.requests
+            if request["path"] == "/v1/chat/completions"
+            and any(
+                "exactly one call to read_source_file" in str(message.get("content"))
+                for message in request["body"].get("messages", [])
+            )
+        ]
+        self.assertEqual(len(chat_bodies), 2)
+        self.assertEqual(
+            chat_bodies[0],
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": CODING_PROMPT}],
+                "tools": [CHAT_TOOL],
+                "tool_choice": "auto",
+                "max_completion_tokens": 128,
+                "temperature": 0,
+            },
+        )
+        self.assertEqual(
+            chat_bodies[1],
+            {
+                "model": MODEL,
+                "messages": [
+                    {"role": "user", "content": CODING_PROMPT},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": CHAT_CALL_ID,
+                                "type": "function",
+                                "function": {
+                                    "name": "read_source_file",
+                                    "arguments": '{"path":"src/lib.rs"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": CHAT_CALL_ID,
+                        "content": tool_output,
+                    },
+                ],
+                "tools": [CHAT_TOOL],
+                "tool_choice": "auto",
+                "max_completion_tokens": 64,
+                "temperature": 0,
+            },
+        )
+        responses_bodies = [
+            request["body"]
+            for request in state.requests
+            if request["path"] == "/v1/responses"
+            and (
+                request["body"].get("previous_response_id") is not None
+                or "exactly one call to read_source_file"
+                in str(request["body"].get("input"))
+            )
+        ]
+        self.assertEqual(len(responses_bodies), 2)
+        self.assertEqual(
+            responses_bodies,
+            [
+                {
+                    "model": MODEL,
+                    "input": CODING_PROMPT,
+                    "tools": [RESPONSES_TOOL],
+                    "tool_choice": "auto",
+                    "max_output_tokens": 128,
+                    "temperature": 0,
+                },
+                {
+                    "model": MODEL,
+                    "previous_response_id": RESPONSE_ID,
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "call_id": RESPONSE_CALL_ID,
+                            "output": tool_output,
+                        }
+                    ],
+                    "tools": [RESPONSES_TOOL],
+                    "tool_choice": "auto",
+                    "max_output_tokens": 64,
+                    "temperature": 0,
+                },
+            ],
+        )
+
+    def test_agent_fixture_rejects_corrupted_continuation_payloads(self):
+        def mutate(case):
+            def apply(path, body):
+                if path == "/v1/chat/completions":
+                    messages = body.get("messages", [])
+                    if (
+                        case == "chat_initial_extra"
+                        and len(messages) == 1
+                        and messages[0].get("content") == CODING_PROMPT
+                    ):
+                        body["unexpected"] = True
+                    elif case == "chat_wrong_assistant_id" and len(messages) == 3:
+                        body["messages"][1]["tool_calls"][0]["id"] = "wrong"
+                    elif case == "chat_wrong_id" and len(messages) == 3:
+                        body["messages"][2]["tool_call_id"] = "wrong"
+                    elif case == "chat_wrong_output" and len(messages) == 3:
+                        body["messages"][2]["content"] = "wrong"
+                    elif case == "chat_extra" and len(messages) == 3:
+                        body["messages"].append({"role": "user", "content": "extra"})
+                if path == "/v1/responses":
+                    if (
+                        case == "responses_initial_extra"
+                        and body.get("input") == CODING_PROMPT
+                    ):
+                        body["unexpected"] = True
+                    elif case == "responses_wrong_previous_id" and body.get(
+                        "previous_response_id"
+                    ):
+                        body["previous_response_id"] = "resp_wrong"
+                    elif case == "responses_wrong_call_id" and body.get(
+                        "previous_response_id"
+                    ):
+                        body["input"][0]["call_id"] = "call_wrong"
+                    elif case == "responses_wrong_output" and body.get(
+                        "previous_response_id"
+                    ):
+                        body["input"][0]["output"] = "wrong"
+                    elif case == "responses_extra" and body.get(
+                        "previous_response_id"
+                    ):
+                        body["input"].append(dict(body["input"][0]))
+                    elif case == "responses_missing_correlation" and body.get(
+                        "previous_response_id"
+                    ):
+                        body.pop("previous_response_id")
+                return body
+
+            return apply
+
+        for case in (
+            "chat_initial_extra",
+            "chat_wrong_assistant_id",
+            "chat_wrong_id",
+            "chat_wrong_output",
+            "chat_extra",
+            "responses_initial_extra",
+            "responses_wrong_previous_id",
+            "responses_wrong_call_id",
+            "responses_wrong_output",
+            "responses_extra",
+            "responses_missing_correlation",
+        ):
+            with self.subTest(case=case):
+                with openai_sdk_fixture(body_mutator=mutate(case)) as (
+                    base_url,
+                    _state,
+                ):
+                    result = self.run_sdk_fixture_script(
+                        "openai_agent_tool_smoke.mjs",
+                        base_url,
+                    )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid fixture request", result.stderr)
 
     def test_agent_script_preserves_malformed_raw_model_output(self):
         with openai_sdk_fixture(malformed_agent=True) as (base_url, _state):

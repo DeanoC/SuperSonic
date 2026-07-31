@@ -118,9 +118,9 @@ enum PersistentDecodeMode {
     PERSISTENT_MODE_LINEAR_STAGE5 = 13,
 };
 
-// Persistent decode kernel template. Instantiated by the bridge for
-// (T=hip_bfloat16, USE_WMMA={true,false}) at launch time based on
-// `device_supports_wmma_bf16(ordinal)` + dim divisibility.
+// Persistent decode kernel template. Attention/linear, FFN, and lm-head
+// WMMA controls remain independent so each phase can be enabled only after
+// its staged kernel has passed the same numerical gate.
 //
 // Each layer runs:
 //   1. attn or linear-attn (selected by descriptor's `is_full_attention`)
@@ -129,7 +129,11 @@ enum PersistentDecodeMode {
 //   3. ffn writes post-ffn residual into the swapped-back `out_buf` (= the
 //      original `in_buf`, since we swap once between phases).
 //   4. reset_counters_16, swap so `out_buf` becomes next-layer input.
-template <typename T, bool USE_WMMA>
+template <
+    typename T,
+    bool USE_ATTN_WMMA,
+    bool USE_FFN_WMMA,
+    bool USE_LM_HEAD_WMMA>
 __global__ void qwen36_moe_persistent_decode_kernel(
     int                                  num_layers,
     int                                  start_layer,
@@ -218,7 +222,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
             ? 5
             : (mode - PERSISTENT_MODE_FFN_STAGE1 + 1);
 
-        qwen36_moe_ffn_step_device<T, USE_WMMA>(
+        qwen36_moe_ffn_step_device<T, USE_FFN_WMMA>(
             ffn_stage,
             hidden, num_experts,
             moe_intermediate, shared_intermediate, top_k,
@@ -258,7 +262,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
         const int linear_stage = mode - PERSISTENT_MODE_LINEAR_STAGE1 + 1;
 
-        qwen36_moe_linear_step_device<T, USE_WMMA>(
+        qwen36_moe_linear_step_device<T, USE_ATTN_WMMA>(
             linear_stage,
             hidden, num_k_heads, num_v_heads,
             head_k_dim, head_v_dim, conv_kernel_dim, rms_norm_eps,
@@ -301,7 +305,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
 
         // ---- attn or linear-attn ----
         if (d.is_full_attention != 0) {
-            qwen36_moe_attn_step_device<T, USE_WMMA>(
+            qwen36_moe_attn_step_device<T, USE_ATTN_WMMA>(
                 /*stage*/ 5,
                 hidden, num_heads, num_kv_heads, head_dim,
                 rotary_dim, rope_theta, rms_norm_eps,
@@ -338,7 +342,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 d.kv_max_t,
                 counters, barrier_counter, barrier_flag);
         } else {
-            qwen36_moe_linear_step_device<T, USE_WMMA>(
+            qwen36_moe_linear_step_device<T, USE_ATTN_WMMA>(
                 /*stage*/ 5,
                 hidden, num_k_heads, num_v_heads,
                 head_k_dim, head_v_dim, conv_kernel_dim, rms_norm_eps,
@@ -388,7 +392,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
 
         // ---- FFN ----
         const int ffn_stage = (mode == PERSISTENT_MODE_ROUTER_ONLY) ? 1 : 5;
-        qwen36_moe_ffn_step_device<T, USE_WMMA>(
+        qwen36_moe_ffn_step_device<T, USE_FFN_WMMA>(
             ffn_stage,
             hidden, num_experts,
             moe_intermediate, shared_intermediate, top_k,
@@ -453,7 +457,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         // double-swap) before the lm_head reads from it as activation.
         reset_counters_16(counters, barrier_counter, barrier_flag, num_blocks);
 
-        qwen36_moe_lm_head_device<T, USE_WMMA>(
+        qwen36_moe_lm_head_device<T, USE_LM_HEAD_WMMA>(
             hidden, vocab, rms_norm_eps,
             in_buf, final_norm_w, lm_head_w, logits_out,
             top1_out, workspace,

@@ -66,6 +66,12 @@ bool device_supports_wmma_bf16(int device_ordinal) {
 #endif
 }
 
+bool ffn_step_supports_wmma_bf16(int device_ordinal) {
+    const char* enabled = std::getenv("SUPERSONIC_QWEN36_ENABLE_FFN_STEP_WMMA");
+    return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0' &&
+           device_supports_wmma_bf16(device_ordinal);
+}
+
 bool sync_each_kernel_enabled() {
     const char* env = std::getenv("SUPERSONIC_SYNC_EACH_KERNEL");
     return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -683,7 +689,7 @@ extern "C" uint64_t qwen36_moe_hip_ffn_step_launch(
     const bool use_wmma =
         routed_int4 &&
         wmma_dims_ok &&
-        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+        ffn_step_supports_wmma_bf16(static_cast<int>(device_ordinal));
 
     if (use_wmma) {
         hipLaunchKernelGGL(
@@ -1265,35 +1271,20 @@ extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
     const size_t lds_bytes =
         static_cast<size_t>(hidden + block_size) * sizeof(float);
 
-    // WMMA gate. Two phase classes have different requirements here:
-    //
-    //  * Layer phases (full_attn / linear_attn / ffn) self-gate the
-    //    WMMA tile path on per-tensor `*_scale != nullptr` — only INT4
-    //    weights need the dequant-to-LDS WMMA pattern; BF16 weights
-    //    fall through to the scalar reduction inside the same template.
-    //    Setting `USE_WMMA=true` on a pure-BF16 model produces
-    //    identical output to `USE_WMMA=false` (extra branches compile
-    //    in but never fire at runtime).
-    //
-    //  * Phase 3f folded lm_head uses BF16 weights directly (the
-    //    engine pre-dequants INT4 lm_head to BF16 at startup) — its
-    //    WMMA path runs unconditionally when the template parameter
-    //    is true, regardless of `int4_scales`.
-    //
-    // Pre-3f the bridge AND'd `int4_scales != nullptr` into the gate,
-    // mirroring "INT4 in play anywhere" semantics. After 3f that
-    // would force BF16-only models onto the scalar lm_head fallback
-    // even on WMMA-capable hardware (Codex P1 review on PR #140), so
-    // the gate now asks only "is the device WMMA-capable".
+    // The persistent kernel used to share one WMMA template bit across
+    // attention, linear attention, FFN, and lm-head. Their independent
+    // parity results differ: attention/linear are qualified, while FFN
+    // and lm-head remain on the scalar path pending qualification.
     const bool disable_wmma =
         std::getenv("SUPERSONIC_QWEN36_DISABLE_PERSISTENT_WMMA") != nullptr;
-    const bool use_wmma =
+    const bool use_attn_wmma =
         !disable_wmma &&
         device_supports_wmma_bf16(static_cast<int>(device_ordinal));
 
-    if (use_wmma) {
+    if (use_attn_wmma) {
         hipLaunchKernelGGL(
-            (qwen36_moe::qwen36_moe_persistent_decode_kernel<hip_bfloat16, true>),
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<
+                hip_bfloat16, true, false, false>),
             dim3(static_cast<unsigned int>(num_blocks)),
             dim3(block_size),
             lds_bytes, 0,
@@ -1315,7 +1306,8 @@ extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
             counters, barrier_counter, barrier_flag);
     } else {
         hipLaunchKernelGGL(
-            (qwen36_moe::qwen36_moe_persistent_decode_kernel<hip_bfloat16, false>),
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<
+                hip_bfloat16, false, false, false>),
             dim3(static_cast<unsigned int>(num_blocks)),
             dim3(block_size),
             lds_bytes, 0,

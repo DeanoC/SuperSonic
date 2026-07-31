@@ -1917,6 +1917,10 @@ fn load_resident_gpu_parts(
         geom,
         &layers,
         config.max_context_len,
+        config
+            .execution_options
+            .batched_prefill
+            .enable_unqualified_hip_native_int4,
     )
     .context("allocate Qwen3.6 engine prefill workspace")?;
 
