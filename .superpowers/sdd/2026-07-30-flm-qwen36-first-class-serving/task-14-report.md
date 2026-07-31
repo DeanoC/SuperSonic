@@ -606,3 +606,276 @@ The report commit follows this section.
 - Repository-wide formatting remains red only in unrelated pre-existing files
   named above. Changed Rust code is rustfmt-clean.
 - Existing backend/compiler warnings remain unrelated to this round.
+
+# Fix Round 2
+
+Fix Round 2 supersedes the Fix Round 1 conclusion that the first-token
+failure had been localized to native tile-scale quality. Tile scaling remains
+a hypothesis only. The new independent boundary tests found shared runtime
+qualification defects, and the exact-prompt BF16 comparison diverges at the
+first layer before the evidence can distinguish quantization error from a
+remaining source/runtime numerical defect.
+
+## Requirements And Outcome
+
+1. `multilayer_chained_decode_matches_oracle` is a required, independently
+   executed real-HIP gate. Router, shared expert, routed experts, residual,
+   final hidden, and logits are compared at separate boundaries.
+2. The layer-0 FFN failure was fixed by separating attention/linear, FFN, and
+   lm-head WMMA selection in the persistent kernel and making chained FFN
+   WMMA explicit opt-in. No existing oracle tolerance was weakened.
+3. Qualified production prefill now has an exact real-logit gate against the
+   per-token implementation. The still-unqualified optimized HIP prefill is
+   opt-in and has a separate `cosine >= 0.999` plus argmax-equality gate.
+4. The committed geo-quant diagnostic records executable commands, repository
+   revisions/status, package/source identities, the exact 322 prompt IDs, all
+   seven native shape families, rank-3 expert samples, and early/middle/late
+   source-to-artifact dequant checks.
+5. The deterministic SDK fixture strictly records and validates both request
+   bodies in Chat and Responses tool loops. Negative mutations cover extra
+   fields, wrong response/tool/call IDs, wrong output, and missing correlation.
+6. `validate_failure_report` is invoked for failure reports and enforces the
+   phase grammar, unique phase failures, exact nested schemas, finite numbers,
+   partial compat/agent forms, and final health/metrics evidence.
+7. `run_process` verifies process-group disappearance after success, nonzero
+   exit, and timeout; it terminates descendants and escalates survivors to
+   `SIGKILL`. Real normal/nonzero leaders with children are covered.
+8. Canonical promotion now has a guarded command and retained JSON ledger. The
+   EOS promotion is recorded retroactively with verified current/distinct
+   digest and size; unverifiable historical values are explicitly `null`.
+9. No V2 ABI migration or higher-fidelity candidate was started. The
+   unqualified optimized prefill still fails its real-logit gate, so the
+   review's independent runtime-clean precondition is not met.
+
+## Files
+
+SuperSonic:
+
+```text
+.superpowers/sdd/2026-07-30-flm-qwen36-first-class-serving/task-14-eos-promotion-ledger.json
+crates/runner/src/qwen36_moe/options.rs
+crates/runner/tests/qwen36_moe_batched_prefill_parity.rs
+crates/runner/tests/qwen36_moe_multilayer_parity.rs
+crates/runtime/src/qwen36_moe/decode.rs
+crates/runtime/src/qwen36_moe/engine.rs
+crates/runtime/src/qwen36_moe/layer_loader.rs
+crates/runtime/src/qwen36_moe/prefill.rs
+kernels/qwen36_moe_bridge.cpp
+kernels/qwen36_moe_persistent/persistent_decode.hip
+oracle/qwen36_moe_multilayer_oracle.py
+tests/gfx1100/run_qwen36_flm_server_e2e.py
+tests/openai_sdk_fixture.py
+tests/test_qwen36_flm_server_e2e.py
+.superpowers/sdd/2026-07-30-flm-qwen36-first-class-serving/task-14-report.md
+```
+
+geo-quant:
+
+```text
+scripts/promote_flm_artifact.py
+scripts/qwen36_flm_diagnostic.py
+scripts/capture_qwen36_bf16_states.py
+scripts/compare_qwen36_prompt_states.py
+tests/test_promote_flm_artifact.py
+tests/test_qwen36_flm_diagnostic.py
+tests/test_capture_qwen36_bf16_states.py
+tests/test_compare_qwen36_prompt_states.py
+```
+
+## RED Evidence
+
+- The first independent layer-0 FFN comparison was
+  `max_abs=0.125 > 0.075`.
+- Selecting scalar chained FFN while the persistent template still shared one
+  global WMMA bit left persistent/chained hidden output at
+  `max_abs=0.34375`, `cosine=0.9998004`.
+- Selecting one global scalar mode made that disagreement worse:
+  `max_abs=1.0625`, `cosine=0.9979977`. This localized a shared phase-selection
+  defect rather than supporting a tile-format conclusion.
+- The final, explicitly opt-in optimized HIP prefill remains red against
+  per-token prefill: `cosine=0.9453402161598206`,
+  `max_abs=7.85546875`, `mismatch_count=247027`, and argmax `50 != 31`.
+  Its qualification threshold is `cosine >= 0.999` with equal argmax because
+  an alternate prefill path must preserve token selection; production uses the
+  stricter exact gate.
+- Exact-prompt BF16 versus FLM first diverges at layer 0 attention:
+  `cosine=0.856315553188324`, `max_abs=0.2333984375`.
+- Real server semantics remain red for legacy Completions, repeated reuse,
+  observed reasoning, and both SDK tool loops. The raw Chat tool attempt was
+  retained as malformed text and was not converted into a fabricated call.
+
+## GREEN Evidence
+
+The required multilayer tests ran, rather than skipping:
+
+```text
+layer0 router max_abs=0.00390625
+layer0 shared max_abs=0.015625
+layer0 routed/expert max_abs=0.03125
+layer0 residual max_abs=0.03125
+layer0 chained FFN max_abs=0.109375 <= derived bound 0.164063
+exact-input logits cosine=0.999994
+chained logits cosine=0.9994795 within the derived triangle/L2 bound
+persistent/chained final hidden: bit exact
+segmented/chained final hidden: bit exact
+folded lm-head cosine=0.9999969, max_abs=0.03125
+```
+
+The final qualified production prefill and explicit per-token path are bit
+identical for all `248320` BF16 logits:
+
+```text
+cosine=1.0
+max_abs=0.0
+mismatch_count=0
+sha256=0bcaa7e793b55e36fd7e36853f7006d329c6fd26b5b6334996c339a8a2e9d0ea
+argmax=31
+```
+
+The exact prompt has SHA-256
+`540f92c1fe4446d0f9764de537a1a59603515b94de27b8ea0562420c5f8ffb8b`,
+size `1459`, and exactly `322` tokenizer IDs. Fresh first-token top-k is:
+
+```text
+BF16 reference:
+248058 <tool_call> 25.625; 851 read 20.125; 24960 (read 16.375;
+1301 " read" 15.6875; 248046 <|im_end|> 15.5625
+
+qualified FLM CLI:
+31 @ 11.875; 36 E 11.6875; 50 S 11.1875; 12 - 11.1875;
+58 [ 11.0
+
+unqualified optimized FLM CLI:
+50 S 15.1875; 36 E 14.4375; 51 T 13.9375; 34 C 13.625;
+43 L 13.4375
+```
+
+All `80` BF16/FLM layer-subphase boundaries were captured. The source mapping
+audit passed `21/21` early/middle/late samples across native packed shapes
+`[8192,1024]`, `[4096,1024]`, `[2048,2048]`,
+`[256,1024,1024]`, `[256,2048,256]`, `[2048,256]`, and
+`[512,1024]`, including experts `0`, `128`, and `255`.
+
+The real server report passed exact failure-schema validation at phase
+`compat_semantic+agent`. Chat, streamed Chat, Responses, streamed Responses,
+stored Responses round-trip, routes, usage, auth, and SSE transport were
+green. Streams had one terminal event in exact order with terminal usage.
+Cancellation observed a nonterminal delta, closed the aborted fetch, held a
+real second request queued, completed that request, and moved scheduler and
+metrics from active/queued `1/1` to `0/0`. Final model loads remained `1`,
+final scheduler and metrics were `0/0`, and `collection_errors=[]`.
+
+The deterministic fixture used pinned OpenAI SDK `6.49.0` and proved exactly
+one canonical call with exact ID/name/arguments/output, no suffix or extras,
+and a text-only continuation for both Chat and Responses. Wrong-key checks
+covered SDK calls and `/health`, `/ready`, `/v1/capabilities`, and `/metrics`.
+
+## Promotion Evidence
+
+The guarded promotion command requires a distinct validated stage artifact,
+an explicit `--authorize-overwrite` value matching the canonical path, and a
+successful validator command before atomic replacement. Its ledger binds old,
+candidate, stage, and final digest/size identities; authorization; copy
+method; timestamps; command; tool revision; and repository revisions.
+
+For the earlier EOS promotion, only these facts could be reverified:
+
+```text
+final/candidate sha256=eb7a58444c3ca057512aca47723a8a4872f2fb1292a801af725f07931033052c
+final/candidate size=22871543808
+canonical validation: OK, tensors=1704, warnings=0
+```
+
+Historical old/stage digest and size, authorization, method, and start/end
+timestamps remain `null`; no values were invented.
+
+## Exact Tests
+
+```text
+/home/deano/projects/geo-quant/.venv-rocm/bin/python -m pytest -q \
+  tests/test_compare_qwen36_prompt_states.py \
+  tests/test_capture_qwen36_bf16_states.py \
+  tests/test_qwen36_flm_diagnostic.py \
+  tests/test_promote_flm_artifact.py \
+  tests/test_qwen36_flm.py
+# 140 passed in 3.28s
+
+python3 -m unittest -q tests.test_qwen36_flm_server_e2e
+# 37 tests, OK
+
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+RUST_TEST_THREADS=1 cargo test -q -p runner \
+  --test qwen36_moe_multilayer_parity -- --nocapture
+# 2 passed; both required oracle tests executed
+
+SUPERSONIC_QWEN36_35B_A3B_DIR=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+RUST_TEST_THREADS=1 cargo test -q -p runner \
+  --test qwen36_moe_batched_prefill_parity \
+  qualified_hip_prefill_matches_per_token -- --nocapture
+# 1 passed; bit exact
+
+cargo test -q -p runtime qwen_generation_stops_on_either_eos_without_emitting_it
+# 1 passed
+
+cargo test -q -p server
+# 26 + 3 + 1 + 16 passed
+
+python3 tests/gfx1100/run_qwen36_flm_server_e2e.py \
+  --flm /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --binary /home/deano/projects/SuperSonicBase/target/release/supersonic-serve \
+  --backend hip --device 0 --max-context 4096 \
+  --host 127.0.0.1 --api-key local \
+  --out-json target/task14-fix2-real-server.json \
+  --startup-timeout 1200 --request-timeout 1200
+# expected exit 1: transport green; semantic/tool capability red
+```
+
+`cargo build -q --release --bin supersonic` and the release server build
+completed. `git diff --check` passed. Changed Rust files are rustfmt-clean;
+repository-wide formatting remains red only in unrelated pre-existing files.
+
+## Commits
+
+SuperSonic implementation:
+
+```text
+ddca3c3183f25ac01b915685f005ad8915644b97
+test(qwen36): qualify Task 14 protocol and parity evidence
+```
+
+geo-quant:
+
+```text
+8b8ce774c264f32258eb015e3baf8bf10a76581d
+test(flm): add reproducible Qwen diagnostic and promotion ledger
+
+61ee2b37f1fb24b3597ac36cf16e9e8e51c3e89f
+test(flm): capture exact Qwen prompt layer states
+
+4d97c345f02c34f83702e779d7ea1aa491e6336f
+test(flm): compare exact Qwen prompt states
+```
+
+The SuperSonic report commit follows this section.
+
+## Concerns / Blocker
+
+- Protocol transport, schemas, auth, usage, cleanup, and cancellation are
+  qualified, but real semantic quality, observed reasoning, legacy
+  Completions reuse, and model-generated tool calls are still red.
+- The optimized HIP batched prefill lane is quarantined and opt-in because it
+  fails the real-logit gate. This remaining runtime defect blocks the
+  review-mandated clean-runtime precondition for a controlled higher-fidelity
+  artifact or V2 ABI migration.
+- Exact BF16/FLM states diverge at layer 0 attention despite clean sampled
+  source mapping and synthetic component parity. More actual-source,
+  layer-0 subphase instrumentation is needed to distinguish quantization loss
+  from a remaining dequant/attention defect. Tile scaling is only a hypothesis.
+- Transformers' optimized Qwen linear-attention path was unavailable because
+  `flash-linear-attention` and `causal-conv1d` are not installed. The reference
+  used the model implementation's Torch fallback and records package/source
+  identities. Its first-token result is decisive; performance is not.
+- The server has no logit/top-k response surface. The real route retains raw
+  generated output; full top-k evidence comes from the same committed FLM
+  engine through the CLI dump hook.
