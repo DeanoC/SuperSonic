@@ -414,6 +414,20 @@ fn persistent_dispatch_qualifies_ffn_wmma_independently_of_attention() {
 }
 
 #[test]
+fn persistent_ffn_wmma_is_qualified_only_for_single_token_decode() {
+    let qualification = BRIDGE
+        .find("const bool use_ffn_wmma =")
+        .and_then(|start| BRIDGE[start..].find("persistent_ffn_wmma_qualified").map(|end| {
+            &BRIDGE[start..start + end]
+        }))
+        .expect("persistent FFN qualification expression must remain explicit");
+    assert!(
+        qualification.contains("prefill_len <= 1"),
+        "FFN WMMA must be disabled for multi-token persistent prefill launches"
+    );
+}
+
+#[test]
 fn routed_and_shared_down_wmma_operands_match_independent_bf16_oracle() {
     for cols in [512, 2048, 4096] {
         let (packed, scales, desc, experts, rows) = fixture(cols, true);

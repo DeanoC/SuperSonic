@@ -1730,8 +1730,12 @@ extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
     const bool use_attn_wmma =
         !disable_wmma && persistent_wmma_dims_ok &&
         device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+    // The FFN WMMA path is parity-sensitive across a multi-token persistent
+    // prefill: its different F32 accumulation order can perturb the hidden
+    // state that seeds the first generated token. Keep prefill on the scalar
+    // reference while retaining the qualified path for one-token decode.
     const bool use_ffn_wmma =
-        !disable_wmma &&
+        !disable_wmma && prefill_len <= 1 &&
         persistent_ffn_wmma_qualified(
             int4_scales,
             device_ordinal,
