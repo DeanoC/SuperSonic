@@ -91,3 +91,76 @@ fn production_decoder_matches_independent_known_byte_abi_fixture() {
         );
     }
 }
+
+#[test]
+fn hip_descriptor_decoder_preserves_tile_v1_known_bytes() -> anyhow::Result<()> {
+    use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+    use half::bf16;
+    use kernel_ffi::qwen36_moe::{int4_descriptor_dequant_smoke_launch, Qwen36MoeInt4WeightDesc};
+
+    set_backend(Backend::Hip);
+    let fixture: Value = serde_json::from_str(FIXTURE)?;
+    let rows = fixture["logical_shape"][0].as_u64().unwrap() as usize;
+    let cols = fixture["logical_shape"][1].as_u64().unwrap() as usize;
+    let row_pattern = hex_bytes(fixture["packed"]["row_pattern_hex"].as_str().unwrap());
+    let pattern_repeats = fixture["packed"]["pattern_repeats_per_row"]
+        .as_u64()
+        .unwrap() as usize;
+    let packed = row_pattern.repeat(pattern_repeats).repeat(rows);
+    let scale = hex_bytes(fixture["scale_bf16_le_hex"].as_str().unwrap());
+    let zero = hex_bytes(fixture["zero_bf16_le_hex"].as_str().unwrap());
+
+    let packed_gpu = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[packed.len()], &packed)?;
+    let scale_gpu = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[scale.len() / 2], &scale)?;
+    let zero_gpu = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[zero.len() / 2], &zero)?;
+    let mut wide_gpu = GpuBuffer::zeros(0, ScalarType::F32, &[rows * cols])?;
+    let mut scalar_gpu = GpuBuffer::zeros(0, ScalarType::F32, &[rows * cols])?;
+    let desc = Qwen36MoeInt4WeightDesc {
+        scale: scale_gpu.as_ptr(),
+        zero: zero_gpu.as_ptr(),
+        packed_row_stride_bytes: (cols / 2) as u64,
+        packed_expert_stride_bytes: 0,
+        scale_row_stride_elements: (cols / 128) as u64,
+        scale_expert_stride_elements: 0,
+        input_group_size: 128,
+        output_group_size: 128,
+        implicit_zero_code: -1,
+        encoding: 1,
+    };
+
+    int4_descriptor_dequant_smoke_launch(
+        0,
+        &packed_gpu,
+        &desc,
+        1,
+        rows as i32,
+        cols as i32,
+        &mut wide_gpu,
+        &mut scalar_gpu,
+    )?;
+
+    let wide = wide_gpu.to_host_bytes()?;
+    let scalar = scalar_gpu.to_host_bytes()?;
+    let expected_tiles = fixture["expected_bf16_bits_by_tile"].as_array().unwrap();
+    for row in 0..rows {
+        for col in 0..cols {
+            let tile = (row / 128) * 2 + col / 128;
+            let expected_bits = hex_u16(&expected_tiles[tile][col % 16]);
+            let expected = f32::from(bf16::from_bits(expected_bits));
+            let offset = (row * cols + col) * 4;
+            let read =
+                |bytes: &[u8]| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            assert_eq!(
+                read(&wide),
+                expected,
+                "tile-v1 8-wide mismatch at row={row} col={col}"
+            );
+            assert_eq!(
+                read(&scalar),
+                expected,
+                "tile-v1 scalar mismatch at row={row} col={col}"
+            );
+        }
+    }
+    Ok(())
+}

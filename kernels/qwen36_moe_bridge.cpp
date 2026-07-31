@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstdio>
+#include <limits>
 #ifndef SUPERSONIC_QWEN36_CUDA_BRIDGE
 #include <hip/hip_runtime.h>
 #endif
@@ -139,6 +140,83 @@ static_assert(offsetof(Qwen36Int4ScaleDesc, shared_expert_down_proj) == 704);
 
 static_assert(sizeof(qwen36_moe::KVCacheFp8Desc) == 16,
               "Qwen36MoeKVCacheFp8Desc layout drift — must be exactly 2 pointers");
+
+bool checked_strided_extent(
+    uint64_t rows,
+    uint64_t row_stride,
+    uint64_t logical_row_elements,
+    uint64_t* extent
+) {
+    const uint64_t preceding_rows = rows - 1;
+    if (preceding_rows != 0 &&
+        row_stride >
+            (std::numeric_limits<uint64_t>::max() - logical_row_elements) /
+                preceding_rows) {
+        return false;
+    }
+    *extent = preceding_rows * row_stride + logical_row_elements;
+    return true;
+}
+
+int validate_int4_descriptor_geometry(
+    const Qwen36Int4WeightDesc& desc,
+    int experts,
+    int out_rows,
+    int in_cols
+) {
+    if (desc.scale == nullptr || experts <= 0 || out_rows <= 0 || in_cols <= 0) {
+        return 171;
+    }
+    if (desc.input_group_size <= 0 || desc.output_group_size <= 0 ||
+        in_cols % desc.input_group_size != 0 ||
+        out_rows % desc.output_group_size != 0) {
+        return 172;
+    }
+    if (desc.encoding == 1) {
+        if (desc.zero == nullptr || desc.implicit_zero_code >= 0 ||
+            desc.input_group_size != 128 || desc.output_group_size != 128) {
+            return 173;
+        }
+    } else if (desc.encoding == 2) {
+        if (desc.zero != nullptr || desc.input_group_size != 32 ||
+            desc.output_group_size != 1 || desc.implicit_zero_code != 8) {
+            return 174;
+        }
+    } else {
+        return 175;
+    }
+
+    const uint64_t packed_row_elements = static_cast<uint64_t>(in_cols / 2);
+    const uint64_t scale_row_elements =
+        static_cast<uint64_t>(in_cols / desc.input_group_size);
+    if (desc.packed_row_stride_bytes < packed_row_elements ||
+        desc.scale_row_stride_elements < scale_row_elements) {
+        return 176;
+    }
+    if (experts > 1) {
+        const uint64_t scale_rows =
+            static_cast<uint64_t>(out_rows / desc.output_group_size);
+        uint64_t packed_expert_elements = 0;
+        uint64_t scale_expert_elements = 0;
+        if (!checked_strided_extent(
+                static_cast<uint64_t>(out_rows),
+                desc.packed_row_stride_bytes,
+                packed_row_elements,
+                &packed_expert_elements) ||
+            !checked_strided_extent(
+                scale_rows,
+                desc.scale_row_stride_elements,
+                scale_row_elements,
+                &scale_expert_elements)) {
+            return 179;
+        }
+        if (desc.packed_expert_stride_bytes < packed_expert_elements ||
+            desc.scale_expert_stride_elements < scale_expert_elements) {
+            return 177;
+        }
+    }
+    return 0;
+}
 
 } // namespace
 
@@ -830,6 +908,83 @@ extern "C" uint64_t qwen36_moe_hip_int4_dequant_smoke_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
+    return 0;
+}
+
+extern "C" uint64_t qwen36_moe_hip_int4_descriptor_dequant_smoke_launch(
+    size_t                         device_ordinal,
+    const uint8_t*                 packed,
+    const Qwen36Int4WeightDesc*    desc,
+    int                            experts,
+    int                            out_rows,
+    int                            in_cols,
+    float*                         dq_8_out,
+    float*                         dq_scalar_out) {
+    if (packed == nullptr || desc == nullptr || desc->scale == nullptr ||
+        dq_8_out == nullptr || dq_scalar_out == nullptr) {
+        return 170;
+    }
+    const int descriptor_status =
+        validate_int4_descriptor_geometry(*desc, experts, out_rows, in_cols);
+    if (descriptor_status != 0) return descriptor_status;
+    if (in_cols % 8 != 0) return 178;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+    constexpr int block_size = 256;
+    if (static_cast<size_t>(experts) >
+        std::numeric_limits<size_t>::max() / static_cast<size_t>(out_rows)) {
+        return 179;
+    }
+    const size_t logical_rows = static_cast<size_t>(experts) * out_rows;
+    const size_t spans_per_row = static_cast<size_t>(in_cols / 8);
+    if (logical_rows > std::numeric_limits<size_t>::max() / spans_per_row) {
+        return 179;
+    }
+    const size_t span_count = logical_rows * spans_per_row;
+    const size_t requested_blocks = (span_count - 1) / block_size + 1;
+    const unsigned int blocks = requested_blocks > 65535
+        ? 65535
+        : static_cast<unsigned int>(requested_blocks);
+    hipLaunchKernelGGL(qwen36_moe::int4_descriptor_dequant_smoke_kernel,
+                       dim3(blocks), dim3(block_size), 0, 0,
+                       packed, *desc, experts, out_rows, in_cols,
+                       dq_8_out, dq_scalar_out);
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
+    return 0;
+}
+
+extern "C" uint64_t qwen36_moe_hip_int4_descriptor_wmma_parity_launch(
+    size_t                         device_ordinal,
+    const uint8_t*                 packed,
+    const Qwen36Int4WeightDesc*    desc,
+    const void*                    activation,
+    int                            out_rows,
+    int                            in_cols,
+    float*                         scalar_out,
+    float*                         wmma_out) {
+    if (packed == nullptr || desc == nullptr || desc->scale == nullptr ||
+        activation == nullptr || scalar_out == nullptr || wmma_out == nullptr) {
+        return 180;
+    }
+    if (out_rows != 32 || in_cols != 128) return 181;
+    const int descriptor_status =
+        validate_int4_descriptor_geometry(*desc, 1, out_rows, in_cols);
+    if (descriptor_status != 0) return descriptor_status;
+    if (!device_supports_wmma_bf16(static_cast<int>(device_ordinal))) return 182;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+    hipLaunchKernelGGL(qwen36_moe::int4_descriptor_wmma_parity_kernel,
+                       dim3(1), dim3(32), 0, 0,
+                       packed, *desc,
+                       static_cast<const hip_bfloat16*>(activation),
+                       out_rows, in_cols, scalar_out, wmma_out);
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return backend_failure(254, launch_err);
     if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;

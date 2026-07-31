@@ -143,20 +143,6 @@ struct DecodeLayerDesc {
     int   kv_shadow_window;  // rolling BF16 sidecar capacity in positions; 0 = disabled
 };
 
-// -- Explicit quantized-weight geometry --------------------------------------
-struct Qwen36MoeInt4WeightDesc {
-    const void* scale;
-    const void* zero;
-    uint64_t    packed_row_stride_bytes;
-    uint64_t    packed_expert_stride_bytes;
-    uint64_t    scale_row_stride_elements;
-    uint64_t    scale_expert_stride_elements;
-    int         input_group_size;
-    int         output_group_size;
-    int         implicit_zero_code;
-    int         encoding;
-};
-
 // Parallel to DecodeLayerDesc. 0=none, 1=tile-v1,
 // 2=row-group-symmetric, 3=fp8-block.
 struct Int4ScaleDesc {
@@ -689,6 +675,78 @@ __global__ void int4_dequant_smoke_kernel(
                 packed, scale, zero, row, col, in_cols, gsz);
         }
     }
+}
+
+// Task 8 descriptor-driven test kernels. They remain isolated from production
+// decode routing until Task 9 converts every material Qwen path.
+__global__ void int4_descriptor_dequant_smoke_kernel(
+    const uint8_t* packed,
+    Qwen36MoeInt4WeightDesc desc,
+    int experts,
+    int out_rows,
+    int in_cols,
+    float* dq_8_out,
+    float* dq_scalar_out
+) {
+    const size_t spans_per_row = static_cast<size_t>(in_cols / 8);
+    const size_t span_count =
+        static_cast<size_t>(experts) * out_rows * spans_per_row;
+    for (size_t span = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         span < span_count;
+         span += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const size_t logical_row = span / spans_per_row;
+        const int expert = static_cast<int>(logical_row / out_rows);
+        const int row = static_cast<int>(logical_row % out_rows);
+        const int col = static_cast<int>((span % spans_per_row) * 8);
+        const size_t output_base = logical_row * in_cols + col;
+        float values[8];
+        qwen36_int4_dequant_8(packed, desc, expert, row, col, values);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            dq_8_out[output_base + i] = values[i];
+            dq_scalar_out[output_base + i] =
+                qwen36_int4_value(packed, desc, expert, row, col + i);
+        }
+    }
+}
+
+__global__ void int4_descriptor_wmma_parity_kernel(
+    const uint8_t* packed,
+    Qwen36MoeInt4WeightDesc desc,
+    const hip_bfloat16* activation,
+    int out_rows,
+    int in_cols,
+    float* scalar_out,
+    float* wmma_out
+) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+    if (lane < out_rows) {
+        float sum = 0.0f;
+        for (int col = 0; col < in_cols; ++col) {
+            const float weight = bf16_round_rne_f32(
+                qwen36_int4_value(packed, desc, 0, lane, col));
+            sum += weight * static_cast<float>(activation[col]);
+        }
+        scalar_out[lane] = sum;
+    }
+    __syncthreads();
+
+#ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
+    #pragma unroll
+    for (int tile = 0; tile < 2; ++tile) {
+        const int row = tile * 16 + lane_row;
+        const qwen36_float8 acc = qwen36_wmma_int4_matvec_partial_16rows(
+            packed, desc, 0, row, row < out_rows,
+            activation, in_cols, lane_row);
+        if (lane_half == 0 && row < out_rows) {
+            wmma_out[row] = acc[0];
+        }
+    }
+#else
+    if (lane < out_rows) wmma_out[lane] = 0.0f;
+#endif
 }
 
 // ---------------------------------------------------------------------------

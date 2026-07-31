@@ -25,6 +25,22 @@
 
 namespace qwen36_moe {
 
+// Explicit quantized-weight geometry shared by every descriptor-driven INT4
+// reconstruction path. This definition lives with the primitive so phase
+// headers cannot accidentally acquire a second storage-layout contract.
+struct Qwen36MoeInt4WeightDesc {
+    const void* scale;
+    const void* zero;
+    uint64_t    packed_row_stride_bytes;
+    uint64_t    packed_expert_stride_bytes;
+    uint64_t    scale_row_stride_elements;
+    uint64_t    scale_expert_stride_elements;
+    int         input_group_size;
+    int         output_group_size;
+    int         implicit_zero_code;
+    int         encoding;
+};
+
 __device__ __forceinline__ float qwen36_wave_sum(float value) {
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         value += __shfl_down(value, offset);
@@ -48,13 +64,87 @@ __device__ __forceinline__ float bf16_round_rne_f32(float x) {
     return y;
 }
 
+// Canonical descriptor-driven INT4 reconstruction contract. Encoding 1
+// (tile-v1) supplies an explicit BF16 zero plane; encoding 2 (row-group)
+// supplies an integer zero code. Host launch validation keeps encoding 3
+// (FP8 block) out of this primitive.
+__device__ inline float qwen36_int4_value(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    int row,
+    int col
+) {
+    const size_t packed_index =
+        static_cast<size_t>(expert) * desc.packed_expert_stride_bytes +
+        static_cast<size_t>(row) * desc.packed_row_stride_bytes +
+        static_cast<size_t>(col / 2);
+    const uint8_t packed_byte = packed[packed_index];
+    const int nibble = (col & 1) != 0
+        ? static_cast<int>((packed_byte >> 4) & 0x0f)
+        : static_cast<int>(packed_byte & 0x0f);
+    const size_t scale_index =
+        static_cast<size_t>(expert) * desc.scale_expert_stride_elements +
+        static_cast<size_t>(row / desc.output_group_size) *
+            desc.scale_row_stride_elements +
+        static_cast<size_t>(col / desc.input_group_size);
+    const hip_bfloat16* scales =
+        static_cast<const hip_bfloat16*>(desc.scale);
+    const float scale = static_cast<float>(scales[scale_index]);
+    const float zero = desc.implicit_zero_code >= 0
+        ? static_cast<float>(desc.implicit_zero_code)
+        : static_cast<float>(
+              static_cast<const hip_bfloat16*>(desc.zero)[scale_index]);
+    return (static_cast<float>(nibble) - zero) * scale;
+}
+
+__device__ inline void qwen36_int4_dequant_8(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    int row,
+    int col,
+    float out[8]
+) {
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out[i] = qwen36_int4_value(packed, desc, expert, row, col + i);
+    }
+}
+
+__device__ inline void qwen36_int4_pair_dequant_8(
+    const uint8_t* packed_a,
+    const Qwen36MoeInt4WeightDesc& desc_a,
+    int expert_a,
+    int row_a,
+    const uint8_t* packed_b,
+    const Qwen36MoeInt4WeightDesc& desc_b,
+    int expert_b,
+    int row_b,
+    int col,
+    float out_a[8],
+    float out_b[8]
+) {
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out_a[i] = qwen36_int4_value(
+            packed_a, desc_a, expert_a, row_a, col + i);
+        out_b[i] = qwen36_int4_value(
+            packed_b, desc_b, expert_b, row_b, col + i);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // INT4 group-quant dequant — ported from kernels/full_attention_4b.hip
 // (PR 4b5). Per CLAUDE.md the qwen36_moe and full_attention_4b kernels are
 // isolated compilation units (hipcc on gfx11xx is fragile), so the helpers
 // live here as a copy rather than a shared header.
 //
-// Layout (matches the bake + the full_attention_4b versions):
+// Legacy tile-v1 compatibility (encoding 1) only. Task 7 rejects encoding 2
+// before production chained/persistent launch; Task 9 will route those paths
+// through the descriptor primitive above.
+//
+// Layout (matches the tile-v1 bake + the full_attention_4b versions):
 //   weights : `[..., out, in/2]` u8   — 2 nibbles/byte, even col → low.
 //   scale   : `[..., out/gs, in/gs]` BF16
 //   zero    : `[..., out/gs, in/gs]` BF16
@@ -131,6 +221,106 @@ struct qwen36_float8_pair {
     qwen36_float8 first;
     qwen36_float8 second;
 };
+
+__device__ inline short qwen36_bf16_operand_bits(float value) {
+    const float rounded = bf16_round_rne_f32(value);
+    uint32_t bits;
+    __builtin_memcpy(&bits, &rounded, sizeof(bits));
+    return static_cast<short>(bits >> 16);
+}
+
+__device__ inline qwen36_short16 qwen36_wmma_activation_operand(
+    const hip_bfloat16* activation,
+    int col,
+    int lane_row
+) {
+    qwen36_short16 operand;
+    if (lane_row == 0) {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            uint16_t bits;
+            __builtin_memcpy(&bits, &activation[col + i], sizeof(bits));
+            operand[i] = static_cast<short>(bits);
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) operand[i] = 0;
+    }
+    return operand;
+}
+
+__device__ inline qwen36_short16 qwen36_wmma_int4_operand(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    int row,
+    int col,
+    bool row_in_range
+) {
+    qwen36_short16 operand;
+    if (row_in_range) {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            operand[i] = qwen36_bf16_operand_bits(
+                qwen36_int4_value(packed, desc, expert, row, col + i));
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) operand[i] = 0;
+    }
+    return operand;
+}
+
+__device__ inline qwen36_float8 qwen36_wmma_int4_matvec_partial_16rows(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    int rhs_row_idx,
+    bool rhs_in_range,
+    const hip_bfloat16* activation,
+    int hidden,
+    int lane_row
+) {
+    qwen36_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int col = 0; col < hidden; col += 16) {
+        const qwen36_short16 a =
+            qwen36_wmma_activation_operand(activation, col, lane_row);
+        const qwen36_short16 b = qwen36_wmma_int4_operand(
+            packed, desc, expert, rhs_row_idx, col, rhs_in_range);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+    return acc;
+}
+
+__device__ inline qwen36_float8_pair
+qwen36_wmma_int4_pair_matvec_partial_16rows(
+    const uint8_t* packed_a,
+    const Qwen36MoeInt4WeightDesc& desc_a,
+    int expert_a,
+    int rhs_row_idx_a,
+    const uint8_t* packed_b,
+    const Qwen36MoeInt4WeightDesc& desc_b,
+    int expert_b,
+    int rhs_row_idx_b,
+    bool rhs_in_range,
+    const hip_bfloat16* activation,
+    int hidden,
+    int lane_row
+) {
+    qwen36_float8 acc_a = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    qwen36_float8 acc_b = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int col = 0; col < hidden; col += 16) {
+        const qwen36_short16 a =
+            qwen36_wmma_activation_operand(activation, col, lane_row);
+        const qwen36_short16 b_a = qwen36_wmma_int4_operand(
+            packed_a, desc_a, expert_a, rhs_row_idx_a, col, rhs_in_range);
+        const qwen36_short16 b_b = qwen36_wmma_int4_operand(
+            packed_b, desc_b, expert_b, rhs_row_idx_b, col, rhs_in_range);
+        acc_a = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b_a, acc_a);
+        acc_b = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b_b, acc_b);
+    }
+    return {acc_a, acc_b};
+}
 #endif
 
 // Work-stealing matvec inner loop for an INT4 slab `[out_rows, in_cols/2]`.
@@ -416,7 +606,8 @@ __device__ inline qwen36_float8_pair wmma_int4_pair_matvec_partial_16rows(
 
 #endif // SUPERSONIC_QWEN36_HAS_WMMA_BF16
 
-// Single-element dequant for non-8-aligned tails. `cols` is the unpacked
+// Legacy tile-v1 (encoding 1) single-element dequant for non-8-aligned
+// tails. `cols` is the unpacked
 // input dim of the 2D slab `(row, col)` indexes into. `scales`/`zeros`
 // are at `[(row/gs) * ((cols + gs - 1)/gs) + col/gs]` — same as the 2D
 // helpers in full_attention_4b.
