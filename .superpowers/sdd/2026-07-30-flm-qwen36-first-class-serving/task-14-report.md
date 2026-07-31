@@ -1042,16 +1042,35 @@ RUST_TEST_THREADS=1 cargo test -q -p runner \
   --test qwen36_moe_batched_prefill_parity \
   qualified_hip_prefill_matches_per_token -- --nocapture
 # 1 passed in 9.76s; production default versus per-token is bit exact
+
+HIP_VISIBLE_DEVICES=0 python3 \
+  tests/gfx1100/run_qwen36_flm_server_e2e.py \
+  --flm /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --binary /home/deano/projects/SuperSonicBase/target/release/supersonic-serve \
+  --backend hip --device 0 --max-context 4096 \
+  --host 127.0.0.1 --api-key local \
+  --out-json target/task14-fix3-real-server.json \
+  --startup-timeout 1200 --request-timeout 1200
+# expected exit 1 at compat_semantic+agent
 ```
 
 The deterministic SDK tool continuations, exact failure schemas, endpoint
 transport, auth, cancellation, scheduler release, and single-load evidence
-remain green. The retained real-server semantic/tool gate remains red for
-legacy Completions quality, repeated reuse, observed reasoning, and both
-model-generated SDK tool loops; raw malformed model output remains evidence
-and is not converted into a fabricated call. Fix Round 3 changes
+remain green. The fresh real-server semantic/tool gate remains red:
+Completions produced `", 123\n\n<think>"` with `finish_reason="length"`,
+reasoning was accepted but not observed, and repeated reuse produced
+`"rrilest\n  ("` instead of `"ready"`. Chat emitted malformed
+`<function>` text and exhausted `128` completion tokens instead of generating
+one valid tool call; the raw output remains evidence and was not converted
+into a fabricated call.
+
+The failure report is retained at phase `compat_semantic+agent`, SHA-256
+`8420e885e83e1c49fd837fe0dea8470121c99da70e5fc1b4e17759e5b85a5583`.
+Final health is `ok`; native INT4 is `330`, BF16 fallback is `0`,
+`model_loads_total=1`, load invariance passes, active/queued scheduler and
+metric values are `0/0`, and `collection_errors=[]`. Fix Round 3 changes
 qualification, promotion safety, and diagnosis, not model generation
-semantics. The optimized HIP batched-prefill lane also remains quarantined and
+semantics. The optimized HIP batched-prefill lane remains quarantined and
 opt-in; production default remains the qualified per-token path.
 
 ### Fix Round 3 Commits
