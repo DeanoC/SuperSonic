@@ -191,6 +191,33 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             [{"load_sequence": 1, "source_open_count": 1}],
         )
 
+    def test_parse_flm_direct_profile_accepts_legacy_line(self):
+        output = (
+            "[qwen36-moe] FLM direct plans: required=693 raw_dense=363 "
+            "native_int4=330 bf16_fallback=0\n"
+        )
+
+        self.assertEqual(
+            bench.parse_flm_direct_profile(output),
+            {
+                "required": 693,
+                "raw_dense": 363,
+                "native_int4": 330,
+                "bf16_fallback": 0,
+            },
+        )
+
+    def test_parse_flm_direct_profile_rejects_malformed_bf16_suffix(self):
+        prefix = (
+            "[qwen36-moe] FLM direct plans: required=693 raw_dense=363 "
+            "native_int4=330 row_group_int4=330 tile_int4_v1=0 "
+            "bf16_fallback="
+        )
+
+        for suffix in ("0.5", "0bogus", "0_", "0e0"):
+            with self.subTest(suffix=suffix):
+                self.assertIsNone(bench.parse_flm_direct_profile(prefix + suffix))
+
     def test_runtime_engine_ownership_parser_preserves_duplicate_markers(self):
         output = (
             "[qwen36-moe] runtime engine ready: "
@@ -1055,6 +1082,89 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "FLM run did not report native INT4 direct plan coverage",
                 "FLM run did not report exactly one runtime engine ownership marker",
             ],
+        )
+
+    def flm_run_args(self, *, tail_chars=4000):
+        return types.SimpleNamespace(
+            binary=Path("target/release/supersonic"),
+            backend="hip",
+            model=None,
+            model_dir=bench.DEFAULT_35B_A3B_FLM_MODEL_DIR,
+            context_size=16,
+            warmup_new_tokens=1,
+            n_gen=1,
+            seed=1,
+            prompt_no_special_tokens=False,
+            quant="none",
+            ignore_eos=True,
+            emit_stage_timings=False,
+            kv_fp8=False,
+            dflash=False,
+            dflash_block=0,
+            dflash_draft_variant=None,
+            dflash_draft_dir=bench.DEFAULT_SUPERSONIC_DFLASH_DRAFT_DIR,
+            dflash_draft_gguf=None,
+            timeout=10,
+            tail_chars=tail_chars,
+            allow_untested_gpu=None,
+            hal_profile=False,
+            runner_env=[],
+            flm_virtual_transfer_backend=None,
+        )
+
+    def flm_success_output(self):
+        return (
+            "[flm] inferred model qwen3.6-35b-a3b from runtime descriptor\n"
+            "[qwen36-moe] FLM weight mode: INT4 native FLM\n"
+            "[qwen36-moe] FLM direct plans: required=693 raw_dense=363 "
+            "native_int4=330 row_group_int4=330 tile_int4_v1=0 "
+            "bf16_fallback=0\n"
+            "[FLM runtime weights] ready-for-decode: YES\n"
+            "[qwen36-moe] runtime engine ready: "
+            "load_sequence=1 source_open_count=1\n"
+            "[result] prompt_tokens=1 generated_tokens=1 "
+            "decode_ms=10 ms_per_step=10\n"
+        )
+
+    def test_run_one_persists_clean_full_output_hf_path_gate(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=self.flm_success_output(),
+            stderr="",
+        )
+
+        with mock.patch.object(bench.subprocess, "run", return_value=completed):
+            row = bench.run_one(self.flm_run_args(), "case", "Hello")
+
+        self.assertEqual(row["returncode"], 0)
+        self.assertEqual(row["flm_full_output_forbidden_markers"], [])
+
+    def test_run_one_rejects_early_hf_marker_missing_from_persisted_tails(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "[fetch] opened an HF path before startup\n"
+                + "x" * 5000
+                + self.flm_success_output()
+            ),
+            stderr="",
+        )
+
+        with mock.patch.object(bench.subprocess, "run", return_value=completed):
+            row = bench.run_one(self.flm_run_args(), "case", "Hello")
+
+        self.assertNotIn("[fetch]", row["stdout_tail"])
+        self.assertNotIn("[fetch]", row["stderr_tail"])
+        self.assertEqual(row["runner_returncode"], 0)
+        self.assertEqual(row["returncode"], 1)
+        self.assertEqual(row["flm_full_output_forbidden_markers"], ["[fetch]"])
+        self.assertTrue(
+            any(
+                "forbidden HF-path markers" in error
+                for error in row["benchmark_validation_errors"]
+            )
         )
 
 

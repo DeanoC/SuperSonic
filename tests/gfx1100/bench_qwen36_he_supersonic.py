@@ -41,6 +41,15 @@ DEFAULT_35B_A3B_FLM_OUT_JSON = Path("target/qwen36_35b_a3b_flm_he_supersonic.jso
 DEFAULT_CONTEXT_SIZE = 512
 LUCEBOX_SERVING_CONTEXT_SIZE = 1024
 GIB = 1024.0 * 1024.0 * 1024.0
+FLM_FORBIDDEN_HF_PATH_MARKERS = (
+    "[fetch]",
+    "[bake]",
+    "config.json",
+    "tokenizer.json",
+    "safetensors",
+    ".supersonic",
+    "INT4 GPTQ",
+)
 LUCEBOX_DRAFT_ALIASES = {
     "supersonic-q8-bf16": {
         "label": "supersonic-q8-bf16",
@@ -80,9 +89,9 @@ FLM_DIRECT_PROFILE_RE = re.compile(
     r"required=(?P<required>\d+)\s+"
     r"raw_dense=(?P<raw_dense>\d+)\s+"
     r"native_int4=(?P<native_int4>\d+)\s+"
-    r"row_group_int4=(?P<row_group_int4>\d+)\s+"
-    r"tile_int4_v1=(?P<tile_int4_v1>\d+)\s+"
-    r"bf16_fallback=(?P<bf16_fallback>\d+)"
+    r"(?:row_group_int4=(?P<row_group_int4>\d+)\s+"
+    r"tile_int4_v1=(?P<tile_int4_v1>\d+)\s+)?"
+    r"bf16_fallback=(?P<bf16_fallback>\d+)(?=\s|$)"
 )
 FLM_READY_RE = re.compile(
     r"\[FLM runtime weights\]\s+ready-for-decode:\s+(?P<ready>YES|NO)"
@@ -260,14 +269,16 @@ def parse_flm_direct_profile(text: str) -> dict[str, int] | None:
     match = FLM_DIRECT_PROFILE_RE.search(text)
     if not match:
         return None
-    return {
+    profile = {
         "required": int(match.group("required")),
         "raw_dense": int(match.group("raw_dense")),
         "native_int4": int(match.group("native_int4")),
-        "row_group_int4": int(match.group("row_group_int4")),
-        "tile_int4_v1": int(match.group("tile_int4_v1")),
         "bf16_fallback": int(match.group("bf16_fallback")),
     }
+    if match.group("row_group_int4") is not None:
+        profile["row_group_int4"] = int(match.group("row_group_int4"))
+        profile["tile_int4_v1"] = int(match.group("tile_int4_v1"))
+    return profile
 
 
 def parse_flm_ready_for_decode(text: str) -> dict[str, bool | str] | None:
@@ -346,7 +357,19 @@ def flm_first_class_validation_errors(args: argparse.Namespace, row: dict) -> li
             "FLM runtime engine ownership marker did not report "
             "load_sequence=1 source_open_count=1"
         )
+    forbidden_markers = row.get("flm_full_output_forbidden_markers")
+    if not isinstance(forbidden_markers, list):
+        errors.append("FLM run did not record full-output HF-path marker evidence")
+    elif forbidden_markers:
+        errors.append(
+            "FLM run reported forbidden HF-path markers: "
+            + ", ".join(str(marker) for marker in forbidden_markers)
+        )
     return errors
+
+
+def find_flm_forbidden_hf_path_markers(text: str) -> list[str]:
+    return [marker for marker in FLM_FORBIDDEN_HF_PATH_MARKERS if marker in text]
 
 
 def apply_target_profile(args: argparse.Namespace) -> None:
@@ -446,6 +469,11 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         "stdout_tail": proc.stdout[-args.tail_chars :],
         "stderr_tail": proc.stderr[-args.tail_chars :],
     }
+    requires_flm_evidence = requires_flm_first_class_evidence(args)
+    if requires_flm_evidence:
+        row["flm_full_output_forbidden_markers"] = (
+            find_flm_forbidden_hf_path_markers(combined)
+        )
     if runner_env_overrides:
         row["runner_env"] = runner_env_overrides
     if flm_virtual_transfer_backend:
@@ -499,7 +527,7 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         row["dflash_draft_label"] = dflash_draft_label
         row["dflash_draft_dir"] = str(dflash_draft_dir)
         row["dflash_draft_gguf"] = str(dflash_draft_gguf) if dflash_draft_gguf else None
-    if proc.returncode == 0 and requires_flm_first_class_evidence(args):
+    if proc.returncode == 0 and requires_flm_evidence:
         validation_errors = flm_first_class_validation_errors(args, row)
         if validation_errors:
             row["runner_returncode"] = proc.returncode

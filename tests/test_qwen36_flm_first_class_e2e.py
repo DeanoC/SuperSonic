@@ -386,6 +386,7 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
                     "load_sequence": 1,
                     "source_open_count": 1,
                 }],
+                "flm_full_output_forbidden_markers": [],
                 "flm_direct_profile": {
                     "required": 693,
                     "raw_dense": 363,
@@ -515,6 +516,18 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
         payload["rows"][0]["runtime_engine_ownership_markers"][0]["source_open_count"] = 2
 
         self.assert_report_rejected(payload, "source_open_count=1")
+
+    def test_report_rejects_missing_full_output_hf_path_gate(self):
+        payload = self.valid_report()
+        payload["rows"][0].pop("flm_full_output_forbidden_markers")
+
+        self.assert_report_rejected(payload, "full-output HF-path marker evidence")
+
+    def test_report_rejects_full_output_hf_path_markers(self):
+        payload = self.valid_report()
+        payload["rows"][0]["flm_full_output_forbidden_markers"] = ["config.json"]
+
+        self.assert_report_rejected(payload, "forbidden HF-path markers")
 
     def test_report_rejects_noncanonical_native_int4_direct_plan_count(self):
         payload = self.valid_report()

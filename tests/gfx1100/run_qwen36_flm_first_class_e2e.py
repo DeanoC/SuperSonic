@@ -497,6 +497,15 @@ def first_class_errors(
                         f"row {index} runtime engine ownership must report source_open_count=1"
                     )
 
+        forbidden_markers = row.get("flm_full_output_forbidden_markers")
+        if not isinstance(forbidden_markers, list):
+            errors.append(f"row {index} has no full-output HF-path marker evidence")
+        elif forbidden_markers:
+            errors.append(
+                f"row {index} has forbidden HF-path markers in full output: "
+                + ", ".join(str(marker) for marker in forbidden_markers)
+            )
+
         direct_profile = row.get("flm_direct_profile")
         if not isinstance(direct_profile, dict):
             errors.append(f"row {index} has no FLM direct profile")
