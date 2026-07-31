@@ -50,6 +50,16 @@ extern "C" {
         wmma_supported: c_int,
     ) -> c_int;
 
+    /// Pure prelaunch-policy probe for persistent attention modes. Returns
+    /// status 150 when row-group attention cannot use the qualified WMMA path.
+    pub fn qwen36_moe_hip_persistent_int4_prelaunch_status_probe(
+        mode: c_int,
+        full_attention_encoding: c_int,
+        linear_attention_encoding: c_int,
+        shape_valid: c_int,
+        wmma_supported: c_int,
+    ) -> c_int;
+
     /// Stub launch entry. Walks the descriptor array, validates field
     /// integrity by writing recognizable sentinel values into the workspace
     /// at known offsets, grid-barriers between layers, and returns 0 on
@@ -618,16 +628,22 @@ extern "C" {
     ) -> Qwen36BridgeStatus;
 }
 
-fn validate_buffer_for_descriptor_launch(
+fn validate_buffer_for_backend_descriptor_launch(
     operation: &str,
     name: &str,
+    backend: Backend,
     ordinal: usize,
     buffer: &GpuBuffer,
     dtype: ScalarType,
 ) -> Result<(), GpuError> {
-    if buffer.backend() != Backend::Hip {
+    if !matches!(backend, Backend::Hip | Backend::Cuda) {
         return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe::{operation}: {name} must use the HIP backend"
+            "qwen36_moe::{operation}: descriptor launch requires HIP or CUDA backend"
+        )));
+    }
+    if buffer.backend() != backend {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: {name} must use the same {backend} backend as the launch"
         )));
     }
     if buffer.device_ordinal() != ordinal {
@@ -644,8 +660,26 @@ fn validate_buffer_for_descriptor_launch(
     Ok(())
 }
 
-fn validate_descriptor_int4_common(
+fn validate_buffer_for_descriptor_launch(
     operation: &str,
+    name: &str,
+    ordinal: usize,
+    buffer: &GpuBuffer,
+    dtype: ScalarType,
+) -> Result<(), GpuError> {
+    validate_buffer_for_backend_descriptor_launch(
+        operation,
+        name,
+        Backend::Hip,
+        ordinal,
+        buffer,
+        dtype,
+    )
+}
+
+fn validate_descriptor_int4_common_for_backend(
+    operation: &str,
+    backend: Backend,
     ordinal: usize,
     packed: &GpuBuffer,
     scale: &GpuBuffer,
@@ -658,11 +692,19 @@ fn validate_descriptor_int4_common(
     fn validate_bf16_sidecar(
         operation: &str,
         name: &str,
+        backend: Backend,
         ordinal: usize,
         sidecar: &GpuBuffer,
         required_elements: u64,
     ) -> Result<(), GpuError> {
-        validate_buffer_for_descriptor_launch(operation, name, ordinal, sidecar, ScalarType::BF16)?;
+        validate_buffer_for_backend_descriptor_launch(
+            operation,
+            name,
+            backend,
+            ordinal,
+            sidecar,
+            ScalarType::BF16,
+        )?;
         let element_bytes = std::mem::size_of::<u16>();
         let shape_bytes = sidecar
             .elem_count()
@@ -696,9 +738,10 @@ fn validate_descriptor_int4_common(
         Ok(())
     }
 
-    validate_buffer_for_descriptor_launch(
+    validate_buffer_for_backend_descriptor_launch(
         operation,
         "packed weights",
+        backend,
         ordinal,
         packed,
         ScalarType::U8,
@@ -807,9 +850,9 @@ fn validate_descriptor_int4_common(
         .ok_or_else(|| {
             GpuError::InvalidArg(format!("qwen36_moe::{operation}: scale extent overflows"))
         })?;
-    validate_bf16_sidecar(operation, "scale", ordinal, scale, scale_extent)?;
+    validate_bf16_sidecar(operation, "scale", backend, ordinal, scale, scale_extent)?;
     if let Some(zero) = explicit_zero {
-        validate_bf16_sidecar(operation, "zero", ordinal, zero, scale_extent)?;
+        validate_bf16_sidecar(operation, "zero", backend, ordinal, zero, scale_extent)?;
     }
     let packed_extent = (experts as u64 - 1)
         .checked_mul(desc.packed_expert_stride_bytes)
@@ -828,6 +871,32 @@ fn validate_descriptor_int4_common(
         .ok_or_else(|| {
             GpuError::InvalidArg(format!("qwen36_moe::{operation}: output extent overflows"))
         })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_descriptor_int4_common(
+    operation: &str,
+    ordinal: usize,
+    packed: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: Option<&GpuBuffer>,
+    desc: &Qwen36MoeInt4WeightDesc,
+    experts: i32,
+    out_rows: i32,
+    in_cols: i32,
+) -> Result<usize, GpuError> {
+    validate_descriptor_int4_common_for_backend(
+        operation,
+        Backend::Hip,
+        ordinal,
+        packed,
+        scale,
+        zero,
+        desc,
+        experts,
+        out_rows,
+        in_cols,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

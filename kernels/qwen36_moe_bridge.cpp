@@ -270,6 +270,21 @@ bool attention_desc_has_row_group(const Qwen36Int4ScaleDesc& desc) {
         is_row_group_execution_desc(desc.linear_out_proj);
 }
 
+bool persistent_mode_runs_attention(int mode) {
+    return mode == 0 || mode == 1 || mode == 3 || (mode >= 9 && mode <= 13);
+}
+
+int persistent_int4_prelaunch_status(
+    int mode,
+    bool attention_has_row_group,
+    bool use_attention_wmma
+) {
+    return persistent_mode_runs_attention(mode) && attention_has_row_group &&
+            !use_attention_wmma
+        ? 150
+        : 0;
+}
+
 int validate_execution_descriptor(
     const Qwen36Int4WeightDesc& desc,
     int experts,
@@ -318,6 +333,21 @@ extern "C" int qwen36_moe_hip_int4_dispatch_policy_probe(
         : select_attention_int4_dispatch(
               true, row_group, shape_valid != 0, wmma_supported != 0);
     return static_cast<int>(policy);
+}
+
+extern "C" int qwen36_moe_hip_persistent_int4_prelaunch_status_probe(
+    int mode,
+    int full_attention_encoding,
+    int linear_attention_encoding,
+    int shape_valid,
+    int wmma_supported
+) {
+    const bool attention_has_row_group =
+        full_attention_encoding == 2 || linear_attention_encoding == 2;
+    return persistent_int4_prelaunch_status(
+        mode,
+        attention_has_row_group,
+        shape_valid != 0 && wmma_supported != 0);
 }
 
 // `dtype` encoding follows the Qwen/Gemma/Phi bridges: 0 = half, 2 = bf16.
@@ -1528,8 +1558,8 @@ extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
     // Encoding 2 is qualified only through BF16-WMMA reconstruction. The
     // descriptors live on device, so inspect them only on the exceptional
     // non-WMMA path; qualified gfx11 production launches pay no D2H cost.
-    const bool mode_runs_attention = mode == 0 || mode == 3 || mode >= 9;
-    if (!use_attn_wmma && mode_runs_attention && int4_scales != nullptr) {
+    if (!use_attn_wmma && persistent_mode_runs_attention(mode) &&
+        int4_scales != nullptr) {
         std::vector<qwen36_moe::Int4ScaleDesc> host_scales(
             static_cast<size_t>(num_layers));
         hipError_t copy_err = hipMemcpy(
@@ -1539,9 +1569,11 @@ extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
             hipMemcpyDeviceToHost);
         if (copy_err != hipSuccess) return backend_failure(251, copy_err);
         for (int li = start_layer; li < end_layer_exclusive; ++li) {
-            if (attention_desc_has_row_group(host_scales[static_cast<size_t>(li)])) {
-                return 150;
-            }
+            const int prelaunch_status = persistent_int4_prelaunch_status(
+                mode,
+                attention_desc_has_row_group(host_scales[static_cast<size_t>(li)]),
+                use_attn_wmma);
+            if (prelaunch_status != 0) return prelaunch_status;
         }
     }
 

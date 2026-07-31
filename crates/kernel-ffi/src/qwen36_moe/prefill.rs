@@ -13153,6 +13153,7 @@ pub fn batched_prefill_router_permute_launch(
 ///                            this is the work-stealing claim counter.
 #[derive(Clone, Copy)]
 struct GroupedExpertCheckedDims {
+    backend: Backend,
     n_tokens: c_int,
     top_k: c_int,
     num_experts: c_int,
@@ -13168,7 +13169,33 @@ fn grouped_expert_c_int(name: &str, value: usize) -> Result<c_int, GpuError> {
     })
 }
 
+fn grouped_expert_launch_backend(backend: Backend) -> Result<Backend, GpuError> {
+    if matches!(backend, Backend::Hip | Backend::Cuda) {
+        Ok(backend)
+    } else {
+        Err(GpuError::backend(
+            backend,
+            "qwen36_moe::batched_prefill_grouped_expert_launch requires HIP or CUDA backend"
+                .to_string(),
+        ))
+    }
+}
+
+fn validate_grouped_expert_backend_match(
+    expected: Backend,
+    name: &str,
+    actual: Backend,
+) -> Result<(), GpuError> {
+    if actual != expected {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::batched_prefill_grouped_expert_launch: {name} must use the same {expected} backend as x_norm"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_grouped_expert_buffer(
+    backend: Backend,
     ordinal: usize,
     name: &str,
     buffer: &GpuBuffer,
@@ -13176,7 +13203,10 @@ fn validate_grouped_expert_buffer(
     required_elements: usize,
 ) -> Result<(), GpuError> {
     const OPERATION: &str = "batched_prefill_grouped_expert_launch";
-    validate_buffer_for_descriptor_launch(OPERATION, name, ordinal, buffer, dtype)?;
+    validate_grouped_expert_backend_match(backend, name, buffer.backend())?;
+    validate_buffer_for_backend_descriptor_launch(
+        OPERATION, name, backend, ordinal, buffer, dtype,
+    )?;
     let element_bytes = dtype.size_in_bytes();
     let shape_bytes = buffer
         .elem_count()
@@ -13232,7 +13262,9 @@ fn validate_batched_prefill_grouped_expert_launch(
     counters: &GpuBuffer,
 ) -> Result<GroupedExpertCheckedDims, GpuError> {
     const OPERATION: &str = "batched_prefill_grouped_expert_launch";
+    let backend = grouped_expert_launch_backend(x_norm.backend())?;
     let dims = GroupedExpertCheckedDims {
+        backend,
         n_tokens: grouped_expert_c_int("n_tokens", n_tokens)?,
         top_k: grouped_expert_c_int("top_k", top_k)?,
         num_experts: grouped_expert_c_int("num_experts", num_experts)?,
@@ -13293,8 +13325,16 @@ fn validate_batched_prefill_grouped_expert_launch(
         ))
     })?;
 
-    validate_grouped_expert_buffer(ordinal, "x_norm", x_norm, ScalarType::BF16, x_norm_elements)?;
     validate_grouped_expert_buffer(
+        backend,
+        ordinal,
+        "x_norm",
+        x_norm,
+        ScalarType::BF16,
+        x_norm_elements,
+    )?;
+    validate_grouped_expert_buffer(
+        backend,
         ordinal,
         "expert_offsets",
         expert_offsets,
@@ -13302,6 +13342,7 @@ fn validate_batched_prefill_grouped_expert_launch(
         offset_elements,
     )?;
     validate_grouped_expert_buffer(
+        backend,
         ordinal,
         "permuted_token_idx",
         permuted_token_idx,
@@ -13309,16 +13350,18 @@ fn validate_batched_prefill_grouped_expert_launch(
         assignments,
     )?;
     validate_grouped_expert_buffer(
+        backend,
         ordinal,
         "expert_out",
         expert_out,
         ScalarType::BF16,
         output_elements,
     )?;
-    validate_grouped_expert_buffer(ordinal, "counters", counters, ScalarType::U32, 1)?;
+    validate_grouped_expert_buffer(backend, ordinal, "counters", counters, ScalarType::U32, 1)?;
 
-    validate_descriptor_int4_common(
+    validate_descriptor_int4_common_for_backend(
         "batched_prefill_grouped_expert_launch gate_up",
+        backend,
         ordinal,
         experts_gate_up_w,
         experts_gate_up_scale,
@@ -13328,8 +13371,9 @@ fn validate_batched_prefill_grouped_expert_launch(
         gate_rows_c_int,
         dims.hidden,
     )?;
-    validate_descriptor_int4_common(
+    validate_descriptor_int4_common_for_backend(
         "batched_prefill_grouped_expert_launch down",
+        backend,
         ordinal,
         experts_down_w,
         experts_down_scale,
@@ -13385,7 +13429,7 @@ pub fn batched_prefill_grouped_expert_launch(
         expert_out,
         counters,
     )?;
-    let backend = Backend::Hip;
+    let backend = dims.backend;
     let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
@@ -13922,6 +13966,45 @@ mod tests {
         assert_eq!(policy(3, 1, true, true), WMMA);
         assert_eq!(policy(3, 1, true, false), SCALAR);
         assert_eq!(policy(1, 3, true, true), REJECT);
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn persistent_router_only_row_group_attention_fails_closed_before_launch() {
+        let status = |full_encoding, linear_encoding, shape_valid, wmma_supported| unsafe {
+            qwen36_moe_hip_persistent_int4_prelaunch_status_probe(
+                1,
+                full_encoding,
+                linear_encoding,
+                i32::from(shape_valid),
+                i32::from(wmma_supported),
+            )
+        };
+
+        assert_eq!(status(2, 1, false, true), 150);
+        assert_eq!(status(1, 2, true, false), 150);
+        assert_eq!(status(2, 2, true, true), 0);
+        assert_eq!(status(1, 1, false, false), 0);
+    }
+
+    #[test]
+    fn grouped_expert_backend_policy_admits_cuda_and_rejects_mixing() {
+        assert_eq!(
+            grouped_expert_launch_backend(Backend::Hip).unwrap(),
+            Backend::Hip
+        );
+        assert_eq!(
+            grouped_expert_launch_backend(Backend::Cuda).unwrap(),
+            Backend::Cuda
+        );
+        assert!(grouped_expert_launch_backend(Backend::Metal).is_err());
+
+        assert!(
+            validate_grouped_expert_backend_match(Backend::Cuda, "scale", Backend::Cuda).is_ok()
+        );
+        let err = validate_grouped_expert_backend_match(Backend::Cuda, "scale", Backend::Hip)
+            .expect_err("mixed grouped-expert backends must fail before launch");
+        assert!(err.to_string().contains("same CUDA backend"), "{err}");
     }
 
     type ExplicitGroupedExpertNativeLauncher = unsafe fn(

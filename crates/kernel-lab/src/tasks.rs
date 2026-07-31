@@ -8,6 +8,28 @@ use std::time::Instant;
 
 const GROUP_SIZE: usize = 128;
 
+fn qwen36_tile_v1_weight_desc(
+    scale: &GpuBuffer,
+    zero: &GpuBuffer,
+    out_rows: usize,
+    in_cols: usize,
+) -> qwen36_moe::Qwen36MoeInt4WeightDesc {
+    let packed_row_stride_bytes = in_cols / 2;
+    let scale_row_stride_elements = in_cols / GROUP_SIZE;
+    qwen36_moe::Qwen36MoeInt4WeightDesc {
+        scale: scale.as_ptr(),
+        zero: zero.as_ptr(),
+        packed_row_stride_bytes: packed_row_stride_bytes as u64,
+        packed_expert_stride_bytes: (out_rows * packed_row_stride_bytes) as u64,
+        scale_row_stride_elements: scale_row_stride_elements as u64,
+        scale_expert_stride_elements: ((out_rows / GROUP_SIZE) * scale_row_stride_elements) as u64,
+        input_group_size: GROUP_SIZE as i32,
+        output_group_size: GROUP_SIZE as i32,
+        implicit_zero_code: -1,
+        encoding: 1,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AttnShape {
     q_heads: usize,
@@ -1123,6 +1145,9 @@ fn run_grouped_expert_case(cfg: &KernelLabConfig, shape: ExpertShape) -> Result<
             shape.moe_intermediate / GROUP_SIZE,
         ],
     )?;
+    let gate_up_desc = qwen36_tile_v1_weight_desc(&gu_s_buf, &gu_z_buf, two_i, shape.hidden);
+    let down_desc =
+        qwen36_tile_v1_weight_desc(&dp_s_buf, &dp_z_buf, shape.hidden, shape.moe_intermediate);
     let mut out = GpuBuffer::zeros(cfg.device, ScalarType::BF16, &[total_rows, shape.hidden])?;
     let mut counters = GpuBuffer::zeros(cfg.device, ScalarType::U32, &[1])?;
     qwen36_moe::batched_prefill_grouped_expert_launch(
@@ -1132,16 +1157,17 @@ fn run_grouped_expert_case(cfg: &KernelLabConfig, shape: ExpertShape) -> Result<
         shape.num_experts,
         shape.hidden,
         shape.moe_intermediate,
-        GROUP_SIZE,
         &x,
         &offsets,
         &perm_token,
         &gu_w_buf,
         &gu_s_buf,
-        &gu_z_buf,
+        Some(&gu_z_buf),
+        &gate_up_desc,
         &dp_w_buf,
         &dp_s_buf,
-        &dp_z_buf,
+        Some(&dp_z_buf),
+        &down_desc,
         &mut out,
         &mut counters,
     )?;
@@ -1173,16 +1199,17 @@ fn run_grouped_expert_case(cfg: &KernelLabConfig, shape: ExpertShape) -> Result<
             shape.num_experts,
             shape.hidden,
             shape.moe_intermediate,
-            GROUP_SIZE,
             &x,
             &offsets,
             &perm_token,
             &gu_w_buf,
             &gu_s_buf,
-            &gu_z_buf,
+            Some(&gu_z_buf),
+            &gate_up_desc,
             &dp_w_buf,
             &dp_s_buf,
-            &dp_z_buf,
+            Some(&dp_z_buf),
+            &down_desc,
             &mut out,
             &mut counters,
         )
@@ -1370,6 +1397,9 @@ fn run_qwen36_moe_pipeline_case(cfg: &KernelLabConfig, shape: ExpertShape) -> Re
             shape.moe_intermediate / GROUP_SIZE,
         ],
     )?;
+    let gate_up_desc = qwen36_tile_v1_weight_desc(&gu_s_buf, &gu_z_buf, two_i, shape.hidden);
+    let down_desc =
+        qwen36_tile_v1_weight_desc(&dp_s_buf, &dp_z_buf, shape.hidden, shape.moe_intermediate);
     let mut expert_out = GpuBuffer::zeros(cfg.device, ScalarType::BF16, &[total, shape.hidden])?;
     let mut counters = GpuBuffer::zeros(cfg.device, ScalarType::U32, &[1])?;
     let mut combined = GpuBuffer::zeros(
@@ -1421,16 +1451,17 @@ fn run_qwen36_moe_pipeline_case(cfg: &KernelLabConfig, shape: ExpertShape) -> Re
         shape.num_experts,
         shape.hidden,
         shape.moe_intermediate,
-        GROUP_SIZE,
         &x,
         &offsets,
         &perm_token,
         &gu_w_buf,
         &gu_s_buf,
-        &gu_z_buf,
+        Some(&gu_z_buf),
+        &gate_up_desc,
         &dp_w_buf,
         &dp_s_buf,
-        &dp_z_buf,
+        Some(&dp_z_buf),
+        &down_desc,
         &mut expert_out,
         &mut counters,
     )?;
@@ -1474,16 +1505,17 @@ fn run_qwen36_moe_pipeline_case(cfg: &KernelLabConfig, shape: ExpertShape) -> Re
             shape.num_experts,
             shape.hidden,
             shape.moe_intermediate,
-            GROUP_SIZE,
             &x,
             &offsets,
             &perm_token,
             &gu_w_buf,
             &gu_s_buf,
-            &gu_z_buf,
+            Some(&gu_z_buf),
+            &gate_up_desc,
             &dp_w_buf,
             &dp_s_buf,
-            &dp_z_buf,
+            Some(&dp_z_buf),
+            &down_desc,
             &mut expert_out,
             &mut counters,
         )?;
