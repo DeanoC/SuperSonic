@@ -5859,6 +5859,14 @@ mod tests {
             &build_test_runtime_directory_with_ct_then_native_int4_stage3_tables(&fixture),
         )
         .expect("parse mixed CT and tile-v1 runtime");
+        let ct_runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_stage3_tables(),
+        )
+        .expect("parse CT-only runtime");
+        let tile_runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_native_int4_stage3_fixture(&fixture),
+        )
+        .expect("parse tile-v1-only runtime");
 
         let logical_order = runtime
             .logical_tensors()
@@ -5945,6 +5953,83 @@ mod tests {
         )]);
         let mut views = HashMap::new();
         let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
+        let assert_ct_publication =
+            |candidate_index: &HashMap<String, TensorMeta>,
+             candidate_upload_views: &HashMap<String, TensorUploadView>,
+             candidate_fallbacks: &HashMap<String, CtSymInt4Bf16Fallback>| {
+                let alias = candidate_index
+                    .get(TEST_CT_INT4_LOGICAL_NAME)
+                    .expect("staged CT logical alias");
+                assert_eq!(alias.name, TEST_CT_INT4_LOGICAL_NAME);
+                assert_eq!(alias.shape, vec![128, 64]);
+                assert_eq!(alias.dtype, "bf16");
+                assert_eq!(alias.layout, LayoutTag::Raw);
+                assert_eq!(alias.offset, 0);
+                assert_eq!(alias.byte_len, 16_384);
+                assert_eq!(
+                    candidate_upload_views.get(TEST_CT_INT4_LOGICAL_NAME),
+                    Some(&TensorUploadView {
+                        dtype: "bf16".to_string(),
+                        shape: vec![128, 64],
+                    })
+                );
+                assert_eq!(
+                    candidate_fallbacks.get(TEST_CT_INT4_LOGICAL_NAME),
+                    Some(&CtSymInt4Bf16Fallback {
+                        packed_tensor: TEST_CT_INT4_PACKED_NAME.to_string(),
+                        scale_tensor: TEST_CT_INT4_SCALE_NAME.to_string(),
+                        shape: vec![128, 64],
+                        group_size: 128,
+                    })
+                );
+            };
+
+        let mut staged_index = index.clone();
+        let mut staged_upload_views = upload_views.clone();
+        let mut staged_fallbacks = fallbacks.clone();
+        let mut staged_views = views.clone();
+        let index_entries = HashMap::new();
+        build_stage3_int4_storage_staged(
+            &ct_runtime,
+            &mut staged_index,
+            &mut staged_upload_views,
+            &mut staged_fallbacks,
+            &mut staged_views,
+            &index_entries,
+            true,
+        )
+        .expect("publish CT fallback into staged maps");
+
+        assert_ct_publication(&staged_index, &staged_upload_views, &staged_fallbacks);
+        assert_eq!(
+            staged_fallbacks.get("preexisting/fallback"),
+            Some(&existing_fallback)
+        );
+        assert!(staged_views.is_empty());
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
+            before,
+            "staged CT publication must not mutate the original maps"
+        );
+
+        let staged_err = build_stage3_int4_storage_staged(
+            &tile_runtime,
+            &mut staged_index,
+            &mut staged_upload_views,
+            &mut staged_fallbacks,
+            &mut staged_views,
+            &index_entries,
+            true,
+        )
+        .expect_err("later tile-v1 SCALE collision must fail staged publication");
+
+        let staged_message = staged_err.to_string();
+        assert!(
+            staged_message.contains("namespace collision")
+                && staged_message.contains(canonical.scale_name),
+            "unexpected staged error: {staged_err}"
+        );
+        assert_ct_publication(&staged_index, &staged_upload_views, &staged_fallbacks);
 
         let err = build_stage3_int4_storage(
             &runtime,
@@ -5952,7 +6037,7 @@ mod tests {
             &mut upload_views,
             &mut fallbacks,
             &mut views,
-            &HashMap::new(),
+            &index_entries,
             true,
         )
         .expect_err("later tile-v1 SCALE collision must roll back the earlier CT fallback");
