@@ -42,8 +42,10 @@ const responsesTool = {
 };
 
 const codingPrompt =
-  "Your entire response must be exactly one call to read_source_file " +
-  "with path src/lib.rs. Do not write natural language before or after the call.";
+  "On the first turn, call read_source_file exactly once with path src/lib.rs. " +
+  "Return only that tool call, with no natural language. After the tool result is " +
+  "provided, summarize the file in one short sentence, stop, and do not call any " +
+  "tool again.";
 
 const toolOutput = JSON.stringify({
   path: "src/lib.rs",

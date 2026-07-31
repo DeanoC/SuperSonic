@@ -1082,6 +1082,67 @@ def _validate_canary(
     _expect(canary["passed"], True, f"{label}.passed")
 
 
+def _validate_completion_semantic(
+    value: object,
+    label: str,
+    *,
+    require_pass: bool,
+) -> bool:
+    completion = _exact_mapping(
+        value,
+        {
+            "mode",
+            "actual",
+            "finish_reason",
+            "nonempty",
+            "stream_actual",
+            "stream_finish_reason",
+            "stream_terminal_count",
+            "protocol_consistent",
+            "passed",
+        },
+        label,
+    )
+    _expect(completion["mode"], "raw_continuation", f"{label}.mode")
+    for field in ("actual", "stream_actual"):
+        if not isinstance(completion[field], str):
+            raise PhaseError(f"{label}.{field} must be a string")
+    allowed_finish_reasons = {"stop", "length", "content_filter"}
+    for field in ("finish_reason", "stream_finish_reason"):
+        finish_reason = _nonempty_string(completion[field], f"{label}.{field}")
+        if finish_reason not in allowed_finish_reasons:
+            raise PhaseError(
+                f"{label}.{field} is unsupported: {finish_reason!r}"
+            )
+    nonempty = _strict_bool(completion["nonempty"], f"{label}.nonempty")
+    terminal_count = _strict_int(
+        completion["stream_terminal_count"],
+        f"{label}.stream_terminal_count",
+    )
+    protocol_consistent = _strict_bool(
+        completion["protocol_consistent"],
+        f"{label}.protocol_consistent",
+    )
+    passed = _strict_bool(completion["passed"], f"{label}.passed")
+    expected_nonempty = bool(completion["actual"].strip())
+    expected_consistent = (
+        completion["stream_actual"] == completion["actual"]
+        and completion["stream_finish_reason"] == completion["finish_reason"]
+        and terminal_count == 1
+    )
+    predicate = expected_nonempty and expected_consistent
+    _expect(nonempty, expected_nonempty, f"{label}.nonempty")
+    _expect(
+        protocol_consistent,
+        expected_consistent,
+        f"{label}.protocol_consistent",
+    )
+    _expect(passed, predicate, f"{label}.passed")
+    if require_pass:
+        _expect(passed, True, f"{label}.passed")
+    return predicate
+
+
 def _validate_compat_transport(value: object) -> None:
     transport = _exact_mapping(
         value,
@@ -1123,7 +1184,12 @@ def _validate_compat_transport(value: object) -> None:
             "received_terminal",
             "received_usage",
         },
-        "completions": {"received"},
+        "completions": {
+            "received",
+            "stream_received_delta",
+            "stream_received_terminal",
+            "stream_received_usage",
+        },
         "responses": {"received", "stored_roundtrip"},
         "responses_stream": {
             "received_delta",
@@ -1156,6 +1222,7 @@ def _validate_compat_usage(value: object) -> None:
             "chat",
             "chat_stream",
             "completions",
+            "completions_stream",
             "responses",
             "responses_stream",
             "repeated_request",
@@ -1204,10 +1271,10 @@ def validate_compat_report(report: dict[str, Any]) -> dict[str, Any]:
         "compat semantic_quality",
     )
     _validate_canary(semantics["chat"], "semantic chat", expected="hello")
-    _validate_canary(
+    _validate_completion_semantic(
         semantics["completions"],
         "semantic completions",
-        expected="hello",
+        require_pass=True,
     )
     _validate_canary(
         semantics["repeated_request"],
@@ -2155,7 +2222,6 @@ def _validate_partial_compat_report(report: object) -> dict[str, Any]:
     child_results = []
     for name, expected in (
         ("chat", "hello"),
-        ("completions", "hello"),
         ("repeated_request", "ready"),
     ):
         canary = _exact_mapping(
@@ -2186,6 +2252,14 @@ def _validate_partial_compat_report(report: object) -> dict[str, Any]:
         predicate = canary["actual"] == expected and finish_reason == "stop"
         _expect(passed, predicate, f"partial semantic {name}.passed")
         child_results.append(predicate)
+
+    child_results.append(
+        _validate_completion_semantic(
+            semantics["completions"],
+            "partial semantic completions",
+            require_pass=False,
+        )
+    )
 
     chat_stream = _exact_mapping(
         semantics["chat_stream"],

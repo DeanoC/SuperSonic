@@ -21,7 +21,10 @@ from tests.openai_sdk_fixture import (
     CHAT_CALL_ID,
     CHAT_TOOL,
     CODING_PROMPT,
+    COMPLETION_PROMPT,
+    COMPLETION_TEXT,
     MODEL,
+    OLD_CODING_PROMPT,
     RESPONSE_CALL_ID,
     RESPONSE_ID,
     RESPONSES_TOOL,
@@ -339,7 +342,12 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                     "received_terminal": True,
                     "received_usage": True,
                 },
-                "completions": {"received": True},
+                "completions": {
+                    "received": True,
+                    "stream_received_delta": True,
+                    "stream_received_terminal": True,
+                    "stream_received_usage": True,
+                },
                 "responses": {"received": True, "stored_roundtrip": True},
                 "responses_stream": {
                     "received_delta": True,
@@ -366,9 +374,14 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                     "usage_last": True,
                 },
                 "completions": {
-                    "expected": "hello",
-                    "actual": "hello",
+                    "mode": "raw_continuation",
+                    "actual": " Paris.",
                     "finish_reason": "stop",
+                    "nonempty": True,
+                    "stream_actual": " Paris.",
+                    "stream_finish_reason": "stop",
+                    "stream_terminal_count": 1,
+                    "protocol_consistent": True,
                     "passed": True,
                 },
                 "responses": {
@@ -406,6 +419,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                     "chat",
                     "chat_stream",
                     "completions",
+                    "completions_stream",
                     "responses",
                     "responses_stream",
                     "repeated_request",
@@ -1720,6 +1734,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             ("requests", "compat", "semantic_quality", "responses_stream"),
             ("requests", "compat", "semantic_quality", "reasoning"),
             ("requests", "compat", "usage", "completions"),
+            ("requests", "compat", "usage", "completions_stream"),
             ("requests", "compat", "semantic_quality", "repeated_request"),
             ("requests", "agent", "requests", "chat_tool_loop"),
             ("requests", "agent", "requests", "responses_tool_loop"),
@@ -1761,7 +1776,9 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             "client.responses.create",
             "function_call_output",
             "controller.abort",
-            "Your entire response must be exactly one call",
+            "On the first turn, call read_source_file exactly once",
+            "After the tool result is ",
+            "do not call any ",
             "cancellation_release",
             "raw",
             "queued_request_completed",
@@ -1799,11 +1816,21 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             {"transport", "semantic_quality", "usage", "throughput"},
         )
         semantics = report["semantic_quality"]
-        for section in ("chat", "chat_stream", "completions", "responses", "responses_stream"):
+        for section in ("chat", "chat_stream", "responses", "responses_stream"):
             with self.subTest(section=section):
                 self.assertEqual(semantics[section]["expected"], "hello")
                 self.assertEqual(semantics[section]["actual"], "hello")
                 self.assertTrue(semantics[section]["passed"])
+        completion = semantics["completions"]
+        self.assertEqual(completion["mode"], "raw_continuation")
+        self.assertEqual(completion["actual"], COMPLETION_TEXT)
+        self.assertEqual(completion["stream_actual"], COMPLETION_TEXT)
+        self.assertTrue(completion["nonempty"])
+        self.assertEqual(completion["finish_reason"], "stop")
+        self.assertEqual(completion["stream_finish_reason"], "stop")
+        self.assertEqual(completion["stream_terminal_count"], 1)
+        self.assertTrue(completion["protocol_consistent"])
+        self.assertTrue(completion["passed"])
         self.assertEqual(semantics["chat"]["finish_reason"], "stop")
         self.assertEqual(semantics["chat_stream"]["finish_reason"], "stop")
         self.assertEqual(semantics["chat_stream"]["terminal_count"], 1)
@@ -1816,6 +1843,32 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         self.assertTrue(semantics["responses_stream"]["terminal_last"])
         self.assertTrue(semantics["reasoning"]["accepted"])
         self.assertTrue(semantics["reasoning"]["observed"])
+
+        completion_requests = [
+            request["body"]
+            for request in _state.requests
+            if request["path"] == "/v1/completions"
+        ]
+        self.assertEqual(len(completion_requests), 2)
+        self.assertEqual(
+            completion_requests,
+            [
+                {
+                    "model": MODEL,
+                    "prompt": COMPLETION_PROMPT,
+                    "max_tokens": 8,
+                    "temperature": 0,
+                },
+                {
+                    "model": MODEL,
+                    "prompt": COMPLETION_PROMPT,
+                    "max_tokens": 8,
+                    "temperature": 0,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
+            ],
+        )
 
     def test_agent_script_executes_exact_tool_loops_and_contention_abort(self):
         with openai_sdk_fixture() as (base_url, state):
@@ -1871,7 +1924,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             for request in state.requests
             if request["path"] == "/v1/chat/completions"
             and any(
-                "exactly one call to read_source_file" in str(message.get("content"))
+                message.get("content") == CODING_PROMPT
                 for message in request["body"].get("messages", [])
             )
         ]
@@ -1925,8 +1978,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             if request["path"] == "/v1/responses"
             and (
                 request["body"].get("previous_response_id") is not None
-                or "exactly one call to read_source_file"
-                in str(request["body"].get("input"))
+                or request["body"].get("input") == CODING_PROMPT
             )
         ]
         self.assertEqual(len(responses_bodies), 2)
@@ -1958,6 +2010,29 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_old_contradictory_agent_prompt_regresses_to_second_call(self):
+        def replace_prompt(_path, body):
+            if body.get("input") == CODING_PROMPT:
+                body["input"] = OLD_CODING_PROMPT
+            for message in body.get("messages", []):
+                if message.get("content") == CODING_PROMPT:
+                    message["content"] = OLD_CODING_PROMPT
+            return body
+
+        with openai_sdk_fixture(body_mutator=replace_prompt) as (base_url, state):
+            result = self.run_sdk_fixture_script(
+                "openai_agent_tool_smoke.mjs",
+                base_url,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(state.old_prompt_second_calls, 1)
+        partial = self.harness.parse_smoke_output(
+            result.stdout,
+            "old contradictory prompt fixture",
+        )
+        self.assertEqual(partial["failure"]["phase"], "chat_tool_loop")
 
     def test_agent_fixture_rejects_corrupted_continuation_payloads(self):
         def mutate(case):

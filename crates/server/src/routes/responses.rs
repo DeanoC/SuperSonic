@@ -15,7 +15,9 @@ use crate::chat_template::{ChatMessage, RenderOptions};
 use crate::compat::validate_model;
 use crate::errors::ApiError;
 use crate::generate::{self, GenParams};
-use crate::output::{parse_assistant_output, AssistantOutput};
+use crate::output::{
+    parse_assistant_output_with_context, AssistantOutput, AssistantOutputParseContext,
+};
 use crate::routes::chat::{
     apply_response_format_hint, cache_request, content_to_text, generation_error,
     has_incomplete_control_block, normalize_tool_calls_for_template, queue_error,
@@ -205,6 +207,11 @@ pub async fn create(
             .collect::<Result<Vec<_>, _>>()?
             .join("\n")
     };
+    let output_context = if state.chat_template.is_some() {
+        AssistantOutputParseContext::from_rendered_prompt(&prompt_text)
+    } else {
+        AssistantOutputParseContext::default()
+    };
 
     let id = next_response_id(state.server_instance_id);
     let created_at = crate::ids::epoch_secs();
@@ -243,6 +250,7 @@ pub async fn create(
             state.server_instance_id,
             state.response_store_max_entries,
             response_cache_key,
+            output_context,
         );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
@@ -257,7 +265,7 @@ pub async fn create(
         );
         let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
         let result = generate::collect(rx).await.map_err(generation_error)?;
-        let parsed = parse_assistant_output(&result.text);
+        let parsed = parse_assistant_output_with_context(&result.text, output_context);
         let stored = build_response(
             id,
             model,
@@ -307,6 +315,7 @@ fn response_sse_stream(
     server_instance_id: u64,
     response_store_max_entries: usize,
     cache_key: Option<String>,
+    output_context: AssistantOutputParseContext,
 ) -> impl Stream<Item = super::sse::SseEvent> {
     async_stream::stream! {
         yield Ok(Event::default()
@@ -320,14 +329,23 @@ fn response_sse_stream(
             }}).to_string()));
         let mut raw = String::new();
         let mut emitted = String::new();
+        let mut emitted_reasoning = String::new();
         while let Some(ev) = rx.recv().await {
             match ev {
                 generate::GenEvent::Token(text) => {
                     raw.push_str(&text);
-                    if has_incomplete_control_block(&raw) {
+                    if has_incomplete_control_block(&raw, output_context) {
                         continue;
                     }
-                    let parsed = parse_assistant_output(&raw);
+                    let parsed = parse_assistant_output_with_context(&raw, output_context);
+                    if let Some(reasoning) = parsed.reasoning_content.as_ref() {
+                        if let Some(delta) = reasoning.strip_prefix(&emitted_reasoning) {
+                            if !delta.is_empty() {
+                                emitted_reasoning = reasoning.clone();
+                                yield Ok(reasoning_delta_event(&id, delta));
+                            }
+                        }
+                    }
                     if let Some(delta) = parsed.content.strip_prefix(&emitted) {
                         if !delta.is_empty() {
                             emitted = parsed.content.clone();
@@ -342,7 +360,27 @@ fn response_sse_stream(
                     }
                 }
                 generate::GenEvent::Done { stats, .. } => {
-                    let parsed = parse_assistant_output(&raw);
+                    let parsed = parse_assistant_output_with_context(&raw, output_context);
+                    if let Some(reasoning) = parsed.reasoning_content.as_ref() {
+                        if let Some(delta) = reasoning.strip_prefix(&emitted_reasoning) {
+                            if !delta.is_empty() {
+                                emitted_reasoning = reasoning.clone();
+                                yield Ok(reasoning_delta_event(&id, delta));
+                            }
+                        }
+                    }
+                    if let Some(delta) = parsed.content.strip_prefix(&emitted) {
+                        if !delta.is_empty() {
+                            emitted = parsed.content.clone();
+                            yield Ok(Event::default()
+                                .event("response.output_text.delta")
+                                .data(json!({
+                                    "type": "response.output_text.delta",
+                                    "response_id": id,
+                                    "delta": delta,
+                                }).to_string()));
+                        }
+                    }
                     let stored = build_response(
                         id.clone(),
                         model.clone(),
@@ -357,6 +395,17 @@ fn response_sse_stream(
                         stored.clone(),
                         response_store_max_entries,
                     );
+                    if !emitted_reasoning.is_empty() {
+                        yield Ok(Event::default()
+                            .event("response.reasoning_summary_text.done")
+                            .data(json!({
+                                "type": "response.reasoning_summary_text.done",
+                                "item_id": format!("{id}-rsn"),
+                                "output_index": 0,
+                                "summary_index": 0,
+                                "text": emitted_reasoning,
+                            }).to_string()));
+                    }
                     yield Ok(Event::default()
                         .event("response.output_text.done")
                         .data(json!({
@@ -391,6 +440,21 @@ fn response_sse_stream(
             }
         }
     }
+}
+
+fn reasoning_delta_event(id: &str, delta: &str) -> Event {
+    Event::default()
+        .event("response.reasoning_summary_text.delta")
+        .data(
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": format!("{id}-rsn"),
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": delta,
+            })
+            .to_string(),
+        )
 }
 
 fn response_messages(

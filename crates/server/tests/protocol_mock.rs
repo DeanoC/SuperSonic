@@ -280,6 +280,58 @@ async fn mock_chat_non_stream_parses_reasoning_and_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_chat_non_stream_parses_prefilled_reasoning() {
+    let h = spawn("plan from prefill</think>\nvisible answer").await;
+    let response = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "medium",
+            "max_completion_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let status = response.status();
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_content"],
+        "plan from prefill"
+    );
+    assert_eq!(body["choices"][0]["message"]["content"], "visible answer");
+    assert!(!body.to_string().contains("<think>"));
+    assert!(!body.to_string().contains("</think>"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_non_stream_parses_prefilled_reasoning() {
+    let h = spawn("plan from prefill</think>\nvisible answer").await;
+    let response = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "hi",
+            "reasoning": {"effort": "medium"},
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let status = response.status();
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
+    assert_eq!(body["output"][0]["type"], "reasoning");
+    assert_eq!(body["output"][0]["summary"][0], "plan from prefill");
+    assert_eq!(body["output"][1]["content"][0]["text"], "visible answer");
+    assert!(!body.to_string().contains("<think>"));
+    assert!(!body.to_string().contains("</think>"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_required_tool_choice_returns_400() {
     let h = spawn("hello").await;
     let tools = json!([{"type": "function", "function": {"name": "lookup"}}]);
@@ -468,14 +520,13 @@ async fn mock_responses_store_is_scoped_per_server_instance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_chat_stream_buffers_reasoning_and_includes_usage() {
-    let h = spawn_chunks(&["<think>plan", "</think>\nhello", " world"]).await;
+    let h = spawn_chunks(&["<thi", "nk>plan</thi", "nk>\nhello", " world"]).await;
     let resp = h
         .client
         .post(format!("{}/v1/chat/completions", h.base))
         .bearer_auth("secret")
         .json(&json!({
             "messages": [{"role": "user", "content": "hi"}],
-            "reasoning_effort": "medium",
             "stream": true,
             "stream_options": {"include_usage": true},
             "prompt_cache_key": "protocol-mock",
@@ -518,6 +569,83 @@ async fn mock_chat_stream_buffers_reasoning_and_includes_usage() {
     assert_eq!(content, "hello world");
     assert!(saw_usage);
     assert!(saw_done);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_chat_stream_parses_prefilled_reasoning() {
+    let h = spawn_chunks(&["plan from ", "prefill</think>\nvisible", " answer"]).await;
+    let response = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "medium",
+            "stream": true,
+            "max_completion_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let events = collect_sse(response).await;
+
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    for event in &events {
+        if let Some(delta) = event["choices"][0]["delta"]["reasoning_content"].as_str() {
+            reasoning.push_str(delta);
+        }
+        if let Some(delta) = event["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(delta);
+        }
+        assert!(!event.to_string().contains("<think>"));
+        assert!(!event.to_string().contains("</think>"));
+    }
+    assert_eq!(reasoning, "plan from prefill");
+    assert_eq!(content, "visible answer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_stream_parses_prefilled_reasoning() {
+    let h = spawn_chunks(&["plan from ", "prefill</think>\nvisible", " answer"]).await;
+    let response = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "hi",
+            "reasoning": {"effort": "medium"},
+            "stream": true,
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let events = collect_sse(response).await;
+
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    for event in &events {
+        if event["type"] == "response.reasoning_summary_text.delta" {
+            reasoning.push_str(event["delta"].as_str().expect("reasoning delta"));
+        }
+        if event["type"] == "response.output_text.delta" {
+            content.push_str(event["delta"].as_str().expect("content delta"));
+        }
+        assert!(!event.to_string().contains("<think>"));
+        assert!(!event.to_string().contains("</think>"));
+    }
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .expect("response.completed");
+    assert_eq!(reasoning, "plan from prefill");
+    assert_eq!(content, "visible answer");
+    assert_eq!(completed["response"]["output"][0]["summary"][0], reasoning);
+    assert_eq!(
+        completed["response"]["output"][1]["content"][0]["text"],
+        content
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -12,6 +12,8 @@ const apiKey = process.env.SUPERSONIC_API_KEY ?? "secret";
 const model = process.env.SUPERSONIC_SMOKE_MODEL ?? "local";
 const timeout = Number(process.env.SUPERSONIC_REQUEST_TIMEOUT_MS ?? "120000");
 const marker = "SUPERSONIC_SMOKE_JSON=";
+const completionPrompt = "The capital of France is";
+const completionFinishReasons = new Set(["stop", "length", "content_filter"]);
 
 const client = new OpenAI({ baseURL, apiKey, timeout });
 
@@ -38,6 +40,10 @@ function exactCanary(actual, finishReason, expected = "hello") {
     finish_reason: finishReason,
     passed: normalized(actual) === expected && finishReason === "stop",
   };
+}
+
+function validCompletionFinishReason(value) {
+  return typeof value === "string" && completionFinishReasons.has(value);
 }
 
 function responseText(response) {
@@ -288,17 +294,64 @@ async function main() {
 
   const completion = await client.completions.create({
     model,
-    prompt: "Output exactly: hello",
+    prompt: completionPrompt,
     max_tokens: 8,
     temperature: 0,
   });
   const completionChoice = completion.choices?.[0];
   assert(completionChoice, "legacy Completion returned no choice", completion);
   const completionUsage = validateUsage(completion.usage, "Completion");
-  const completionSemantic = exactCanary(
-    completionChoice.text,
-    completionChoice.finish_reason,
+  const completionText = completionChoice.text;
+
+  const completionStream = await client.completions.create({
+    model,
+    prompt: completionPrompt,
+    max_tokens: 8,
+    temperature: 0,
+    stream: true,
+    stream_options: { include_usage: true },
+  });
+  let completionStreamText = "";
+  let completionStreamFinishReason;
+  let completionStreamTerminalCount = 0;
+  let completionStreamUsage;
+  for await (const chunk of completionStream) {
+    const choice = chunk.choices?.[0];
+    if (typeof choice?.text === "string" && choice.text.length > 0) {
+      completionStreamText += choice.text;
+    }
+    if (choice?.finish_reason !== null && choice?.finish_reason !== undefined) {
+      completionStreamTerminalCount += 1;
+      completionStreamFinishReason = choice.finish_reason;
+    }
+    if (chunk.usage) completionStreamUsage = chunk.usage;
+  }
+  assert(completionStreamUsage, "Completion stream emitted no usage");
+  const completionStreamUsageCounts = validateUsage(
+    completionStreamUsage,
+    "Completion stream",
   );
+  const completionNonempty =
+    typeof completionText === "string" && completionText.trim().length > 0;
+  const completionProtocolConsistent =
+    completionStreamText === completionText &&
+    completionStreamFinishReason === completionChoice.finish_reason &&
+    completionStreamTerminalCount === 1;
+  const completionSemantic = {
+    mode: "raw_continuation",
+    actual: completionText,
+    finish_reason: completionChoice.finish_reason,
+    nonempty: completionNonempty,
+    stream_actual: completionStreamText,
+    stream_finish_reason: completionStreamFinishReason,
+    stream_terminal_count: completionStreamTerminalCount,
+    protocol_consistent: completionProtocolConsistent,
+    passed:
+      completionNonempty &&
+      validCompletionFinishReason(completionChoice.finish_reason) &&
+      validCompletionFinishReason(completionStreamFinishReason) &&
+      completionProtocolConsistent,
+  };
 
   const response = await client.responses.create({
     model,
@@ -443,7 +496,12 @@ async function main() {
         received_terminal: chatTerminalIndexes.length > 0,
         received_usage: Boolean(chatStreamUsage),
       },
-      completions: { received: true },
+      completions: {
+        received: true,
+        stream_received_delta: completionStreamText.length > 0,
+        stream_received_terminal: completionStreamTerminalCount === 1,
+        stream_received_usage: Boolean(completionStreamUsage),
+      },
       responses: { received: true, stored_roundtrip: storedRoundtrip },
       responses_stream: {
         received_delta: responseStreamText.length > 0,
@@ -458,6 +516,7 @@ async function main() {
       chat: chatUsage,
       chat_stream: chatStreamUsageCounts,
       completions: completionUsage,
+      completions_stream: completionStreamUsageCounts,
       responses: responseUsage,
       responses_stream: responseStreamUsageCounts,
       repeated_request: repeatedUsage,

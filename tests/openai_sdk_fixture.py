@@ -17,9 +17,17 @@ CHAT_CALL_ID = "call_chat_fixture"
 RESPONSE_CALL_ID = "call_response_fixture"
 RESPONSE_ID = "resp_fixture"
 CODING_PROMPT = (
+    "On the first turn, call read_source_file exactly once with path src/lib.rs. "
+    "Return only that tool call, with no natural language. After the tool result is "
+    "provided, summarize the file in one short sentence, stop, and do not call any "
+    "tool again."
+)
+OLD_CODING_PROMPT = (
     "Your entire response must be exactly one call to read_source_file "
     "with path src/lib.rs. Do not write natural language before or after the call."
 )
+COMPLETION_PROMPT = "The capital of France is"
+COMPLETION_TEXT = " Paris."
 TOOL_OUTPUT = json.dumps(
     {
         "path": "src/lib.rs",
@@ -209,6 +217,7 @@ class FixtureState:
         self.cancel_active = 0
         self.cancel_queued = 0
         self.cancel_released = threading.Event()
+        self.old_prompt_second_calls = 0
         self.stored_response = _response_object([_message_output("hello")])
         self.requests: list[dict[str, object]] = []
 
@@ -386,6 +395,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._json(200, {"text": "hello world"})
             return
         if self.path == "/v1/completions":
+            if body.get("stream"):
+                self._completion_stream()
+                return
             self._json(
                 200,
                 {
@@ -396,7 +408,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     "choices": [
                         {
                             "index": 0,
-                            "text": "hello",
+                            "text": COMPLETION_TEXT,
                             "finish_reason": "stop",
                         }
                     ],
@@ -427,6 +439,27 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         if body.get("stream"):
             self._chat_stream()
+            return
+        if OLD_CODING_PROMPT in prompt:
+            if len(messages) == 3:
+                self.server.state.old_prompt_second_calls += 1
+            self._json(
+                200,
+                _chat_response(
+                    None,
+                    finish_reason="tool_calls",
+                    tool_calls=[
+                        {
+                            "id": CHAT_CALL_ID,
+                            "type": "function",
+                            "function": {
+                                "name": "read_source_file",
+                                "arguments": '{"path":"src/lib.rs"}',
+                            },
+                        }
+                    ],
+                ),
+            )
             return
         if "read_source_file" in prompt:
             if len(messages) == 3:
@@ -474,6 +507,44 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self._json(200, _chat_response("ready", finish_reason="stop"))
             return
         self._json(200, _chat_response("hello", finish_reason="stop"))
+
+    def _completion_stream(self) -> None:
+        self._sse_start()
+        base = {
+            "id": "cmpl_stream_fixture",
+            "object": "text_completion",
+            "created": 1,
+            "model": MODEL,
+        }
+        for text in (" Par", "is."):
+            self._sse(
+                {
+                    **base,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": text,
+                            "finish_reason": None,
+                        }
+                    ],
+                    "usage": None,
+                }
+            )
+        self._sse(
+            {
+                **base,
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": "",
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": _usage(),
+            }
+        )
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
     def _chat_stream(self) -> None:
         self._sse_start()
