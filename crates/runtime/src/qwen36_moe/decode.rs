@@ -49,6 +49,7 @@ use kernel_ffi::qwen36_moe::{
 
 use crate::qwen36_moe::layer_loader::ensure_legacy_int4_execution_supported;
 use crate::qwen36_moe::lm_head::bf16_bytes_to_f32;
+use crate::qwen36_moe::persistent_decode::build_int4_weight_desc;
 use crate::qwen36_moe::types::{
     AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, FullAttnKvCache,
     LayerBuffers, MultiLayerGeom,
@@ -1501,6 +1502,7 @@ fn emit_decode_batch_shared_parity_taps(
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
                     gate_up_proj_type: s.gate_up_proj_type,
+                    gate_up_proj: build_int4_weight_desc(&s.gate_up_proj)?,
                     gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
@@ -1508,6 +1510,7 @@ fn emit_decode_batch_shared_parity_taps(
                         s.gate_up_proj.zero_ptr()
                     },
                     down_proj_type: s.down_proj_type,
+                    down_proj: build_int4_weight_desc(&s.down_proj)?,
                     down_proj_scale: s.down_proj.scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
@@ -1515,6 +1518,7 @@ fn emit_decode_batch_shared_parity_taps(
                         s.down_proj.zero_ptr()
                     },
                     shared_gate_proj_type: s.shared_gate_proj_type,
+                    shared_gate_proj: build_int4_weight_desc(&s.shared_gate_proj)?,
                     shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                     shared_gate_proj_zero: if fp8 {
                         ptr::null()
@@ -1522,6 +1526,7 @@ fn emit_decode_batch_shared_parity_taps(
                         s.shared_gate_proj.zero_ptr()
                     },
                     shared_up_proj_type: s.shared_up_proj_type,
+                    shared_up_proj: build_int4_weight_desc(&s.shared_up_proj)?,
                     shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                     shared_up_proj_zero: if fp8 {
                         ptr::null()
@@ -1529,6 +1534,7 @@ fn emit_decode_batch_shared_parity_taps(
                         s.shared_up_proj.zero_ptr()
                     },
                     shared_down_proj_type: s.shared_down_proj_type,
+                    shared_down_proj: build_int4_weight_desc(&s.shared_down_proj)?,
                     shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                     shared_down_proj_zero: if fp8 {
                         ptr::null()
@@ -1654,6 +1660,7 @@ fn emit_decode_batch_router_parity_taps(
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
                     gate_up_proj_type: s.gate_up_proj_type,
+                    gate_up_proj: build_int4_weight_desc(&s.gate_up_proj)?,
                     gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
@@ -1661,6 +1668,7 @@ fn emit_decode_batch_router_parity_taps(
                         s.gate_up_proj.zero_ptr()
                     },
                     down_proj_type: s.down_proj_type,
+                    down_proj: build_int4_weight_desc(&s.down_proj)?,
                     down_proj_scale: s.down_proj.scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
@@ -1668,6 +1676,7 @@ fn emit_decode_batch_router_parity_taps(
                         s.down_proj.zero_ptr()
                     },
                     shared_gate_proj_type: s.shared_gate_proj_type,
+                    shared_gate_proj: build_int4_weight_desc(&s.shared_gate_proj)?,
                     shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                     shared_gate_proj_zero: if fp8 {
                         ptr::null()
@@ -1675,6 +1684,7 @@ fn emit_decode_batch_router_parity_taps(
                         s.shared_gate_proj.zero_ptr()
                     },
                     shared_up_proj_type: s.shared_up_proj_type,
+                    shared_up_proj: build_int4_weight_desc(&s.shared_up_proj)?,
                     shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                     shared_up_proj_zero: if fp8 {
                         ptr::null()
@@ -1682,6 +1692,7 @@ fn emit_decode_batch_router_parity_taps(
                         s.shared_up_proj.zero_ptr()
                     },
                     shared_down_proj_type: s.shared_down_proj_type,
+                    shared_down_proj: build_int4_weight_desc(&s.shared_down_proj)?,
                     shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                     shared_down_proj_zero: if fp8 {
                         ptr::null()
@@ -1818,6 +1829,7 @@ fn emit_decode_batch_routed_parity_taps(
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
                     gate_up_proj_type: s.gate_up_proj_type,
+                    gate_up_proj: build_int4_weight_desc(&s.gate_up_proj)?,
                     gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
@@ -1825,6 +1837,7 @@ fn emit_decode_batch_routed_parity_taps(
                         s.gate_up_proj.zero_ptr()
                     },
                     down_proj_type: s.down_proj_type,
+                    down_proj: build_int4_weight_desc(&s.down_proj)?,
                     down_proj_scale: s.down_proj.scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
@@ -1832,6 +1845,7 @@ fn emit_decode_batch_routed_parity_taps(
                         s.down_proj.zero_ptr()
                     },
                     shared_gate_proj_type: s.shared_gate_proj_type,
+                    shared_gate_proj: build_int4_weight_desc(&s.shared_gate_proj)?,
                     shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                     shared_gate_proj_zero: if fp8 {
                         ptr::null()
@@ -1839,6 +1853,7 @@ fn emit_decode_batch_routed_parity_taps(
                         s.shared_gate_proj.zero_ptr()
                     },
                     shared_up_proj_type: s.shared_up_proj_type,
+                    shared_up_proj: build_int4_weight_desc(&s.shared_up_proj)?,
                     shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                     shared_up_proj_zero: if fp8 {
                         ptr::null()
@@ -1846,6 +1861,7 @@ fn emit_decode_batch_routed_parity_taps(
                         s.shared_up_proj.zero_ptr()
                     },
                     shared_down_proj_type: s.shared_down_proj_type,
+                    shared_down_proj: build_int4_weight_desc(&s.shared_down_proj)?,
                     shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                     shared_down_proj_zero: if fp8 {
                         ptr::null()
@@ -2412,6 +2428,7 @@ fn run_chained_decode_impl_with_cache_pos(
                     Qwen36MoeFfnStepInt4 {
                         group_size: s.group_size,
                         gate_up_proj_type: s.gate_up_proj_type,
+                        gate_up_proj: build_int4_weight_desc(&s.gate_up_proj)?,
                         gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                         gate_up_proj_zero: if fp8 {
                             ptr::null()
@@ -2419,6 +2436,7 @@ fn run_chained_decode_impl_with_cache_pos(
                             s.gate_up_proj.zero_ptr()
                         },
                         down_proj_type: s.down_proj_type,
+                        down_proj: build_int4_weight_desc(&s.down_proj)?,
                         down_proj_scale: s.down_proj.scale.as_ptr(),
                         down_proj_zero: if fp8 {
                             ptr::null()
@@ -2426,6 +2444,7 @@ fn run_chained_decode_impl_with_cache_pos(
                             s.down_proj.zero_ptr()
                         },
                         shared_gate_proj_type: s.shared_gate_proj_type,
+                        shared_gate_proj: build_int4_weight_desc(&s.shared_gate_proj)?,
                         shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                         shared_gate_proj_zero: if fp8 {
                             ptr::null()
@@ -2433,6 +2452,7 @@ fn run_chained_decode_impl_with_cache_pos(
                             s.shared_gate_proj.zero_ptr()
                         },
                         shared_up_proj_type: s.shared_up_proj_type,
+                        shared_up_proj: build_int4_weight_desc(&s.shared_up_proj)?,
                         shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                         shared_up_proj_zero: if fp8 {
                             ptr::null()
@@ -2440,6 +2460,7 @@ fn run_chained_decode_impl_with_cache_pos(
                             s.shared_up_proj.zero_ptr()
                         },
                         shared_down_proj_type: s.shared_down_proj_type,
+                        shared_down_proj: build_int4_weight_desc(&s.shared_down_proj)?,
                         shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                         shared_down_proj_zero: if fp8 {
                             ptr::null()
@@ -2512,6 +2533,7 @@ fn run_chained_decode_impl_with_cache_pos(
                         Qwen36MoeAttnStepInt4 {
                             group_size: s.group_size,
                             q_proj_type: s.q_proj_type,
+                            q_proj: build_int4_weight_desc(&s.q_proj)?,
                             q_proj_scale: s.q_proj.scale.as_ptr(),
                             q_proj_zero: if fp8 {
                                 ptr::null()
@@ -2519,6 +2541,7 @@ fn run_chained_decode_impl_with_cache_pos(
                                 s.q_proj.zero_ptr()
                             },
                             k_proj_type: s.k_proj_type,
+                            k_proj: build_int4_weight_desc(&s.k_proj)?,
                             k_proj_scale: s.k_proj.scale.as_ptr(),
                             k_proj_zero: if fp8 {
                                 ptr::null()
@@ -2526,6 +2549,7 @@ fn run_chained_decode_impl_with_cache_pos(
                                 s.k_proj.zero_ptr()
                             },
                             v_proj_type: s.v_proj_type,
+                            v_proj: build_int4_weight_desc(&s.v_proj)?,
                             v_proj_scale: s.v_proj.scale.as_ptr(),
                             v_proj_zero: if fp8 {
                                 ptr::null()
@@ -2533,6 +2557,7 @@ fn run_chained_decode_impl_with_cache_pos(
                                 s.v_proj.zero_ptr()
                             },
                             o_proj_type: s.o_proj_type,
+                            o_proj: build_int4_weight_desc(&s.o_proj)?,
                             o_proj_scale: s.o_proj.scale.as_ptr(),
                             o_proj_zero: if fp8 {
                                 ptr::null()
@@ -2718,6 +2743,7 @@ fn run_chained_decode_impl_with_cache_pos(
                         Qwen36MoeLinearStepInt4 {
                             group_size: s.group_size,
                             in_proj_qkv_type: s.in_proj_qkv_type,
+                            in_proj_qkv: build_int4_weight_desc(&s.in_proj_qkv)?,
                             in_proj_qkv_scale: s.in_proj_qkv.scale.as_ptr(),
                             in_proj_qkv_zero: if fp8 {
                                 ptr::null()
@@ -2725,6 +2751,7 @@ fn run_chained_decode_impl_with_cache_pos(
                                 s.in_proj_qkv.zero_ptr()
                             },
                             in_proj_z_type: s.in_proj_z_type,
+                            in_proj_z: build_int4_weight_desc(&s.in_proj_z)?,
                             in_proj_z_scale: s.in_proj_z.scale.as_ptr(),
                             in_proj_z_zero: if fp8 {
                                 ptr::null()
@@ -2732,6 +2759,7 @@ fn run_chained_decode_impl_with_cache_pos(
                                 s.in_proj_z.zero_ptr()
                             },
                             out_proj_type: s.out_proj_type,
+                            out_proj: build_int4_weight_desc(&s.out_proj)?,
                             out_proj_scale: s.out_proj.scale.as_ptr(),
                             out_proj_zero: if fp8 {
                                 ptr::null()
@@ -2886,6 +2914,7 @@ fn run_chained_decode_impl_with_cache_pos(
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
                     gate_up_proj_type: s.gate_up_proj_type,
+                    gate_up_proj: build_int4_weight_desc(&s.gate_up_proj)?,
                     gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
@@ -2893,6 +2922,7 @@ fn run_chained_decode_impl_with_cache_pos(
                         s.gate_up_proj.zero_ptr()
                     },
                     down_proj_type: s.down_proj_type,
+                    down_proj: build_int4_weight_desc(&s.down_proj)?,
                     down_proj_scale: s.down_proj.scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
@@ -2900,6 +2930,7 @@ fn run_chained_decode_impl_with_cache_pos(
                         s.down_proj.zero_ptr()
                     },
                     shared_gate_proj_type: s.shared_gate_proj_type,
+                    shared_gate_proj: build_int4_weight_desc(&s.shared_gate_proj)?,
                     shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                     shared_gate_proj_zero: if fp8 {
                         ptr::null()
@@ -2907,6 +2938,7 @@ fn run_chained_decode_impl_with_cache_pos(
                         s.shared_gate_proj.zero_ptr()
                     },
                     shared_up_proj_type: s.shared_up_proj_type,
+                    shared_up_proj: build_int4_weight_desc(&s.shared_up_proj)?,
                     shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                     shared_up_proj_zero: if fp8 {
                         ptr::null()
@@ -2914,6 +2946,7 @@ fn run_chained_decode_impl_with_cache_pos(
                         s.shared_up_proj.zero_ptr()
                     },
                     shared_down_proj_type: s.shared_down_proj_type,
+                    shared_down_proj: build_int4_weight_desc(&s.shared_down_proj)?,
                     shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                     shared_down_proj_zero: if fp8 {
                         ptr::null()

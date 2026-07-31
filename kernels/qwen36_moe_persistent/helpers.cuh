@@ -134,15 +134,72 @@ __device__ inline void qwen36_int4_pair_dequant_8(
     }
 }
 
+struct qwen36_float_pair {
+    float first;
+    float second;
+};
+
+__device__ inline float qwen36_int4_dq8_matvec_partial(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    const float* __restrict__ x,
+    int row,
+    int cols,
+    int tid,
+    int block_size
+) {
+    float partial = 0.0f;
+    for (int col = tid * 8; col < cols; col += block_size * 8) {
+        float values[8];
+        qwen36_int4_dequant_8(packed, desc, expert, row, col, values);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) partial += values[i] * x[col + i];
+    }
+    return partial;
+}
+
+__device__ inline qwen36_float_pair qwen36_int4_dq8_pair_matvec_partial_same_row(
+    const uint8_t* packed_a,
+    const Qwen36MoeInt4WeightDesc& desc_a,
+    int expert_a,
+    const uint8_t* packed_b,
+    const Qwen36MoeInt4WeightDesc& desc_b,
+    int expert_b,
+    const float* __restrict__ x,
+    int row,
+    int cols,
+    int tid,
+    int block_size
+) {
+    float partial_a = 0.0f;
+    float partial_b = 0.0f;
+    for (int col = tid * 8; col < cols; col += block_size * 8) {
+        float values_a[8];
+        float values_b[8];
+        qwen36_int4_pair_dequant_8(
+            packed_a, desc_a, expert_a, row,
+            packed_b, desc_b, expert_b, row,
+            col, values_a, values_b);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float value = x[col + i];
+            partial_a += values_a[i] * value;
+            partial_b += values_b[i] * value;
+        }
+    }
+    return {partial_a, partial_b};
+}
+
 // ---------------------------------------------------------------------------
 // INT4 group-quant dequant — ported from kernels/full_attention_4b.hip
 // (PR 4b5). Per CLAUDE.md the qwen36_moe and full_attention_4b kernels are
 // isolated compilation units (hipcc on gfx11xx is fragile), so the helpers
 // live here as a copy rather than a shared header.
 //
-// Legacy tile-v1 compatibility (encoding 1) only. Task 7 rejects encoding 2
-// before production chained/persistent launch; Task 9 will route those paths
-// through the descriptor primitive above.
+// Legacy tile-v1 compatibility (encoding 1) only. Production qwen36 phase
+// paths route both encoding 1 and encoding 2 through the descriptor primitive
+// above; these helpers remain for isolated tile-v1 known-byte coverage.
 //
 // Layout (matches the tile-v1 bake + the full_attention_4b versions):
 //   weights : `[..., out, in/2]` u8   — 2 nibbles/byte, even col → low.
@@ -249,6 +306,26 @@ __device__ inline qwen36_short16 qwen36_wmma_activation_operand(
     return operand;
 }
 
+__device__ inline qwen36_short16 qwen36_wmma_activation_operand(
+    const float* activation,
+    int col,
+    int lane_row
+) {
+    qwen36_short16 operand;
+    if (lane_row == 0) {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            uint32_t bits;
+            __builtin_memcpy(&bits, &activation[col + i], sizeof(bits));
+            operand[i] = static_cast<short>(bits >> 16);
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) operand[i] = 0;
+    }
+    return operand;
+}
+
 __device__ inline qwen36_short16 qwen36_wmma_int4_operand(
     const uint8_t* packed,
     const Qwen36MoeInt4WeightDesc& desc,
@@ -271,13 +348,14 @@ __device__ inline qwen36_short16 qwen36_wmma_int4_operand(
     return operand;
 }
 
+template <typename Activation>
 __device__ inline qwen36_float8 qwen36_wmma_int4_matvec_partial_16rows(
     const uint8_t* packed,
     const Qwen36MoeInt4WeightDesc& desc,
     int expert,
     int rhs_row_idx,
     bool rhs_in_range,
-    const hip_bfloat16* activation,
+    const Activation* activation,
     int hidden,
     int lane_row
 ) {
@@ -292,6 +370,7 @@ __device__ inline qwen36_float8 qwen36_wmma_int4_matvec_partial_16rows(
     return acc;
 }
 
+template <typename Activation>
 __device__ inline qwen36_float8_pair
 qwen36_wmma_int4_pair_matvec_partial_16rows(
     const uint8_t* packed_a,
@@ -303,7 +382,7 @@ qwen36_wmma_int4_pair_matvec_partial_16rows(
     int expert_b,
     int rhs_row_idx_b,
     bool rhs_in_range,
-    const hip_bfloat16* activation,
+    const Activation* activation,
     int hidden,
     int lane_row
 ) {
@@ -369,11 +448,6 @@ __device__ inline float int4_dq8_matvec_partial(
     }
     return partial;
 }
-
-struct qwen36_float_pair {
-    float first;
-    float second;
-};
 
 __device__ inline qwen36_float_pair int4_dq8_pair_matvec_partial_same_row(
     const uint8_t*      __restrict__ packed_a,

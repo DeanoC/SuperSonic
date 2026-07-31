@@ -326,22 +326,10 @@ __global__ void qwen36_moe_attn_step_kernel(
     const T* __restrict__          q_norm_w,      // [d]
     const T* __restrict__          k_norm_w,      // [d]               (nullable for stage<2)
     const T* __restrict__          o_proj_w,      // [hidden, H*d]     (nullable for stage<5)
-    // PR 4b6 INT4 sidecars. `int4_group_size == 0` ⇒ all weights are BF16
-    // and every sidecar pointer must be null. When non-zero, each sidecar
-    // pair (`*_scale`, `*_zero`) is consulted independently per tensor: a
-    // null `*_scale` for a given tensor keeps it on the BF16 path, a
-    // non-null pair switches that tensor to INT4. The kernel reinterprets
-    // the matching weight pointer as `const uint8_t*` packed bytes (low
-    // nibble = even col) and dequants per-element via `int4_dequant_scalar`.
-    int                                  int4_group_size,
-    const hip_bfloat16* __restrict__     q_proj_scale,
-    const hip_bfloat16* __restrict__     q_proj_zero,
-    const hip_bfloat16* __restrict__     k_proj_scale,
-    const hip_bfloat16* __restrict__     k_proj_zero,
-    const hip_bfloat16* __restrict__     v_proj_scale,
-    const hip_bfloat16* __restrict__     v_proj_zero,
-    const hip_bfloat16* __restrict__     o_proj_scale,
-    const hip_bfloat16* __restrict__     o_proj_zero,
+    Qwen36MoeInt4WeightDesc              q_proj_desc,
+    Qwen36MoeInt4WeightDesc              k_proj_desc,
+    Qwen36MoeInt4WeightDesc              v_proj_desc,
+    Qwen36MoeInt4WeightDesc              o_proj_desc,
     T* __restrict__                output,        // BF16, sized for the largest staged intermediate
     float* __restrict__             workspace,    // F32 scratch, see header comment
     // PR 4d KV cache extension. When `kv_cache_k`/`kv_cache_v` are non-null
@@ -365,11 +353,7 @@ __global__ void qwen36_moe_attn_step_kernel(
         input_hidden, input_norm_w,
         q_proj_w, k_proj_w, v_proj_w,
         q_norm_w, k_norm_w, o_proj_w,
-        int4_group_size,
-        q_proj_scale, q_proj_zero,
-        k_proj_scale, k_proj_zero,
-        v_proj_scale, v_proj_zero,
-        o_proj_scale, o_proj_zero,
+        q_proj_desc, k_proj_desc, v_proj_desc, o_proj_desc,
         output, workspace,
         kv_cache_k, kv_cache_v,
         /*kv_scale_k*/ nullptr, /*kv_scale_v*/ nullptr,
@@ -460,17 +444,9 @@ __global__ void qwen36_moe_linear_step_kernel(
     const T* __restrict__          out_proj_w,          // unused at stage 1
     T* __restrict__                conv_state,          // unused at stage 1
     float* __restrict__            recurrent_state,     // unused at stage 1
-    // PR 4b6 INT4 sidecars. Same null-pointer-as-mode discipline as the
-    // full-attn kernel. Only the three projections that the bake quantizes
-    // are wired (in_proj_qkv, in_proj_z, out_proj). in_proj_a/in_proj_b are
-    // tiny per-V-head scalars and stay BF16.
-    int                                  int4_group_size,
-    const hip_bfloat16* __restrict__     in_proj_qkv_scale,
-    const hip_bfloat16* __restrict__     in_proj_qkv_zero,
-    const hip_bfloat16* __restrict__     in_proj_z_scale,
-    const hip_bfloat16* __restrict__     in_proj_z_zero,
-    const hip_bfloat16* __restrict__     out_proj_scale,
-    const hip_bfloat16* __restrict__     out_proj_zero,
+    Qwen36MoeInt4WeightDesc              in_proj_qkv_desc,
+    Qwen36MoeInt4WeightDesc              in_proj_z_desc,
+    Qwen36MoeInt4WeightDesc              out_proj_desc,
     T* __restrict__                output,
     float* __restrict__            workspace,
     unsigned int* __restrict__     counters,
@@ -485,10 +461,7 @@ __global__ void qwen36_moe_linear_step_kernel(
         conv1d_w, conv1d_bias, dt_bias, a_log,
         norm_w, out_proj_w,
         conv_state, recurrent_state,
-        int4_group_size,
-        in_proj_qkv_scale, in_proj_qkv_zero,
-        in_proj_z_scale,   in_proj_z_zero,
-        out_proj_scale,    out_proj_zero,
+        in_proj_qkv_desc, in_proj_z_desc, out_proj_desc,
         output, workspace,
         counters, barrier_counter, barrier_flag);
 }
@@ -583,24 +556,11 @@ __global__ void qwen36_moe_ffn_step_kernel(
     const T* __restrict__          shared_up_proj_w,             // [Is, hidden]       (nullable for stage<2)
     const T* __restrict__          shared_down_proj_w,           // [hidden, Is]       (nullable for stage<2)
     const T* __restrict__          shared_expert_gate_w,         // [1, hidden]        (nullable for stage<2)
-    // PR 4b5 INT4 sidecars. `int4_group_size == 0` ⇒ all weights are BF16
-    // and every sidecar pointer must be null. When non-zero, each sidecar
-    // pair (`*_scale`, `*_zero`) is consulted independently per tensor: a
-    // null `*_scale` for a given tensor keeps it on the BF16 path, a
-    // non-null pair switches that tensor to INT4. The kernel reinterprets
-    // the matching weight pointer as `const uint8_t*` packed bytes (low
-    // nibble = even col) and dequants per-element via `int4_dequant_scalar`.
-    int                                  int4_group_size,
-    const hip_bfloat16* __restrict__     gate_up_proj_scale,
-    const hip_bfloat16* __restrict__     gate_up_proj_zero,
-    const hip_bfloat16* __restrict__     down_proj_scale,
-    const hip_bfloat16* __restrict__     down_proj_zero,
-    const hip_bfloat16* __restrict__     shared_gate_proj_scale,
-    const hip_bfloat16* __restrict__     shared_gate_proj_zero,
-    const hip_bfloat16* __restrict__     shared_up_proj_scale,
-    const hip_bfloat16* __restrict__     shared_up_proj_zero,
-    const hip_bfloat16* __restrict__     shared_down_proj_scale,
-    const hip_bfloat16* __restrict__     shared_down_proj_zero,
+    Qwen36MoeInt4WeightDesc              gate_up_proj_desc,
+    Qwen36MoeInt4WeightDesc              down_proj_desc,
+    Qwen36MoeInt4WeightDesc              shared_gate_proj_desc,
+    Qwen36MoeInt4WeightDesc              shared_up_proj_desc,
+    Qwen36MoeInt4WeightDesc              shared_down_proj_desc,
     T* __restrict__                output,                       // BF16, sized for the largest staged intermediate
     int* __restrict__              output_idx,                   // [k] topk indices (stage 1+)
     float* __restrict__            workspace,
@@ -616,12 +576,8 @@ __global__ void qwen36_moe_ffn_step_kernel(
         gate_up_proj_w, down_proj_w,
         shared_gate_proj_w, shared_up_proj_w, shared_down_proj_w,
         shared_expert_gate_w,
-        int4_group_size,
-        gate_up_proj_scale, gate_up_proj_zero,
-        down_proj_scale, down_proj_zero,
-        shared_gate_proj_scale, shared_gate_proj_zero,
-        shared_up_proj_scale, shared_up_proj_zero,
-        shared_down_proj_scale, shared_down_proj_zero,
+        gate_up_proj_desc, down_proj_desc,
+        shared_gate_proj_desc, shared_up_proj_desc, shared_down_proj_desc,
         output, output_idx, workspace,
         counters, barrier_counter, barrier_flag);
 }

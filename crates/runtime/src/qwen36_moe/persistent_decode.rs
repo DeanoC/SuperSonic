@@ -29,9 +29,10 @@
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, copy_h2d, sync, Backend, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeAttnStepParams,
-    Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc, Qwen36MoeInt4WeightDesc,
-    Qwen36MoeKVCacheFp8Desc, Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold,
+    persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeAttnStepInt4,
+    Qwen36MoeAttnStepParams, Qwen36MoeDecodeLayerDesc, Qwen36MoeFfnStepInt4,
+    Qwen36MoeInt4ScaleDesc, Qwen36MoeInt4WeightDesc, Qwen36MoeKVCacheFp8Desc,
+    Qwen36MoeLinearStepInt4, Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold,
     Qwen36MoePersistentMode,
 };
 use model_store::store::Int4StorageKind;
@@ -71,8 +72,8 @@ use crate::qwen36_moe::layers::{
 };
 use crate::qwen36_moe::lm_head::bf16_bytes_to_f32;
 use crate::qwen36_moe::types::{
-    AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers,
-    LoadedInt4Sidecar, MultiLayerGeom,
+    AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, FfnInt4Sidecars,
+    FullAttnInt4Sidecars, LayerBuffers, LinearAttnInt4Sidecars, LoadedInt4Sidecar, MultiLayerGeom,
 };
 
 /// Pre-allocated scratch + cached descriptor arrays for the persistent
@@ -1220,9 +1221,7 @@ pub fn build_layer_descs(layers: &mut [LayerBuffers]) -> Vec<Qwen36MoeDecodeLaye
     descs
 }
 
-pub(crate) fn build_int4_weight_desc(
-    sidecar: &LoadedInt4Sidecar,
-) -> Result<Qwen36MoeInt4WeightDesc> {
+pub fn build_int4_weight_desc(sidecar: &LoadedInt4Sidecar) -> Result<Qwen36MoeInt4WeightDesc> {
     let view = &sidecar.view;
     let encoding = match view.kind {
         Int4StorageKind::RowGroupSymmetric => {
@@ -1278,6 +1277,74 @@ pub(crate) fn build_int4_weight_desc(
         output_group_size,
         implicit_zero_code: view.implicit_zero_code.map(i32::from).unwrap_or(-1),
         encoding,
+    })
+}
+
+pub fn build_attn_step_int4(sidecars: &FullAttnInt4Sidecars) -> Result<Qwen36MoeAttnStepInt4> {
+    Ok(Qwen36MoeAttnStepInt4 {
+        group_size: sidecars.group_size,
+        q_proj_type: sidecars.q_proj_type,
+        q_proj: build_int4_weight_desc(&sidecars.q_proj)?,
+        q_proj_scale: sidecars.q_proj.scale.as_ptr(),
+        q_proj_zero: sidecars.q_proj.zero_ptr(),
+        k_proj_type: sidecars.k_proj_type,
+        k_proj: build_int4_weight_desc(&sidecars.k_proj)?,
+        k_proj_scale: sidecars.k_proj.scale.as_ptr(),
+        k_proj_zero: sidecars.k_proj.zero_ptr(),
+        v_proj_type: sidecars.v_proj_type,
+        v_proj: build_int4_weight_desc(&sidecars.v_proj)?,
+        v_proj_scale: sidecars.v_proj.scale.as_ptr(),
+        v_proj_zero: sidecars.v_proj.zero_ptr(),
+        o_proj_type: sidecars.o_proj_type,
+        o_proj: build_int4_weight_desc(&sidecars.o_proj)?,
+        o_proj_scale: sidecars.o_proj.scale.as_ptr(),
+        o_proj_zero: sidecars.o_proj.zero_ptr(),
+    })
+}
+
+pub fn build_linear_step_int4(
+    sidecars: &LinearAttnInt4Sidecars,
+) -> Result<Qwen36MoeLinearStepInt4> {
+    Ok(Qwen36MoeLinearStepInt4 {
+        group_size: sidecars.group_size,
+        in_proj_qkv_type: sidecars.in_proj_qkv_type,
+        in_proj_qkv: build_int4_weight_desc(&sidecars.in_proj_qkv)?,
+        in_proj_qkv_scale: sidecars.in_proj_qkv.scale.as_ptr(),
+        in_proj_qkv_zero: sidecars.in_proj_qkv.zero_ptr(),
+        in_proj_z_type: sidecars.in_proj_z_type,
+        in_proj_z: build_int4_weight_desc(&sidecars.in_proj_z)?,
+        in_proj_z_scale: sidecars.in_proj_z.scale.as_ptr(),
+        in_proj_z_zero: sidecars.in_proj_z.zero_ptr(),
+        out_proj_type: sidecars.out_proj_type,
+        out_proj: build_int4_weight_desc(&sidecars.out_proj)?,
+        out_proj_scale: sidecars.out_proj.scale.as_ptr(),
+        out_proj_zero: sidecars.out_proj.zero_ptr(),
+    })
+}
+
+pub fn build_ffn_step_int4(sidecars: &FfnInt4Sidecars) -> Result<Qwen36MoeFfnStepInt4> {
+    Ok(Qwen36MoeFfnStepInt4 {
+        group_size: sidecars.group_size,
+        gate_up_proj_type: sidecars.gate_up_proj_type,
+        gate_up_proj: build_int4_weight_desc(&sidecars.gate_up_proj)?,
+        gate_up_proj_scale: sidecars.gate_up_proj.scale.as_ptr(),
+        gate_up_proj_zero: sidecars.gate_up_proj.zero_ptr(),
+        down_proj_type: sidecars.down_proj_type,
+        down_proj: build_int4_weight_desc(&sidecars.down_proj)?,
+        down_proj_scale: sidecars.down_proj.scale.as_ptr(),
+        down_proj_zero: sidecars.down_proj.zero_ptr(),
+        shared_gate_proj_type: sidecars.shared_gate_proj_type,
+        shared_gate_proj: build_int4_weight_desc(&sidecars.shared_gate_proj)?,
+        shared_gate_proj_scale: sidecars.shared_gate_proj.scale.as_ptr(),
+        shared_gate_proj_zero: sidecars.shared_gate_proj.zero_ptr(),
+        shared_up_proj_type: sidecars.shared_up_proj_type,
+        shared_up_proj: build_int4_weight_desc(&sidecars.shared_up_proj)?,
+        shared_up_proj_scale: sidecars.shared_up_proj.scale.as_ptr(),
+        shared_up_proj_zero: sidecars.shared_up_proj.zero_ptr(),
+        shared_down_proj_type: sidecars.shared_down_proj_type,
+        shared_down_proj: build_int4_weight_desc(&sidecars.shared_down_proj)?,
+        shared_down_proj_scale: sidecars.shared_down_proj.scale.as_ptr(),
+        shared_down_proj_zero: sidecars.shared_down_proj.zero_ptr(),
     })
 }
 

@@ -63,6 +63,7 @@ use crate::qwen36_moe::decode::{
 };
 use crate::qwen36_moe::layer_loader::{classify_layer_weight_encoding, Qwen36LayerWeightEncoding};
 use crate::qwen36_moe::layers::LoadedQwen36Layers;
+use crate::qwen36_moe::persistent_decode::build_int4_weight_desc;
 use crate::qwen36_moe::types::{
     AttnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, MultiLayerGeom,
     PositionPair,
@@ -144,6 +145,10 @@ fn optimized_prefill_supports_encoding(
 ) -> bool {
     encoding == Qwen36LayerWeightEncoding::NativeInt4
         && (backend != Backend::Hip || enable_unqualified_hip_native_int4)
+}
+
+fn optimized_batched_ffn_supports_group_size(group_size: i32) -> bool {
+    group_size == 128
 }
 
 fn full_attn_kv_capacities(layers: &[LayerBuffers]) -> Vec<(usize, usize)> {
@@ -620,6 +625,10 @@ fn run_batched_prefill_impl(
 ///   negative-group-size sentinel signals FP8 weight sidecars (see
 ///   `kernels/qwen36_moe_persistent/ffn_phase.cuh:109`); the new grouped
 ///   FFN GEMM only handles INT4 with positive group_size.
+/// - **G32 row-group INT4** — the grouped routed-expert launcher accepts its
+///   exact descriptors, but this complete workflow still computes the shared
+///   expert with tile-v1-only generic G128 helpers. G32 falls through to the
+///   descriptor-driven per-token workflow until that separate path converts.
 /// - **Sparse-VMM MoE residency** — sparse mode only reserves expert weight
 ///   tensors upfront; per-step expert prefetch must run via `run_chain_step`
 ///   before FFN compute to page in any non-resident routed experts. The
@@ -644,6 +653,11 @@ fn supports_batched_path(
         return Ok(false);
     }
     for l in layers {
+        if let Some(int4) = &l.ffn.int4 {
+            if !optimized_batched_ffn_supports_group_size(int4.group_size) {
+                return Ok(false);
+            }
+        }
         if let AttnLayerBuffers::Full {
             kv_cache: Some(c), ..
         } = &l.attn
@@ -1553,6 +1567,7 @@ fn process_linear_attn_layer_pertoken(
             Qwen36MoeLinearStepInt4 {
                 group_size: s.group_size,
                 in_proj_qkv_type: s.in_proj_qkv_type,
+                in_proj_qkv: build_int4_weight_desc(&s.in_proj_qkv)?,
                 in_proj_qkv_scale: s.in_proj_qkv.scale.as_ptr(),
                 in_proj_qkv_zero: if fp8 {
                     std::ptr::null()
@@ -1560,6 +1575,7 @@ fn process_linear_attn_layer_pertoken(
                     s.in_proj_qkv.zero_ptr()
                 },
                 in_proj_z_type: s.in_proj_z_type,
+                in_proj_z: build_int4_weight_desc(&s.in_proj_z)?,
                 in_proj_z_scale: s.in_proj_z.scale.as_ptr(),
                 in_proj_z_zero: if fp8 {
                     std::ptr::null()
@@ -1567,6 +1583,7 @@ fn process_linear_attn_layer_pertoken(
                     s.in_proj_z.zero_ptr()
                 },
                 out_proj_type: s.out_proj_type,
+                out_proj: build_int4_weight_desc(&s.out_proj)?,
                 out_proj_scale: s.out_proj.scale.as_ptr(),
                 out_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1703,6 +1720,7 @@ fn process_full_attn_layer_pertoken(
             Qwen36MoeAttnStepInt4 {
                 group_size: s.group_size,
                 q_proj_type: s.q_proj_type,
+                q_proj: build_int4_weight_desc(&s.q_proj)?,
                 q_proj_scale: s.q_proj.scale.as_ptr(),
                 q_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1710,6 +1728,7 @@ fn process_full_attn_layer_pertoken(
                     s.q_proj.zero_ptr()
                 },
                 k_proj_type: s.k_proj_type,
+                k_proj: build_int4_weight_desc(&s.k_proj)?,
                 k_proj_scale: s.k_proj.scale.as_ptr(),
                 k_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1717,6 +1736,7 @@ fn process_full_attn_layer_pertoken(
                     s.k_proj.zero_ptr()
                 },
                 v_proj_type: s.v_proj_type,
+                v_proj: build_int4_weight_desc(&s.v_proj)?,
                 v_proj_scale: s.v_proj.scale.as_ptr(),
                 v_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1724,6 +1744,7 @@ fn process_full_attn_layer_pertoken(
                     s.v_proj.zero_ptr()
                 },
                 o_proj_type: s.o_proj_type,
+                o_proj: build_int4_weight_desc(&s.o_proj)?,
                 o_proj_scale: s.o_proj.scale.as_ptr(),
                 o_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1818,6 +1839,7 @@ fn process_ffn_pertoken(
             Qwen36MoeFfnStepInt4 {
                 group_size: s.group_size,
                 gate_up_proj_type: s.gate_up_proj_type,
+                gate_up_proj: build_int4_weight_desc(&s.gate_up_proj)?,
                 gate_up_proj_scale: s.gate_up_proj.scale.as_ptr(),
                 gate_up_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1825,6 +1847,7 @@ fn process_ffn_pertoken(
                     s.gate_up_proj.zero_ptr()
                 },
                 down_proj_type: s.down_proj_type,
+                down_proj: build_int4_weight_desc(&s.down_proj)?,
                 down_proj_scale: s.down_proj.scale.as_ptr(),
                 down_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1832,6 +1855,7 @@ fn process_ffn_pertoken(
                     s.down_proj.zero_ptr()
                 },
                 shared_gate_proj_type: s.shared_gate_proj_type,
+                shared_gate_proj: build_int4_weight_desc(&s.shared_gate_proj)?,
                 shared_gate_proj_scale: s.shared_gate_proj.scale.as_ptr(),
                 shared_gate_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1839,6 +1863,7 @@ fn process_ffn_pertoken(
                     s.shared_gate_proj.zero_ptr()
                 },
                 shared_up_proj_type: s.shared_up_proj_type,
+                shared_up_proj: build_int4_weight_desc(&s.shared_up_proj)?,
                 shared_up_proj_scale: s.shared_up_proj.scale.as_ptr(),
                 shared_up_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1846,6 +1871,7 @@ fn process_ffn_pertoken(
                     s.shared_up_proj.zero_ptr()
                 },
                 shared_down_proj_type: s.shared_down_proj_type,
+                shared_down_proj: build_int4_weight_desc(&s.shared_down_proj)?,
                 shared_down_proj_scale: s.shared_down_proj.scale.as_ptr(),
                 shared_down_proj_zero: if fp8 {
                     std::ptr::null()
@@ -2364,6 +2390,8 @@ fn process_ffn_batched_grouped(
         // Virtual VMM allocation; the raw-pointer launcher accepts both.
         let gate_up_w_ptr = ffn.gate_up_proj_w.as_ptr();
         let down_w_ptr = ffn.down_proj_w.as_ptr();
+        let gate_up_desc = build_int4_weight_desc(&int4.gate_up_proj)?;
+        let down_desc = build_int4_weight_desc(&int4.down_proj)?;
         unsafe {
             batched_prefill_grouped_expert_launch_raw(
                 ordinal,
@@ -2372,16 +2400,13 @@ fn process_ffn_batched_grouped(
                 num_experts,
                 hidden,
                 moe_intermediate,
-                group_size,
                 &scratch.h_norm,
                 &scratch.expert_offsets,
                 &scratch.permuted_token_idx,
                 gate_up_w_ptr,
-                int4.gate_up_proj.scale.as_ptr(),
-                int4.gate_up_proj.zero_ptr(),
+                &gate_up_desc,
                 down_w_ptr,
-                int4.down_proj.scale.as_ptr(),
-                int4.down_proj.zero_ptr(),
+                &down_desc,
                 &mut scratch.expert_out,
                 &mut scratch.expert_counters,
             )
@@ -2976,6 +3001,13 @@ mod orchestration_tests {
             Backend::Metal,
             false,
         ));
+    }
+
+    #[test]
+    fn optimized_batched_shared_expert_remains_tile_v1_only() {
+        assert!(optimized_batched_ffn_supports_group_size(128));
+        assert!(!optimized_batched_ffn_supports_group_size(32));
+        assert!(!optimized_batched_ffn_supports_group_size(-1));
     }
 
     #[test]

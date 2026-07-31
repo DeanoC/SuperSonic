@@ -139,6 +139,23 @@ pub struct Qwen36MoeInt4WeightDesc {
 unsafe impl Send for Qwen36MoeInt4WeightDesc {}
 unsafe impl Sync for Qwen36MoeInt4WeightDesc {}
 
+impl Qwen36MoeInt4WeightDesc {
+    pub const fn disabled() -> Self {
+        Self {
+            scale: std::ptr::null(),
+            zero: std::ptr::null(),
+            packed_row_stride_bytes: 0,
+            packed_expert_stride_bytes: 0,
+            scale_row_stride_elements: 0,
+            scale_expert_stride_elements: 0,
+            input_group_size: 0,
+            output_group_size: 0,
+            implicit_zero_code: 0,
+            encoding: 0,
+        }
+    }
+}
+
 impl Default for Qwen36MoeInt4WeightDesc {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }

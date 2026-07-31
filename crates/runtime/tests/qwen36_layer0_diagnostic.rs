@@ -7,8 +7,8 @@ use base64::Engine;
 use gpu_hal::{memset_zeros, set_backend, Backend, GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::qwen36_moe::{
-    linear_step_launch, Qwen36MoeLinearStepInt4, Qwen36MoeLinearStepParams,
-    Qwen36MoeLinearStepWeights,
+    linear_step_launch, Qwen36MoeInt4WeightDesc, Qwen36MoeLinearStepInt4,
+    Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -148,6 +148,29 @@ struct RecurrenceResult {
     conv_state_before_final: Vec<u8>,
     recurrent_state_before_final: Vec<u8>,
     final_stage: StageResult,
+}
+
+fn tile_v1_desc(
+    scale: &GpuBuffer,
+    zero: &GpuBuffer,
+    out_rows: usize,
+    in_cols: usize,
+) -> Qwen36MoeInt4WeightDesc {
+    let group_size = QWEN36_MOE_INT4_GROUP_SIZE as usize;
+    let packed_row_stride_bytes = in_cols / 2;
+    let scale_row_stride_elements = in_cols / group_size;
+    Qwen36MoeInt4WeightDesc {
+        scale: scale.as_ptr(),
+        zero: zero.as_ptr(),
+        packed_row_stride_bytes: packed_row_stride_bytes as u64,
+        packed_expert_stride_bytes: (out_rows * packed_row_stride_bytes) as u64,
+        scale_row_stride_elements: scale_row_stride_elements as u64,
+        scale_expert_stride_elements: ((out_rows / group_size) * scale_row_stride_elements) as u64,
+        input_group_size: QWEN36_MOE_INT4_GROUP_SIZE,
+        output_group_size: QWEN36_MOE_INT4_GROUP_SIZE,
+        implicit_zero_code: -1,
+        encoding: 1,
+    }
 }
 
 fn usize_field(value: &Value, key: &str) -> Result<usize> {
@@ -387,12 +410,30 @@ fn run_production_recurrence(
     let int4 = Qwen36MoeLinearStepInt4 {
         group_size: QWEN36_MOE_INT4_GROUP_SIZE,
         in_proj_qkv_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        in_proj_qkv: tile_v1_desc(
+            &weights.qkv_scale,
+            &weights.qkv_zero,
+            geometry.qkv_dim(),
+            geometry.hidden,
+        ),
         in_proj_qkv_scale: weights.qkv_scale.as_ptr(),
         in_proj_qkv_zero: weights.qkv_zero.as_ptr(),
         in_proj_z_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        in_proj_z: tile_v1_desc(
+            &weights.z_scale,
+            &weights.z_zero,
+            geometry.value_dim(),
+            geometry.hidden,
+        ),
         in_proj_z_scale: weights.z_scale.as_ptr(),
         in_proj_z_zero: weights.z_zero.as_ptr(),
         out_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        out_proj: tile_v1_desc(
+            &weights.out_scale,
+            &weights.out_zero,
+            geometry.hidden,
+            geometry.value_dim(),
+        ),
         out_proj_scale: weights.out_scale.as_ptr(),
         out_proj_zero: weights.out_zero.as_ptr(),
     };
@@ -498,12 +539,30 @@ fn run_stage(
     let int4 = Qwen36MoeLinearStepInt4 {
         group_size: QWEN36_MOE_INT4_GROUP_SIZE,
         in_proj_qkv_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        in_proj_qkv: tile_v1_desc(
+            &weights.qkv_scale,
+            &weights.qkv_zero,
+            geometry.qkv_dim(),
+            geometry.hidden,
+        ),
         in_proj_qkv_scale: weights.qkv_scale.as_ptr(),
         in_proj_qkv_zero: weights.qkv_zero.as_ptr(),
         in_proj_z_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        in_proj_z: tile_v1_desc(
+            &weights.z_scale,
+            &weights.z_zero,
+            geometry.value_dim(),
+            geometry.hidden,
+        ),
         in_proj_z_scale: weights.z_scale.as_ptr(),
         in_proj_z_zero: weights.z_zero.as_ptr(),
         out_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
+        out_proj: tile_v1_desc(
+            &weights.out_scale,
+            &weights.out_zero,
+            geometry.hidden,
+            geometry.value_dim(),
+        ),
         out_proj_scale: weights.out_scale.as_ptr(),
         out_proj_zero: weights.out_zero.as_ptr(),
     };

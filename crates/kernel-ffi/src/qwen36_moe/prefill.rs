@@ -181,15 +181,19 @@ impl Default for Qwen36MoeAttnStepWeights {
 pub struct Qwen36MoeAttnStepInt4 {
     pub group_size: i32,
     pub q_proj_type: i32,
+    pub q_proj: Qwen36MoeInt4WeightDesc,
     pub q_proj_scale: *const c_void,
     pub q_proj_zero: *const c_void,
     pub k_proj_type: i32,
+    pub k_proj: Qwen36MoeInt4WeightDesc,
     pub k_proj_scale: *const c_void,
     pub k_proj_zero: *const c_void,
     pub v_proj_type: i32,
+    pub v_proj: Qwen36MoeInt4WeightDesc,
     pub v_proj_scale: *const c_void,
     pub v_proj_zero: *const c_void,
     pub o_proj_type: i32,
+    pub o_proj: Qwen36MoeInt4WeightDesc,
     pub o_proj_scale: *const c_void,
     pub o_proj_zero: *const c_void,
 }
@@ -201,17 +205,31 @@ impl Qwen36MoeAttnStepInt4 {
         Self {
             group_size: 0,
             q_proj_type: 0,
+            q_proj: Qwen36MoeInt4WeightDesc::disabled(),
             q_proj_scale: std::ptr::null(),
             q_proj_zero: std::ptr::null(),
             k_proj_type: 0,
+            k_proj: Qwen36MoeInt4WeightDesc::disabled(),
             k_proj_scale: std::ptr::null(),
             k_proj_zero: std::ptr::null(),
             v_proj_type: 0,
+            v_proj: Qwen36MoeInt4WeightDesc::disabled(),
             v_proj_scale: std::ptr::null(),
             v_proj_zero: std::ptr::null(),
             o_proj_type: 0,
+            o_proj: Qwen36MoeInt4WeightDesc::disabled(),
             o_proj_scale: std::ptr::null(),
             o_proj_zero: std::ptr::null(),
+        }
+    }
+
+    fn descriptor(self) -> Qwen36MoeInt4ScaleDesc {
+        Qwen36MoeInt4ScaleDesc {
+            q_proj: self.q_proj,
+            k_proj: self.k_proj,
+            v_proj: self.v_proj,
+            o_proj: self.o_proj,
+            ..Qwen36MoeInt4ScaleDesc::default()
         }
     }
 }
@@ -299,6 +317,7 @@ fn attn_step_launch_impl(
     // Sync_buf must be at least 96 bytes zeroed before launch.
     let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
+    let int4_desc = int4.descriptor();
 
     let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
@@ -325,15 +344,7 @@ fn attn_step_launch_impl(
                     weights.q_norm_w,
                     weights.k_norm_w,
                     weights.o_proj_w,
-                    int4.group_size as c_int,
-                    int4.q_proj_scale,
-                    int4.q_proj_zero,
-                    int4.k_proj_scale,
-                    int4.k_proj_zero,
-                    int4.v_proj_scale,
-                    int4.v_proj_zero,
-                    int4.o_proj_scale,
-                    int4.o_proj_zero,
+                    &int4_desc,
                     output.as_mut_ptr(),
                     workspace.as_mut_ptr() as *mut f32,
                     weights.kv_cache_k,
@@ -1258,12 +1269,15 @@ pub struct Qwen36MoeLinearStepWeights {
 pub struct Qwen36MoeLinearStepInt4 {
     pub group_size: i32,
     pub in_proj_qkv_type: i32,
+    pub in_proj_qkv: Qwen36MoeInt4WeightDesc,
     pub in_proj_qkv_scale: *const c_void,
     pub in_proj_qkv_zero: *const c_void,
     pub in_proj_z_type: i32,
+    pub in_proj_z: Qwen36MoeInt4WeightDesc,
     pub in_proj_z_scale: *const c_void,
     pub in_proj_z_zero: *const c_void,
     pub out_proj_type: i32,
+    pub out_proj: Qwen36MoeInt4WeightDesc,
     pub out_proj_scale: *const c_void,
     pub out_proj_zero: *const c_void,
 }
@@ -1274,14 +1288,26 @@ impl Qwen36MoeLinearStepInt4 {
         Self {
             group_size: 0,
             in_proj_qkv_type: 0,
+            in_proj_qkv: Qwen36MoeInt4WeightDesc::disabled(),
             in_proj_qkv_scale: std::ptr::null(),
             in_proj_qkv_zero: std::ptr::null(),
             in_proj_z_type: 0,
+            in_proj_z: Qwen36MoeInt4WeightDesc::disabled(),
             in_proj_z_scale: std::ptr::null(),
             in_proj_z_zero: std::ptr::null(),
             out_proj_type: 0,
+            out_proj: Qwen36MoeInt4WeightDesc::disabled(),
             out_proj_scale: std::ptr::null(),
             out_proj_zero: std::ptr::null(),
+        }
+    }
+
+    fn descriptor(self) -> Qwen36MoeInt4ScaleDesc {
+        Qwen36MoeInt4ScaleDesc {
+            linear_in_proj_qkv: self.in_proj_qkv,
+            linear_in_proj_z: self.in_proj_z,
+            linear_out_proj: self.out_proj,
+            ..Qwen36MoeInt4ScaleDesc::default()
         }
     }
 }
@@ -1422,6 +1448,7 @@ fn linear_step_launch_impl(
     // Sync_buf must be at least 96 bytes zeroed before launch.
     let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
+    let int4_desc = int4.descriptor();
 
     let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
@@ -1452,13 +1479,7 @@ fn linear_step_launch_impl(
                     weights.out_proj_w,
                     weights.conv_state,
                     weights.recurrent_state as *mut f32,
-                    int4.group_size as c_int,
-                    int4.in_proj_qkv_scale,
-                    int4.in_proj_qkv_zero,
-                    int4.in_proj_z_scale,
-                    int4.in_proj_z_zero,
-                    int4.out_proj_scale,
-                    int4.out_proj_zero,
+                    &int4_desc,
                     output.as_mut_ptr(),
                     workspace.as_mut_ptr() as *mut f32,
                     counters,
@@ -2130,18 +2151,23 @@ pub struct Qwen36MoeFfnStepWeights {
 pub struct Qwen36MoeFfnStepInt4 {
     pub group_size: i32,
     pub gate_up_proj_type: i32,
+    pub gate_up_proj: Qwen36MoeInt4WeightDesc,
     pub gate_up_proj_scale: *const c_void,
     pub gate_up_proj_zero: *const c_void,
     pub down_proj_type: i32,
+    pub down_proj: Qwen36MoeInt4WeightDesc,
     pub down_proj_scale: *const c_void,
     pub down_proj_zero: *const c_void,
     pub shared_gate_proj_type: i32,
+    pub shared_gate_proj: Qwen36MoeInt4WeightDesc,
     pub shared_gate_proj_scale: *const c_void,
     pub shared_gate_proj_zero: *const c_void,
     pub shared_up_proj_type: i32,
+    pub shared_up_proj: Qwen36MoeInt4WeightDesc,
     pub shared_up_proj_scale: *const c_void,
     pub shared_up_proj_zero: *const c_void,
     pub shared_down_proj_type: i32,
+    pub shared_down_proj: Qwen36MoeInt4WeightDesc,
     pub shared_down_proj_scale: *const c_void,
     pub shared_down_proj_zero: *const c_void,
 }
@@ -2154,20 +2180,36 @@ impl Qwen36MoeFfnStepInt4 {
         Self {
             group_size: 0,
             gate_up_proj_type: 0,
+            gate_up_proj: Qwen36MoeInt4WeightDesc::disabled(),
             gate_up_proj_scale: std::ptr::null(),
             gate_up_proj_zero: std::ptr::null(),
             down_proj_type: 0,
+            down_proj: Qwen36MoeInt4WeightDesc::disabled(),
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
             shared_gate_proj_type: 0,
+            shared_gate_proj: Qwen36MoeInt4WeightDesc::disabled(),
             shared_gate_proj_scale: std::ptr::null(),
             shared_gate_proj_zero: std::ptr::null(),
             shared_up_proj_type: 0,
+            shared_up_proj: Qwen36MoeInt4WeightDesc::disabled(),
             shared_up_proj_scale: std::ptr::null(),
             shared_up_proj_zero: std::ptr::null(),
             shared_down_proj_type: 0,
+            shared_down_proj: Qwen36MoeInt4WeightDesc::disabled(),
             shared_down_proj_scale: std::ptr::null(),
             shared_down_proj_zero: std::ptr::null(),
+        }
+    }
+
+    fn descriptor(self) -> Qwen36MoeInt4ScaleDesc {
+        Qwen36MoeInt4ScaleDesc {
+            experts_gate_up: self.gate_up_proj,
+            experts_down: self.down_proj,
+            shared_expert_gate_proj: self.shared_gate_proj,
+            shared_expert_up_proj: self.shared_up_proj,
+            shared_expert_down_proj: self.shared_down_proj,
+            ..Qwen36MoeInt4ScaleDesc::default()
         }
     }
 }
@@ -9236,6 +9278,7 @@ fn ffn_step_launch_impl(
     // Sync_buf must be at least 96 bytes zeroed before launch.
     let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
+    let int4_desc = int4.descriptor();
 
     let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
@@ -9260,17 +9303,7 @@ fn ffn_step_launch_impl(
                     weights.shared_up_proj_w,
                     weights.shared_down_proj_w,
                     weights.shared_expert_gate_w,
-                    int4.group_size as c_int,
-                    int4.gate_up_proj_scale,
-                    int4.gate_up_proj_zero,
-                    int4.down_proj_scale,
-                    int4.down_proj_zero,
-                    int4.shared_gate_proj_scale,
-                    int4.shared_gate_proj_zero,
-                    int4.shared_up_proj_scale,
-                    int4.shared_up_proj_zero,
-                    int4.shared_down_proj_scale,
-                    int4.shared_down_proj_zero,
+                    &int4_desc,
                     output.as_mut_ptr(),
                     output_idx.as_mut_ptr() as *mut c_int,
                     workspace.as_mut_ptr() as *mut f32,
@@ -13110,9 +13143,11 @@ pub fn batched_prefill_router_permute_launch(
 ///                            `[num_experts + 1]`. M9 output.
 /// - `permuted_token_idx`  : i32 (U32 storage), `[n_tokens * top_k]`. M9.
 /// - `experts_gate_up_w`   : u8 (U8 storage), `[E, 2*I, hidden/2]`.
-/// - `experts_gate_up_scale/zero` : BF16, `[E, 2*I/gs, hidden/gs]`.
+/// - `experts_gate_up_scale/zero/desc` : descriptor-owned BF16 sidecars and
+///                                        exact packed/scale strides.
 /// - `experts_down_w`      : u8, `[E, hidden, I/2]`.
-/// - `experts_down_scale/zero` : BF16, `[E, hidden/gs, I/gs]`.
+/// - `experts_down_scale/zero/desc` : descriptor-owned BF16 sidecars and
+///                                     exact packed/scale strides.
 /// - `expert_out`          : BF16, `[n_tokens * top_k, hidden]`.
 /// - `counters`            : u32, `[1]`. CALLER MUST ZERO BEFORE LAUNCH —
 ///                            this is the work-stealing claim counter.
@@ -13124,16 +13159,17 @@ pub fn batched_prefill_grouped_expert_launch(
     num_experts: usize,
     hidden: usize,
     moe_intermediate: usize,
-    group_size: usize,
     x_norm: &GpuBuffer,
     expert_offsets: &GpuBuffer,
     permuted_token_idx: &GpuBuffer,
     experts_gate_up_w: &GpuBuffer,
     experts_gate_up_scale: &GpuBuffer,
-    experts_gate_up_zero: &GpuBuffer,
+    experts_gate_up_zero: Option<&GpuBuffer>,
+    experts_gate_up_desc: &Qwen36MoeInt4WeightDesc,
     experts_down_w: &GpuBuffer,
     experts_down_scale: &GpuBuffer,
-    experts_down_zero: &GpuBuffer,
+    experts_down_zero: Option<&GpuBuffer>,
+    experts_down_desc: &Qwen36MoeInt4WeightDesc,
     expert_out: &mut GpuBuffer,
     counters: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
@@ -13143,6 +13179,22 @@ pub fn batched_prefill_grouped_expert_launch(
             backend,
             "qwen36_moe::batched_prefill_grouped_expert_launch requires HIP or CUDA backend"
                 .to_string(),
+        ));
+    }
+    if experts_gate_up_desc.scale != experts_gate_up_scale.as_ptr()
+        || experts_gate_up_desc.zero
+            != experts_gate_up_zero
+                .map(GpuBuffer::as_ptr)
+                .unwrap_or(std::ptr::null())
+        || experts_down_desc.scale != experts_down_scale.as_ptr()
+        || experts_down_desc.zero
+            != experts_down_zero
+                .map(GpuBuffer::as_ptr)
+                .unwrap_or(std::ptr::null())
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::batched_prefill_grouped_expert_launch descriptor sidecar pointer mismatch"
+                .into(),
         ));
     }
     let status: Qwen36BridgeStatus = match backend {
@@ -13157,16 +13209,13 @@ pub fn batched_prefill_grouped_expert_launch(
                     num_experts as c_int,
                     hidden as c_int,
                     moe_intermediate as c_int,
-                    group_size as c_int,
                     x_norm.as_ptr(),
                     expert_offsets.as_ptr(),
                     permuted_token_idx.as_ptr(),
                     experts_gate_up_w.as_ptr(),
-                    experts_gate_up_scale.as_ptr(),
-                    experts_gate_up_zero.as_ptr(),
+                    experts_gate_up_desc,
                     experts_down_w.as_ptr(),
-                    experts_down_scale.as_ptr(),
-                    experts_down_zero.as_ptr(),
+                    experts_down_desc,
                     expert_out.as_mut_ptr(),
                     counters.as_mut_ptr(),
                 )
@@ -13180,16 +13229,17 @@ pub fn batched_prefill_grouped_expert_launch(
                     num_experts,
                     hidden,
                     moe_intermediate,
-                    group_size,
                     x_norm,
                     expert_offsets,
                     permuted_token_idx,
                     experts_gate_up_w,
                     experts_gate_up_scale,
                     experts_gate_up_zero,
+                    experts_gate_up_desc,
                     experts_down_w,
                     experts_down_scale,
                     experts_down_zero,
+                    experts_down_desc,
                     expert_out,
                     counters,
                 );
@@ -13214,7 +13264,6 @@ pub fn batched_prefill_grouped_expert_launch(
         num_experts,
         hidden,
         moe_intermediate,
-        group_size,
     );
     Ok(())
 }
@@ -13222,7 +13271,7 @@ pub fn batched_prefill_grouped_expert_launch(
 /// Raw-pointer variant of `batched_prefill_grouped_expert_launch`.
 ///
 /// Same kernel, but accepts `*const c_void` for the per-expert weight slabs
-/// (gate_up + down packed nibbles, plus their parallel scale/zero tables).
+/// (gate_up + down packed nibbles, with sidecars reached through descriptors).
 /// This is needed by the M11 orchestrator because the runner stores those
 /// tensors via `ResidentWeight`, which can be either a `Dense` `GpuBuffer`
 /// or a `Virtual` allocation (raw pointer + shape) depending on the
@@ -13242,16 +13291,13 @@ pub unsafe fn batched_prefill_grouped_expert_launch_raw(
     num_experts: usize,
     hidden: usize,
     moe_intermediate: usize,
-    group_size: usize,
     x_norm: &GpuBuffer,
     expert_offsets: &GpuBuffer,
     permuted_token_idx: &GpuBuffer,
     experts_gate_up_w: *const c_void,
-    experts_gate_up_scale: *const c_void,
-    experts_gate_up_zero: *const c_void,
+    experts_gate_up_desc: &Qwen36MoeInt4WeightDesc,
     experts_down_w: *const c_void,
-    experts_down_scale: *const c_void,
-    experts_down_zero: *const c_void,
+    experts_down_desc: &Qwen36MoeInt4WeightDesc,
     expert_out: &mut GpuBuffer,
     counters: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
@@ -13275,16 +13321,13 @@ pub unsafe fn batched_prefill_grouped_expert_launch_raw(
                     num_experts as c_int,
                     hidden as c_int,
                     moe_intermediate as c_int,
-                    group_size as c_int,
                     x_norm.as_ptr(),
                     expert_offsets.as_ptr(),
                     permuted_token_idx.as_ptr(),
                     experts_gate_up_w,
-                    experts_gate_up_scale,
-                    experts_gate_up_zero,
+                    experts_gate_up_desc,
                     experts_down_w,
-                    experts_down_scale,
-                    experts_down_zero,
+                    experts_down_desc,
                     expert_out.as_mut_ptr(),
                     counters.as_mut_ptr(),
                 )
@@ -13298,16 +13341,13 @@ pub unsafe fn batched_prefill_grouped_expert_launch_raw(
                     num_experts,
                     hidden,
                     moe_intermediate,
-                    group_size,
                     x_norm,
                     expert_offsets,
                     permuted_token_idx,
                     experts_gate_up_w,
-                    experts_gate_up_scale,
-                    experts_gate_up_zero,
+                    experts_gate_up_desc,
                     experts_down_w,
-                    experts_down_scale,
-                    experts_down_zero,
+                    experts_down_desc,
                     expert_out,
                     counters,
                 );
@@ -13412,6 +13452,32 @@ mod tests {
     use std::sync::Mutex;
 
     static PROFILE_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tile_v1_weight_desc(
+        scale: &GpuBuffer,
+        zero: &GpuBuffer,
+        _experts: usize,
+        out_rows: usize,
+        in_cols: usize,
+        group_size: i32,
+    ) -> Qwen36MoeInt4WeightDesc {
+        let group_size = group_size as usize;
+        let packed_row_stride_bytes = in_cols / 2;
+        let scale_row_stride_elements = in_cols / group_size;
+        Qwen36MoeInt4WeightDesc {
+            scale: scale.as_ptr(),
+            zero: zero.as_ptr(),
+            packed_row_stride_bytes: packed_row_stride_bytes as u64,
+            packed_expert_stride_bytes: (out_rows * packed_row_stride_bytes) as u64,
+            scale_row_stride_elements: scale_row_stride_elements as u64,
+            scale_expert_stride_elements: ((out_rows / group_size) * scale_row_stride_elements)
+                as u64,
+            input_group_size: group_size as i32,
+            output_group_size: group_size as i32,
+            implicit_zero_code: -1,
+            encoding: 1,
+        }
+    }
 
     type ExplicitGroupedExpertNativeLauncher = unsafe fn(
         usize,
@@ -17982,15 +18048,47 @@ mod tests {
         let int4_ptrs = Qwen36MoeAttnStepInt4 {
             group_size,
             q_proj_type: 4,
+            q_proj: tile_v1_weight_desc(
+                &q_scale_buf,
+                &q_zero_buf,
+                1,
+                2 * h_us * d_us,
+                hidden_us,
+                group_size,
+            ),
             q_proj_scale: q_scale_buf.as_ptr(),
             q_proj_zero: q_zero_buf.as_ptr(),
             k_proj_type: 4,
+            k_proj: tile_v1_weight_desc(
+                &k_scale_buf,
+                &k_zero_buf,
+                1,
+                hkv_us * d_us,
+                hidden_us,
+                group_size,
+            ),
             k_proj_scale: k_scale_buf.as_ptr(),
             k_proj_zero: k_zero_buf.as_ptr(),
             v_proj_type: 4,
+            v_proj: tile_v1_weight_desc(
+                &v_scale_buf,
+                &v_zero_buf,
+                1,
+                hkv_us * d_us,
+                hidden_us,
+                group_size,
+            ),
             v_proj_scale: v_scale_buf.as_ptr(),
             v_proj_zero: v_zero_buf.as_ptr(),
             o_proj_type: 4,
+            o_proj: tile_v1_weight_desc(
+                &o_scale_buf,
+                &o_zero_buf,
+                1,
+                hidden_us,
+                h_us * d_us,
+                group_size,
+            ),
             o_proj_scale: o_scale_buf.as_ptr(),
             o_proj_zero: o_zero_buf.as_ptr(),
         };
@@ -19290,12 +19388,36 @@ mod tests {
         let int4_ptrs = Qwen36MoeLinearStepInt4 {
             group_size,
             in_proj_qkv_type: 4,
+            in_proj_qkv: tile_v1_weight_desc(
+                &qkv_scale_buf,
+                &qkv_zero_buf,
+                1,
+                qkv_dim,
+                hidden_us,
+                group_size,
+            ),
             in_proj_qkv_scale: qkv_scale_buf.as_ptr(),
             in_proj_qkv_zero: qkv_zero_buf.as_ptr(),
             in_proj_z_type: 4,
+            in_proj_z: tile_v1_weight_desc(
+                &z_scale_buf,
+                &z_zero_buf,
+                1,
+                val_dim,
+                hidden_us,
+                group_size,
+            ),
             in_proj_z_scale: z_scale_buf.as_ptr(),
             in_proj_z_zero: z_zero_buf.as_ptr(),
             out_proj_type: 4,
+            out_proj: tile_v1_weight_desc(
+                &out_scale_buf,
+                &out_zero_buf,
+                1,
+                hidden_us,
+                val_dim,
+                group_size,
+            ),
             out_proj_scale: out_scale_buf.as_ptr(),
             out_proj_zero: out_zero_buf.as_ptr(),
         };
@@ -20464,18 +20586,44 @@ mod tests {
         let int4_ptrs = Qwen36MoeFfnStepInt4 {
             group_size,
             gate_up_proj_type: 4,
+            gate_up_proj: Qwen36MoeInt4WeightDesc::disabled(),
             gate_up_proj_scale: std::ptr::null(),
             gate_up_proj_zero: std::ptr::null(),
             down_proj_type: 4,
+            down_proj: Qwen36MoeInt4WeightDesc::disabled(),
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
             shared_gate_proj_type: 4,
+            shared_gate_proj: tile_v1_weight_desc(
+                &sgp_scale_buf,
+                &sgp_zero_buf,
+                1,
+                is_us,
+                hidden_us,
+                group_size,
+            ),
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
             shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
             shared_up_proj_type: 4,
+            shared_up_proj: tile_v1_weight_desc(
+                &sup_scale_buf,
+                &sup_zero_buf,
+                1,
+                is_us,
+                hidden_us,
+                group_size,
+            ),
             shared_up_proj_scale: sup_scale_buf.as_ptr(),
             shared_up_proj_zero: sup_zero_buf.as_ptr(),
             shared_down_proj_type: 4,
+            shared_down_proj: tile_v1_weight_desc(
+                &sdp_scale_buf,
+                &sdp_zero_buf,
+                1,
+                hidden_us,
+                is_us,
+                group_size,
+            ),
             shared_down_proj_scale: sdp_scale_buf.as_ptr(),
             shared_down_proj_zero: sdp_zero_buf.as_ptr(),
         };
@@ -20709,19 +20857,52 @@ mod tests {
         let int4_ptrs = Qwen36MoeFfnStepInt4 {
             group_size,
             gate_up_proj_type: 4,
+            gate_up_proj: tile_v1_weight_desc(
+                &gup_scale_buf,
+                &gup_zero_buf,
+                e_us,
+                2 * i_us,
+                hidden_us,
+                group_size,
+            ),
             gate_up_proj_scale: gup_scale_buf.as_ptr(),
             gate_up_proj_zero: gup_zero_buf.as_ptr(),
             // down_proj stays BF16 until step 5 wires Phase I.
             down_proj_type: 4,
+            down_proj: Qwen36MoeInt4WeightDesc::disabled(),
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
             shared_gate_proj_type: 4,
+            shared_gate_proj: tile_v1_weight_desc(
+                &sgp_scale_buf,
+                &sgp_zero_buf,
+                1,
+                is_us,
+                hidden_us,
+                group_size,
+            ),
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
             shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
             shared_up_proj_type: 4,
+            shared_up_proj: tile_v1_weight_desc(
+                &sup_scale_buf,
+                &sup_zero_buf,
+                1,
+                is_us,
+                hidden_us,
+                group_size,
+            ),
             shared_up_proj_scale: sup_scale_buf.as_ptr(),
             shared_up_proj_zero: sup_zero_buf.as_ptr(),
             shared_down_proj_type: 4,
+            shared_down_proj: tile_v1_weight_desc(
+                &sdp_scale_buf,
+                &sdp_zero_buf,
+                1,
+                hidden_us,
+                is_us,
+                group_size,
+            ),
             shared_down_proj_scale: sdp_scale_buf.as_ptr(),
             shared_down_proj_zero: sdp_zero_buf.as_ptr(),
         };
@@ -20947,18 +21128,58 @@ mod tests {
         let int4_ptrs = Qwen36MoeFfnStepInt4 {
             group_size,
             gate_up_proj_type: 4,
+            gate_up_proj: tile_v1_weight_desc(
+                &gup_scale_buf,
+                &gup_zero_buf,
+                e_us,
+                2 * i_us,
+                hidden_us,
+                group_size,
+            ),
             gate_up_proj_scale: gup_scale_buf.as_ptr(),
             gate_up_proj_zero: gup_zero_buf.as_ptr(),
             down_proj_type: 4,
+            down_proj: tile_v1_weight_desc(
+                &dp_scale_buf,
+                &dp_zero_buf,
+                e_us,
+                hidden_us,
+                i_us,
+                group_size,
+            ),
             down_proj_scale: dp_scale_buf.as_ptr(),
             down_proj_zero: dp_zero_buf.as_ptr(),
             shared_gate_proj_type: 4,
+            shared_gate_proj: tile_v1_weight_desc(
+                &sgp_scale_buf,
+                &sgp_zero_buf,
+                1,
+                is_us,
+                hidden_us,
+                group_size,
+            ),
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
             shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
             shared_up_proj_type: 4,
+            shared_up_proj: tile_v1_weight_desc(
+                &sup_scale_buf,
+                &sup_zero_buf,
+                1,
+                is_us,
+                hidden_us,
+                group_size,
+            ),
             shared_up_proj_scale: sup_scale_buf.as_ptr(),
             shared_up_proj_zero: sup_zero_buf.as_ptr(),
             shared_down_proj_type: 4,
+            shared_down_proj: tile_v1_weight_desc(
+                &sdp_scale_buf,
+                &sdp_zero_buf,
+                1,
+                hidden_us,
+                is_us,
+                group_size,
+            ),
             shared_down_proj_scale: sdp_scale_buf.as_ptr(),
             shared_down_proj_zero: sdp_zero_buf.as_ptr(),
         };

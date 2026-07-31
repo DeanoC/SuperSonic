@@ -3,9 +3,8 @@
 //!
 //! Runs the GPU kernel against a pure-CPU reference that does the same
 //! gather + gate_up + silu*mul + down sequence per (token, kpos) pair.
-//! The reference uses the same INT4 dequant formula as
-//! `helpers.cuh::int4_dequant_8` (single BF16-rounding through
-//! `nibble * scale - zero * scale`) so the only deltas should come from
+//! The reference uses the canonical row-group INT4 formula
+//! `(nibble - 8) * scale` with one scale row per output row, so the only deltas should come from
 //! BF16/F32 accumulation order — bounded by the codebase's INT4 floor of
 //! `max_abs < 2e-2`, `max_rel < 5e-2` with a `1e-3` denominator floor
 //! (matches the M3 attn parity test in this repo).
@@ -13,6 +12,7 @@
 //! Skipped silently when HIP backend isn't compiled.
 
 use gpu_hal::{Backend, GpuBuffer, ScalarType};
+use kernel_ffi::qwen36_moe::Qwen36MoeInt4WeightDesc;
 use supersonic_runtime::qwen36_moe::prefill::batched_prefill_grouped_expert_launch;
 
 // gpu-hal's ScalarType has no I32 variant — we use U32 as the 4-byte
@@ -85,12 +85,10 @@ fn bf16_round_rne_f32(x: f32) -> f32 {
     f32::from_bits(rounded)
 }
 
-/// Same dequant formula as `int4_dequant_8` / `int4_dequant_scalar`:
-///   `bf16_round_rne_f32(nibble * scale - zero * scale)`
-fn int4_dequant_scalar(nibble: u32, scale_bf16: half::bf16, zero_bf16: half::bf16) -> f32 {
+/// Same dequant formula as `qwen36_int4_value` for encoding 2.
+fn int4_dequant_scalar(nibble: u32, scale_bf16: half::bf16) -> f32 {
     let s = scale_bf16.to_f32();
-    let z = zero_bf16.to_f32();
-    bf16_round_rne_f32((nibble as f32) * s - z * s)
+    bf16_round_rne_f32((nibble as f32 - 8.0) * s)
 }
 
 #[derive(Clone, Copy)]
@@ -102,7 +100,7 @@ struct Shape {
     moe_intermediate: usize,
 }
 
-const GROUP_SIZE: usize = 128;
+const GROUP_SIZE: usize = 32;
 
 fn make_x_norm(n_tokens: usize, hidden: usize, seed: u64) -> Vec<half::bf16> {
     let mut state = seed;
@@ -161,20 +159,18 @@ fn cpu_router_permute(
 }
 
 /// Pack two i4 nibbles per byte; even col → low nibble.
-/// Returns (packed_bytes, scales_bf16, zeros_bf16).
+/// Returns (packed_bytes, scales_bf16).
 ///
 /// Layout of `packed`: `[out_rows, in_cols / 2]` u8.
-/// Layout of `scales` / `zeros`: `[out_rows / gs, in_cols / gs]` BF16.
+/// Layout of `scales`: `[out_rows, in_cols / gs]` BF16.
 fn make_int4_slab(
     out_rows: usize,
     in_cols: usize,
     gs: usize,
     seed: u64,
-) -> (Vec<u8>, Vec<half::bf16>, Vec<half::bf16>) {
+) -> (Vec<u8>, Vec<half::bf16>) {
     assert!(in_cols % 2 == 0);
-    assert!(out_rows % gs == 0);
     assert!(in_cols % gs == 0);
-    let scale_rows = out_rows / gs;
     let scale_cols = in_cols / gs;
 
     let mut state = seed;
@@ -185,22 +181,36 @@ fn make_int4_slab(
         *byte = (raw & 0xFF) as u8; // both nibbles random in [0, 16).
     }
 
-    let mut scales = vec![half::bf16::ZERO; scale_rows * scale_cols];
-    let mut zeros = vec![half::bf16::ZERO; scale_rows * scale_cols];
-    for i in 0..scale_rows * scale_cols {
+    let mut scales = vec![half::bf16::ZERO; out_rows * scale_cols];
+    for i in 0..out_rows * scale_cols {
         let (next, raw) = lcg(state);
         state = next;
         // Scale in roughly [0.001, 0.02]: keeps dequanted weights small
         // enough that the cumulative dot products don't blow up.
         let s = 0.001 + ((raw % 1000) as f32 / 1000.0) * 0.02;
         scales[i] = half::bf16::from_f32(s);
-        let (next2, raw2) = lcg(state);
-        state = next2;
-        // Zero point in nibble-space [0, 16). Matches GPTQ-style INT4.
-        let z = (raw2 % 16) as f32;
-        zeros[i] = half::bf16::from_f32(z);
     }
-    (packed, scales, zeros)
+    (packed, scales)
+}
+
+fn row_group_desc(scale: &GpuBuffer, out_rows: usize, in_cols: usize) -> Qwen36MoeInt4WeightDesc {
+    let packed_row_stride_bytes = in_cols / 2;
+    let scale_row_stride_elements = in_cols / GROUP_SIZE;
+    let desc = Qwen36MoeInt4WeightDesc {
+        scale: scale.as_ptr(),
+        zero: std::ptr::null(),
+        packed_row_stride_bytes: packed_row_stride_bytes as u64,
+        packed_expert_stride_bytes: (out_rows * packed_row_stride_bytes) as u64,
+        scale_row_stride_elements: scale_row_stride_elements as u64,
+        scale_expert_stride_elements: (out_rows * scale_row_stride_elements) as u64,
+        input_group_size: GROUP_SIZE as i32,
+        output_group_size: 1,
+        implicit_zero_code: 8,
+        encoding: 2,
+    };
+    assert_eq!(desc.encoding, 2);
+    assert!(desc.zero.is_null());
+    desc
 }
 
 /// Per-row matvec against a 2D INT4 slab. Mirrors `int4_dequant_8` numerics:
@@ -208,7 +218,6 @@ fn make_int4_slab(
 fn int4_matvec_row(
     packed: &[u8],
     scales: &[half::bf16],
-    zeros: &[half::bf16],
     out_rows: usize,
     in_cols: usize,
     gs: usize,
@@ -218,7 +227,7 @@ fn int4_matvec_row(
     let _ = out_rows;
     let byte_cols = in_cols / 2;
     let scale_cols = in_cols / gs;
-    let scale_row = row / gs;
+    let scale_row = row;
     let row_byte_off = row * byte_cols;
 
     let mut acc = 0.0f32;
@@ -238,8 +247,7 @@ fn int4_matvec_row(
         for i in 0..8 {
             let g = (col + i) / gs;
             let s = scales[scale_row * scale_cols + g];
-            let z = zeros[scale_row * scale_cols + g];
-            let dq = int4_dequant_scalar(n[i] as u32, s, z);
+            let dq = int4_dequant_scalar(n[i] as u32, s);
             acc += dq * x[col + i];
         }
         col += 8;
@@ -257,10 +265,8 @@ fn cpu_grouped_expert(
     expert_offsets: &[i32],
     gate_up_w: &[u8],
     gate_up_s: &[half::bf16],
-    gate_up_z: &[half::bf16],
     down_w: &[u8],
     down_s: &[half::bf16],
-    down_z: &[half::bf16],
 ) -> Vec<half::bf16> {
     let Shape {
         n_tokens,
@@ -276,10 +282,10 @@ fn cpu_grouped_expert(
     let mut out = vec![half::bf16::ZERO; n_tokens * top_k * hidden];
 
     let gu_per_expert_packed = two_i * (hidden / 2);
-    let gu_per_expert_scales = (two_i / GROUP_SIZE) * (hidden / GROUP_SIZE);
+    let gu_per_expert_scales = two_i * (hidden / GROUP_SIZE);
 
     let dp_per_expert_packed = hidden * (i / 2);
-    let dp_per_expert_scales = (hidden / GROUP_SIZE) * (i / GROUP_SIZE);
+    let dp_per_expert_scales = hidden * (i / GROUP_SIZE);
 
     for e in 0..num_experts {
         let lo = expert_offsets[e] as usize;
@@ -289,10 +295,8 @@ fn cpu_grouped_expert(
         }
         let gu_w = &gate_up_w[e * gu_per_expert_packed..(e + 1) * gu_per_expert_packed];
         let gu_s = &gate_up_s[e * gu_per_expert_scales..(e + 1) * gu_per_expert_scales];
-        let gu_z = &gate_up_z[e * gu_per_expert_scales..(e + 1) * gu_per_expert_scales];
         let dp_w = &down_w[e * dp_per_expert_packed..(e + 1) * dp_per_expert_packed];
         let dp_s = &down_s[e * dp_per_expert_scales..(e + 1) * dp_per_expert_scales];
-        let dp_z = &down_z[e * dp_per_expert_scales..(e + 1) * dp_per_expert_scales];
 
         for row in lo..hi {
             let token_idx = permuted_token_idx[row] as usize;
@@ -308,7 +312,7 @@ fn cpu_grouped_expert(
             // Phase G: gate_up @ x → gu[2*I].
             let mut gu = vec![0.0f32; two_i];
             for r in 0..two_i {
-                gu[r] = int4_matvec_row(gu_w, gu_s, gu_z, two_i, hidden, GROUP_SIZE, r, &x);
+                gu[r] = int4_matvec_row(gu_w, gu_s, two_i, hidden, GROUP_SIZE, r, &x);
             }
 
             // Phase H: silu(gp) * up. BF16-round on store to match the
@@ -326,7 +330,7 @@ fn cpu_grouped_expert(
 
             // Phase I: down @ mid → out_row[hidden] BF16.
             for r in 0..hidden {
-                let val = int4_matvec_row(dp_w, dp_s, dp_z, hidden, i, GROUP_SIZE, r, &mid);
+                let val = int4_matvec_row(dp_w, dp_s, hidden, i, GROUP_SIZE, r, &mid);
                 out[row * hidden + r] = half::bf16::from_f32(bf16_round_rne_f32(val));
             }
         }
@@ -357,15 +361,14 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
     );
 
     // Synthesize per-expert INT4 weights. Layouts match the bake:
-    //   gate_up: [E, 2*I, hidden/2] u8 + [E, 2*I/gs, hidden/gs] BF16.
-    //   down:    [E, hidden, I/2] u8 + [E, hidden/gs, I/gs] BF16.
+    //   gate_up: [E, 2*I, hidden/2] u8 + [E, 2*I, hidden/gs] BF16.
+    //   down:    [E, hidden, I/2] u8 + [E, hidden, I/gs] BF16.
     let two_i = 2 * shape.moe_intermediate;
     let mut gu_w_all: Vec<u8> = Vec::with_capacity(shape.num_experts * two_i * (shape.hidden / 2));
     let mut gu_s_all: Vec<half::bf16> =
-        Vec::with_capacity(shape.num_experts * (two_i / GROUP_SIZE) * (shape.hidden / GROUP_SIZE));
-    let mut gu_z_all: Vec<half::bf16> = Vec::with_capacity(gu_s_all.capacity());
+        Vec::with_capacity(shape.num_experts * two_i * (shape.hidden / GROUP_SIZE));
     for e in 0..shape.num_experts {
-        let (w, s, z) = make_int4_slab(
+        let (w, s) = make_int4_slab(
             two_i,
             shape.hidden,
             GROUP_SIZE,
@@ -373,17 +376,15 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
         );
         gu_w_all.extend_from_slice(&w);
         gu_s_all.extend_from_slice(&s);
-        gu_z_all.extend_from_slice(&z);
     }
 
     let mut dp_w_all: Vec<u8> =
         Vec::with_capacity(shape.num_experts * shape.hidden * (shape.moe_intermediate / 2));
     let mut dp_s_all: Vec<half::bf16> = Vec::with_capacity(
-        shape.num_experts * (shape.hidden / GROUP_SIZE) * (shape.moe_intermediate / GROUP_SIZE),
+        shape.num_experts * shape.hidden * (shape.moe_intermediate / GROUP_SIZE),
     );
-    let mut dp_z_all: Vec<half::bf16> = Vec::with_capacity(dp_s_all.capacity());
     for e in 0..shape.num_experts {
-        let (w, s, z) = make_int4_slab(
+        let (w, s) = make_int4_slab(
             shape.hidden,
             shape.moe_intermediate,
             GROUP_SIZE,
@@ -391,7 +392,6 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
         );
         dp_w_all.extend_from_slice(&w);
         dp_s_all.extend_from_slice(&s);
-        dp_z_all.extend_from_slice(&z);
     }
 
     // Upload buffers.
@@ -407,20 +407,7 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
     let gu_s_buf = upload_bf16(
         ordinal,
         &gu_s_all,
-        &[
-            shape.num_experts,
-            two_i / GROUP_SIZE,
-            shape.hidden / GROUP_SIZE,
-        ],
-    );
-    let gu_z_buf = upload_bf16(
-        ordinal,
-        &gu_z_all,
-        &[
-            shape.num_experts,
-            two_i / GROUP_SIZE,
-            shape.hidden / GROUP_SIZE,
-        ],
+        &[shape.num_experts, two_i, shape.hidden / GROUP_SIZE],
     );
     let dp_w_buf = upload_u8(
         ordinal,
@@ -432,19 +419,12 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
         &dp_s_all,
         &[
             shape.num_experts,
-            shape.hidden / GROUP_SIZE,
+            shape.hidden,
             shape.moe_intermediate / GROUP_SIZE,
         ],
     );
-    let dp_z_buf = upload_bf16(
-        ordinal,
-        &dp_z_all,
-        &[
-            shape.num_experts,
-            shape.hidden / GROUP_SIZE,
-            shape.moe_intermediate / GROUP_SIZE,
-        ],
-    );
+    let gate_up_desc = row_group_desc(&gu_s_buf, two_i, shape.hidden);
+    let down_desc = row_group_desc(&dp_s_buf, shape.hidden, shape.moe_intermediate);
 
     let mut out_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[total_rows, shape.hidden])
         .expect("alloc expert_out");
@@ -458,16 +438,17 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
         shape.num_experts,
         shape.hidden,
         shape.moe_intermediate,
-        GROUP_SIZE,
         &x_buf,
         &offsets_buf,
         &perm_token_buf,
         &gu_w_buf,
         &gu_s_buf,
-        &gu_z_buf,
+        None,
+        &gate_up_desc,
         &dp_w_buf,
         &dp_s_buf,
-        &dp_z_buf,
+        None,
+        &down_desc,
         &mut out_buf,
         &mut counters_buf,
     )
@@ -483,10 +464,8 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
         &offsets_host,
         &gu_w_all,
         &gu_s_all,
-        &gu_z_all,
         &dp_w_all,
         &dp_s_all,
-        &dp_z_all,
     );
 
     // Tolerances. INT4 GEMV + WMMA + BF16 quantisation noise pushes
@@ -608,10 +587,10 @@ fn grouped_expert_matches_cpu_reference() {
     // Sweep production shape (N=64, top_k=8, num_experts=256, hidden=2048, I=512)
     // plus smaller shapes to exercise edge cases: minimum hidden divisible by gs,
     // single-token, smaller num_experts. The minimal shape uses the smallest
-    // dims that still respect group_size=128 divisibility on both reduction dims.
+    // dims that still respect group_size=32 divisibility on both reduction dims.
     for &(n_tokens, top_k, num_experts, hidden, moe_int, seed) in &[
-        // Minimal: hidden=128, I=128 are both = group_size (one scale-row each).
-        (4usize, 2usize, 8usize, 128usize, 128usize, 0x10u64),
+        // Minimal: hidden=32, I=32 are both = group_size.
+        (4usize, 2usize, 8usize, 32usize, 32usize, 0x10u64),
         // Smaller mid: closer to production but trims I and hidden by 4x.
         (16, 8, 64, 512, 256, 0x20),
         // Production shape — the one that matters for qwen3.6-35b-a3b.

@@ -10,11 +10,10 @@ use std::{io::Write as _, path::Path, ptr};
 
 use anyhow::{Context, Result};
 use gpu_hal::{set_backend, Backend};
-use kernel_ffi::qwen36_moe::{
-    Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
-};
+use kernel_ffi::qwen36_moe::{Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights};
 use model_store::manifest::QuantProfile;
 use model_store::BakedStore;
+use supersonic_runtime::qwen36_moe::persistent_decode::build_ffn_step_int4;
 use supersonic_runtime::qwen36_moe_config::qwen36_kv_vmm_mode_from_env_value;
 
 use crate::bakes::{
@@ -111,45 +110,8 @@ fn prewarm_qwen36_mps_static_topn_if_requested(
             shared_down_proj_w: ffn.shared_down_proj_w.as_ptr(),
             shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
         };
-        let fp8 = int4.group_size < 0;
-        let int4_ptrs = Qwen36MoeFfnStepInt4 {
-            group_size: int4.group_size,
-            gate_up_proj_type: int4.gate_up_proj_type,
-            gate_up_proj_scale: int4.gate_up_proj_scale.as_ptr(),
-            gate_up_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.gate_up_proj_zero.as_ptr()
-            },
-            down_proj_type: int4.down_proj_type,
-            down_proj_scale: int4.down_proj_scale.as_ptr(),
-            down_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.down_proj_zero.as_ptr()
-            },
-            shared_gate_proj_type: int4.shared_gate_proj_type,
-            shared_gate_proj_scale: int4.shared_gate_proj_scale.as_ptr(),
-            shared_gate_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.shared_gate_proj_zero.as_ptr()
-            },
-            shared_up_proj_type: int4.shared_up_proj_type,
-            shared_up_proj_scale: int4.shared_up_proj_scale.as_ptr(),
-            shared_up_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.shared_up_proj_zero.as_ptr()
-            },
-            shared_down_proj_type: int4.shared_down_proj_type,
-            shared_down_proj_scale: int4.shared_down_proj_scale.as_ptr(),
-            shared_down_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.shared_down_proj_zero.as_ptr()
-            },
-        };
+        let int4_ptrs = build_ffn_step_int4(int4)
+            .with_context(|| format!("build Qwen3.6 FFN descriptors for layer {layer_idx}"))?;
         if let Some(stats) = kernel_ffi::qwen36_moe::qwen36_prewarm_mps_static_topn_rhs_for_metal(
             ordinal, params, &weights, &int4_ptrs,
         )

@@ -345,24 +345,32 @@ fn classify_projection_set(
     if group_size < 0 {
         return Ok(Qwen36LayerWeightEncoding::Fp8);
     }
-    if group_size != QWEN36_MOE_INT4_GROUP_SIZE {
-        return Err(anyhow!(
-            "unsupported Qwen3.6 low-bit group size {group_size}; expected {}",
-            QWEN36_MOE_INT4_GROUP_SIZE
-        ));
-    }
     if projection_types
         .iter()
         .all(|&projection_type| projection_type == QWEN36_MOE_LOWBIT_NATIVE_INT4)
     {
-        Ok(Qwen36LayerWeightEncoding::NativeInt4)
+        if matches!(group_size, 32 | QWEN36_MOE_INT4_GROUP_SIZE) {
+            Ok(Qwen36LayerWeightEncoding::NativeInt4)
+        } else {
+            Err(anyhow!(
+                "unsupported Qwen3.6 native INT4 group size {group_size}; expected 32 or {}",
+                QWEN36_MOE_INT4_GROUP_SIZE
+            ))
+        }
     } else if projection_types.iter().all(|&projection_type| {
         matches!(
             projection_type,
             QWEN36_MOE_LOWBIT_GGML_Q4_K | QWEN36_MOE_LOWBIT_GGML_Q5_K | QWEN36_MOE_LOWBIT_GGML_Q6_K
         )
     }) {
-        Ok(Qwen36LayerWeightEncoding::GgmlKBlock)
+        if group_size == QWEN36_MOE_INT4_GROUP_SIZE {
+            Ok(Qwen36LayerWeightEncoding::GgmlKBlock)
+        } else {
+            Err(anyhow!(
+                "unsupported Qwen3.6 GGML K-block group size {group_size}; expected {}",
+                QWEN36_MOE_INT4_GROUP_SIZE
+            ))
+        }
     } else {
         Err(anyhow!(
             "mixed or unsupported Qwen3.6 projection types {projection_types:?}"
@@ -424,14 +432,25 @@ pub(crate) fn ensure_legacy_int4_execution_supported(
     layers: &[LayerBuffers],
     execution_path: &str,
 ) -> Result<()> {
-    let reject_row_group =
+    let validate_row_group =
         |layer_idx: usize, projection: &str, sidecar: &LoadedInt4Sidecar| -> Result<()> {
             if sidecar.view.kind == Int4StorageKind::RowGroupSymmetric {
-                return Err(anyhow!(
-                    "Qwen3.6 {execution_path} legacy execution does not support row-group INT4 \
-                     encoding 2 (layer {layer_idx} {projection}); descriptor-driven \
-                     row-group dequantization is required"
-                ));
+                if !matches!(execution_path, "chained decode" | "persistent decode") {
+                    return Err(anyhow!(
+                        "Qwen3.6 {execution_path} does not advertise descriptor-driven row-group \
+                         INT4 execution (layer {layer_idx} {projection})"
+                    ));
+                }
+                let desc = crate::qwen36_moe::persistent_decode::build_int4_weight_desc(sidecar)
+                    .with_context(|| {
+                        format!("Qwen3.6 {execution_path} layer {layer_idx} {projection}")
+                    })?;
+                if desc.encoding != 2 || desc.zero != std::ptr::null() {
+                    return Err(anyhow!(
+                        "Qwen3.6 {execution_path} layer {layer_idx} {projection} did not build \
+                         the encoding-2 null-zero descriptor"
+                    ));
+                }
             }
             Ok(())
         };
@@ -445,7 +464,7 @@ pub(crate) fn ensure_legacy_int4_execution_supported(
                     ("v_proj", &s.v_proj),
                     ("o_proj", &s.o_proj),
                 ] {
-                    reject_row_group(layer_idx, projection, sidecar)?;
+                    validate_row_group(layer_idx, projection, sidecar)?;
                 }
             }
             AttnLayerBuffers::Linear { int4: Some(s), .. } => {
@@ -454,7 +473,7 @@ pub(crate) fn ensure_legacy_int4_execution_supported(
                     ("linear_in_proj_z", &s.in_proj_z),
                     ("linear_out_proj", &s.out_proj),
                 ] {
-                    reject_row_group(layer_idx, projection, sidecar)?;
+                    validate_row_group(layer_idx, projection, sidecar)?;
                 }
             }
             AttnLayerBuffers::Full { int4: None, .. }
@@ -469,7 +488,7 @@ pub(crate) fn ensure_legacy_int4_execution_supported(
                 ("shared_expert_up_proj", &s.shared_up_proj),
                 ("shared_expert_down_proj", &s.shared_down_proj),
             ] {
-                reject_row_group(layer_idx, projection, sidecar)?;
+                validate_row_group(layer_idx, projection, sidecar)?;
             }
         }
     }
@@ -1506,7 +1525,7 @@ pub fn load_qwen36_layers(
 mod direct_load_tests {
     use super::*;
     use crate::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
-    use crate::qwen36_moe::decode::{run_chained_decode_fast, Qwen36ExecutionOptions};
+    use crate::qwen36_moe::decode::Qwen36ExecutionOptions;
     use crate::qwen36_moe::persistent_decode::{build_int4_weight_desc, validate_int4_sidecar_set};
     use crate::qwen36_moe::prefill::run_batched_prefill;
     use crate::qwen36_moe::residency::{MoeExpertResidencyConfig, MoeExpertResidencyManager};
@@ -2255,7 +2274,7 @@ mod direct_load_tests {
     }
 
     #[test]
-    fn flm_row_group_geometry_reaches_descriptors_but_legacy_decode_rejects_before_launch() {
+    fn flm_row_group_geometry_is_admitted_only_on_descriptor_driven_decode_paths() {
         let _backend_lock = GPU_BACKEND_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2294,27 +2313,18 @@ mod direct_load_tests {
         assert!(desc.zero.is_null());
         assert_eq!(desc.encoding, 2);
 
-        let invalid_ordinal = usize::MAX;
-        let persistent_err = loaded
-            .enable_persistent(invalid_ordinal, &geom())
-            .expect_err("persistent legacy execution must reject row-group INT4");
-        let chained_err = match run_chained_decode_fast(
-            invalid_ordinal,
-            &geom(),
-            loaded.layers_mut_before_persistent().unwrap(),
-            &[0; 128 * 2],
-            0,
-            false,
-            &Qwen36ExecutionOptions::default(),
-        ) {
-            Ok(_) => panic!("chained legacy execution must reject row-group INT4"),
-            Err(err) => err,
-        };
+        ensure_legacy_int4_execution_supported(loaded.layers(), "persistent decode")
+            .expect("persistent decode must admit descriptor-driven row-group INT4");
+        ensure_legacy_int4_execution_supported(loaded.layers(), "chained decode")
+            .expect("chained decode must admit descriptor-driven row-group INT4");
+        let unsupported =
+            ensure_legacy_int4_execution_supported(loaded.layers(), "unconverted diagnostic path")
+                .expect_err("unconverted paths must reject row-group INT4 before device work");
         assert!(
-            persistent_err.to_string().contains("row-group INT4")
-                && chained_err.to_string().contains("row-group INT4"),
-            "legacy paths did not reject row-group INT4 before device work:\n\
-             persistent: {persistent_err:#}\nchained: {chained_err:#}"
+            unsupported
+                .to_string()
+                .contains("does not advertise descriptor-driven row-group INT4 execution"),
+            "unexpected fail-closed guard error: {unsupported:#}"
         );
     }
 

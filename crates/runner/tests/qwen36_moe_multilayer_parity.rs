@@ -32,7 +32,9 @@ use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, Sc
 use half::bf16;
 use kernel_ffi::qwen36_moe::{
     ffn_step_launch, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
+    Qwen36MoeInt4WeightDesc,
 };
+use model_store::store::{Int4StorageKind, Int4StorageView};
 use runner::qwen36_moe_logits::{bf16_bytes_to_f32, host_final_norm_lm_head};
 use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
 use serde_json::Value;
@@ -44,10 +46,12 @@ use supersonic_runtime::qwen36_moe::decode::{
 };
 use supersonic_runtime::qwen36_moe::layer_loader::Qwen36WeightMode;
 use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
+use supersonic_runtime::qwen36_moe::persistent_decode::build_int4_descs;
 use supersonic_runtime::qwen36_moe::persistent_decode::{LmHeadFold, CACHE_POS_INHERIT};
 use supersonic_runtime::qwen36_moe::types::{
     is_full_attn_layer, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
-    LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, PositionPair, ResidentWeight,
+    LayerBuffers, LinearAttnInt4Sidecars, LoadedInt4Sidecar, MultiLayerGeom, PositionPair,
+    ResidentWeight,
 };
 
 const TRACKED_MULTILAYER_ORACLE: &str = "../../oracle/fixtures/qwen36_moe_multilayer_int4_v1.json";
@@ -183,9 +187,9 @@ fn upload_u8(ordinal: usize, shape: &[usize], bytes: &[u8], label: &str) -> GpuB
         .unwrap_or_else(|e| panic!("upload {label}: {e}"))
 }
 
-/// Helper: pull (packed_u8, scale_bf16, zero_bf16) byte streams for one
+/// Helper: pull (packed_u8, scale_bf16, optional zero_bf16) byte streams for one
 /// INT4-quantized tensor out of `int4_weights_per_layer[li].{attn|ffn}.<name>`.
-fn decode_int4_sidecar(block: &Value, name: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+fn decode_int4_sidecar(block: &Value, name: &str) -> (Vec<u8>, Vec<u8>, Option<Vec<u8>>) {
     let blk = &block[name];
     let packed = b64(blk["packed"]
         .as_str()
@@ -193,10 +197,58 @@ fn decode_int4_sidecar(block: &Value, name: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>)
     let scale = b64(blk["scale"]
         .as_str()
         .unwrap_or_else(|| panic!("missing int4 {name}.scale")));
-    let zero = b64(blk["zero"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing int4 {name}.zero")));
+    let zero = blk.get("zero").and_then(Value::as_str).map(b64);
     (packed, scale, zero)
+}
+
+fn row_group_sidecar(
+    ordinal: usize,
+    name: &str,
+    logical_shape: &[usize],
+    group_size: usize,
+    scale: &[u8],
+    zero: Option<&[u8]>,
+) -> LoadedInt4Sidecar {
+    assert_eq!(group_size, 32, "row-group fixture must use G32");
+    assert!(zero.is_none(), "row-group fixture {name} must omit zero");
+    let out_rows = logical_shape[logical_shape.len() - 2];
+    let in_cols = logical_shape[logical_shape.len() - 1];
+    let packed_row_stride_bytes = in_cols / 2;
+    let scale_row_stride_elements = in_cols / group_size;
+    LoadedInt4Sidecar {
+        scale: upload_bf16(ordinal, &[scale.len() / 2], scale, &format!("{name} scale")),
+        zero: None,
+        view: Int4StorageView {
+            kind: Int4StorageKind::RowGroupSymmetric,
+            group_size,
+            packed_tensor: format!("{name}.packed"),
+            scale_tensor: format!("{name}.scale"),
+            zero_tensor: None,
+            logical_shape: logical_shape.to_vec(),
+            packed_row_stride_bytes,
+            packed_expert_stride_bytes: out_rows * packed_row_stride_bytes,
+            scale_row_stride_elements,
+            scale_expert_stride_elements: out_rows * scale_row_stride_elements,
+            output_group_size: 1,
+            implicit_zero_code: Some(8),
+        },
+    }
+}
+
+fn row_group_weight_desc(sidecar: &LoadedInt4Sidecar) -> Qwen36MoeInt4WeightDesc {
+    let view = &sidecar.view;
+    Qwen36MoeInt4WeightDesc {
+        scale: sidecar.scale.as_ptr(),
+        zero: std::ptr::null(),
+        packed_row_stride_bytes: view.packed_row_stride_bytes as u64,
+        packed_expert_stride_bytes: view.packed_expert_stride_bytes as u64,
+        scale_row_stride_elements: view.scale_row_stride_elements as u64,
+        scale_expert_stride_elements: view.scale_expert_stride_elements as u64,
+        input_group_size: view.group_size as i32,
+        output_group_size: view.output_group_size as i32,
+        implicit_zero_code: view.implicit_zero_code.unwrap() as i32,
+        encoding: 2,
+    }
 }
 
 fn build_full_attn_layer(
@@ -226,17 +278,41 @@ fn build_full_attn_layer(
         let int4 = FullAttnInt4Sidecars {
             group_size,
             q_proj_type: 4,
-            q_proj_scale: upload_bf16(ordinal, &[qs.len() / 2], &qs, "q scale"),
-            q_proj_zero: upload_bf16(ordinal, &[qz.len() / 2], &qz, "q zero"),
+            q_proj: row_group_sidecar(
+                ordinal,
+                "q_proj",
+                &[2 * h * d, hidden],
+                group_size as usize,
+                &qs,
+                qz.as_deref(),
+            ),
             k_proj_type: 4,
-            k_proj_scale: upload_bf16(ordinal, &[ks.len() / 2], &ks, "k scale"),
-            k_proj_zero: upload_bf16(ordinal, &[kz.len() / 2], &kz, "k zero"),
+            k_proj: row_group_sidecar(
+                ordinal,
+                "k_proj",
+                &[hkv * d, hidden],
+                group_size as usize,
+                &ks,
+                kz.as_deref(),
+            ),
             v_proj_type: 4,
-            v_proj_scale: upload_bf16(ordinal, &[vs.len() / 2], &vs, "v scale"),
-            v_proj_zero: upload_bf16(ordinal, &[vz.len() / 2], &vz, "v zero"),
+            v_proj: row_group_sidecar(
+                ordinal,
+                "v_proj",
+                &[hkv * d, hidden],
+                group_size as usize,
+                &vs,
+                vz.as_deref(),
+            ),
             o_proj_type: 4,
-            o_proj_scale: upload_bf16(ordinal, &[os.len() / 2], &os, "o scale"),
-            o_proj_zero: upload_bf16(ordinal, &[oz.len() / 2], &oz, "o zero"),
+            o_proj: row_group_sidecar(
+                ordinal,
+                "o_proj",
+                &[hidden, h * d],
+                group_size as usize,
+                &os,
+                oz.as_deref(),
+            ),
         };
         (q_proj_w, k_proj_w, v_proj_w, o_proj_w, Some(int4))
     } else {
@@ -322,14 +398,32 @@ fn build_linear_attn_layer(
         let int4 = LinearAttnInt4Sidecars {
             group_size,
             in_proj_qkv_type: 4,
-            in_proj_qkv_scale: upload_bf16(ordinal, &[qs.len() / 2], &qs, "in_proj_qkv scale"),
-            in_proj_qkv_zero: upload_bf16(ordinal, &[qz.len() / 2], &qz, "in_proj_qkv zero"),
+            in_proj_qkv: row_group_sidecar(
+                ordinal,
+                "in_proj_qkv",
+                &[qkv_dim, hidden],
+                group_size as usize,
+                &qs,
+                qz.as_deref(),
+            ),
             in_proj_z_type: 4,
-            in_proj_z_scale: upload_bf16(ordinal, &[zs.len() / 2], &zs, "in_proj_z scale"),
-            in_proj_z_zero: upload_bf16(ordinal, &[zz.len() / 2], &zz, "in_proj_z zero"),
+            in_proj_z: row_group_sidecar(
+                ordinal,
+                "in_proj_z",
+                &[val_dim, hidden],
+                group_size as usize,
+                &zs,
+                zz.as_deref(),
+            ),
             out_proj_type: 4,
-            out_proj_scale: upload_bf16(ordinal, &[os.len() / 2], &os, "out_proj scale"),
-            out_proj_zero: upload_bf16(ordinal, &[oz.len() / 2], &oz, "out_proj zero"),
+            out_proj: row_group_sidecar(
+                ordinal,
+                "linear_out_proj",
+                &[hidden, val_dim],
+                group_size as usize,
+                &os,
+                oz.as_deref(),
+            ),
         };
         (in_proj_qkv_w, in_proj_z_w, out_proj_w, Some(int4))
     } else {
@@ -443,20 +537,50 @@ fn build_ffn_layer(
         let int4 = FfnInt4Sidecars {
             group_size,
             gate_up_proj_type: 4,
-            gate_up_proj_scale: upload_bf16(ordinal, &[gs.len() / 2], &gs, "gate_up scale"),
-            gate_up_proj_zero: upload_bf16(ordinal, &[gz.len() / 2], &gz, "gate_up zero"),
+            gate_up_proj: row_group_sidecar(
+                ordinal,
+                "gate_up_proj",
+                &[e, 2 * i_dim, hidden],
+                group_size as usize,
+                &gs,
+                gz.as_deref(),
+            ),
             down_proj_type: 4,
-            down_proj_scale: upload_bf16(ordinal, &[ds.len() / 2], &ds, "down_proj scale"),
-            down_proj_zero: upload_bf16(ordinal, &[dz.len() / 2], &dz, "down_proj zero"),
+            down_proj: row_group_sidecar(
+                ordinal,
+                "down_proj",
+                &[e, hidden, i_dim],
+                group_size as usize,
+                &ds,
+                dz.as_deref(),
+            ),
             shared_gate_proj_type: 4,
-            shared_gate_proj_scale: upload_bf16(ordinal, &[sgs.len() / 2], &sgs, "sgp scale"),
-            shared_gate_proj_zero: upload_bf16(ordinal, &[sgz.len() / 2], &sgz, "sgp zero"),
+            shared_gate_proj: row_group_sidecar(
+                ordinal,
+                "shared_gate_proj",
+                &[is_dim, hidden],
+                group_size as usize,
+                &sgs,
+                sgz.as_deref(),
+            ),
             shared_up_proj_type: 4,
-            shared_up_proj_scale: upload_bf16(ordinal, &[sus.len() / 2], &sus, "sup scale"),
-            shared_up_proj_zero: upload_bf16(ordinal, &[suz.len() / 2], &suz, "sup zero"),
+            shared_up_proj: row_group_sidecar(
+                ordinal,
+                "shared_up_proj",
+                &[is_dim, hidden],
+                group_size as usize,
+                &sus,
+                suz.as_deref(),
+            ),
             shared_down_proj_type: 4,
-            shared_down_proj_scale: upload_bf16(ordinal, &[sds.len() / 2], &sds, "sdp scale"),
-            shared_down_proj_zero: upload_bf16(ordinal, &[sdz.len() / 2], &sdz, "sdp zero"),
+            shared_down_proj: row_group_sidecar(
+                ordinal,
+                "shared_down_proj",
+                &[hidden, is_dim],
+                group_size as usize,
+                &sds,
+                sdz.as_deref(),
+            ),
         };
         (
             gate_up_proj_w,
@@ -554,6 +678,51 @@ fn build_layers(
             LayerBuffers { attn, ffn }
         })
         .collect()
+}
+
+fn assert_all_material_descriptors_are_row_group(layers: &[LayerBuffers]) {
+    let descs = build_int4_descs(layers)
+        .expect("build row-group descriptors")
+        .expect("row-group descriptor array");
+    for (layer_idx, desc) in descs.iter().enumerate() {
+        let mut expected = vec![
+            ("experts_gate_up", &desc.experts_gate_up),
+            ("experts_down", &desc.experts_down),
+            ("shared_gate", &desc.shared_expert_gate_proj),
+            ("shared_up", &desc.shared_expert_up_proj),
+            ("shared_down", &desc.shared_expert_down_proj),
+        ];
+        if is_full_attn_layer(layer_idx as i32) {
+            expected.extend([
+                ("q_proj", &desc.q_proj),
+                ("k_proj", &desc.k_proj),
+                ("v_proj", &desc.v_proj),
+                ("o_proj", &desc.o_proj),
+            ]);
+        } else {
+            expected.extend([
+                ("linear_qkv", &desc.linear_in_proj_qkv),
+                ("linear_z", &desc.linear_in_proj_z),
+                ("linear_out", &desc.linear_out_proj),
+            ]);
+        }
+        for (projection, weight) in expected {
+            assert_eq!(weight.encoding, 2, "layer {layer_idx} {projection}");
+            assert!(weight.zero.is_null(), "layer {layer_idx} {projection} zero");
+            assert_eq!(
+                weight.input_group_size, 32,
+                "layer {layer_idx} {projection}"
+            );
+            assert_eq!(
+                weight.output_group_size, 1,
+                "layer {layer_idx} {projection}"
+            );
+            assert_eq!(
+                weight.implicit_zero_code, 8,
+                "layer {layer_idx} {projection}"
+            );
+        }
+    }
 }
 
 fn run_isolated_attention(
@@ -705,6 +874,18 @@ fn tracked_multilayer_oracle_is_the_mandatory_default() {
         json["schema"], "qwen36-moe-oracle-multilayer-int4-v1",
         "qualification default must be the independent INT4 oracle"
     );
+    assert_eq!(json["config"]["int4_layout"], "row_group");
+    assert_eq!(json["config"]["int4_group_size"], 32);
+    for layer in json["int4_weights_per_layer"].as_array().unwrap() {
+        for block in ["attn", "ffn"] {
+            for (projection, sidecar) in layer[block].as_object().unwrap() {
+                assert!(
+                    sidecar.get("zero").is_none(),
+                    "{block}.{projection} row-group sidecar must omit zero"
+                );
+            }
+        }
+    }
     assert_eq!(json["mode"], "synthetic");
     assert_eq!(json["state"], "fresh");
     assert_eq!(json["num_layers"], 4);
@@ -776,20 +957,25 @@ fn run_isolated_ffn_stage(
             Qwen36MoeFfnStepInt4 {
                 group_size: sidecars.group_size,
                 gate_up_proj_type: sidecars.gate_up_proj_type,
-                gate_up_proj_scale: sidecars.gate_up_proj_scale.as_ptr(),
-                gate_up_proj_zero: sidecars.gate_up_proj_zero.as_ptr(),
+                gate_up_proj: row_group_weight_desc(&sidecars.gate_up_proj),
+                gate_up_proj_scale: sidecars.gate_up_proj.scale.as_ptr(),
+                gate_up_proj_zero: sidecars.gate_up_proj.zero_ptr(),
                 down_proj_type: sidecars.down_proj_type,
-                down_proj_scale: sidecars.down_proj_scale.as_ptr(),
-                down_proj_zero: sidecars.down_proj_zero.as_ptr(),
+                down_proj: row_group_weight_desc(&sidecars.down_proj),
+                down_proj_scale: sidecars.down_proj.scale.as_ptr(),
+                down_proj_zero: sidecars.down_proj.zero_ptr(),
                 shared_gate_proj_type: sidecars.shared_gate_proj_type,
-                shared_gate_proj_scale: sidecars.shared_gate_proj_scale.as_ptr(),
-                shared_gate_proj_zero: sidecars.shared_gate_proj_zero.as_ptr(),
+                shared_gate_proj: row_group_weight_desc(&sidecars.shared_gate_proj),
+                shared_gate_proj_scale: sidecars.shared_gate_proj.scale.as_ptr(),
+                shared_gate_proj_zero: sidecars.shared_gate_proj.zero_ptr(),
                 shared_up_proj_type: sidecars.shared_up_proj_type,
-                shared_up_proj_scale: sidecars.shared_up_proj_scale.as_ptr(),
-                shared_up_proj_zero: sidecars.shared_up_proj_zero.as_ptr(),
+                shared_up_proj: row_group_weight_desc(&sidecars.shared_up_proj),
+                shared_up_proj_scale: sidecars.shared_up_proj.scale.as_ptr(),
+                shared_up_proj_zero: sidecars.shared_up_proj.zero_ptr(),
                 shared_down_proj_type: sidecars.shared_down_proj_type,
-                shared_down_proj_scale: sidecars.shared_down_proj_scale.as_ptr(),
-                shared_down_proj_zero: sidecars.shared_down_proj_zero.as_ptr(),
+                shared_down_proj: row_group_weight_desc(&sidecars.shared_down_proj),
+                shared_down_proj_scale: sidecars.shared_down_proj.scale.as_ptr(),
+                shared_down_proj_zero: sidecars.shared_down_proj.zero_ptr(),
             }
         });
     ffn_step_launch(
@@ -886,6 +1072,7 @@ fn multilayer_chained_decode_matches_oracle() {
         int4_per_layer,
         int4_group_size,
     );
+    assert_all_material_descriptors_are_row_group(&layers);
     let mut exact_input_attn_layers = build_layers(
         ordinal,
         &geom,
@@ -1228,6 +1415,7 @@ fn multilayer_persistent_decode_matches_chained() {
         let ffn = build_ffn_layer(ordinal, &geom, ffn_w, ffn_int4, int4_group_size);
         layers.push(LayerBuffers { attn, ffn });
     }
+    assert_all_material_descriptors_are_row_group(&layers);
 
     let initial_hidden = b64_field(&json, "input_hidden");
     let final_norm_w = b64_field(&json, "final_norm_w");

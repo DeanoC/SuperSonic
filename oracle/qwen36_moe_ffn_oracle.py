@@ -9,13 +9,13 @@ expert dispatch, shared-expert path, and the final residual add. The HIP
 kernel's parity test reads the JSON this script emits and compares its own
 intermediates point for point.
 
-`--int4` switches into INT4 mode: the five projection weights that the
-INT4 bake quantizes (`gate_up_proj`, `down_proj`, and the shared expert's
-`gate_proj`/`up_proj`/`down_proj`) are min/max group-quantized at gs=128
-with BF16 scale + zero. The `weights` block then carries the BF16-rounded
-*reconstruction* of those tensors (so the existing BF16 kernel path is
-still exercised) and a parallel `int4_weights` block carries the packed
-nibbles + scale + zero sidecars the INT4 kernel path will read. Schema
+`--int4` switches the five routed/shared projections to tile-v1 G128
+min/max quantization with BF16 scale + zero or row-group G32 symmetric
+quantization with per-output-row BF16 scales and no zero plane. The
+`weights` block carries BF16 tile-v1 reconstruction or exact F32
+row-group `(code - 8) * scale` values, matching the production compute
+path's operand semantics. `int4_weights` carries the packed nibbles and
+layout-specific sidecars read by the kernel. Schema
 becomes `qwen36-moe-oracle-ffn-int4-v1`.
 
 The INT4 quantization mirrors `oracle/bake_int4.py::fused_expert_minmax_int4_packed`
@@ -116,8 +116,8 @@ INT4_FFN_TARGETS: tuple[str, ...] = (
 
 @torch.no_grad()
 def minmax_int4_packed_and_recon(
-    W: torch.Tensor, group_size: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    W: torch.Tensor, group_size: int, layout: str = "tile_v1"
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Min/max INT4 group-quant for a tensor whose last two axes are
     `[out, in]`. Leading axes (e.g. the per-layer expert axis) are
     preserved. Mirrors `bake_int4.py::fused_expert_minmax_int4_packed` for
@@ -126,18 +126,19 @@ def minmax_int4_packed_and_recon(
     size and storage layout are the same).
 
     Returns (all on CPU except `recon`, which stays on `W.device` so it can
-    be reinjected as the BF16 weight value the BF16 kernel path reads):
+    be reinjected as the layout-specific reference weight value):
 
       packed   uint8  shape `[..., out, in/2]`     two nibbles per byte,
                                                     even col → low nibble.
-      scale    f32    shape `[..., out/gs, in/gs]` BF16 values stored as f32.
-      zero     f32    shape `[..., out/gs, in/gs]` BF16 values stored as f32.
-      recon    bf16   shape `[..., out, in]`        single-rounding
-                                                    `bf16(q*s - z*s)` —
-                                                    matches the kernel's
-                                                    `bf16_round_rne_f32_finite(
-                                                       n*s - zs)` exactly.
+      scale    f32    tile-v1 `[..., out/gs, in/gs]`, row-group
+                       `[..., out, in/gs]`; BF16 values stored as f32.
+      zero     f32    tile-v1 `[..., out/gs, in/gs]`; absent row-group.
+      recon           shape `[..., out, in]`        F32 `(q-8)*s` for
+                                                    row-group, BF16 tile-v1
+                                                    compatibility otherwise.
     """
+    if layout not in ("tile_v1", "row_group"):
+        raise ValueError(f"unsupported INT4 layout: {layout}")
     if W.dim() < 2:
         raise ValueError(f"expected 2+ dim, got shape {tuple(W.shape)}")
     out_f, in_f = W.shape[-2], W.shape[-1]
@@ -146,24 +147,43 @@ def minmax_int4_packed_and_recon(
         raise ValueError(
             f"in_features {in_f} must be divisible by group_size={gs} and even"
         )
-    if out_f % gs != 0:
+    if layout == "tile_v1" and out_f % gs != 0:
         raise ValueError(
             f"out_features {out_f} must be divisible by group_size={gs}"
         )
-    sr = out_f // gs
+    scale_rows = out_f if layout == "row_group" else out_f // gs
     sc = in_f // gs
     leading = tuple(W.shape[:-2])
     Wf = W.reshape(-1, out_f, in_f).to(torch.float32)
     n_slabs = Wf.shape[0]
 
     packed_buf = torch.empty((n_slabs, out_f, in_f // 2), dtype=torch.uint8)
-    scale_buf = torch.empty((n_slabs, sr, sc), dtype=torch.float32)
-    zero_buf = torch.empty((n_slabs, sr, sc), dtype=torch.float32)
+    scale_buf = torch.empty((n_slabs, scale_rows, sc), dtype=torch.float32)
+    zero_buf = (None if layout == "row_group" else
+                torch.empty((n_slabs, scale_rows, sc), dtype=torch.float32))
+    recon_dtype = torch.float32 if layout == "row_group" else torch.bfloat16
     recon_buf = torch.empty((n_slabs, out_f, in_f),
-                            dtype=torch.bfloat16, device=W.device)
+                            dtype=recon_dtype, device=W.device)
 
     for i in range(n_slabs):
         slab = Wf[i]
+        if layout == "row_group":
+            groups = slab.reshape(out_f, sc, gs)
+            max_abs = groups.abs().amax(dim=2)
+            s = torch.where(max_abs > 0, max_abs / 7.0, torch.ones_like(max_abs))
+            s = s.to(torch.bfloat16).to(torch.float32)
+            s_full = s.repeat_interleave(gs, 1)
+            q = torch.clamp(
+                torch.round(slab / s_full) + 8.0, 0.0, 15.0
+            ).to(torch.uint8)
+            recon = (q.to(torch.float32) - 8.0) * s_full
+            packed = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous()
+            packed_buf[i] = packed.cpu()
+            scale_buf[i] = s.cpu()
+            recon_buf[i] = recon
+            continue
+
+        sr = out_f // gs
         tiles = slab.reshape(sr, gs, sc, gs)
         tmax = tiles.amax(dim=(1, 3))
         tmin = tiles.amin(dim=(1, 3))
@@ -193,8 +213,9 @@ def minmax_int4_packed_and_recon(
         recon_buf[i] = recon
 
     packed_buf = packed_buf.reshape(leading + (out_f, in_f // 2))
-    scale_buf = scale_buf.reshape(leading + (sr, sc))
-    zero_buf = zero_buf.reshape(leading + (sr, sc))
+    scale_buf = scale_buf.reshape(leading + (scale_rows, sc))
+    if zero_buf is not None:
+        zero_buf = zero_buf.reshape(leading + (scale_rows, sc))
     recon_buf = recon_buf.reshape(leading + (out_f, in_f))
     return packed_buf, scale_buf, zero_buf, recon_buf
 
@@ -203,50 +224,62 @@ def minmax_int4_packed_and_recon(
 def dequant_int4_packed(
     packed: torch.Tensor,
     scale: torch.Tensor,
-    zero: torch.Tensor,
+    zero: torch.Tensor | None,
     group_size: int,
+    layout: str = "tile_v1",
 ) -> torch.Tensor:
-    """Reference dequant — inverse of `minmax_int4_packed_and_recon`. Used
-    for the in-process self-check below. Returns BF16 values as F32."""
+    """Reference dequant — inverse of `minmax_int4_packed_and_recon`."""
     out_f = packed.shape[-2]
     in_half = packed.shape[-1]
     in_f = in_half * 2
     gs = group_size
     leading = tuple(packed.shape[:-2])
     pf = packed.reshape(-1, out_f, in_half)
-    sf = scale.reshape(-1, out_f // gs, in_f // gs)
-    zf = zero.reshape(-1, out_f // gs, in_f // gs)
+    scale_rows = out_f if layout == "row_group" else out_f // gs
+    sf = scale.reshape(-1, scale_rows, in_f // gs)
+    zf = None if zero is None else zero.reshape(-1, scale_rows, in_f // gs)
     n = pf.shape[0]
     out = torch.empty((n, out_f, in_f), dtype=torch.float32)
     for i in range(n):
         q = torch.empty((out_f, in_f), dtype=torch.uint8)
         q[:, 0::2] = pf[i] & 0x0F
         q[:, 1::2] = (pf[i] >> 4) & 0x0F
-        s_full = sf[i].repeat_interleave(gs, 0).repeat_interleave(gs, 1)
-        z_full = zf[i].repeat_interleave(gs, 0).repeat_interleave(gs, 1)
-        recon = (q.to(torch.float32) * s_full - z_full * s_full).to(torch.bfloat16)
+        if layout == "row_group":
+            if zf is not None:
+                raise ValueError("row-group INT4 must omit zero")
+            s_full = sf[i].repeat_interleave(gs, 1)
+            recon = (q.to(torch.float32) - 8.0) * s_full
+        else:
+            if layout != "tile_v1" or zf is None:
+                raise ValueError("tile-v1 INT4 requires an explicit zero plane")
+            s_full = sf[i].repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+            z_full = zf[i].repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+            recon = (q.to(torch.float32) * s_full - z_full * s_full).to(torch.bfloat16)
         out[i] = recon.to(torch.float32)
     return out.reshape(leading + (out_f, in_f))
 
 
 def quantize_int4_ffn_weights(
-    weights: dict[str, torch.Tensor], group_size: int
+    weights: dict[str, torch.Tensor], group_size: int, layout: str = "tile_v1"
 ) -> dict[str, dict[str, torch.Tensor]]:
     """Quantize the INT4-targeted FFN weights in-place: replace each entry
-    in `weights` with its BF16 reconstruction (cast to that weight's
-    original dtype + device). Return a parallel dict of
+    in `weights` with its layout-specific reconstruction. Return a parallel dict of
     `{name: {"packed", "scale", "zero"}}` sidecars on CPU."""
     int4_sidecars: dict[str, dict[str, torch.Tensor]] = {}
     for name in INT4_FFN_TARGETS:
         if name not in weights:
             raise SystemExit(f"INT4 mode missing required weight: {name}")
         W = weights[name]
-        packed, scale, zero, recon = minmax_int4_packed_and_recon(W, group_size)
+        packed, scale, zero, recon = minmax_int4_packed_and_recon(
+            W, group_size, layout
+        )
 
         # In-process self-check: verify (packed, scale, zero) round-trips
         # to exactly `recon`. Catches packing bugs before the kernel ever
         # sees the JSON.
-        recon_check = dequant_int4_packed(packed, scale, zero, group_size)
+        recon_check = dequant_int4_packed(
+            packed, scale, zero, group_size, layout
+        )
         diff = (recon.to(torch.float32).cpu() - recon_check).abs().max().item()
         if diff != 0.0:
             raise RuntimeError(
@@ -254,8 +287,12 @@ def quantize_int4_ffn_weights(
                 f"max |recon - dequant(packed)| = {diff:.3e}"
             )
 
-        int4_sidecars[name] = {"packed": packed, "scale": scale, "zero": zero}
-        weights[name] = recon.to(dtype=W.dtype, device=W.device)
+        sidecar = {"packed": packed, "scale": scale}
+        if zero is not None:
+            sidecar["zero"] = zero
+        int4_sidecars[name] = sidecar
+        recon_dtype = torch.float32 if layout == "row_group" else W.dtype
+        weights[name] = recon.to(dtype=recon_dtype, device=W.device)
     return int4_sidecars
 
 
@@ -502,14 +539,19 @@ def parse_args() -> argparse.Namespace:
                         "sidecars for the kernel's INT4 path. Schema becomes "
                         "`qwen36-moe-oracle-ffn-int4-v1`.")
     p.add_argument("--int4-group-size", type=int, default=128,
-                   help="Group size for INT4 min/max quant. Must divide "
-                        "out_features and in_features of every quantized "
-                        "tensor. The runtime + bake both pin to 128.")
+                   help="INT4 group size. Tile-v1 defaults to 128; "
+                        "production row-group requires 32.")
+    p.add_argument("--int4-layout", choices=["tile_v1", "row_group"],
+                   default="tile_v1",
+                   help="INT4 sidecar layout. Production row-group mode uses "
+                        "group_size=32, one scale row per output row, and no zero plane.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.int4 and args.int4_layout == "row_group" and args.int4_group_size != 32:
+        raise SystemExit("row-group INT4 oracle mode requires --int4-group-size 32")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
     int4_sidecars: dict[str, dict[str, torch.Tensor]] | None = None
@@ -597,7 +639,9 @@ def main() -> None:
         # same BF16-reconstructed weights the kernel will see — intermediates
         # are then valid for both the BF16 and INT4 kernel paths.
         # (Skipped when bake mode already populated int4_sidecars from disk.)
-        int4_sidecars = quantize_int4_ffn_weights(weights, args.int4_group_size)
+        int4_sidecars = quantize_int4_ffn_weights(
+            weights, args.int4_group_size, args.int4_layout
+        )
 
     intermediates = reference_moe_ffn_block(
         num_experts=args.num_experts,
@@ -630,6 +674,7 @@ def main() -> None:
     }
     if args.int4:
         config["int4_group_size"] = args.int4_group_size
+        config["int4_layout"] = args.int4_layout
 
     out = {
         "schema": ("qwen36-moe-oracle-ffn-int4-v1"
@@ -642,14 +687,15 @@ def main() -> None:
         "intermediates": enc_intermediates,
     }
     if int4_sidecars is not None:
-        out["int4_weights"] = {
-            name: {
+        out["int4_weights"] = {}
+        for name, t in int4_sidecars.items():
+            encoded = {
                 "packed": b64_u8(t["packed"]),
                 "scale": b64_bf16(t["scale"]),
-                "zero": b64_bf16(t["zero"]),
             }
-            for name, t in int4_sidecars.items()
-        }
+            if "zero" in t:
+                encoded["zero"] = b64_bf16(t["zero"])
+            out["int4_weights"][name] = encoded
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(out))
 

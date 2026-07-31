@@ -21,7 +21,7 @@ Modes:
   --synthetic --num-layers 4
       4 layers (3 linear + 1 full at idx 3) at small synthetic geometry
       (default `hidden=256`). Primary parity gate: fits in <1 GiB host RAM
-      and runs in seconds. INT4 mode pinned to `group_size=128`.
+      and runs in seconds. INT4 supports tile-v1 G128 and row-group G32.
   --checkpoint --num-layers 8 --model-dir /path/to/Qwen3.6-MoE
       Loads per-layer tensors on demand from a real checkpoint to keep host
       RAM honest (35B BF16 is ~65 GiB — won't fit 64 GiB host). Production-
@@ -363,6 +363,19 @@ def encode_ffn_weights(ffn_w: dict, encode) -> dict[str, str]:
     return {name: encode(tensor) for name, tensor in ffn_w.items() if tensor is not None}
 
 
+def encode_int4_sidecars(sidecars: dict[str, dict[str, torch.Tensor]]) -> dict:
+    encoded = {}
+    for name, tensors in sidecars.items():
+        item = {
+            "packed": b64_u8(tensors["packed"]),
+            "scale": b64_bf16(tensors["scale"]),
+        }
+        if "zero" in tensors:
+            item["zero"] = b64_bf16(tensors["zero"])
+        encoded[name] = item
+    return encoded
+
+
 # ---------------------------------------------------------------------------
 # Argparse + main
 # ---------------------------------------------------------------------------
@@ -390,8 +403,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", type=Path, required=True,
                    help="JSON output path")
 
-    # Geometry — synthetic defaults are tuned to satisfy INT4 group_size=128
-    # divisibility on every quantized projection at the smallest size.
+    # Geometry — synthetic defaults satisfy both tile-v1 G128 and row-group
+    # G32 divisibility on every quantized projection.
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--vocab", type=int, default=1024,
                    help="lm_head output dim. Stays BF16 (no INT4 path).")
@@ -413,8 +426,8 @@ def parse_args() -> argparse.Namespace:
     # FFN geometry (small synthetic; production is E=256, I=Is=512, top_k=8).
     p.add_argument("--num-experts", type=int, default=8)
     p.add_argument("--moe-intermediate", type=int, default=128,
-                   help="Per-expert intermediate dim. Must be ≥ INT4 "
-                        "group_size (128) so down_proj's in_features fits.")
+                   help="Per-expert intermediate dim. Must be divisible by "
+                        "the selected INT4 group size.")
     p.add_argument("--shared-intermediate", type=int, default=128)
     p.add_argument("--top-k", type=int, default=2)
 
@@ -425,8 +438,12 @@ def parse_args() -> argparse.Namespace:
                         "per-block oracles' INT4 helpers (min/max group-quant). "
                         "Schema becomes `qwen36-moe-oracle-multilayer-int4-v1`.")
     p.add_argument("--int4-group-size", type=int, default=128,
-                   help="Group size for INT4 min/max quant. Pinned to 128 "
-                        "across the runtime + bake.")
+                   help="INT4 group size. Tile-v1 defaults to 128; "
+                        "production row-group requires 32.")
+    p.add_argument("--int4-layout", choices=["tile_v1", "row_group"],
+                   default="tile_v1",
+                   help="INT4 sidecar layout. Production row-group mode uses "
+                        "group_size=32, one scale row per output row, and no zero plane.")
 
     p.add_argument("--no-emit-weights", action="store_true",
                    help="Skip per-layer weight emission. Use for cheap shape/"
@@ -436,6 +453,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.int4 and args.int4_layout == "row_group" and args.int4_group_size != 32:
+        raise SystemExit("row-group INT4 oracle mode requires --int4-group-size 32")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
     attn_cfg = {
@@ -533,14 +552,14 @@ def main() -> None:
             entry: dict = {}
             if is_full_attn_layer(layer_idx):
                 entry["attn"] = quantize_int4_attn_weights(
-                    layer["attn"], args.int4_group_size
+                    layer["attn"], args.int4_group_size, args.int4_layout
                 )
             else:
                 entry["attn"] = quantize_int4_linear_weights(
-                    layer["attn"], args.int4_group_size
+                    layer["attn"], args.int4_group_size, args.int4_layout
                 )
             entry["ffn"] = quantize_int4_ffn_weights(
-                layer["ffn"], args.int4_group_size
+                layer["ffn"], args.int4_group_size, args.int4_layout
             )
             int4_per_layer.append(entry)
 
@@ -574,6 +593,7 @@ def main() -> None:
     }
     if args.int4:
         config["int4_group_size"] = args.int4_group_size
+        config["int4_layout"] = args.int4_layout
 
     layer_meta = [
         {"layer_idx": i, "kind": "full" if is_full_attn_layer(i) else "linear"}
@@ -631,22 +651,8 @@ def main() -> None:
     if int4_per_layer is not None and not args.no_emit_weights:
         out["int4_weights_per_layer"] = [
             {
-                "attn": {
-                    name: {
-                        "packed": b64_u8(t["packed"]),
-                        "scale": b64_bf16(t["scale"]),
-                        "zero": b64_bf16(t["zero"]),
-                    }
-                    for name, t in entry["attn"].items()
-                },
-                "ffn": {
-                    name: {
-                        "packed": b64_u8(t["packed"]),
-                        "scale": b64_bf16(t["scale"]),
-                        "zero": b64_bf16(t["zero"]),
-                    }
-                    for name, t in entry["ffn"].items()
-                },
+                "attn": encode_int4_sidecars(entry["attn"]),
+                "ffn": encode_int4_sidecars(entry["ffn"]),
             }
             for entry in int4_per_layer
         ]

@@ -195,15 +195,7 @@ extern "C" {
         q_norm_w: *const c_void,
         k_norm_w: *const c_void,
         o_proj_w: *const c_void,
-        int4_group_size: c_int,
-        q_proj_scale: *const c_void,
-        q_proj_zero: *const c_void,
-        k_proj_scale: *const c_void,
-        k_proj_zero: *const c_void,
-        v_proj_scale: *const c_void,
-        v_proj_zero: *const c_void,
-        o_proj_scale: *const c_void,
-        o_proj_zero: *const c_void,
+        int4_desc: *const Qwen36MoeInt4ScaleDesc,
         output: *mut c_void,
         workspace: *mut f32,
         kv_cache_k: *mut c_void,
@@ -263,13 +255,7 @@ extern "C" {
         out_proj_w: *const c_void,
         conv_state: *mut c_void,
         recurrent_state: *mut f32,
-        int4_group_size: c_int,
-        in_proj_qkv_scale: *const c_void,
-        in_proj_qkv_zero: *const c_void,
-        in_proj_z_scale: *const c_void,
-        in_proj_z_zero: *const c_void,
-        out_proj_scale: *const c_void,
-        out_proj_zero: *const c_void,
+        int4_desc: *const Qwen36MoeInt4ScaleDesc,
         output: *mut c_void,
         workspace: *mut f32,
         counters: *mut c_uint,
@@ -378,17 +364,7 @@ extern "C" {
         shared_up_proj_w: *const c_void,
         shared_down_proj_w: *const c_void,
         shared_expert_gate_w: *const c_void,
-        int4_group_size: c_int,
-        gate_up_proj_scale: *const c_void,
-        gate_up_proj_zero: *const c_void,
-        down_proj_scale: *const c_void,
-        down_proj_zero: *const c_void,
-        shared_gate_proj_scale: *const c_void,
-        shared_gate_proj_zero: *const c_void,
-        shared_up_proj_scale: *const c_void,
-        shared_up_proj_zero: *const c_void,
-        shared_down_proj_scale: *const c_void,
-        shared_down_proj_zero: *const c_void,
+        int4_desc: *const Qwen36MoeInt4ScaleDesc,
         output: *mut c_void,
         output_idx: *mut c_int,
         workspace: *mut f32,
@@ -558,8 +534,10 @@ extern "C" {
     ///                            hidden states; gathered by `permuted_token_idx`.
     /// - `expert_offsets`      : `[num_experts + 1]` i32 — M9 prefix sum.
     /// - `permuted_token_idx`  : `[n_tokens * top_k]` i32 — M9 sort output.
-    /// - `experts_gate_up_w/s/z` : `[E, 2*I, hidden/2]` u8 + `[E, 2*I/gs, hidden/gs]` BF16.
-    /// - `experts_down_w/s/z`    : `[E, hidden, I/2]` u8 + `[E, hidden/gs, I/gs]` BF16.
+    /// - `experts_gate_up_w` + descriptor: `[E, 2*I, hidden/2]` packed INT4
+    ///   with descriptor-owned scale/zero geometry.
+    /// - `experts_down_w` + descriptor: `[E, hidden, I/2]` packed INT4 with
+    ///   descriptor-owned scale/zero geometry.
     ///
     /// Caller-owned buffers:
     /// - `expert_out` : `[n_tokens * top_k, hidden]` BF16 — per-permuted-row
@@ -570,8 +548,8 @@ extern "C" {
     /// Status codes (non-zero = failure):
     ///   150 invalid args (zero/negative dims)
     ///   151 num_experts > 256
-    ///   152 hidden / moe_intermediate not divisible by group_size (or 16)
-    ///   153 group_size != 128
+    ///   152 hidden / moe_intermediate not divisible by 16
+    ///   153 missing or invalid INT4 descriptor
     ///   154 top_k * n_tokens > 16384
     ///   155 dtype != bf16
     ///   156 LDS overflow
@@ -584,16 +562,13 @@ extern "C" {
         num_experts: c_int,
         hidden: c_int,
         moe_intermediate: c_int,
-        group_size: c_int,
         x_norm: *const c_void,
         expert_offsets: *const c_void,
         permuted_token_idx: *const c_void,
         experts_gate_up_w: *const c_void,
-        experts_gate_up_scale: *const c_void,
-        experts_gate_up_zero: *const c_void,
+        experts_gate_up_desc: *const Qwen36MoeInt4WeightDesc,
         experts_down_w: *const c_void,
-        experts_down_scale: *const c_void,
-        experts_down_zero: *const c_void,
+        experts_down_desc: *const Qwen36MoeInt4WeightDesc,
         expert_out: *mut c_void,
         counters: *mut c_void,
     ) -> Qwen36BridgeStatus;
