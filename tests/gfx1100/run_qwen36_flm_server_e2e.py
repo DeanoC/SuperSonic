@@ -30,11 +30,30 @@ DEFAULT_BINARY = ROOT / "target" / "release" / "supersonic-serve"
 DEFAULT_OUT_JSON = ROOT / "target" / "qwen36_35b_a3b_flm_server_e2e.json"
 DEFAULT_OPENAI_SDK_DIR = ROOT / "target" / "openai-sdk-smoke"
 EXPECTED_MODEL = "qwen3.6-35b-a3b"
+EXPECTED_FAMILY = "qwen3.6-moe"
+EXPECTED_BACKEND = "HIP"
 EXPECTED_SOURCE = "flm"
+EXPECTED_MAX_CONTEXT = 4096
 EXPECTED_NATIVE_INT4 = 330
 EXPECTED_BF16_FALLBACK = 0
 EXPECTED_REQUIRED_WEIGHTS = 693
 EXPECTED_RAW_DENSE_WEIGHTS = 363
+EXPECTED_ARCHITECTURE_ID = 2
+EXPECTED_MODEL_ID = 2
+EXPECTED_STORAGE_ABI_IDS = [8]
+EXPECTED_TRANSFER_BACKEND = "pageable_h2d"
+EXPECTED_SCHEDULER = {
+    "active_requests": 0,
+    "queued_requests": 0,
+    "max_queued_requests": 32,
+    "queue_timeout_ms": 30_000,
+}
+EXPECTED_FLM_FEATURES = {
+    "plain_prefill_decode": True,
+    "native_dflash_generate": False,
+    "prefix_snapshot": False,
+    "disk_prefix_snapshot": False,
+}
 OPENAI_SDK_VERSION = "6.49.0"
 PROCESS_GRACE_SECONDS = 5
 READY_POLL_SECONDS = 0.25
@@ -315,6 +334,12 @@ def _strict_int(value: object, label: str) -> int:
     return value
 
 
+def _strict_bool(value: object, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise PhaseError(f"{label} must be a boolean")
+    return value
+
+
 def _finite_number(value: object, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise PhaseError(f"{label} must be a number")
@@ -340,6 +365,13 @@ def _positive_int(value: object, label: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: object, label: str) -> int:
+    parsed = _strict_int(value, label)
+    if parsed < 0:
+        raise PhaseError(f"{label} must be non-negative")
+    return parsed
+
+
 def _validate_finite_tree(value: object, label: str) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
@@ -348,18 +380,53 @@ def _validate_finite_tree(value: object, label: str) -> None:
     _finite_number(value, label)
 
 
-def _metric_int(
-    metrics: dict[str, int | float],
-    name: str,
-    *,
-    expected: int | None = None,
-) -> int:
-    if name not in metrics:
-        raise PhaseError(f"required metric {name} is missing")
-    value = _strict_int(metrics[name], f"metric {name}")
-    if expected is not None:
-        _expect(value, expected, f"metric {name}")
-    return value
+def _validate_startup_schema(value: object, label: str) -> dict[str, Any]:
+    startup = _exact_mapping(
+        value,
+        {"total_seconds", "exclusive_components"},
+        label,
+    )
+    components = _exact_mapping(
+        startup["exclusive_components"],
+        {"source_open", "tokenizer_seconds", "descriptor_seconds"},
+        f"{label}.exclusive_components",
+    )
+    source_open = _exact_mapping(
+        components["source_open"],
+        {"total_seconds", "exclusive_phases"},
+        f"{label}.exclusive_components.source_open",
+    )
+    phases = _exact_mapping(
+        source_open["exclusive_phases"],
+        {"store_open_seconds", "config_seconds", "direct_plan_seconds"},
+        f"{label}.exclusive_components.source_open.exclusive_phases",
+    )
+    total = _finite_number(startup["total_seconds"], f"{label}.total_seconds")
+    if total <= 0:
+        raise PhaseError(f"{label}.total_seconds must be positive")
+    for field, number in (
+        ("exclusive_components.tokenizer_seconds", components["tokenizer_seconds"]),
+        ("exclusive_components.descriptor_seconds", components["descriptor_seconds"]),
+        (
+            "exclusive_components.source_open.total_seconds",
+            source_open["total_seconds"],
+        ),
+        (
+            "exclusive_components.source_open.exclusive_phases.store_open_seconds",
+            phases["store_open_seconds"],
+        ),
+        (
+            "exclusive_components.source_open.exclusive_phases.config_seconds",
+            phases["config_seconds"],
+        ),
+        (
+            "exclusive_components.source_open.exclusive_phases.direct_plan_seconds",
+            phases["direct_plan_seconds"],
+        ),
+    ):
+        if _finite_number(number, f"{label}.{field}") < 0:
+            raise PhaseError(f"{label}.{field} must be non-negative")
+    return startup
 
 
 def _validate_flm_payload_schema(value: object, label: str) -> dict[str, Any]:
@@ -387,52 +454,58 @@ def _validate_flm_payload_schema(value: object, label: str) -> dict[str, Any]:
         },
         label,
     )
-    for field in (
-        "architecture_id",
-        "model_id",
-        "required_weights",
-        "raw_dense_weights",
-        "native_int4_direct_weights",
-        "bf16_fallback_weights",
-        "source_bytes",
-        "device_upload_bytes",
-        "load_sequence",
-        "source_open_count",
-        "resident_allocation_count",
-    ):
+    exact_integers = {
+        "architecture_id": EXPECTED_ARCHITECTURE_ID,
+        "model_id": EXPECTED_MODEL_ID,
+        "required_weights": EXPECTED_REQUIRED_WEIGHTS,
+        "raw_dense_weights": EXPECTED_RAW_DENSE_WEIGHTS,
+        "native_int4_direct_weights": EXPECTED_NATIVE_INT4,
+        "bf16_fallback_weights": EXPECTED_BF16_FALLBACK,
+        "load_sequence": 1,
+        "source_open_count": 1,
+    }
+    for field, expected in exact_integers.items():
         _strict_int(flm[field], f"{label}.{field}")
+        _expect(flm[field], expected, f"{label}.{field}")
     storage_abis = flm["storage_abi_ids"]
-    if not isinstance(storage_abis, list) or not storage_abis:
-        raise PhaseError(f"{label}.storage_abi_ids must be a non-empty list")
+    if not isinstance(storage_abis, list):
+        raise PhaseError(f"{label}.storage_abi_ids must be a list")
     for index, storage_abi in enumerate(storage_abis):
         _strict_int(storage_abi, f"{label}.storage_abi_ids[{index}]")
-    _nonempty_string(flm["source"], f"{label}.source")
-    _nonempty_string(flm["file"], f"{label}.file")
-    _nonempty_string(flm["transfer_backend"], f"{label}.transfer_backend")
-
-    startup = _exact_mapping(
-        flm["startup"],
-        {"total_seconds", "exclusive_components"},
-        f"{label}.startup",
-    )
-    components = _exact_mapping(
-        startup["exclusive_components"],
-        {"source_open", "tokenizer_seconds", "descriptor_seconds"},
-        f"{label}.startup.exclusive_components",
-    )
-    source_open = _exact_mapping(
-        components["source_open"],
-        {"total_seconds", "exclusive_phases"},
-        f"{label}.startup.exclusive_components.source_open",
-    )
-    _exact_mapping(
-        source_open["exclusive_phases"],
-        {"store_open_seconds", "config_seconds", "direct_plan_seconds"},
-        f"{label}.startup.exclusive_components.source_open.exclusive_phases",
-    )
-    _validate_finite_tree(startup, f"{label}.startup")
     _expect(
+        storage_abis,
+        EXPECTED_STORAGE_ABI_IDS,
+        f"{label}.storage_abi_ids",
+    )
+    _expect(flm["source"], EXPECTED_SOURCE, f"{label}.source")
+    filename = _nonempty_string(flm["file"], f"{label}.file")
+    if not filename.endswith(".flm"):
+        raise PhaseError(f"{label}.file must name an FLM artifact")
+    _expect(
+        flm["transfer_backend"],
+        EXPECTED_TRANSFER_BACKEND,
+        f"{label}.transfer_backend",
+    )
+    source_bytes = _positive_int(flm["source_bytes"], f"{label}.source_bytes")
+    device_upload_bytes = _positive_int(
+        flm["device_upload_bytes"],
+        f"{label}.device_upload_bytes",
+    )
+    if device_upload_bytes > source_bytes:
+        raise PhaseError(f"{label}.device_upload_bytes exceeds source_bytes")
+    _positive_int(
+        flm["resident_allocation_count"],
+        f"{label}.resident_allocation_count",
+    )
+    startup_seconds = _finite_number(
         flm["startup_seconds"],
+        f"{label}.startup_seconds",
+    )
+    if startup_seconds <= 0:
+        raise PhaseError(f"{label}.startup_seconds must be positive")
+    startup = _validate_startup_schema(flm["startup"], f"{label}.startup")
+    _expect(
+        startup_seconds,
         startup["total_seconds"],
         f"{label}.startup_seconds",
     )
@@ -446,9 +519,16 @@ def _validate_flm_payload_schema(value: object, label: str) -> dict[str, Any]:
         },
         f"{label}.features",
     )
-    for field, enabled in features.items():
-        if not isinstance(enabled, bool):
-            raise PhaseError(f"{label}.features.{field} must be a boolean")
+    for field, expected in EXPECTED_FLM_FEATURES.items():
+        _strict_bool(features[field], f"{label}.features.{field}")
+        _expect(features[field], expected, f"{label}.features.{field}")
+    if (
+        flm["raw_dense_weights"]
+        + flm["native_int4_direct_weights"]
+        + flm["bf16_fallback_weights"]
+        != flm["required_weights"]
+    ):
+        raise PhaseError(f"{label} direct-profile counts do not add up")
     return flm
 
 
@@ -474,21 +554,59 @@ def _validate_prefix_cache_schema(value: object, label: str) -> dict[str, Any]:
         },
         label,
     )
-    if not isinstance(cache["enabled"], bool):
-        raise PhaseError(f"{label}.enabled must be a boolean")
+    _strict_bool(cache["enabled"], f"{label}.enabled")
+    _expect(cache["enabled"], False, f"{label}.enabled")
     if not isinstance(cache["dir"], str):
         raise PhaseError(f"{label}.dir must be a string")
-    for field in set(cache) - {"enabled", "dir"}:
+    _expect(cache["dir"], "", f"{label}.dir")
+    exact_integers = {
+        "min_tokens": 128,
+        "max_entries": 1,
+        "resident_bytes": 0,
+        "entries": 0,
+        "hits": 0,
+        "misses": 0,
+        "cached_tokens": 0,
+        "evictions": 0,
+        "disk_writes": 0,
+        "disk_reads": 0,
+        "restore_failures": 0,
+        "admission_skips": 0,
+    }
+    for field, expected in exact_integers.items():
         _strict_int(cache[field], f"{label}.{field}")
+        _expect(cache[field], expected, f"{label}.{field}")
+    _positive_int(cache["max_bytes"], f"{label}.max_bytes")
     return cache
 
 
-def validate_flm_evidence(
-    capabilities: dict[str, Any],
-    metrics: dict[str, int | float],
+def _validate_scheduler_schema(value: object, label: str) -> dict[str, Any]:
+    scheduler = _exact_mapping(
+        value,
+        set(EXPECTED_SCHEDULER),
+        label,
+    )
+    for field, expected in EXPECTED_SCHEDULER.items():
+        _strict_int(scheduler[field], f"{label}.{field}")
+        _expect(scheduler[field], expected, f"{label}.{field}")
+    return scheduler
+
+
+def _validate_endpoints(value: object, label: str) -> list[str]:
+    if not isinstance(value, list):
+        raise PhaseError(f"{label} must be a list")
+    for index, endpoint in enumerate(value):
+        _nonempty_string(endpoint, f"{label}[{index}]")
+    _expect(value, EXPECTED_ENDPOINTS, label)
+    return value
+
+
+def _validate_capabilities_schema(
+    value: object,
+    label: str,
 ) -> dict[str, Any]:
     capabilities = _exact_mapping(
-        capabilities,
+        value,
         {
             "model",
             "family",
@@ -507,13 +625,20 @@ def validate_flm_evidence(
             "prefix_cache",
             "flm",
         },
-        "capabilities",
+        label,
     )
-    metrics = _exact_mapping(metrics, FINAL_METRIC_KEYS, "metrics")
-    _expect(capabilities.get("model"), EXPECTED_MODEL, "capabilities model")
-    _expect(capabilities.get("backend"), "HIP", "capabilities backend")
-    _expect(capabilities.get("ready"), True, "capabilities ready")
-    _expect(capabilities["endpoints"], EXPECTED_ENDPOINTS, "capabilities endpoints")
+    _expect(capabilities["model"], EXPECTED_MODEL, f"{label}.model")
+    _expect(capabilities["family"], EXPECTED_FAMILY, f"{label}.family")
+    _expect(capabilities["backend"], EXPECTED_BACKEND, f"{label}.backend")
+    _strict_bool(capabilities["ready"], f"{label}.ready")
+    _expect(capabilities["ready"], True, f"{label}.ready")
+    _strict_int(capabilities["max_context"], f"{label}.max_context")
+    _expect(
+        capabilities["max_context"],
+        EXPECTED_MAX_CONTEXT,
+        f"{label}.max_context",
+    )
+    _validate_endpoints(capabilities["endpoints"], f"{label}.endpoints")
     for field in (
         "chat",
         "completions",
@@ -523,70 +648,189 @@ def validate_flm_evidence(
         "tools",
         "reasoning",
     ):
-        _expect(capabilities.get(field), True, f"capabilities {field}")
-
-    scheduler = _mapping(capabilities.get("scheduler"), "capabilities scheduler")
-    for field in (
-        "active_requests",
-        "queued_requests",
-        "max_queued_requests",
-        "queue_timeout_ms",
-    ):
-        _strict_int(scheduler.get(field), f"scheduler {field}")
-    _expect(scheduler.get("active_requests"), 0, "scheduler active_requests")
-    _expect(scheduler.get("queued_requests"), 0, "scheduler queued_requests")
+        _strict_bool(capabilities[field], f"{label}.{field}")
+        _expect(capabilities[field], True, f"{label}.{field}")
+    _validate_scheduler_schema(capabilities["scheduler"], f"{label}.scheduler")
     _validate_prefix_cache_schema(
         capabilities["prefix_cache"],
-        "capabilities prefix_cache",
+        f"{label}.prefix_cache",
     )
+    _validate_flm_payload_schema(capabilities["flm"], f"{label}.flm")
+    return capabilities
 
-    flm = _validate_flm_payload_schema(capabilities.get("flm"), "capabilities flm")
-    exact_fields = {
-        "source": EXPECTED_SOURCE,
-        "required_weights": EXPECTED_REQUIRED_WEIGHTS,
-        "raw_dense_weights": EXPECTED_RAW_DENSE_WEIGHTS,
-        "native_int4_direct_weights": EXPECTED_NATIVE_INT4,
-        "bf16_fallback_weights": EXPECTED_BF16_FALLBACK,
-        "load_sequence": 1,
-        "source_open_count": 1,
+
+def _validate_health_schema(value: object, label: str) -> dict[str, Any]:
+    health = _exact_mapping(
+        value,
+        {
+            "status",
+            "ready",
+            "model",
+            "max_context",
+            "active_requests",
+            "queued_requests",
+            "max_queued_requests",
+            "prefix_cache_entries",
+            "flm",
+        },
+        label,
+    )
+    _expect(health["status"], "ok", f"{label}.status")
+    _strict_bool(health["ready"], f"{label}.ready")
+    _expect(health["ready"], True, f"{label}.ready")
+    _expect(health["model"], EXPECTED_MODEL, f"{label}.model")
+    exact_integers = {
+        "max_context": EXPECTED_MAX_CONTEXT,
+        "active_requests": 0,
+        "queued_requests": 0,
+        "max_queued_requests": EXPECTED_SCHEDULER["max_queued_requests"],
+        "prefix_cache_entries": 0,
     }
-    for field, expected in exact_fields.items():
-        if isinstance(expected, int):
-            _strict_int(flm.get(field), f"FLM {field}")
-        _expect(flm.get(field), expected, f"FLM {field}")
-    _positive_int(
-        flm.get("resident_allocation_count"),
-        "FLM resident_allocation_count",
-    )
-    source_bytes = _positive_int(flm.get("source_bytes"), "FLM source_bytes")
-    device_upload_bytes = _positive_int(
-        flm.get("device_upload_bytes"),
-        "FLM device_upload_bytes",
-    )
-    transfer_backend = flm.get("transfer_backend")
-    if not isinstance(transfer_backend, str) or not transfer_backend:
-        raise PhaseError("FLM transfer_backend must be a non-empty string")
-    startup = _mapping(flm.get("startup"), "FLM startup")
-    _validate_finite_tree(startup, "FLM startup")
-    if _finite_number(startup.get("total_seconds"), "FLM startup.total_seconds") <= 0:
-        raise PhaseError("FLM startup.total_seconds must be positive")
+    for field, expected in exact_integers.items():
+        _strict_int(health[field], f"{label}.{field}")
+        _expect(health[field], expected, f"{label}.{field}")
+    _validate_flm_payload_schema(health["flm"], f"{label}.flm")
+    return health
 
-    metric_expectations = {
+
+def _validate_metrics_schema(
+    value: object,
+    label: str,
+    *,
+    capabilities: dict[str, Any] | None = None,
+    health: dict[str, Any] | None = None,
+) -> dict[str, int | float]:
+    metrics = _exact_mapping(value, FINAL_METRIC_KEYS, label)
+    for name in FINAL_METRIC_KEYS - {"supersonic_flm_startup_seconds"}:
+        _nonnegative_int(metrics[name], f"{label}.{name}")
+    startup_seconds = _finite_number(
+        metrics["supersonic_flm_startup_seconds"],
+        f"{label}.supersonic_flm_startup_seconds",
+    )
+    if startup_seconds <= 0:
+        raise PhaseError(f"{label}.supersonic_flm_startup_seconds must be positive")
+    exact_metrics = {
         "supersonic_ready": 1,
         "supersonic_active_requests": 0,
         "supersonic_queued_requests": 0,
+        "supersonic_generation_active": 0,
+        "supersonic_generation_queued": 0,
+        "supersonic_max_queued_requests": EXPECTED_SCHEDULER[
+            "max_queued_requests"
+        ],
+        "supersonic_queue_timeout_ms": EXPECTED_SCHEDULER["queue_timeout_ms"],
+        "supersonic_max_context": EXPECTED_MAX_CONTEXT,
+        "supersonic_prefix_cache_enabled": 0,
+        "supersonic_prefix_cache_entries": 0,
+        "supersonic_prefix_cache_resident_bytes": 0,
+        "supersonic_prefix_cache_hits": 0,
+        "supersonic_prefix_cache_misses": 0,
+        "supersonic_prefix_cache_cached_tokens": 0,
+        "supersonic_prefix_cache_evictions": 0,
+        "supersonic_prefix_cache_disk_writes": 0,
+        "supersonic_prefix_cache_disk_reads": 0,
+        "supersonic_prefix_cache_restore_failures": 0,
+        "supersonic_prefix_cache_admission_skips": 0,
+        "supersonic_dflash_last_rounds": 0,
+        "supersonic_dflash_last_accepted_total": 0,
+        "supersonic_dflash_last_decode_ms": 0,
         "supersonic_model_loads_total": 1,
         "supersonic_flm_native_int4_direct_weights": EXPECTED_NATIVE_INT4,
         "supersonic_flm_bf16_fallback_weights": EXPECTED_BF16_FALLBACK,
-        "supersonic_flm_source_bytes": source_bytes,
-        "supersonic_flm_device_upload_bytes": device_upload_bytes,
     }
-    for name, expected in metric_expectations.items():
-        _metric_int(metrics, name, expected=expected)
-    startup_metric = metrics.get("supersonic_flm_startup_seconds")
-    if _finite_number(startup_metric, "metric supersonic_flm_startup_seconds") <= 0:
-        raise PhaseError("metric supersonic_flm_startup_seconds must be positive")
+    for name, expected in exact_metrics.items():
+        _expect(metrics[name], expected, f"{label}.{name}")
+    _positive_int(
+        metrics["supersonic_prefix_cache_max_bytes"],
+        f"{label}.supersonic_prefix_cache_max_bytes",
+    )
+    source_bytes = _positive_int(
+        metrics["supersonic_flm_source_bytes"],
+        f"{label}.supersonic_flm_source_bytes",
+    )
+    device_upload_bytes = _positive_int(
+        metrics["supersonic_flm_device_upload_bytes"],
+        f"{label}.supersonic_flm_device_upload_bytes",
+    )
+    if device_upload_bytes > source_bytes:
+        raise PhaseError(
+            f"{label}.supersonic_flm_device_upload_bytes exceeds source bytes"
+        )
 
+    if capabilities is not None:
+        scheduler = capabilities["scheduler"]
+        cache = capabilities["prefix_cache"]
+        flm = capabilities["flm"]
+        cross_fields = {
+            "supersonic_ready": int(capabilities["ready"]),
+            "supersonic_active_requests": scheduler["active_requests"],
+            "supersonic_queued_requests": scheduler["queued_requests"],
+            "supersonic_max_queued_requests": scheduler["max_queued_requests"],
+            "supersonic_queue_timeout_ms": scheduler["queue_timeout_ms"],
+            "supersonic_max_context": capabilities["max_context"],
+            "supersonic_prefix_cache_enabled": int(cache["enabled"]),
+            "supersonic_prefix_cache_entries": cache["entries"],
+            "supersonic_prefix_cache_resident_bytes": cache["resident_bytes"],
+            "supersonic_prefix_cache_max_bytes": cache["max_bytes"],
+            "supersonic_prefix_cache_hits": cache["hits"],
+            "supersonic_prefix_cache_misses": cache["misses"],
+            "supersonic_prefix_cache_cached_tokens": cache["cached_tokens"],
+            "supersonic_prefix_cache_evictions": cache["evictions"],
+            "supersonic_prefix_cache_disk_writes": cache["disk_writes"],
+            "supersonic_prefix_cache_disk_reads": cache["disk_reads"],
+            "supersonic_prefix_cache_restore_failures": cache["restore_failures"],
+            "supersonic_prefix_cache_admission_skips": cache["admission_skips"],
+            "supersonic_flm_native_int4_direct_weights": flm[
+                "native_int4_direct_weights"
+            ],
+            "supersonic_flm_bf16_fallback_weights": flm[
+                "bf16_fallback_weights"
+            ],
+            "supersonic_flm_source_bytes": flm["source_bytes"],
+            "supersonic_flm_device_upload_bytes": flm["device_upload_bytes"],
+            "supersonic_flm_startup_seconds": flm["startup_seconds"],
+        }
+        for name, expected in cross_fields.items():
+            _expect(metrics[name], expected, f"{label}.{name}")
+    if health is not None:
+        health_flm = health["flm"]
+        health_cross_fields = {
+            "supersonic_ready": int(health["ready"]),
+            "supersonic_active_requests": health["active_requests"],
+            "supersonic_queued_requests": health["queued_requests"],
+            "supersonic_max_queued_requests": health["max_queued_requests"],
+            "supersonic_max_context": health["max_context"],
+            "supersonic_prefix_cache_entries": health["prefix_cache_entries"],
+            "supersonic_model_loads_total": health_flm["load_sequence"],
+            "supersonic_flm_native_int4_direct_weights": health_flm[
+                "native_int4_direct_weights"
+            ],
+            "supersonic_flm_bf16_fallback_weights": health_flm[
+                "bf16_fallback_weights"
+            ],
+            "supersonic_flm_source_bytes": health_flm["source_bytes"],
+            "supersonic_flm_device_upload_bytes": health_flm[
+                "device_upload_bytes"
+            ],
+            "supersonic_flm_startup_seconds": health_flm["startup_seconds"],
+        }
+        for name, expected in health_cross_fields.items():
+            _expect(metrics[name], expected, f"{label}.{name}")
+    return metrics
+
+
+def validate_flm_evidence(
+    capabilities: dict[str, Any],
+    metrics: dict[str, int | float],
+) -> dict[str, Any]:
+    capabilities = _validate_capabilities_schema(capabilities, "capabilities")
+    metrics = _validate_metrics_schema(
+        metrics,
+        "metrics",
+        capabilities=capabilities,
+    )
+    flm = capabilities["flm"]
+    scheduler = capabilities["scheduler"]
     return {
         "model": EXPECTED_MODEL,
         "source": EXPECTED_SOURCE,
@@ -594,10 +838,10 @@ def validate_flm_evidence(
         "native_int4": EXPECTED_NATIVE_INT4,
         "bf16_fallback": EXPECTED_BF16_FALLBACK,
         "model_loads_total": 1,
-        "startup": startup,
-        "transfer_backend": transfer_backend,
-        "source_bytes": source_bytes,
-        "device_upload_bytes": device_upload_bytes,
+        "startup": flm["startup"],
+        "transfer_backend": flm["transfer_backend"],
+        "source_bytes": flm["source_bytes"],
+        "device_upload_bytes": flm["device_upload_bytes"],
         "source_open_count": 1,
         "resident_allocation_count": flm["resident_allocation_count"],
         "scheduler": scheduler,
@@ -1676,12 +1920,6 @@ def collect_final_evidence(
     return final
 
 
-def _strict_bool(value: object, label: str) -> bool:
-    if not isinstance(value, bool):
-        raise PhaseError(f"{label} must be a boolean")
-    return value
-
-
 def _reject_nonfinite_json(value: object, label: str) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
@@ -1730,23 +1968,18 @@ def _validate_flm_snapshot(value: object, label: str) -> dict[str, Any]:
         "resident_allocation_count",
     ):
         _positive_int(snapshot[field], f"{label}.{field}")
-    _nonempty_string(snapshot["transfer_backend"], f"{label}.transfer_backend")
-    startup = _mapping(snapshot["startup"], f"{label}.startup")
-    _validate_finite_tree(startup, f"{label}.startup")
-    scheduler = _exact_mapping(
+    if snapshot["device_upload_bytes"] > snapshot["source_bytes"]:
+        raise PhaseError(f"{label}.device_upload_bytes exceeds source_bytes")
+    _expect(
+        snapshot["transfer_backend"],
+        EXPECTED_TRANSFER_BACKEND,
+        f"{label}.transfer_backend",
+    )
+    _validate_startup_schema(snapshot["startup"], f"{label}.startup")
+    _validate_scheduler_schema(
         snapshot["scheduler"],
-        {
-            "active_requests",
-            "queued_requests",
-            "max_queued_requests",
-            "queue_timeout_ms",
-        },
         f"{label}.scheduler",
     )
-    for field in scheduler:
-        _strict_int(scheduler[field], f"{label}.scheduler.{field}")
-    _expect(scheduler["active_requests"], 0, f"{label}.scheduler.active_requests")
-    _expect(scheduler["queued_requests"], 0, f"{label}.scheduler.queued_requests")
     return snapshot
 
 
@@ -2096,80 +2329,44 @@ def _validate_final_evidence(value: object, label: str) -> dict[str, Any]:
         raise PhaseError(f"{label}.collection_errors must be unique")
 
     if final["health"] is not None:
-        health = _exact_mapping(
+        health = _validate_health_schema(
             final["health"],
-            {
-                "status",
-                "ready",
-                "model",
-                "max_context",
-                "active_requests",
-                "queued_requests",
-                "max_queued_requests",
-                "prefix_cache_entries",
-                "flm",
-            },
             f"{label}.health",
         )
-        _expect(health["status"], "ok", f"{label}.health.status")
-        _expect(health["ready"], True, f"{label}.health.ready")
-        _expect(health["model"], EXPECTED_MODEL, f"{label}.health.model")
-        for field in (
-            "max_context",
-            "active_requests",
-            "queued_requests",
-            "max_queued_requests",
-            "prefix_cache_entries",
-        ):
-            _strict_int(health[field], f"{label}.health.{field}")
-        _expect(health["active_requests"], 0, f"{label}.health.active_requests")
-        _expect(health["queued_requests"], 0, f"{label}.health.queued_requests")
-        _validate_flm_payload_schema(health["flm"], f"{label}.health.flm")
     else:
         health = None
-    metrics = final["metrics"]
-    if metrics is not None:
-        metrics = _exact_mapping(metrics, FINAL_METRIC_KEYS, f"{label}.metrics")
-        for name, metric in metrics.items():
-            _finite_number(metric, f"{label}.metrics.{name}")
+
     capabilities = final["capabilities"]
     if capabilities is not None:
-        capabilities = _exact_mapping(
+        capabilities = _validate_capabilities_schema(
             capabilities,
-            {
-                "model",
-                "family",
-                "backend",
-                "ready",
-                "max_context",
-                "endpoints",
-                "chat",
-                "completions",
-                "responses",
-                "streaming",
-                "stream_usage",
-                "tools",
-                "reasoning",
-                "scheduler",
-                "prefix_cache",
-                "flm",
-            },
             f"{label}.capabilities",
         )
-        _validate_prefix_cache_schema(
-            capabilities["prefix_cache"],
-            f"{label}.capabilities.prefix_cache",
+
+    metrics = final["metrics"]
+    if metrics is not None:
+        metrics = _validate_metrics_schema(
+            metrics,
+            f"{label}.metrics",
+            capabilities=capabilities,
+            health=health,
         )
-        _validate_flm_payload_schema(
-            capabilities["flm"],
-            f"{label}.capabilities.flm",
-        )
+
     if health is not None and capabilities is not None:
-        _expect(
-            health["flm"],
-            capabilities["flm"],
-            f"{label}.health.flm",
-        )
+        cross_fields = {
+            "ready": capabilities["ready"],
+            "model": capabilities["model"],
+            "max_context": capabilities["max_context"],
+            "active_requests": capabilities["scheduler"]["active_requests"],
+            "queued_requests": capabilities["scheduler"]["queued_requests"],
+            "max_queued_requests": capabilities["scheduler"][
+                "max_queued_requests"
+            ],
+            "prefix_cache_entries": capabilities["prefix_cache"]["entries"],
+            "flm": capabilities["flm"],
+        }
+        for field, expected in cross_fields.items():
+            _expect(health[field], expected, f"{label}.health.{field}")
 
     if capabilities is not None and metrics is not None:
         if final["flm_evidence"] is None:

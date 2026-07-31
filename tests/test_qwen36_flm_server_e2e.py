@@ -203,7 +203,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 "raw_dense_weights": 363,
                 "native_int4_direct_weights": 330,
                 "bf16_fallback_weights": 0,
-                "transfer_backend": "pageable-h2d",
+                "transfer_backend": "pageable_h2d",
                 "source_bytes": 8_000_000_000,
                 "device_upload_bytes": 7_000_000_000,
                 "startup_seconds": 1.25,
@@ -477,7 +477,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
             "startup": {
                 "ready_seconds": 2.0,
                 "total_seconds": 1.25,
-                "transfer_backend": "pageable-h2d",
+                "transfer_backend": "pageable_h2d",
                 "source_bytes": 8_000_000_000,
                 "device_upload_bytes": 7_000_000_000,
                 "source_open_count": 1,
@@ -803,7 +803,7 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                 "bf16_fallback": 0,
                 "model_loads_total": 1,
                 "startup": self.valid_capabilities()["flm"]["startup"],
-                "transfer_backend": "pageable-h2d",
+                "transfer_backend": "pageable_h2d",
                 "source_bytes": 8_000_000_000,
                 "device_upload_bytes": 7_000_000_000,
                 "source_open_count": 1,
@@ -833,6 +833,204 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
                         self.harness.parse_prometheus_metrics(
                             self.valid_metrics_text()
                         ),
+                    )
+
+    def test_validate_flm_evidence_rejects_exact_nested_contract_mutations(self):
+        mutations = [
+            ("scheduler extra", lambda c: c["scheduler"].update({"extra": 0})),
+            (
+                "scheduler missing",
+                lambda c: c["scheduler"].pop("queue_timeout_ms"),
+            ),
+            (
+                "scheduler wrong type",
+                lambda c: c["scheduler"].update({"active_requests": False}),
+            ),
+            (
+                "scheduler unsupported value",
+                lambda c: c["scheduler"].update({"max_queued_requests": 31}),
+            ),
+            ("family", lambda c: c.update({"family": "qwen3-moe"})),
+            ("backend", lambda c: c.update({"backend": "CUDA"})),
+            ("ready value", lambda c: c.update({"ready": False})),
+            ("ready type", lambda c: c.update({"ready": 1})),
+            ("max context type", lambda c: c.update({"max_context": "4096"})),
+            ("max context value", lambda c: c.update({"max_context": 2048})),
+            ("endpoints type", lambda c: c.update({"endpoints": "/v1/models"})),
+            (
+                "endpoint element type",
+                lambda c: c["endpoints"].__setitem__(0, 1),
+            ),
+            ("endpoint missing", lambda c: c["endpoints"].pop()),
+            ("feature type", lambda c: c.update({"chat": 1})),
+            ("feature value", lambda c: c.update({"tools": False})),
+            (
+                "prefix cache extra",
+                lambda c: c["prefix_cache"].update({"extra": 0}),
+            ),
+            (
+                "prefix cache missing",
+                lambda c: c["prefix_cache"].pop("admission_skips"),
+            ),
+            (
+                "prefix cache enabled type",
+                lambda c: c["prefix_cache"].update({"enabled": 0}),
+            ),
+            (
+                "prefix cache enabled value",
+                lambda c: c["prefix_cache"].update({"enabled": True}),
+            ),
+            (
+                "prefix cache dir",
+                lambda c: c["prefix_cache"].update({"dir": "/tmp/cache"}),
+            ),
+            (
+                "prefix cache min tokens",
+                lambda c: c["prefix_cache"].update({"min_tokens": 64}),
+            ),
+            (
+                "prefix cache max entries type",
+                lambda c: c["prefix_cache"].update({"max_entries": True}),
+            ),
+            (
+                "prefix cache max bytes",
+                lambda c: c["prefix_cache"].update({"max_bytes": 0}),
+            ),
+            (
+                "prefix cache disabled counter",
+                lambda c: c["prefix_cache"].update({"hits": 1}),
+            ),
+            ("FLM extra", lambda c: c["flm"].update({"extra": 0})),
+            ("FLM missing", lambda c: c["flm"].pop("features")),
+            (
+                "FLM architecture type",
+                lambda c: c["flm"].update({"architecture_id": True}),
+            ),
+            (
+                "FLM architecture value",
+                lambda c: c["flm"].update({"architecture_id": 3}),
+            ),
+            ("FLM model id", lambda c: c["flm"].update({"model_id": 3})),
+            (
+                "FLM storage type",
+                lambda c: c["flm"].update({"storage_abi_ids": (8,)}),
+            ),
+            (
+                "FLM storage value",
+                lambda c: c["flm"].update({"storage_abi_ids": [9]}),
+            ),
+            (
+                "FLM transfer backend",
+                lambda c: c["flm"].update({"transfer_backend": "pageable-h2d"}),
+            ),
+            (
+                "FLM profile count",
+                lambda c: c["flm"].update({"required_weights": 692}),
+            ),
+            (
+                "FLM source bytes type",
+                lambda c: c["flm"].update({"source_bytes": True}),
+            ),
+            (
+                "FLM upload size",
+                lambda c: c["flm"].update({"device_upload_bytes": 9_000_000_000}),
+            ),
+            (
+                "FLM startup mismatch",
+                lambda c: c["flm"].update({"startup_seconds": 1.5}),
+            ),
+            (
+                "FLM feature extra",
+                lambda c: c["flm"]["features"].update({"extra": False}),
+            ),
+            (
+                "FLM feature missing",
+                lambda c: c["flm"]["features"].pop("disk_prefix_snapshot"),
+            ),
+            (
+                "FLM feature type",
+                lambda c: c["flm"]["features"].update(
+                    {"plain_prefill_decode": 1}
+                ),
+            ),
+            (
+                "FLM feature value",
+                lambda c: c["flm"]["features"].update(
+                    {"native_dflash_generate": True}
+                ),
+            ),
+        ]
+        for label, mutation in mutations:
+            with self.subTest(label=label):
+                capabilities = self.valid_capabilities()
+                mutation(capabilities)
+                with self.assertRaises(self.harness.PhaseError):
+                    self.harness.validate_flm_evidence(
+                        capabilities,
+                        self.harness.parse_prometheus_metrics(
+                            self.valid_metrics_text()
+                        ),
+                    )
+
+    def test_validate_flm_evidence_rejects_metric_contract_mutations(self):
+        mutations = [
+            ("extra", lambda m: m.update({"extra_metric": 0})),
+            ("missing", lambda m: m.pop("supersonic_ready")),
+            ("ready type", lambda m: m.update({"supersonic_ready": True})),
+            ("ready value", lambda m: m.update({"supersonic_ready": 0})),
+            (
+                "active requests",
+                lambda m: m.update({"supersonic_active_requests": 1}),
+            ),
+            (
+                "integer type",
+                lambda m: m.update({"supersonic_generation_active": 0.5}),
+            ),
+            (
+                "scheduler contradiction",
+                lambda m: m.update({"supersonic_max_queued_requests": 31}),
+            ),
+            (
+                "context contradiction",
+                lambda m: m.update({"supersonic_max_context": 2048}),
+            ),
+            (
+                "prefix enabled contradiction",
+                lambda m: m.update({"supersonic_prefix_cache_enabled": 1}),
+            ),
+            (
+                "prefix counter contradiction",
+                lambda m: m.update({"supersonic_prefix_cache_hits": 1}),
+            ),
+            (
+                "dynamic prefix capacity contradiction",
+                lambda m: m.update(
+                    {"supersonic_prefix_cache_max_bytes": 2_000_000}
+                ),
+            ),
+            (
+                "FLM bytes contradiction",
+                lambda m: m.update({"supersonic_flm_source_bytes": 1}),
+            ),
+            (
+                "startup contradiction",
+                lambda m: m.update({"supersonic_flm_startup_seconds": 1.5}),
+            ),
+            (
+                "DFlash contradiction",
+                lambda m: m.update({"supersonic_dflash_last_rounds": 1}),
+            ),
+        ]
+        for label, mutation in mutations:
+            with self.subTest(label=label):
+                metrics = self.harness.parse_prometheus_metrics(
+                    self.valid_metrics_text()
+                )
+                mutation(metrics)
+                with self.assertRaises(self.harness.PhaseError):
+                    self.harness.validate_flm_evidence(
+                        self.valid_capabilities(),
+                        metrics,
                     )
 
     def test_validate_load_invariance_requires_one_unchanged_load(self):
@@ -1136,6 +1334,83 @@ class Qwen36FlmServerHarnessTests(unittest.TestCase):
         ]
         for mutation in mutations:
             with self.subTest(mutation=mutation):
+                report = self.valid_failure_report()
+                mutation(report)
+                with self.assertRaises(self.harness.PhaseError):
+                    self.harness.validate_failure_report(report)
+
+    def test_validate_failure_report_rejects_final_evidence_contract_mutations(self):
+        def health_metric_contradiction(report):
+            report["final"]["capabilities"] = None
+            report["final"]["flm_evidence"] = None
+            report["final"]["health"]["flm"]["source_bytes"] = 8_100_000_000
+
+        mutations = [
+            (
+                "health missing",
+                lambda r: r["final"]["health"].pop("max_context"),
+            ),
+            (
+                "health status",
+                lambda r: r["final"]["health"].update({"status": "degraded"}),
+            ),
+            (
+                "health readiness type",
+                lambda r: r["final"]["health"].update({"ready": 1}),
+            ),
+            (
+                "health endpoint contradiction",
+                lambda r: r["final"]["health"].update({"max_context": 2048}),
+            ),
+            (
+                "health scheduler contradiction",
+                lambda r: r["final"]["health"].update(
+                    {"max_queued_requests": 31}
+                ),
+            ),
+            (
+                "health FLM contradiction",
+                lambda r: r["final"]["health"]["flm"].update(
+                    {"transfer_backend": "gpu_direct_storage"}
+                ),
+            ),
+            (
+                "health capability FLM contradiction",
+                lambda r: r["final"]["health"]["flm"].update(
+                    {"file": "different-valid.flm"}
+                ),
+            ),
+            (
+                "capability scheduler extra",
+                lambda r: r["final"]["capabilities"]["scheduler"].update(
+                    {"extra": 0}
+                ),
+            ),
+            (
+                "capability endpoint type",
+                lambda r: r["final"]["capabilities"].update(
+                    {"endpoints": "/v1/models"}
+                ),
+            ),
+            (
+                "capability feature value",
+                lambda r: r["final"]["capabilities"]["flm"]["features"].update(
+                    {"plain_prefill_decode": False}
+                ),
+            ),
+            (
+                "metric readiness contradiction",
+                lambda r: r["final"]["metrics"].update(
+                    {"supersonic_ready": 0}
+                ),
+            ),
+            (
+                "health metric contradiction",
+                health_metric_contradiction,
+            ),
+        ]
+        for label, mutation in mutations:
+            with self.subTest(label=label):
                 report = self.valid_failure_report()
                 mutation(report)
                 with self.assertRaises(self.harness.PhaseError):
