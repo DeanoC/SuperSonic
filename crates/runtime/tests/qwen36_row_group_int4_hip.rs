@@ -2,7 +2,7 @@ use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::qwen36_moe::{
     int4_descriptor_dequant_smoke_launch, int4_descriptor_wmma_parity_launch,
-    Qwen36MoeInt4WeightDesc,
+    qwen36_moe_hip_int4_descriptor_wmma_parity_launch, Qwen36MoeInt4WeightDesc,
 };
 
 // Task 2's binding row-group fixture, copied verbatim rather than packed here.
@@ -37,6 +37,21 @@ fn row_group_desc(scale: &GpuBuffer, cols: usize) -> Qwen36MoeInt4WeightDesc {
     }
 }
 
+fn tile_v1_desc(scale: &GpuBuffer, zero: &GpuBuffer, cols: usize) -> Qwen36MoeInt4WeightDesc {
+    Qwen36MoeInt4WeightDesc {
+        scale: scale.as_ptr(),
+        zero: zero.as_ptr(),
+        packed_row_stride_bytes: (cols / 2) as u64,
+        packed_expert_stride_bytes: 0,
+        scale_row_stride_elements: (cols / 128) as u64,
+        scale_expert_stride_elements: 0,
+        input_group_size: 128,
+        output_group_size: 128,
+        implicit_zero_code: -1,
+        encoding: 1,
+    }
+}
+
 fn run_known_bytes(scale_bits: u16) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
     let rows = 1;
     let cols = 32;
@@ -48,6 +63,8 @@ fn run_known_bytes(scale_bits: u16) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
     int4_descriptor_dequant_smoke_launch(
         0,
         &packed,
+        &scale,
+        None,
         &desc,
         1,
         rows as i32,
@@ -111,7 +128,18 @@ fn hip_scalar_and_8wide_follow_explicit_expert_strides() -> anyhow::Result<()> {
     desc.packed_expert_stride_bytes = 20;
     desc.scale_expert_stride_elements = 2;
 
-    int4_descriptor_dequant_smoke_launch(0, &packed, &desc, 2, 1, 32, &mut wide, &mut scalar)?;
+    int4_descriptor_dequant_smoke_launch(
+        0,
+        &packed,
+        &scale,
+        None,
+        &desc,
+        2,
+        1,
+        32,
+        &mut wide,
+        &mut scalar,
+    )?;
     let wide = f32_values(&wide)?;
     let scalar = f32_values(&scalar)?;
     let nibbles = [
@@ -138,19 +166,19 @@ fn hip_wmma_matches_scalar_g32_matvec() -> anyhow::Result<()> {
 
     let mut packed_bytes = Vec::with_capacity(ROWS * COLS / 2);
     for row in 0..ROWS {
-        for byte_col in 0..COLS / 2 {
-            let low = 1 + ((row * 7 + byte_col * 3) % 15) as u8;
-            let high = 1 + ((row * 11 + byte_col * 5 + 1) % 15) as u8;
-            packed_bytes.push(low | (high << 4));
+        let code = 9 + (row % 7) as u8;
+        for _ in 0..COLS / 2 {
+            packed_bytes.push(code | (code << 4));
         }
     }
-    let scale_pattern = [0x3f00u16, 0x3f40, 0x3f80, 0x3fc0];
-    let scale_bits: Vec<u16> = (0..ROWS)
-        .flat_map(|row| (0..COLS / 32).map(move |group| scale_pattern[(row + group) % 4]))
-        .collect();
-    let activation_bits: Vec<u16> = (0..COLS)
-        .map(|col| bf16::from_f32(((col % 17) as f32 - 8.0) / 16.0).to_bits())
-        .collect();
+    let scale_bits = vec![0x3dcdu16; ROWS * COLS / 32];
+    let activation_bits = vec![bf16::ONE.to_bits(); COLS];
+    let reconstructed_witness = 3.0 * f32::from(bf16::from_bits(0x3dcd));
+    assert_ne!(
+        reconstructed_witness,
+        f32::from(bf16::from_f32(reconstructed_witness)),
+        "code 11 with scale 0x3dcd must require BF16 RNE"
+    );
 
     let packed =
         GpuBuffer::from_host_bytes(0, ScalarType::U8, &[packed_bytes.len()], &packed_bytes)?;
@@ -169,6 +197,8 @@ fn hip_wmma_matches_scalar_g32_matvec() -> anyhow::Result<()> {
     int4_descriptor_wmma_parity_launch(
         0,
         &packed,
+        &scale,
+        None,
         &desc,
         &activation,
         ROWS as i32,
@@ -205,12 +235,252 @@ fn descriptor_surface_keeps_fp8_encoding_distinct() -> anyhow::Result<()> {
     let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[32])?;
     let mut desc = row_group_desc(&scale, 32);
     desc.encoding = 3;
-    let error =
-        int4_descriptor_dequant_smoke_launch(0, &packed, &desc, 1, 1, 32, &mut wide, &mut scalar)
-            .expect_err("FP8 encoding must not enter the INT4 descriptor primitive");
+    let error = int4_descriptor_dequant_smoke_launch(
+        0,
+        &packed,
+        &scale,
+        None,
+        &desc,
+        1,
+        1,
+        32,
+        &mut wide,
+        &mut scalar,
+    )
+    .expect_err("FP8 encoding must not enter the INT4 descriptor primitive");
     assert!(
         error.to_string().contains("encoding 3"),
         "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn safe_launch_rejects_descriptor_scale_pointer_mismatch_before_ffi() -> anyhow::Result<()> {
+    set_backend(Backend::Hip);
+    let packed = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[16], &TASK2_PACKED)?;
+    let scale = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x3f80]))?;
+    let other_scale =
+        GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x3f00]))?;
+    let mut wide = GpuBuffer::zeros(0, ScalarType::F32, &[32])?;
+    let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[32])?;
+    let mut desc = row_group_desc(&other_scale, 32);
+    desc.scale = other_scale.as_ptr();
+
+    let error = int4_descriptor_dequant_smoke_launch(
+        0,
+        &packed,
+        &scale,
+        None,
+        &desc,
+        1,
+        1,
+        32,
+        &mut wide,
+        &mut scalar,
+    )
+    .expect_err("descriptor scale pointer must identify the borrowed scale buffer");
+    assert!(error.to_string().contains("scale pointer"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn safe_launch_rejects_short_scale_sidecar_before_ffi() -> anyhow::Result<()> {
+    set_backend(Backend::Hip);
+    let packed_bytes = TASK2_PACKED.repeat(2);
+    let packed = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[32], &packed_bytes)?;
+    let scale = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x3f80]))?;
+    let mut wide = GpuBuffer::zeros(0, ScalarType::F32, &[64])?;
+    let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[64])?;
+    let desc = row_group_desc(&scale, 32);
+
+    let error = int4_descriptor_dequant_smoke_launch(
+        0,
+        &packed,
+        &scale,
+        None,
+        &desc,
+        1,
+        2,
+        32,
+        &mut wide,
+        &mut scalar,
+    )
+    .expect_err("two rows require two BF16 scale elements");
+    assert!(error.to_string().contains("scale sidecar"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn safe_launch_rejects_non_bf16_scale_sidecar_before_ffi() -> anyhow::Result<()> {
+    set_backend(Backend::Hip);
+    let packed = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[16], &TASK2_PACKED)?;
+    let scale = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[2], &[0x80, 0x3f])?;
+    let mut wide = GpuBuffer::zeros(0, ScalarType::F32, &[32])?;
+    let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[32])?;
+    let desc = row_group_desc(&scale, 32);
+
+    let error = int4_descriptor_dequant_smoke_launch(
+        0,
+        &packed,
+        &scale,
+        None,
+        &desc,
+        1,
+        1,
+        32,
+        &mut wide,
+        &mut scalar,
+    )
+    .expect_err("scale sidecar dtype must be validated before FFI");
+    assert!(error.to_string().contains("BF16"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn safe_launch_rejects_zero_buffer_for_implicit_zero_encoding_before_ffi() -> anyhow::Result<()> {
+    set_backend(Backend::Hip);
+    let packed = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[16], &TASK2_PACKED)?;
+    let scale = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x3f80]))?;
+    let zero = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x4100]))?;
+    let mut wide = GpuBuffer::zeros(0, ScalarType::F32, &[32])?;
+    let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[32])?;
+    let desc = row_group_desc(&scale, 32);
+
+    let error = int4_descriptor_dequant_smoke_launch(
+        0,
+        &packed,
+        &scale,
+        Some(&zero),
+        &desc,
+        1,
+        1,
+        32,
+        &mut wide,
+        &mut scalar,
+    )
+    .expect_err("encoding 2 must not accept a zero sidecar buffer");
+    assert!(error.to_string().contains("zero buffer"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn safe_launch_rejects_descriptor_zero_pointer_mismatch_before_ffi() -> anyhow::Result<()> {
+    set_backend(Backend::Hip);
+    const ROWS: usize = 128;
+    const COLS: usize = 128;
+    let packed = GpuBuffer::zeros(0, ScalarType::U8, &[ROWS * COLS / 2])?;
+    let scale = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x3f80]))?;
+    let zero = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x4100]))?;
+    let other_zero = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x40e0]))?;
+    let mut wide = GpuBuffer::zeros(0, ScalarType::F32, &[ROWS * COLS])?;
+    let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[ROWS * COLS])?;
+    let desc = tile_v1_desc(&scale, &other_zero, COLS);
+
+    let error = int4_descriptor_dequant_smoke_launch(
+        0,
+        &packed,
+        &scale,
+        Some(&zero),
+        &desc,
+        1,
+        ROWS as i32,
+        COLS as i32,
+        &mut wide,
+        &mut scalar,
+    )
+    .expect_err("descriptor zero pointer must identify the borrowed zero buffer");
+    assert!(error.to_string().contains("zero pointer"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn safe_launch_rejects_short_explicit_zero_sidecar_before_ffi() -> anyhow::Result<()> {
+    set_backend(Backend::Hip);
+    const ROWS: usize = 256;
+    const COLS: usize = 128;
+    let packed = GpuBuffer::zeros(0, ScalarType::U8, &[ROWS * COLS / 2])?;
+    let scale =
+        GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[2], &bf16_bytes(&[0x3f80, 0x3f80]))?;
+    let zero = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x4100]))?;
+    let mut wide = GpuBuffer::zeros(0, ScalarType::F32, &[ROWS * COLS])?;
+    let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[ROWS * COLS])?;
+    let desc = tile_v1_desc(&scale, &zero, COLS);
+
+    let error = int4_descriptor_dequant_smoke_launch(
+        0,
+        &packed,
+        &scale,
+        Some(&zero),
+        &desc,
+        1,
+        ROWS as i32,
+        COLS as i32,
+        &mut wide,
+        &mut scalar,
+    )
+    .expect_err("two output groups require two BF16 zero elements");
+    assert!(error.to_string().contains("zero sidecar"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn safe_launch_rejects_buffer_launch_ordinal_mismatch_before_ffi() -> anyhow::Result<()> {
+    set_backend(Backend::Hip);
+    let packed = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[16], &TASK2_PACKED)?;
+    let scale = GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[1], &bf16_bytes(&[0x3f80]))?;
+    let mut wide = GpuBuffer::zeros(0, ScalarType::F32, &[32])?;
+    let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[32])?;
+    let desc = row_group_desc(&scale, 32);
+
+    let error = int4_descriptor_dequant_smoke_launch(
+        usize::MAX,
+        &packed,
+        &scale,
+        None,
+        &desc,
+        1,
+        1,
+        32,
+        &mut wide,
+        &mut scalar,
+    )
+    .expect_err("all borrowed buffers must match the launch ordinal before FFI");
+    assert!(error.to_string().contains("device ordinal"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn cpp_wmma_ffi_rejects_single_expert_scale_extent_overflow() -> anyhow::Result<()> {
+    set_backend(Backend::Hip);
+    const ROWS: usize = 32;
+    const COLS: usize = 128;
+    let packed = GpuBuffer::zeros(0, ScalarType::U8, &[ROWS * COLS / 2])?;
+    let scale = GpuBuffer::zeros(0, ScalarType::BF16, &[ROWS * COLS / 32])?;
+    let activation = GpuBuffer::zeros(0, ScalarType::BF16, &[COLS])?;
+    let mut scalar = GpuBuffer::zeros(0, ScalarType::F32, &[ROWS])?;
+    let mut wmma = GpuBuffer::zeros(0, ScalarType::F32, &[ROWS])?;
+    let mut desc = row_group_desc(&scale, COLS);
+    desc.scale_row_stride_elements = u64::MAX;
+
+    // The invalid ordinal keeps the pre-fix path from launching after it
+    // incorrectly accepts the overflowing one-expert descriptor.
+    let status = unsafe {
+        qwen36_moe_hip_int4_descriptor_wmma_parity_launch(
+            usize::MAX,
+            packed.as_ptr() as *const u8,
+            &desc,
+            activation.as_ptr(),
+            ROWS as i32,
+            COLS as i32,
+            scalar.as_mut_ptr() as *mut f32,
+            wmma.as_mut_ptr() as *mut f32,
+        )
+    };
+    let raw_status: u64 = unsafe { std::mem::transmute(status) };
+    assert_eq!(
+        raw_status, 179,
+        "C++ descriptor validation must reject overflow before device probing"
     );
     Ok(())
 }

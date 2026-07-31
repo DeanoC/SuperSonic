@@ -634,22 +634,94 @@ extern "C" {
     ) -> Qwen36BridgeStatus;
 }
 
+fn validate_buffer_for_descriptor_launch(
+    operation: &str,
+    name: &str,
+    ordinal: usize,
+    buffer: &GpuBuffer,
+    dtype: ScalarType,
+) -> Result<(), GpuError> {
+    if buffer.backend() != Backend::Hip {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: {name} must use the HIP backend"
+        )));
+    }
+    if buffer.device_ordinal() != ordinal {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: {name} device ordinal {} does not match launch ordinal {ordinal}",
+            buffer.device_ordinal()
+        )));
+    }
+    if buffer.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: {name} must be {dtype:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_descriptor_int4_common(
     operation: &str,
+    ordinal: usize,
     packed: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: Option<&GpuBuffer>,
     desc: &Qwen36MoeInt4WeightDesc,
     experts: i32,
     out_rows: i32,
     in_cols: i32,
 ) -> Result<usize, GpuError> {
-    if packed.backend() != Backend::Hip {
-        return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe::{operation}: HIP buffer required"
-        )));
+    fn validate_bf16_sidecar(
+        operation: &str,
+        name: &str,
+        ordinal: usize,
+        sidecar: &GpuBuffer,
+        required_elements: u64,
+    ) -> Result<(), GpuError> {
+        validate_buffer_for_descriptor_launch(operation, name, ordinal, sidecar, ScalarType::BF16)?;
+        let element_bytes = std::mem::size_of::<u16>();
+        let shape_bytes = sidecar
+            .elem_count()
+            .checked_mul(element_bytes)
+            .ok_or_else(|| {
+                GpuError::InvalidArg(format!(
+                    "qwen36_moe::{operation}: {name} BF16 byte shape overflows"
+                ))
+            })?;
+        if sidecar.len_bytes() != shape_bytes
+            || sidecar.len_bytes() % element_bytes != 0
+            || (sidecar.as_ptr() as usize) % std::mem::align_of::<u16>() != 0
+        {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::{operation}: {name} has invalid BF16 byte shape or alignment"
+            )));
+        }
+        let required_bytes = usize::try_from(required_elements)
+            .ok()
+            .and_then(|elements| elements.checked_mul(element_bytes))
+            .ok_or_else(|| {
+                GpuError::InvalidArg(format!(
+                    "qwen36_moe::{operation}: {name} required byte extent overflows"
+                ))
+            })?;
+        if sidecar.len_bytes() < required_bytes {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::{operation}: {name} sidecar is shorter than descriptor extent"
+            )));
+        }
+        Ok(())
     }
-    if packed.dtype() != ScalarType::U8 {
+
+    validate_buffer_for_descriptor_launch(
+        operation,
+        "packed weights",
+        ordinal,
+        packed,
+        ScalarType::U8,
+    )?;
+    if desc.scale != scale.as_ptr() {
         return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe::{operation}: packed weights must be U8"
+            "qwen36_moe::{operation}: descriptor scale pointer does not match borrowed scale buffer"
         )));
     }
     if experts <= 0 || out_rows <= 0 || in_cols <= 0 || in_cols % 8 != 0 {
@@ -679,8 +751,7 @@ fn validate_descriptor_int4_common(
         )));
     }
     if desc.encoding == 1
-        && (desc.zero.is_null()
-            || desc.implicit_zero_code >= 0
+        && (desc.implicit_zero_code >= 0
             || desc.input_group_size != 128
             || desc.output_group_size != 128)
     {
@@ -688,14 +759,30 @@ fn validate_descriptor_int4_common(
             "qwen36_moe::{operation}: tile-v1 encoding 1 requires explicit zero values"
         )));
     }
+    let explicit_zero = if desc.encoding == 1 {
+        let zero = zero.ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "qwen36_moe::{operation}: tile-v1 encoding 1 requires a borrowed zero buffer"
+            ))
+        })?;
+        if desc.zero != zero.as_ptr() {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::{operation}: descriptor zero pointer does not match borrowed zero buffer"
+            )));
+        }
+        Some(zero)
+    } else {
+        None
+    };
     if desc.encoding == 2
         && (!desc.zero.is_null()
+            || zero.is_some()
             || desc.input_group_size != 32
             || desc.output_group_size != 1
             || desc.implicit_zero_code != 8)
     {
         return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe::{operation}: row-group encoding 2 requires G32, output group 1, and implicit zero 8"
+            "qwen36_moe::{operation}: row-group encoding 2 requires G32, output group 1, implicit zero 8, and no zero buffer"
         )));
     }
     let logical_row_bytes = (in_cols / 2) as u64;
@@ -730,6 +817,16 @@ fn validate_descriptor_int4_common(
             "qwen36_moe::{operation}: scale expert stride is too short"
         )));
     }
+    let scale_extent = (experts as u64 - 1)
+        .checked_mul(desc.scale_expert_stride_elements)
+        .and_then(|offset| offset.checked_add(scale_per_expert))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!("qwen36_moe::{operation}: scale extent overflows"))
+        })?;
+    validate_bf16_sidecar(operation, "scale", ordinal, scale, scale_extent)?;
+    if let Some(zero) = explicit_zero {
+        validate_bf16_sidecar(operation, "zero", ordinal, zero, scale_extent)?;
+    }
     let packed_extent = (experts as u64 - 1)
         .checked_mul(desc.packed_expert_stride_bytes)
         .and_then(|offset| offset.checked_add(packed_per_expert))
@@ -753,6 +850,8 @@ fn validate_descriptor_int4_common(
 pub fn int4_descriptor_dequant_smoke_launch(
     ordinal: usize,
     packed: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: Option<&GpuBuffer>,
     desc: &Qwen36MoeInt4WeightDesc,
     experts: i32,
     out_rows: i32,
@@ -762,17 +861,24 @@ pub fn int4_descriptor_dequant_smoke_launch(
 ) -> Result<(), GpuError> {
     let output_count = validate_descriptor_int4_common(
         "int4_descriptor_dequant_smoke_launch",
+        ordinal,
         packed,
+        scale,
+        zero,
         desc,
         experts,
         out_rows,
         in_cols,
     )?;
     for output in [&*dq_8_out, &*dq_scalar_out] {
-        if output.backend() != Backend::Hip
-            || output.dtype() != ScalarType::F32
-            || output.elem_count() < output_count
-        {
+        validate_buffer_for_descriptor_launch(
+            "int4_descriptor_dequant_smoke_launch",
+            "dequant output",
+            ordinal,
+            output,
+            ScalarType::F32,
+        )?;
+        if output.elem_count() < output_count {
             return Err(GpuError::InvalidArg(
                 "qwen36_moe::int4_descriptor_dequant_smoke_launch: F32 HIP outputs are too short"
                     .into(),
@@ -808,6 +914,8 @@ pub fn int4_descriptor_dequant_smoke_launch(
 pub fn int4_descriptor_wmma_parity_launch(
     ordinal: usize,
     packed: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: Option<&GpuBuffer>,
     desc: &Qwen36MoeInt4WeightDesc,
     activation: &GpuBuffer,
     out_rows: i32,
@@ -817,7 +925,10 @@ pub fn int4_descriptor_wmma_parity_launch(
 ) -> Result<(), GpuError> {
     let output_count = validate_descriptor_int4_common(
         "int4_descriptor_wmma_parity_launch",
+        ordinal,
         packed,
+        scale,
+        zero,
         desc,
         1,
         out_rows,
@@ -828,20 +939,28 @@ pub fn int4_descriptor_wmma_parity_launch(
             "qwen36_moe::int4_descriptor_wmma_parity_launch: fixture must be [32, 128]".into(),
         ));
     }
-    if activation.backend() != Backend::Hip
-        || activation.dtype() != ScalarType::BF16
-        || activation.elem_count() < in_cols as usize
-    {
+    validate_buffer_for_descriptor_launch(
+        "int4_descriptor_wmma_parity_launch",
+        "activation",
+        ordinal,
+        activation,
+        ScalarType::BF16,
+    )?;
+    if activation.elem_count() < in_cols as usize {
         return Err(GpuError::InvalidArg(
             "qwen36_moe::int4_descriptor_wmma_parity_launch: BF16 HIP activation is too short"
                 .into(),
         ));
     }
     for output in [&*scalar_out, &*wmma_out] {
-        if output.backend() != Backend::Hip
-            || output.dtype() != ScalarType::F32
-            || output.elem_count() < output_count / in_cols as usize
-        {
+        validate_buffer_for_descriptor_launch(
+            "int4_descriptor_wmma_parity_launch",
+            "matvec output",
+            ordinal,
+            output,
+            ScalarType::F32,
+        )?;
+        if output.elem_count() < output_count / in_cols as usize {
             return Err(GpuError::InvalidArg(
                 "qwen36_moe::int4_descriptor_wmma_parity_launch: F32 HIP outputs are too short"
                     .into(),

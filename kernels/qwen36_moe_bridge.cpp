@@ -193,27 +193,26 @@ int validate_int4_descriptor_geometry(
         desc.scale_row_stride_elements < scale_row_elements) {
         return 176;
     }
-    if (experts > 1) {
-        const uint64_t scale_rows =
-            static_cast<uint64_t>(out_rows / desc.output_group_size);
-        uint64_t packed_expert_elements = 0;
-        uint64_t scale_expert_elements = 0;
-        if (!checked_strided_extent(
-                static_cast<uint64_t>(out_rows),
-                desc.packed_row_stride_bytes,
-                packed_row_elements,
-                &packed_expert_elements) ||
-            !checked_strided_extent(
-                scale_rows,
-                desc.scale_row_stride_elements,
-                scale_row_elements,
-                &scale_expert_elements)) {
-            return 179;
-        }
-        if (desc.packed_expert_stride_bytes < packed_expert_elements ||
-            desc.scale_expert_stride_elements < scale_expert_elements) {
-            return 177;
-        }
+    const uint64_t scale_rows =
+        static_cast<uint64_t>(out_rows / desc.output_group_size);
+    uint64_t packed_expert_elements = 0;
+    uint64_t scale_expert_elements = 0;
+    if (!checked_strided_extent(
+            static_cast<uint64_t>(out_rows),
+            desc.packed_row_stride_bytes,
+            packed_row_elements,
+            &packed_expert_elements) ||
+        !checked_strided_extent(
+            scale_rows,
+            desc.scale_row_stride_elements,
+            scale_row_elements,
+            &scale_expert_elements)) {
+        return 179;
+    }
+    if (experts > 1 &&
+        (desc.packed_expert_stride_bytes < packed_expert_elements ||
+         desc.scale_expert_stride_elements < scale_expert_elements)) {
+        return 177;
     }
     return 0;
 }

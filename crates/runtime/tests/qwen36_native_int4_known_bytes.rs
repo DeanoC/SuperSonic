@@ -131,6 +131,8 @@ fn hip_descriptor_decoder_preserves_tile_v1_known_bytes() -> anyhow::Result<()> 
     int4_descriptor_dequant_smoke_launch(
         0,
         &packed_gpu,
+        &scale_gpu,
+        Some(&zero_gpu),
         &desc,
         1,
         rows as i32,
