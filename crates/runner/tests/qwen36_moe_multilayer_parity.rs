@@ -10,7 +10,7 @@
 //! per-layer cumulative budgets, and final logits retain cos_sim ≥ 0.999.
 //!
 //! The qualification fixture is tracked at
-//! `oracle/fixtures/qwen36_moe_multilayer_int4_v1.json` and is mandatory.
+//! `oracle/fixtures/qwen36_moe_multilayer_row_group_g32_v2.json` and is mandatory.
 //! `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON` may override it for diagnostic
 //! runs, but the normal qualification command needs no environment variable:
 //!
@@ -46,7 +46,7 @@ use supersonic_runtime::qwen36_moe::decode::{
 };
 use supersonic_runtime::qwen36_moe::layer_loader::Qwen36WeightMode;
 use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
-use supersonic_runtime::qwen36_moe::persistent_decode::build_int4_descs;
+use supersonic_runtime::qwen36_moe::persistent_decode::{build_int4_descs, build_int4_weight_desc};
 use supersonic_runtime::qwen36_moe::persistent_decode::{LmHeadFold, CACHE_POS_INHERIT};
 use supersonic_runtime::qwen36_moe::types::{
     is_full_attn_layer, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
@@ -54,7 +54,9 @@ use supersonic_runtime::qwen36_moe::types::{
     ResidentWeight,
 };
 
-const TRACKED_MULTILAYER_ORACLE: &str = "../../oracle/fixtures/qwen36_moe_multilayer_int4_v1.json";
+const TRACKED_MULTILAYER_ORACLE: &str =
+    "../../oracle/fixtures/qwen36_moe_multilayer_row_group_g32_v2.json";
+const TILE_V1_MULTILAYER_ORACLE: &str = "../../oracle/fixtures/qwen36_moe_multilayer_int4_v1.json";
 
 #[derive(Clone, Copy, Debug)]
 struct NumericalBudget {
@@ -66,6 +68,52 @@ struct NumericalBudget {
 enum HandoffBoundary {
     Attention,
     Ffn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Int4FixtureLayout {
+    TileV1G128,
+    RowGroupG32,
+}
+
+fn fixture_int4_layout(json: &Value) -> Option<Int4FixtureLayout> {
+    let schema = json["schema"].as_str().unwrap_or("");
+    let layout = match schema {
+        "qwen36-moe-oracle-multilayer-v1" => return None,
+        "qwen36-moe-oracle-multilayer-int4-v1" => Int4FixtureLayout::TileV1G128,
+        "qwen36-moe-oracle-multilayer-row-group-int4-v2" => {
+            assert_eq!(json["fixture_id"], "qwen36-moe-multilayer-row-group-g32-v2");
+            Int4FixtureLayout::RowGroupG32
+        }
+        other => panic!("unsupported multi-layer schema: {other}"),
+    };
+    let expected_group = match layout {
+        Int4FixtureLayout::TileV1G128 => 128,
+        Int4FixtureLayout::RowGroupG32 => 32,
+    };
+    assert_eq!(json["config"]["int4_group_size"], expected_group);
+    match layout {
+        Int4FixtureLayout::TileV1G128 => {
+            assert!(json["config"].get("int4_layout").is_none());
+            assert!(json.get("fixture_id").is_none());
+        }
+        Int4FixtureLayout::RowGroupG32 => {
+            assert_eq!(json["config"]["int4_layout"], "row_group");
+        }
+    }
+    for layer in json["int4_weights_per_layer"].as_array().unwrap() {
+        for block in ["attn", "ffn"] {
+            for (projection, sidecar) in layer[block].as_object().unwrap() {
+                let has_zero = sidecar.get("zero").and_then(Value::as_str).is_some();
+                assert_eq!(
+                    has_zero,
+                    layout == Int4FixtureLayout::TileV1G128,
+                    "{schema} {block}.{projection} zero-plane contract"
+                );
+            }
+        }
+    }
+    Some(layout)
 }
 
 // Candidate-independent cumulative budgets frozen from the accepted Round 3
@@ -201,54 +249,65 @@ fn decode_int4_sidecar(block: &Value, name: &str) -> (Vec<u8>, Vec<u8>, Option<V
     (packed, scale, zero)
 }
 
-fn row_group_sidecar(
+fn fixture_int4_sidecar(
     ordinal: usize,
     name: &str,
     logical_shape: &[usize],
     group_size: usize,
     scale: &[u8],
     zero: Option<&[u8]>,
+    layout: Int4FixtureLayout,
 ) -> LoadedInt4Sidecar {
-    assert_eq!(group_size, 32, "row-group fixture must use G32");
-    assert!(zero.is_none(), "row-group fixture {name} must omit zero");
     let out_rows = logical_shape[logical_shape.len() - 2];
     let in_cols = logical_shape[logical_shape.len() - 1];
     let packed_row_stride_bytes = in_cols / 2;
     let scale_row_stride_elements = in_cols / group_size;
+    let (kind, zero, zero_tensor, output_group_size, implicit_zero_code) = match layout {
+        Int4FixtureLayout::TileV1G128 => {
+            assert_eq!(group_size, 128, "tile-v1 fixture must use G128");
+            let zero = zero.unwrap_or_else(|| panic!("tile-v1 fixture {name} requires zero"));
+            (
+                Int4StorageKind::TileV1,
+                Some(upload_bf16(
+                    ordinal,
+                    &[zero.len() / 2],
+                    zero,
+                    &format!("{name} zero"),
+                )),
+                Some(format!("{name}.zero")),
+                group_size,
+                None,
+            )
+        }
+        Int4FixtureLayout::RowGroupG32 => {
+            assert_eq!(group_size, 32, "row-group fixture must use G32");
+            assert!(zero.is_none(), "row-group fixture {name} must omit zero");
+            (Int4StorageKind::RowGroupSymmetric, None, None, 1, Some(8))
+        }
+    };
     LoadedInt4Sidecar {
         scale: upload_bf16(ordinal, &[scale.len() / 2], scale, &format!("{name} scale")),
-        zero: None,
+        zero,
         view: Int4StorageView {
-            kind: Int4StorageKind::RowGroupSymmetric,
+            kind,
             group_size,
             packed_tensor: format!("{name}.packed"),
             scale_tensor: format!("{name}.scale"),
-            zero_tensor: None,
+            zero_tensor,
             logical_shape: logical_shape.to_vec(),
             packed_row_stride_bytes,
             packed_expert_stride_bytes: out_rows * packed_row_stride_bytes,
             scale_row_stride_elements,
-            scale_expert_stride_elements: out_rows * scale_row_stride_elements,
-            output_group_size: 1,
-            implicit_zero_code: Some(8),
+            scale_expert_stride_elements: (out_rows / output_group_size)
+                * scale_row_stride_elements,
+            output_group_size,
+            implicit_zero_code,
         },
     }
 }
 
-fn row_group_weight_desc(sidecar: &LoadedInt4Sidecar) -> Qwen36MoeInt4WeightDesc {
-    let view = &sidecar.view;
-    Qwen36MoeInt4WeightDesc {
-        scale: sidecar.scale.as_ptr(),
-        zero: std::ptr::null(),
-        packed_row_stride_bytes: view.packed_row_stride_bytes as u64,
-        packed_expert_stride_bytes: view.packed_expert_stride_bytes as u64,
-        scale_row_stride_elements: view.scale_row_stride_elements as u64,
-        scale_expert_stride_elements: view.scale_expert_stride_elements as u64,
-        input_group_size: view.group_size as i32,
-        output_group_size: view.output_group_size as i32,
-        implicit_zero_code: view.implicit_zero_code.unwrap() as i32,
-        encoding: 2,
-    }
+fn fixture_weight_desc(sidecar: &LoadedInt4Sidecar) -> Qwen36MoeInt4WeightDesc {
+    build_int4_weight_desc(sidecar).expect("build fixture INT4 descriptor")
 }
 
 fn build_full_attn_layer(
@@ -257,6 +316,7 @@ fn build_full_attn_layer(
     weights: &Value,
     int4_block: Option<&Value>,
     group_size: i32,
+    int4_layout: Option<Int4FixtureLayout>,
 ) -> AttnLayerBuffers {
     let hidden = geom.hidden as usize;
     let h = geom.num_attention_heads as usize;
@@ -275,43 +335,48 @@ fn build_full_attn_layer(
         let k_proj_w = upload_u8(ordinal, &[hkv * d, hidden / 2], &kp, "k_proj packed");
         let v_proj_w = upload_u8(ordinal, &[hkv * d, hidden / 2], &vp, "v_proj packed");
         let o_proj_w = upload_u8(ordinal, &[hidden, h * d / 2], &op, "o_proj packed");
+        let layout = int4_layout.expect("INT4 full-attention fixture layout");
         let int4 = FullAttnInt4Sidecars {
             group_size,
             q_proj_type: 4,
-            q_proj: row_group_sidecar(
+            q_proj: fixture_int4_sidecar(
                 ordinal,
                 "q_proj",
                 &[2 * h * d, hidden],
                 group_size as usize,
                 &qs,
                 qz.as_deref(),
+                layout,
             ),
             k_proj_type: 4,
-            k_proj: row_group_sidecar(
+            k_proj: fixture_int4_sidecar(
                 ordinal,
                 "k_proj",
                 &[hkv * d, hidden],
                 group_size as usize,
                 &ks,
                 kz.as_deref(),
+                layout,
             ),
             v_proj_type: 4,
-            v_proj: row_group_sidecar(
+            v_proj: fixture_int4_sidecar(
                 ordinal,
                 "v_proj",
                 &[hkv * d, hidden],
                 group_size as usize,
                 &vs,
                 vz.as_deref(),
+                layout,
             ),
             o_proj_type: 4,
-            o_proj: row_group_sidecar(
+            o_proj: fixture_int4_sidecar(
                 ordinal,
                 "o_proj",
                 &[hidden, h * d],
                 group_size as usize,
                 &os,
                 oz.as_deref(),
+                layout,
             ),
         };
         (q_proj_w, k_proj_w, v_proj_w, o_proj_w, Some(int4))
@@ -371,6 +436,7 @@ fn build_linear_attn_layer(
     weights: &Value,
     int4_block: Option<&Value>,
     group_size: i32,
+    int4_layout: Option<Int4FixtureLayout>,
 ) -> AttnLayerBuffers {
     let hidden = geom.hidden as usize;
     let k = geom.num_k_heads as usize;
@@ -395,34 +461,38 @@ fn build_linear_attn_layer(
         let in_proj_qkv_w = upload_u8(ordinal, &[qkv_dim, hidden / 2], &qp, "in_proj_qkv packed");
         let in_proj_z_w = upload_u8(ordinal, &[val_dim, hidden / 2], &zp, "in_proj_z packed");
         let out_proj_w = upload_u8(ordinal, &[hidden, val_dim / 2], &op, "out_proj packed");
+        let layout = int4_layout.expect("INT4 linear-attention fixture layout");
         let int4 = LinearAttnInt4Sidecars {
             group_size,
             in_proj_qkv_type: 4,
-            in_proj_qkv: row_group_sidecar(
+            in_proj_qkv: fixture_int4_sidecar(
                 ordinal,
                 "in_proj_qkv",
                 &[qkv_dim, hidden],
                 group_size as usize,
                 &qs,
                 qz.as_deref(),
+                layout,
             ),
             in_proj_z_type: 4,
-            in_proj_z: row_group_sidecar(
+            in_proj_z: fixture_int4_sidecar(
                 ordinal,
                 "in_proj_z",
                 &[val_dim, hidden],
                 group_size as usize,
                 &zs,
                 zz.as_deref(),
+                layout,
             ),
             out_proj_type: 4,
-            out_proj: row_group_sidecar(
+            out_proj: fixture_int4_sidecar(
                 ordinal,
                 "linear_out_proj",
                 &[hidden, val_dim],
                 group_size as usize,
                 &os,
                 oz.as_deref(),
+                layout,
             ),
         };
         (in_proj_qkv_w, in_proj_z_w, out_proj_w, Some(int4))
@@ -508,6 +578,7 @@ fn build_ffn_layer(
     weights: &Value,
     int4_block: Option<&Value>,
     group_size: i32,
+    int4_layout: Option<Int4FixtureLayout>,
 ) -> FfnLayerBuffers {
     let hidden = geom.hidden as usize;
     let e = geom.num_experts as usize;
@@ -534,52 +605,58 @@ fn build_ffn_layer(
         let shared_gate_proj_w = upload_u8(ordinal, &[is_dim, hidden / 2], &sgp, "sgp packed");
         let shared_up_proj_w = upload_u8(ordinal, &[is_dim, hidden / 2], &sup, "sup packed");
         let shared_down_proj_w = upload_u8(ordinal, &[hidden, is_dim / 2], &sdp, "sdp packed");
+        let layout = int4_layout.expect("INT4 FFN fixture layout");
         let int4 = FfnInt4Sidecars {
             group_size,
             gate_up_proj_type: 4,
-            gate_up_proj: row_group_sidecar(
+            gate_up_proj: fixture_int4_sidecar(
                 ordinal,
                 "gate_up_proj",
                 &[e, 2 * i_dim, hidden],
                 group_size as usize,
                 &gs,
                 gz.as_deref(),
+                layout,
             ),
             down_proj_type: 4,
-            down_proj: row_group_sidecar(
+            down_proj: fixture_int4_sidecar(
                 ordinal,
                 "down_proj",
                 &[e, hidden, i_dim],
                 group_size as usize,
                 &ds,
                 dz.as_deref(),
+                layout,
             ),
             shared_gate_proj_type: 4,
-            shared_gate_proj: row_group_sidecar(
+            shared_gate_proj: fixture_int4_sidecar(
                 ordinal,
                 "shared_gate_proj",
                 &[is_dim, hidden],
                 group_size as usize,
                 &sgs,
                 sgz.as_deref(),
+                layout,
             ),
             shared_up_proj_type: 4,
-            shared_up_proj: row_group_sidecar(
+            shared_up_proj: fixture_int4_sidecar(
                 ordinal,
                 "shared_up_proj",
                 &[is_dim, hidden],
                 group_size as usize,
                 &sus,
                 suz.as_deref(),
+                layout,
             ),
             shared_down_proj_type: 4,
-            shared_down_proj: row_group_sidecar(
+            shared_down_proj: fixture_int4_sidecar(
                 ordinal,
                 "shared_down_proj",
                 &[hidden, is_dim],
                 group_size as usize,
                 &sds,
                 sdz.as_deref(),
+                layout,
             ),
         };
         (
@@ -660,6 +737,7 @@ fn build_layers(
     weights_per_layer: &[Value],
     int4_per_layer: Option<&Vec<Value>>,
     int4_group_size: i32,
+    int4_layout: Option<Int4FixtureLayout>,
 ) -> Vec<LayerBuffers> {
     weights_per_layer
         .iter()
@@ -670,17 +748,34 @@ fn build_layers(
             let attn_int4 = int4_per_layer.map(|layers| &layers[li]["attn"]);
             let ffn_int4 = int4_per_layer.map(|layers| &layers[li]["ffn"]);
             let attn = if is_full_attn_layer(li as i32) {
-                build_full_attn_layer(ordinal, geom, attn_w, attn_int4, int4_group_size)
+                build_full_attn_layer(
+                    ordinal,
+                    geom,
+                    attn_w,
+                    attn_int4,
+                    int4_group_size,
+                    int4_layout,
+                )
             } else {
-                build_linear_attn_layer(ordinal, geom, attn_w, attn_int4, int4_group_size)
+                build_linear_attn_layer(
+                    ordinal,
+                    geom,
+                    attn_w,
+                    attn_int4,
+                    int4_group_size,
+                    int4_layout,
+                )
             };
-            let ffn = build_ffn_layer(ordinal, geom, ffn_w, ffn_int4, int4_group_size);
+            let ffn = build_ffn_layer(ordinal, geom, ffn_w, ffn_int4, int4_group_size, int4_layout);
             LayerBuffers { attn, ffn }
         })
         .collect()
 }
 
-fn assert_all_material_descriptors_are_row_group(layers: &[LayerBuffers]) {
+fn assert_all_material_descriptors_match_fixture(
+    layers: &[LayerBuffers],
+    layout: Int4FixtureLayout,
+) {
     let descs = build_int4_descs(layers)
         .expect("build row-group descriptors")
         .expect("row-group descriptor array");
@@ -707,18 +802,26 @@ fn assert_all_material_descriptors_are_row_group(layers: &[LayerBuffers]) {
             ]);
         }
         for (projection, weight) in expected {
-            assert_eq!(weight.encoding, 2, "layer {layer_idx} {projection}");
-            assert!(weight.zero.is_null(), "layer {layer_idx} {projection} zero");
+            let (encoding, input_group, output_group, implicit_zero) = match layout {
+                Int4FixtureLayout::TileV1G128 => (1, 128, 128, -1),
+                Int4FixtureLayout::RowGroupG32 => (2, 32, 1, 8),
+            };
+            assert_eq!(weight.encoding, encoding, "layer {layer_idx} {projection}");
             assert_eq!(
-                weight.input_group_size, 32,
+                weight.zero.is_null(),
+                layout == Int4FixtureLayout::RowGroupG32,
+                "layer {layer_idx} {projection} zero"
+            );
+            assert_eq!(
+                weight.input_group_size, input_group,
                 "layer {layer_idx} {projection}"
             );
             assert_eq!(
-                weight.output_group_size, 1,
+                weight.output_group_size, output_group,
                 "layer {layer_idx} {projection}"
             );
             assert_eq!(
-                weight.implicit_zero_code, 8,
+                weight.implicit_zero_code, implicit_zero,
                 "layer {layer_idx} {projection}"
             );
         }
@@ -871,9 +974,10 @@ fn tracked_multilayer_oracle_is_the_mandatory_default() {
     let raw = std::fs::read_to_string(&path).expect("read tracked multi-layer oracle");
     let json: Value = serde_json::from_str(&raw).expect("parse tracked multi-layer oracle");
     assert_eq!(
-        json["schema"], "qwen36-moe-oracle-multilayer-int4-v1",
-        "qualification default must be the independent INT4 oracle"
+        json["schema"], "qwen36-moe-oracle-multilayer-row-group-int4-v2",
+        "qualification default must explicitly select the row-group v2 oracle"
     );
+    assert_eq!(json["fixture_id"], "qwen36-moe-multilayer-row-group-g32-v2");
     assert_eq!(json["config"]["int4_layout"], "row_group");
     assert_eq!(json["config"]["int4_group_size"], 32);
     for layer in json["int4_weights_per_layer"].as_array().unwrap() {
@@ -889,6 +993,27 @@ fn tracked_multilayer_oracle_is_the_mandatory_default() {
     assert_eq!(json["mode"], "synthetic");
     assert_eq!(json["state"], "fresh");
     assert_eq!(json["num_layers"], 4);
+}
+
+#[test]
+fn tile_v1_g128_fixture_retains_the_v1_contract() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TILE_V1_MULTILAYER_ORACLE);
+    let raw = std::fs::read_to_string(&path).expect("read tile-v1 G128 fixture");
+    let json: Value = serde_json::from_str(&raw).expect("parse tile-v1 G128 fixture");
+    assert_eq!(json["schema"], "qwen36-moe-oracle-multilayer-int4-v1");
+    assert!(json.get("fixture_id").is_none());
+    assert!(json["config"].get("int4_layout").is_none());
+    assert_eq!(json["config"]["int4_group_size"], 128);
+    for layer in json["int4_weights_per_layer"].as_array().unwrap() {
+        for block in ["attn", "ffn"] {
+            for (projection, sidecar) in layer[block].as_object().unwrap() {
+                assert!(
+                    sidecar.get("zero").and_then(Value::as_str).is_some(),
+                    "{block}.{projection} tile-v1 sidecar requires explicit zero"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -957,23 +1082,23 @@ fn run_isolated_ffn_stage(
             Qwen36MoeFfnStepInt4 {
                 group_size: sidecars.group_size,
                 gate_up_proj_type: sidecars.gate_up_proj_type,
-                gate_up_proj: row_group_weight_desc(&sidecars.gate_up_proj),
+                gate_up_proj: fixture_weight_desc(&sidecars.gate_up_proj),
                 gate_up_proj_scale: sidecars.gate_up_proj.scale.as_ptr(),
                 gate_up_proj_zero: sidecars.gate_up_proj.zero_ptr(),
                 down_proj_type: sidecars.down_proj_type,
-                down_proj: row_group_weight_desc(&sidecars.down_proj),
+                down_proj: fixture_weight_desc(&sidecars.down_proj),
                 down_proj_scale: sidecars.down_proj.scale.as_ptr(),
                 down_proj_zero: sidecars.down_proj.zero_ptr(),
                 shared_gate_proj_type: sidecars.shared_gate_proj_type,
-                shared_gate_proj: row_group_weight_desc(&sidecars.shared_gate_proj),
+                shared_gate_proj: fixture_weight_desc(&sidecars.shared_gate_proj),
                 shared_gate_proj_scale: sidecars.shared_gate_proj.scale.as_ptr(),
                 shared_gate_proj_zero: sidecars.shared_gate_proj.zero_ptr(),
                 shared_up_proj_type: sidecars.shared_up_proj_type,
-                shared_up_proj: row_group_weight_desc(&sidecars.shared_up_proj),
+                shared_up_proj: fixture_weight_desc(&sidecars.shared_up_proj),
                 shared_up_proj_scale: sidecars.shared_up_proj.scale.as_ptr(),
                 shared_up_proj_zero: sidecars.shared_up_proj.zero_ptr(),
                 shared_down_proj_type: sidecars.shared_down_proj_type,
-                shared_down_proj: row_group_weight_desc(&sidecars.shared_down_proj),
+                shared_down_proj: fixture_weight_desc(&sidecars.shared_down_proj),
                 shared_down_proj_scale: sidecars.shared_down_proj.scale.as_ptr(),
                 shared_down_proj_zero: sidecars.shared_down_proj.zero_ptr(),
             }
@@ -1022,12 +1147,8 @@ fn multilayer_chained_decode_matches_oracle() {
     let raw = std::fs::read_to_string(&json_path)
         .unwrap_or_else(|e| panic!("read multi-layer oracle json {}: {e}", json_path.display()));
     let json: Value = serde_json::from_str(&raw).expect("parse multi-layer oracle json");
-    let schema = json["schema"].as_str().unwrap_or("");
-    let int4_mode = match schema {
-        "qwen36-moe-oracle-multilayer-v1" => false,
-        "qwen36-moe-oracle-multilayer-int4-v1" => true,
-        other => panic!("unsupported multi-layer schema: {other}"),
-    };
+    let int4_layout = fixture_int4_layout(&json);
+    let int4_mode = int4_layout.is_some();
     assert_eq!(
         json["dtype"].as_str().unwrap_or(""),
         "bf16",
@@ -1071,14 +1192,18 @@ fn multilayer_chained_decode_matches_oracle() {
         weights_per_layer,
         int4_per_layer,
         int4_group_size,
+        int4_layout,
     );
-    assert_all_material_descriptors_are_row_group(&layers);
+    if let Some(layout) = int4_layout {
+        assert_all_material_descriptors_match_fixture(&layers, layout);
+    }
     let mut exact_input_attn_layers = build_layers(
         ordinal,
         &geom,
         weights_per_layer,
         int4_per_layer,
         int4_group_size,
+        int4_layout,
     );
     let mut chained_input_attn_layers = build_layers(
         ordinal,
@@ -1086,6 +1211,7 @@ fn multilayer_chained_decode_matches_oracle() {
         weights_per_layer,
         int4_per_layer,
         int4_group_size,
+        int4_layout,
     );
 
     let initial_hidden = b64_field(&json, "input_hidden");
@@ -1370,12 +1496,8 @@ fn multilayer_persistent_decode_matches_chained() {
     let json_path = tracked_multilayer_oracle_path();
     let raw = std::fs::read_to_string(&json_path).expect("read multi-layer oracle json");
     let json: Value = serde_json::from_str(&raw).expect("parse multi-layer oracle json");
-    let schema = json["schema"].as_str().unwrap_or("");
-    let int4_mode = match schema {
-        "qwen36-moe-oracle-multilayer-v1" => false,
-        "qwen36-moe-oracle-multilayer-int4-v1" => true,
-        other => panic!("unsupported multi-layer schema: {other}"),
-    };
+    let int4_layout = fixture_int4_layout(&json);
+    let int4_mode = int4_layout.is_some();
 
     let geom = parse_geom(&json);
     let position = json["position"].as_i64().unwrap_or(0) as i32;
@@ -1408,14 +1530,37 @@ fn multilayer_persistent_decode_matches_chained() {
         let attn_int4 = int4_per_layer.map(|v| &v[li]["attn"]);
         let ffn_int4 = int4_per_layer.map(|v| &v[li]["ffn"]);
         let attn = if is_full_attn_layer(li as i32) {
-            build_full_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
+            build_full_attn_layer(
+                ordinal,
+                &geom,
+                attn_w,
+                attn_int4,
+                int4_group_size,
+                int4_layout,
+            )
         } else {
-            build_linear_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
+            build_linear_attn_layer(
+                ordinal,
+                &geom,
+                attn_w,
+                attn_int4,
+                int4_group_size,
+                int4_layout,
+            )
         };
-        let ffn = build_ffn_layer(ordinal, &geom, ffn_w, ffn_int4, int4_group_size);
+        let ffn = build_ffn_layer(
+            ordinal,
+            &geom,
+            ffn_w,
+            ffn_int4,
+            int4_group_size,
+            int4_layout,
+        );
         layers.push(LayerBuffers { attn, ffn });
     }
-    assert_all_material_descriptors_are_row_group(&layers);
+    if let Some(layout) = int4_layout {
+        assert_all_material_descriptors_match_fixture(&layers, layout);
+    }
 
     let initial_hidden = b64_field(&json, "input_hidden");
     let final_norm_w = b64_field(&json, "final_norm_w");

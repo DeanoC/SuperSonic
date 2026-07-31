@@ -41,6 +41,15 @@ pub fn metal_mps_expert_f16_probe(
 
 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
 extern "C" {
+    /// Pure dispatch-policy probe used to pin the production encoding-aware
+    /// attention/FFN branch selectors without requiring a device launch.
+    pub fn qwen36_moe_hip_int4_dispatch_policy_probe(
+        phase: c_int,
+        encoding: c_int,
+        shape_valid: c_int,
+        wmma_supported: c_int,
+    ) -> c_int;
+
     /// Stub launch entry. Walks the descriptor array, validates field
     /// integrity by writing recognizable sentinel values into the workspace
     /// at known offsets, grid-barriers between layers, and returns 0 on

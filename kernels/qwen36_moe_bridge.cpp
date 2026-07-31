@@ -23,6 +23,7 @@
 #endif
 #include <mutex>
 #include <stdint.h>
+#include <vector>
 
 namespace {
 
@@ -221,6 +222,54 @@ bool is_int4_execution_desc(const Qwen36Int4WeightDesc& desc) {
     return desc.encoding == 1 || desc.encoding == 2;
 }
 
+bool is_row_group_execution_desc(const Qwen36Int4WeightDesc& desc) {
+    return desc.encoding == 2;
+}
+
+enum class Int4DispatchPolicy : int {
+    Scalar = 0,
+    Wmma = 1,
+    Reject = 2,
+};
+
+Int4DispatchPolicy select_attention_int4_dispatch(
+    bool any_int4,
+    bool any_row_group,
+    bool shape_valid,
+    bool wmma_supported
+) {
+    if (any_row_group) {
+        return shape_valid && wmma_supported
+            ? Int4DispatchPolicy::Wmma
+            : Int4DispatchPolicy::Reject;
+    }
+    return any_int4 && shape_valid && wmma_supported
+        ? Int4DispatchPolicy::Wmma
+        : Int4DispatchPolicy::Scalar;
+}
+
+Int4DispatchPolicy select_ffn_int4_dispatch(
+    bool routed_int4,
+    bool any_row_group,
+    bool shape_valid,
+    bool wmma_supported
+) {
+    if (any_row_group) return Int4DispatchPolicy::Scalar;
+    return routed_int4 && shape_valid && wmma_supported
+        ? Int4DispatchPolicy::Wmma
+        : Int4DispatchPolicy::Scalar;
+}
+
+bool attention_desc_has_row_group(const Qwen36Int4ScaleDesc& desc) {
+    return is_row_group_execution_desc(desc.q_proj) ||
+        is_row_group_execution_desc(desc.k_proj) ||
+        is_row_group_execution_desc(desc.v_proj) ||
+        is_row_group_execution_desc(desc.o_proj) ||
+        is_row_group_execution_desc(desc.linear_in_proj_qkv) ||
+        is_row_group_execution_desc(desc.linear_in_proj_z) ||
+        is_row_group_execution_desc(desc.linear_out_proj);
+}
+
 int validate_execution_descriptor(
     const Qwen36Int4WeightDesc& desc,
     int experts,
@@ -251,6 +300,24 @@ extern "C" uint64_t supersonic_qwen36_encode_bridge_status(
     return native_status == 0
         ? static_cast<uint32_t>(project_status)
         : backend_failure(project_status, static_cast<hipError_t>(native_status));
+}
+
+extern "C" int qwen36_moe_hip_int4_dispatch_policy_probe(
+    int phase,
+    int encoding,
+    int shape_valid,
+    int wmma_supported
+) {
+    if (encoding != 1 && encoding != 2) {
+        return static_cast<int>(Int4DispatchPolicy::Reject);
+    }
+    const bool row_group = encoding == 2;
+    const auto policy = phase == 3
+        ? select_ffn_int4_dispatch(
+              true, row_group, shape_valid != 0, wmma_supported != 0)
+        : select_attention_int4_dispatch(
+              true, row_group, shape_valid != 0, wmma_supported != 0);
+    return static_cast<int>(policy);
 }
 
 // `dtype` encoding follows the Qwen/Gemma/Phi bridges: 0 = half, 2 = bf16.
@@ -412,6 +479,11 @@ extern "C" uint64_t qwen36_moe_hip_attn_step_launch(
         is_int4_execution_desc(quant.k_proj) ||
         is_int4_execution_desc(quant.v_proj) ||
         is_int4_execution_desc(quant.o_proj);
+    const bool any_row_group_attn =
+        is_row_group_execution_desc(quant.q_proj) ||
+        is_row_group_execution_desc(quant.k_proj) ||
+        is_row_group_execution_desc(quant.v_proj) ||
+        is_row_group_execution_desc(quant.o_proj);
     auto wmma_group_ok = [](const Qwen36Int4WeightDesc& desc) {
         return !is_int4_execution_desc(desc) ||
             desc.input_group_size % 16 == 0;
@@ -420,10 +492,13 @@ extern "C" uint64_t qwen36_moe_hip_attn_step_launch(
         (hidden % 16 == 0) && (o_cols % 16 == 0) &&
         wmma_group_ok(quant.q_proj) && wmma_group_ok(quant.k_proj) &&
         wmma_group_ok(quant.v_proj) && wmma_group_ok(quant.o_proj);
-    const bool use_wmma_attn =
-        any_int4_attn &&
-        wmma_dims_ok_attn &&
-        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+    const auto attn_dispatch = select_attention_int4_dispatch(
+        any_int4_attn,
+        any_row_group_attn,
+        wmma_dims_ok_attn,
+        device_supports_wmma_bf16(static_cast<int>(device_ordinal)));
+    if (attn_dispatch == Int4DispatchPolicy::Reject) return 116;
+    const bool use_wmma_attn = attn_dispatch == Int4DispatchPolicy::Wmma;
 
     if (use_wmma_attn) {
         hipLaunchKernelGGL(
@@ -579,6 +654,10 @@ extern "C" uint64_t qwen36_moe_hip_linear_step_launch(
         is_int4_execution_desc(quant.linear_in_proj_qkv) ||
         is_int4_execution_desc(quant.linear_in_proj_z) ||
         is_int4_execution_desc(quant.linear_out_proj);
+    const bool any_row_group_lin =
+        is_row_group_execution_desc(quant.linear_in_proj_qkv) ||
+        is_row_group_execution_desc(quant.linear_in_proj_z) ||
+        is_row_group_execution_desc(quant.linear_out_proj);
     const bool wmma_dims_ok_lin =
         (hidden % 16 == 0) &&
         (value_dim % 16 == 0) &&
@@ -588,10 +667,13 @@ extern "C" uint64_t qwen36_moe_hip_linear_step_launch(
          quant.linear_in_proj_z.input_group_size % 16 == 0) &&
         (!is_int4_execution_desc(quant.linear_out_proj) ||
          quant.linear_out_proj.input_group_size % 16 == 0);
-    const bool use_wmma_lin =
-        any_int4_routed_lin &&
-        wmma_dims_ok_lin &&
-        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+    const auto linear_dispatch = select_attention_int4_dispatch(
+        any_int4_routed_lin,
+        any_row_group_lin,
+        wmma_dims_ok_lin,
+        device_supports_wmma_bf16(static_cast<int>(device_ordinal)));
+    if (linear_dispatch == Int4DispatchPolicy::Reject) return 126;
+    const bool use_wmma_lin = linear_dispatch == Int4DispatchPolicy::Wmma;
 
     if (use_wmma_lin) {
         hipLaunchKernelGGL(
@@ -763,15 +845,23 @@ extern "C" uint64_t qwen36_moe_hip_ffn_step_launch(
     const bool routed_int4 =
         is_int4_execution_desc(quant.experts_gate_up) &&
         is_int4_execution_desc(quant.experts_down);
+    const bool any_row_group_ffn =
+        is_row_group_execution_desc(quant.experts_gate_up) ||
+        is_row_group_execution_desc(quant.experts_down) ||
+        is_row_group_execution_desc(quant.shared_expert_gate_proj) ||
+        is_row_group_execution_desc(quant.shared_expert_up_proj) ||
+        is_row_group_execution_desc(quant.shared_expert_down_proj);
     const bool wmma_dims_ok =
         (hidden % 16 == 0) &&
         (moe_intermediate % 16 == 0) &&
         (quant.experts_gate_up.input_group_size % 16 == 0) &&
         (quant.experts_down.input_group_size % 16 == 0);
-    const bool use_wmma =
-        routed_int4 &&
-        wmma_dims_ok &&
-        ffn_step_supports_wmma_bf16(static_cast<int>(device_ordinal));
+    const bool use_wmma = select_ffn_int4_dispatch(
+        routed_int4,
+        any_row_group_ffn,
+        wmma_dims_ok,
+        ffn_step_supports_wmma_bf16(static_cast<int>(device_ordinal))) ==
+        Int4DispatchPolicy::Wmma;
 
     if (use_wmma) {
         hipLaunchKernelGGL(
@@ -1424,9 +1514,36 @@ extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
     // and lm-head remain on the scalar path pending qualification.
     const bool disable_wmma =
         std::getenv("SUPERSONIC_QWEN36_DISABLE_PERSISTENT_WMMA") != nullptr;
+    const int64_t full_attn_width =
+        static_cast<int64_t>(num_heads) * static_cast<int64_t>(head_dim);
+    const int64_t linear_value_width =
+        static_cast<int64_t>(num_v_heads) * static_cast<int64_t>(head_v_dim);
+    const bool persistent_wmma_dims_ok =
+        hidden % 16 == 0 && full_attn_width % 16 == 0 &&
+        linear_value_width % 16 == 0;
     const bool use_attn_wmma =
-        !disable_wmma &&
+        !disable_wmma && persistent_wmma_dims_ok &&
         device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+
+    // Encoding 2 is qualified only through BF16-WMMA reconstruction. The
+    // descriptors live on device, so inspect them only on the exceptional
+    // non-WMMA path; qualified gfx11 production launches pay no D2H cost.
+    const bool mode_runs_attention = mode == 0 || mode == 3 || mode >= 9;
+    if (!use_attn_wmma && mode_runs_attention && int4_scales != nullptr) {
+        std::vector<qwen36_moe::Int4ScaleDesc> host_scales(
+            static_cast<size_t>(num_layers));
+        hipError_t copy_err = hipMemcpy(
+            host_scales.data(),
+            int4_scales,
+            host_scales.size() * sizeof(qwen36_moe::Int4ScaleDesc),
+            hipMemcpyDeviceToHost);
+        if (copy_err != hipSuccess) return backend_failure(251, copy_err);
+        for (int li = start_layer; li < end_layer_exclusive; ++li) {
+            if (attention_desc_has_row_group(host_scales[static_cast<size_t>(li)])) {
+                return 150;
+            }
+        }
+    }
 
     if (use_attn_wmma) {
         hipLaunchKernelGGL(

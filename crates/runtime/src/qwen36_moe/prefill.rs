@@ -147,8 +147,16 @@ fn optimized_prefill_supports_encoding(
         && (backend != Backend::Hip || enable_unqualified_hip_native_int4)
 }
 
-fn optimized_batched_ffn_supports_group_size(group_size: i32) -> bool {
-    group_size == 128
+fn optimized_batched_projection_is_tile_v1(
+    sidecar: &crate::qwen36_moe::types::LoadedInt4Sidecar,
+) -> Result<bool> {
+    let desc = build_int4_weight_desc(sidecar)
+        .context("build Qwen3.6 optimized-prefill INT4 projection descriptor")?;
+    Ok(desc.encoding == 1
+        && desc.input_group_size == 128
+        && desc.output_group_size == 128
+        && desc.implicit_zero_code < 0
+        && !desc.zero.is_null())
 }
 
 fn full_attn_kv_capacities(layers: &[LayerBuffers]) -> Vec<(usize, usize)> {
@@ -635,7 +643,7 @@ fn run_batched_prefill_impl(
 ///   batched FFN bypasses that hook, so it would read non-resident memory.
 /// - **HIP native INT4 without an explicit diagnostic opt-in** — the exact
 ///   prompt real-model gate currently changes both logits and greedy argmax.
-fn supports_batched_path(
+pub(crate) fn supports_batched_path(
     layers: &[LayerBuffers],
     sparse_residency_active: bool,
     enable_unqualified_hip_native_int4: bool,
@@ -653,9 +661,34 @@ fn supports_batched_path(
         return Ok(false);
     }
     for l in layers {
-        if let Some(int4) = &l.ffn.int4 {
-            if !optimized_batched_ffn_supports_group_size(int4.group_size) {
-                return Ok(false);
+        match &l.attn {
+            AttnLayerBuffers::Full { int4: Some(s), .. } => {
+                for projection in [&s.q_proj, &s.k_proj, &s.v_proj, &s.o_proj] {
+                    if !optimized_batched_projection_is_tile_v1(projection)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            AttnLayerBuffers::Linear { int4: Some(s), .. } => {
+                for projection in [&s.in_proj_qkv, &s.in_proj_z, &s.out_proj] {
+                    if !optimized_batched_projection_is_tile_v1(projection)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(s) = &l.ffn.int4 {
+            for projection in [
+                &s.gate_up_proj,
+                &s.down_proj,
+                &s.shared_gate_proj,
+                &s.shared_up_proj,
+                &s.shared_down_proj,
+            ] {
+                if !optimized_batched_projection_is_tile_v1(projection)? {
+                    return Ok(false);
+                }
             }
         }
         if let AttnLayerBuffers::Full {
@@ -3001,13 +3034,6 @@ mod orchestration_tests {
             Backend::Metal,
             false,
         ));
-    }
-
-    #[test]
-    fn optimized_batched_shared_expert_remains_tile_v1_only() {
-        assert!(optimized_batched_ffn_supports_group_size(128));
-        assert!(!optimized_batched_ffn_supports_group_size(32));
-        assert!(!optimized_batched_ffn_supports_group_size(-1));
     }
 
     #[test]

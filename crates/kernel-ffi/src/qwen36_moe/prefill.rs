@@ -13151,6 +13151,197 @@ pub fn batched_prefill_router_permute_launch(
 /// - `expert_out`          : BF16, `[n_tokens * top_k, hidden]`.
 /// - `counters`            : u32, `[1]`. CALLER MUST ZERO BEFORE LAUNCH —
 ///                            this is the work-stealing claim counter.
+#[derive(Clone, Copy)]
+struct GroupedExpertCheckedDims {
+    n_tokens: c_int,
+    top_k: c_int,
+    num_experts: c_int,
+    hidden: c_int,
+    moe_intermediate: c_int,
+}
+
+fn grouped_expert_c_int(name: &str, value: usize) -> Result<c_int, GpuError> {
+    c_int::try_from(value).map_err(|_| {
+        GpuError::InvalidArg(format!(
+            "qwen36_moe::batched_prefill_grouped_expert_launch: {name} does not fit c_int"
+        ))
+    })
+}
+
+fn validate_grouped_expert_buffer(
+    ordinal: usize,
+    name: &str,
+    buffer: &GpuBuffer,
+    dtype: ScalarType,
+    required_elements: usize,
+) -> Result<(), GpuError> {
+    const OPERATION: &str = "batched_prefill_grouped_expert_launch";
+    validate_buffer_for_descriptor_launch(OPERATION, name, ordinal, buffer, dtype)?;
+    let element_bytes = dtype.size_in_bytes();
+    let shape_bytes = buffer
+        .elem_count()
+        .checked_mul(element_bytes)
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "qwen36_moe::{OPERATION}: {name} byte shape overflows"
+            ))
+        })?;
+    let required_bytes = required_elements
+        .checked_mul(element_bytes)
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "qwen36_moe::{OPERATION}: {name} required byte extent overflows"
+            ))
+        })?;
+    if buffer.len_bytes() != shape_bytes
+        || buffer.len_bytes() % element_bytes != 0
+        || (buffer.as_ptr() as usize) % element_bytes != 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{OPERATION}: {name} has invalid byte shape or alignment"
+        )));
+    }
+    if buffer.len_bytes() < required_bytes {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{OPERATION}: {name} is shorter than its required extent"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_batched_prefill_grouped_expert_launch(
+    ordinal: usize,
+    n_tokens: usize,
+    top_k: usize,
+    num_experts: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    x_norm: &GpuBuffer,
+    expert_offsets: &GpuBuffer,
+    permuted_token_idx: &GpuBuffer,
+    experts_gate_up_w: &GpuBuffer,
+    experts_gate_up_scale: &GpuBuffer,
+    experts_gate_up_zero: Option<&GpuBuffer>,
+    experts_gate_up_desc: &Qwen36MoeInt4WeightDesc,
+    experts_down_w: &GpuBuffer,
+    experts_down_scale: &GpuBuffer,
+    experts_down_zero: Option<&GpuBuffer>,
+    experts_down_desc: &Qwen36MoeInt4WeightDesc,
+    expert_out: &GpuBuffer,
+    counters: &GpuBuffer,
+) -> Result<GroupedExpertCheckedDims, GpuError> {
+    const OPERATION: &str = "batched_prefill_grouped_expert_launch";
+    let dims = GroupedExpertCheckedDims {
+        n_tokens: grouped_expert_c_int("n_tokens", n_tokens)?,
+        top_k: grouped_expert_c_int("top_k", top_k)?,
+        num_experts: grouped_expert_c_int("num_experts", num_experts)?,
+        hidden: grouped_expert_c_int("hidden", hidden)?,
+        moe_intermediate: grouped_expert_c_int("moe_intermediate", moe_intermediate)?,
+    };
+    if n_tokens == 0
+        || top_k == 0
+        || num_experts == 0
+        || hidden == 0
+        || moe_intermediate == 0
+        || num_experts > 256
+        || hidden % 16 != 0
+        || moe_intermediate % 16 != 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{OPERATION}: invalid grouped-expert dimensions"
+        )));
+    }
+
+    let gate_rows = moe_intermediate.checked_mul(2).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "qwen36_moe::{OPERATION}: 2 * moe_intermediate overflows"
+        ))
+    })?;
+    let gate_rows_c_int = grouped_expert_c_int("2 * moe_intermediate", gate_rows)?;
+    let assignments = n_tokens.checked_mul(top_k).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "qwen36_moe::{OPERATION}: n_tokens * top_k overflows"
+        ))
+    })?;
+    if assignments > 16_384 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{OPERATION}: n_tokens * top_k exceeds 16384"
+        )));
+    }
+    hidden
+        .checked_add(gate_rows)
+        .and_then(|elements| elements.checked_add(moe_intermediate))
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "qwen36_moe::{OPERATION}: grouped-expert LDS extent overflows"
+            ))
+        })?;
+
+    let x_norm_elements = n_tokens.checked_mul(hidden).ok_or_else(|| {
+        GpuError::InvalidArg(format!("qwen36_moe::{OPERATION}: x_norm extent overflows"))
+    })?;
+    let offset_elements = num_experts.checked_add(1).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "qwen36_moe::{OPERATION}: expert_offsets extent overflows"
+        ))
+    })?;
+    let output_elements = assignments.checked_mul(hidden).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "qwen36_moe::{OPERATION}: expert_out extent overflows"
+        ))
+    })?;
+
+    validate_grouped_expert_buffer(ordinal, "x_norm", x_norm, ScalarType::BF16, x_norm_elements)?;
+    validate_grouped_expert_buffer(
+        ordinal,
+        "expert_offsets",
+        expert_offsets,
+        ScalarType::U32,
+        offset_elements,
+    )?;
+    validate_grouped_expert_buffer(
+        ordinal,
+        "permuted_token_idx",
+        permuted_token_idx,
+        ScalarType::U32,
+        assignments,
+    )?;
+    validate_grouped_expert_buffer(
+        ordinal,
+        "expert_out",
+        expert_out,
+        ScalarType::BF16,
+        output_elements,
+    )?;
+    validate_grouped_expert_buffer(ordinal, "counters", counters, ScalarType::U32, 1)?;
+
+    validate_descriptor_int4_common(
+        "batched_prefill_grouped_expert_launch gate_up",
+        ordinal,
+        experts_gate_up_w,
+        experts_gate_up_scale,
+        experts_gate_up_zero,
+        experts_gate_up_desc,
+        dims.num_experts,
+        gate_rows_c_int,
+        dims.hidden,
+    )?;
+    validate_descriptor_int4_common(
+        "batched_prefill_grouped_expert_launch down",
+        ordinal,
+        experts_down_w,
+        experts_down_scale,
+        experts_down_zero,
+        experts_down_desc,
+        dims.num_experts,
+        dims.hidden,
+        dims.moe_intermediate,
+    )?;
+    Ok(dims)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn batched_prefill_grouped_expert_launch(
     ordinal: usize,
@@ -13173,30 +13364,28 @@ pub fn batched_prefill_grouped_expert_launch(
     expert_out: &mut GpuBuffer,
     counters: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    let backend = x_norm.backend();
-    if backend != Backend::Hip && backend != Backend::Cuda {
-        return Err(GpuError::backend(
-            backend,
-            "qwen36_moe::batched_prefill_grouped_expert_launch requires HIP or CUDA backend"
-                .to_string(),
-        ));
-    }
-    if experts_gate_up_desc.scale != experts_gate_up_scale.as_ptr()
-        || experts_gate_up_desc.zero
-            != experts_gate_up_zero
-                .map(GpuBuffer::as_ptr)
-                .unwrap_or(std::ptr::null())
-        || experts_down_desc.scale != experts_down_scale.as_ptr()
-        || experts_down_desc.zero
-            != experts_down_zero
-                .map(GpuBuffer::as_ptr)
-                .unwrap_or(std::ptr::null())
-    {
-        return Err(GpuError::InvalidArg(
-            "qwen36_moe::batched_prefill_grouped_expert_launch descriptor sidecar pointer mismatch"
-                .into(),
-        ));
-    }
+    let dims = validate_batched_prefill_grouped_expert_launch(
+        ordinal,
+        n_tokens,
+        top_k,
+        num_experts,
+        hidden,
+        moe_intermediate,
+        x_norm,
+        expert_offsets,
+        permuted_token_idx,
+        experts_gate_up_w,
+        experts_gate_up_scale,
+        experts_gate_up_zero,
+        experts_gate_up_desc,
+        experts_down_w,
+        experts_down_scale,
+        experts_down_zero,
+        experts_down_desc,
+        expert_out,
+        counters,
+    )?;
+    let backend = Backend::Hip;
     let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
@@ -13204,11 +13393,11 @@ pub fn batched_prefill_grouped_expert_launch(
                 qwen36_moe_hip_batched_prefill_grouped_expert_launch(
                     2, // bf16
                     ordinal,
-                    n_tokens as c_int,
-                    top_k as c_int,
-                    num_experts as c_int,
-                    hidden as c_int,
-                    moe_intermediate as c_int,
+                    dims.n_tokens,
+                    dims.top_k,
+                    dims.num_experts,
+                    dims.hidden,
+                    dims.moe_intermediate,
                     x_norm.as_ptr(),
                     expert_offsets.as_ptr(),
                     permuted_token_idx.as_ptr(),
@@ -13257,14 +13446,6 @@ pub fn batched_prefill_grouped_expert_launch(
         "qwen36_moe batched_prefill_grouped_expert_launch",
         status,
     )?;
-    let _ = (
-        ordinal,
-        n_tokens,
-        top_k,
-        num_experts,
-        hidden,
-        moe_intermediate,
-    );
     Ok(())
 }
 
@@ -13477,6 +13658,270 @@ mod tests {
             implicit_zero_code: -1,
             encoding: 1,
         }
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    struct GroupedExpertSafeFixture {
+        x_norm: GpuBuffer,
+        expert_offsets: GpuBuffer,
+        permuted_token_idx: GpuBuffer,
+        gate_w: GpuBuffer,
+        gate_scale: GpuBuffer,
+        gate_zero: GpuBuffer,
+        gate_desc: Qwen36MoeInt4WeightDesc,
+        down_w: GpuBuffer,
+        down_scale: GpuBuffer,
+        down_zero: GpuBuffer,
+        down_desc: Qwen36MoeInt4WeightDesc,
+        expert_out: GpuBuffer,
+        counters: GpuBuffer,
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    impl GroupedExpertSafeFixture {
+        const HIDDEN: usize = 128;
+        const INTERMEDIATE: usize = 128;
+
+        fn new() -> Self {
+            gpu_hal::set_backend(Backend::Hip);
+            let ordinal = 0;
+            let gate_scale =
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2]).expect("allocate gate scale");
+            let gate_zero =
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2]).expect("allocate gate zero");
+            let down_scale =
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1]).expect("allocate down scale");
+            let down_zero =
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1]).expect("allocate down zero");
+            let gate_desc = tile_v1_weight_desc(
+                &gate_scale,
+                &gate_zero,
+                1,
+                2 * Self::INTERMEDIATE,
+                Self::HIDDEN,
+                128,
+            );
+            let down_desc = tile_v1_weight_desc(
+                &down_scale,
+                &down_zero,
+                1,
+                Self::HIDDEN,
+                Self::INTERMEDIATE,
+                128,
+            );
+            Self {
+                x_norm: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[Self::HIDDEN])
+                    .expect("allocate x_norm"),
+                expert_offsets: GpuBuffer::zeros(ordinal, ScalarType::U32, &[2])
+                    .expect("allocate offsets"),
+                permuted_token_idx: GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+                    .expect("allocate permutation"),
+                gate_w: GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::U8,
+                    &[2 * Self::INTERMEDIATE * Self::HIDDEN / 2],
+                )
+                .expect("allocate gate weights"),
+                gate_scale,
+                gate_zero,
+                gate_desc,
+                down_w: GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::U8,
+                    &[Self::HIDDEN * Self::INTERMEDIATE / 2],
+                )
+                .expect("allocate down weights"),
+                down_scale,
+                down_zero,
+                down_desc,
+                expert_out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[Self::HIDDEN])
+                    .expect("allocate expert output"),
+                counters: GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+                    .expect("allocate counters"),
+            }
+        }
+
+        fn launch(
+            &mut self,
+            ordinal: usize,
+            n_tokens: usize,
+            hidden: usize,
+            x_norm: Option<&GpuBuffer>,
+        ) -> Result<(), GpuError> {
+            self.launch_with_intermediate(ordinal, n_tokens, hidden, Self::INTERMEDIATE, x_norm)
+        }
+
+        fn launch_with_intermediate(
+            &mut self,
+            ordinal: usize,
+            n_tokens: usize,
+            hidden: usize,
+            moe_intermediate: usize,
+            x_norm: Option<&GpuBuffer>,
+        ) -> Result<(), GpuError> {
+            batched_prefill_grouped_expert_launch(
+                ordinal,
+                n_tokens,
+                1,
+                1,
+                hidden,
+                moe_intermediate,
+                x_norm.unwrap_or(&self.x_norm),
+                &self.expert_offsets,
+                &self.permuted_token_idx,
+                &self.gate_w,
+                &self.gate_scale,
+                Some(&self.gate_zero),
+                &self.gate_desc,
+                &self.down_w,
+                &self.down_scale,
+                Some(&self.down_zero),
+                &self.down_desc,
+                &mut self.expert_out,
+                &mut self.counters,
+            )
+        }
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn grouped_expert_safe_wrapper_rejects_usize_to_c_int_overflow() {
+        let mut fixture = GroupedExpertSafeFixture::new();
+        let err = fixture
+            .launch(0, usize::MAX, GroupedExpertSafeFixture::HIDDEN, None)
+            .expect_err("usize overflow must fail before C ABI");
+        assert!(
+            err.to_string().contains("n_tokens does not fit c_int"),
+            "{err}"
+        );
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn grouped_expert_safe_wrapper_rejects_short_descriptor_buffers() {
+        let mut fixture = GroupedExpertSafeFixture::new();
+        fixture.gate_scale =
+            GpuBuffer::zeros(0, ScalarType::BF16, &[1]).expect("allocate short scale");
+        fixture.gate_desc.scale = fixture.gate_scale.as_ptr();
+        let err = fixture
+            .launch(0, 1, GroupedExpertSafeFixture::HIDDEN, None)
+            .expect_err("short scale must fail before launch");
+        assert!(
+            err.to_string().contains("scale sidecar is shorter"),
+            "{err}"
+        );
+
+        let mut fixture = GroupedExpertSafeFixture::new();
+        fixture.expert_out =
+            GpuBuffer::zeros(0, ScalarType::BF16, &[127]).expect("allocate short output");
+        let err = fixture
+            .launch(0, 1, GroupedExpertSafeFixture::HIDDEN, None)
+            .expect_err("short output must fail before launch");
+        assert!(err.to_string().contains("expert_out is shorter"), "{err}");
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn grouped_expert_safe_wrapper_rejects_cross_device_and_dtype_mismatch() {
+        let mut fixture = GroupedExpertSafeFixture::new();
+        let err = fixture
+            .launch(1, 1, GroupedExpertSafeFixture::HIDDEN, None)
+            .expect_err("cross-device launch must fail before C ABI");
+        assert!(err.to_string().contains("device ordinal"), "{err}");
+
+        let wrong_dtype =
+            GpuBuffer::zeros(0, ScalarType::F32, &[128]).expect("allocate wrong-dtype x_norm");
+        let err = fixture
+            .launch(0, 1, GroupedExpertSafeFixture::HIDDEN, Some(&wrong_dtype))
+            .expect_err("dtype mismatch must fail before launch");
+        assert!(err.to_string().contains("x_norm must be BF16"), "{err}");
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn grouped_expert_safe_wrapper_rejects_checked_product_overflow() {
+        let mut fixture = GroupedExpertSafeFixture::new();
+        let err = fixture
+            .launch(0, 1, usize::MAX, None)
+            .expect_err("extent overflow must fail before C ABI");
+        assert!(
+            err.to_string().contains("hidden does not fit c_int"),
+            "{err}"
+        );
+
+        let err = fixture
+            .launch(0, i32::MAX as usize, GroupedExpertSafeFixture::HIDDEN, None)
+            .expect_err("assignment extent overflow must fail before C ABI");
+        assert!(err.to_string().contains("n_tokens * top_k"), "{err}");
+
+        let err = fixture
+            .launch_with_intermediate(
+                0,
+                1,
+                GroupedExpertSafeFixture::HIDDEN,
+                i32::MAX as usize - 15,
+                None,
+            )
+            .expect_err("2 * moe_intermediate must fit the C ABI");
+        assert!(
+            err.to_string()
+                .contains("2 * moe_intermediate does not fit c_int"),
+            "{err}"
+        );
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn grouped_expert_safe_wrapper_rejects_sidecar_identity_and_zero_semantics() {
+        let mut fixture = GroupedExpertSafeFixture::new();
+        fixture.gate_desc.scale = fixture.down_scale.as_ptr();
+        let err = fixture
+            .launch(0, 1, GroupedExpertSafeFixture::HIDDEN, None)
+            .expect_err("descriptor scale identity must be checked");
+        assert!(
+            err.to_string().contains("descriptor scale pointer"),
+            "{err}"
+        );
+
+        let mut fixture = GroupedExpertSafeFixture::new();
+        fixture.gate_desc.encoding = 2;
+        fixture.gate_desc.input_group_size = 32;
+        fixture.gate_desc.output_group_size = 1;
+        fixture.gate_desc.implicit_zero_code = 8;
+        fixture.gate_desc.zero = std::ptr::null();
+        let err = fixture
+            .launch(0, 1, GroupedExpertSafeFixture::HIDDEN, None)
+            .expect_err("row-group descriptor must reject a borrowed zero plane");
+        assert!(err.to_string().contains("row-group encoding 2"), "{err}");
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn encoding_aware_bridge_policy_qualifies_row_group_attention_and_ffn() {
+        const SCALAR: c_int = 0;
+        const WMMA: c_int = 1;
+        const REJECT: c_int = 2;
+        let policy = |phase, encoding, shape_valid, wmma_supported| unsafe {
+            qwen36_moe_hip_int4_dispatch_policy_probe(
+                phase,
+                encoding,
+                i32::from(shape_valid),
+                i32::from(wmma_supported),
+            )
+        };
+
+        for phase in [1, 2] {
+            assert_eq!(policy(phase, 2, true, true), WMMA);
+            assert_eq!(policy(phase, 2, false, true), REJECT);
+            assert_eq!(policy(phase, 2, true, false), REJECT);
+            assert_eq!(policy(phase, 1, true, true), WMMA);
+            assert_eq!(policy(phase, 1, true, false), SCALAR);
+        }
+        assert_eq!(policy(3, 2, true, true), SCALAR);
+        assert_eq!(policy(3, 2, false, false), SCALAR);
+        assert_eq!(policy(3, 1, true, true), WMMA);
+        assert_eq!(policy(3, 1, true, false), SCALAR);
+        assert_eq!(policy(1, 3, true, true), REJECT);
     }
 
     type ExplicitGroupedExpertNativeLauncher = unsafe fn(

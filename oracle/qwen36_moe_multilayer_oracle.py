@@ -436,7 +436,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--int4", action="store_true",
                    help="Quantize each layer's projection weights via the "
                         "per-block oracles' INT4 helpers (min/max group-quant). "
-                        "Schema becomes `qwen36-moe-oracle-multilayer-int4-v1`.")
+                        "Tile-v1 uses schema v1; row-group uses schema v2.")
     p.add_argument("--int4-group-size", type=int, default=128,
                    help="INT4 group size. Tile-v1 defaults to 128; "
                         "production row-group requires 32.")
@@ -593,7 +593,8 @@ def main() -> None:
     }
     if args.int4:
         config["int4_group_size"] = args.int4_group_size
-        config["int4_layout"] = args.int4_layout
+        if args.int4_layout == "row_group":
+            config["int4_layout"] = args.int4_layout
 
     layer_meta = [
         {"layer_idx": i, "kind": "full" if is_full_attn_layer(i) else "linear"}
@@ -620,7 +621,9 @@ def main() -> None:
 
     out = {
         "schema": (
-            "qwen36-moe-oracle-multilayer-int4-v1"
+            "qwen36-moe-oracle-multilayer-row-group-int4-v2"
+            if args.int4 and args.int4_layout == "row_group"
+            else "qwen36-moe-oracle-multilayer-int4-v1"
             if args.int4
             else "qwen36-moe-oracle-multilayer-v1"
         ),
@@ -638,6 +641,8 @@ def main() -> None:
         "final_hidden": encode(final_hidden),
         "logits": encode(logits),
     }
+    if args.int4 and args.int4_layout == "row_group":
+        out["fixture_id"] = "qwen36-moe-multilayer-row-group-g32-v2"
 
     if not args.no_emit_weights:
         out["weights_per_layer"] = [

@@ -1527,7 +1527,7 @@ mod direct_load_tests {
     use crate::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
     use crate::qwen36_moe::decode::Qwen36ExecutionOptions;
     use crate::qwen36_moe::persistent_decode::{build_int4_weight_desc, validate_int4_sidecar_set};
-    use crate::qwen36_moe::prefill::run_batched_prefill;
+    use crate::qwen36_moe::prefill::{run_batched_prefill, supports_batched_path};
     use crate::qwen36_moe::residency::{MoeExpertResidencyConfig, MoeExpertResidencyManager};
     use crate::qwen36_moe::types::PositionPair;
     use gpu_hal::{copy_d2h, copy_h2d};
@@ -2326,6 +2326,65 @@ mod direct_load_tests {
                 .contains("does not advertise descriptor-driven row-group INT4 execution"),
             "unexpected fail-closed guard error: {unsupported:#}"
         );
+    }
+
+    #[test]
+    fn production_loaded_row_group_flm_prefill_uses_per_token_fallback() {
+        let _backend_lock = GPU_BACKEND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen36_row_group_rank3.flm");
+        let row_group_store =
+            BakedStore::open_flm(&fixture).expect("open canonical row-group FLM fixture");
+        let mut loaded = load_direct(Qwen36WeightMode::Int4);
+
+        assert!(
+            supports_batched_path(loaded.layers(), false, true)
+                .expect("classify production tile-v1 load"),
+            "production tile-v1 G128 must remain admitted"
+        );
+
+        install_row_group_flm_sidecars(&row_group_store, &mut loaded);
+        let ffn = loaded.layers()[0]
+            .ffn
+            .int4
+            .as_ref()
+            .expect("loaded INT4 FFN sidecars");
+        assert_eq!(ffn.group_size, 128, "reproduce stale aggregate metadata");
+        assert_eq!(ffn.shared_gate_proj.view.group_size, 32);
+        assert!(ffn.shared_gate_proj.zero.is_none());
+        assert!(
+            !supports_batched_path(loaded.layers(), false, true)
+                .expect("classify production row-group load"),
+            "encoding-2 G32 must not enter the explicit-zero G128 shared-expert path"
+        );
+
+        let direct_store_dir = TestDir::new(Qwen36WeightMode::Int4);
+        let direct_store = BakedStore::open(direct_store_dir.path()).expect("open direct store");
+        let mut execution = Qwen36ExecutionOptions::default();
+        execution.batched_prefill.enable_unqualified_hip_native_int4 = true;
+        let mut fallback_calls = 0usize;
+        let mut callback = |_loaded: &mut LoadedQwen36Layers, step, token, position| {
+            assert_eq!((step, token, position), (0, 7, PositionPair::dense(0)));
+            fallback_calls += 1;
+            Ok(Default::default())
+        };
+        run_batched_prefill(
+            0,
+            &geom(),
+            &direct_store,
+            "model.language_model",
+            &mut loaded,
+            &[7],
+            &[PositionPair::dense(0)],
+            false,
+            &execution,
+            Some(&mut callback),
+            None,
+        )
+        .expect("row-group production load must use descriptor-driven per-token fallback");
+        assert_eq!(fallback_calls, 1, "optimized shared expert was entered");
     }
 
     fn kv_bytes(loaded: &LoadedQwen36Layers) -> Vec<u8> {
