@@ -2,6 +2,9 @@ use half::bf16;
 
 const HELPERS: &str =
     include_str!("../../../kernels/qwen36_moe_persistent/helpers.cuh");
+const BRIDGE: &str = include_str!("../../../kernels/qwen36_moe_bridge.cpp");
+const FFN_PHASE: &str =
+    include_str!("../../../kernels/qwen36_moe_persistent/ffn_phase.cuh");
 
 #[derive(Clone, Copy, Debug)]
 struct HostDesc {
@@ -209,7 +212,7 @@ fn descriptor_scalar_pair_and_wmma_routes_have_g32_fast_branches() {
         ),
         (
             "qwen36_int4_pair_dequant_8(",
-            "struct qwen36_float_pair",
+            "qwen36_int4_dq8_matvec_partial(",
         ),
         (
             "qwen36_int4_dq8_matvec_partial(",
@@ -221,7 +224,11 @@ fn descriptor_scalar_pair_and_wmma_routes_have_g32_fast_branches() {
         ),
     ] {
         let region = helper_region(signature, next_signature);
-        assert!(region.contains("qwen36_g32_dequant_span_8"), "{signature} lacks G32 span route");
+        assert!(
+            region.contains("qwen36_g32_dequant_span_8")
+                || region.contains("qwen36_g32_matvec_partial"),
+            "{signature} lacks G32 span route"
+        );
         assert!(region.contains("qwen36_int4_value") || region.contains("qwen36_int4_dequant_8"));
     }
 
@@ -240,6 +247,26 @@ fn descriptor_scalar_pair_and_wmma_routes_have_g32_fast_branches() {
         "#endif",
     );
     assert!(wmma_pair.contains("qwen36_g32_wmma_operand"));
+}
+
+#[test]
+fn persistent_ffn_has_a_prevalidated_g32_matrix_route_and_generic_fallback() {
+    let ffn = include_str!("../../../kernels/qwen36_moe_persistent/ffn_phase.cuh");
+    for required in [
+        "Qwen36MoeG32Matrix",
+        "qwen36_g32_matrix_from_desc",
+        "qwen36_g32_matvec_partial",
+        "qwen36_g32_pair_matvec_partial_same_row",
+        "qwen36_int4_dq8_matvec_partial",
+    ] {
+        assert!(ffn.contains(required), "missing persistent G32 route: {required}");
+    }
+    assert!(ffn.contains("qwen36_g32_descriptor_is_canonical"));
+    assert!(
+        ffn.contains("if (shared_gate_g32") && ffn.contains("if (gu_g32")
+            && ffn.contains("if (dp_g32"),
+        "FFN must retain explicit fast/fallback splits"
+    );
 }
 
 #[test]
@@ -312,4 +339,117 @@ fn generic_fallback_remains_selected_for_tile_v1_and_unusual_geometry() {
     unusual.implicit_zero_code = 8;
     unusual.packed_row_stride += 16;
     assert!(!canonical_g32(unusual, 512));
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FfnWmmaQualification {
+    routed_gate_up_g32: bool,
+    routed_down_g32: bool,
+    shared_down_bf16_or_g32: bool,
+    shape_valid: bool,
+    device_supports_wmma: bool,
+}
+
+fn expected_g32_ffn_wmma_route(case: FfnWmmaQualification) -> bool {
+    case.routed_gate_up_g32
+        && case.routed_down_g32
+        && case.shared_down_bf16_or_g32
+        && case.shape_valid
+        && case.device_supports_wmma
+}
+
+#[test]
+fn routed_and_shared_down_wmma_route_is_fail_closed_and_source_qualified() {
+    for required in [
+        "is_canonical_g32_execution_desc",
+        "select_g32_ffn_int4_dispatch",
+        "routed_g32_wmma",
+        "shared_down_g32",
+    ] {
+        assert!(BRIDGE.contains(required), "missing G32 WMMA qualification: {required}");
+    }
+    for required in [
+        "if (shared_down_g32)",
+        "if (gu_g32)",
+        "if (dp_g32)",
+    ] {
+        assert!(FFN_PHASE.contains(required), "missing FFN WMMA guard: {required}");
+    }
+
+    let canonical = FfnWmmaQualification {
+        routed_gate_up_g32: true,
+        routed_down_g32: true,
+        shared_down_bf16_or_g32: true,
+        shape_valid: true,
+        device_supports_wmma: true,
+    };
+    assert!(expected_g32_ffn_wmma_route(canonical));
+
+    for mutation in [
+        FfnWmmaQualification { routed_gate_up_g32: false, ..canonical },
+        FfnWmmaQualification { routed_down_g32: false, ..canonical },
+        FfnWmmaQualification { shared_down_bf16_or_g32: false, ..canonical },
+        FfnWmmaQualification { shape_valid: false, ..canonical },
+        FfnWmmaQualification { device_supports_wmma: false, ..canonical },
+    ] {
+        assert!(!expected_g32_ffn_wmma_route(mutation), "mutation must disable WMMA: {mutation:?}");
+    }
+}
+
+#[test]
+fn persistent_dispatch_qualifies_ffn_wmma_independently_of_attention() {
+    let normalized_bridge = BRIDGE.split_whitespace().collect::<String>();
+    for required in [
+        "persistent_ffn_wmma_qualified",
+        "use_ffn_wmma",
+        "qwen36_moe::qwen36_moe_persistent_decode_kernel<hip_bfloat16, true, true, false>",
+        "qwen36_moe::qwen36_moe_persistent_decode_kernel<hip_bfloat16, false, true, false>",
+    ] {
+        let normalized_required = required.split_whitespace().collect::<String>();
+        assert!(
+            normalized_bridge.contains(&normalized_required),
+            "persistent launcher missing independent FFN WMMA dispatch: {required}"
+        );
+    }
+}
+
+#[test]
+fn routed_and_shared_down_wmma_operands_match_independent_bf16_oracle() {
+    for cols in [512, 2048, 4096] {
+        let (packed, scales, desc, experts, rows) = fixture(cols, true);
+        for expert in 0..experts {
+            for row in 0..rows {
+                for col in (0..cols).step_by(16) {
+                    let generic = (0..16)
+                        .map(|offset| {
+                            bf16::from_f32(generic_value(
+                                &packed,
+                                &scales,
+                                None,
+                                desc,
+                                expert,
+                                row,
+                                col + offset,
+                            ))
+                            .to_bits()
+                        })
+                        .collect::<Vec<_>>();
+                    let fast = g32_span16_bf16_bits(
+                        &packed, &scales, desc, expert, row, col,
+                    );
+                    assert_eq!(generic, fast, "WMMA oracle mismatch K={cols} e={expert} r={row} c={col}");
+
+                    let mut mutated = packed.clone();
+                    let byte = expert * desc.packed_expert_stride
+                        + row * desc.packed_row_stride
+                        + col / 2;
+                    mutated[byte] ^= 0x10;
+                    let mutated_fast = g32_span16_bf16_bits(
+                        &mutated, &scales, desc, expert, row, col,
+                    );
+                    assert_ne!(mutated_fast, fast, "packed nibble mutation must affect WMMA operand");
+                }
+            }
+        }
+    }
 }

@@ -142,6 +142,43 @@ struct Qwen36MoeG32RowBases {
     const hip_bfloat16* scale_row;
 };
 
+// A canonical G32 matrix is bound to one expert before its row work pool
+// starts. This keeps expert base arithmetic and descriptor field loads out of
+// every row's per-thread matvec call.
+struct Qwen36MoeG32Matrix {
+    const uint8_t* packed_base;
+    const hip_bfloat16* scale_base;
+    uint64_t packed_row_stride_bytes;
+    uint64_t scale_row_stride_elements;
+};
+
+__device__ __forceinline__ Qwen36MoeG32Matrix qwen36_g32_matrix_from_desc(
+    const uint8_t* __restrict__ packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert
+) {
+    const hip_bfloat16* __restrict__ scales =
+        static_cast<const hip_bfloat16*>(desc.scale);
+    return {
+        packed + static_cast<size_t>(expert) * desc.packed_expert_stride_bytes,
+        scales + static_cast<size_t>(expert) * desc.scale_expert_stride_elements,
+        desc.packed_row_stride_bytes,
+        desc.scale_row_stride_elements,
+    };
+}
+
+__device__ __forceinline__ Qwen36MoeG32RowBases qwen36_g32_matrix_row_bases(
+    const Qwen36MoeG32Matrix& matrix,
+    int row
+) {
+    return {
+        matrix.packed_base +
+            static_cast<size_t>(row) * matrix.packed_row_stride_bytes,
+        matrix.scale_base +
+            static_cast<size_t>(row) * matrix.scale_row_stride_elements,
+    };
+}
+
 __device__ __forceinline__ Qwen36MoeG32RowBases qwen36_g32_row_bases(
     const uint8_t* __restrict__ packed,
     const hip_bfloat16* __restrict__ scales,
@@ -149,12 +186,13 @@ __device__ __forceinline__ Qwen36MoeG32RowBases qwen36_g32_row_bases(
     int expert,
     int row
 ) {
-    return {
-        packed + static_cast<size_t>(expert) * desc.packed_expert_stride_bytes +
-            static_cast<size_t>(row) * desc.packed_row_stride_bytes,
-        scales + static_cast<size_t>(expert) * desc.scale_expert_stride_elements +
-            static_cast<size_t>(row) * desc.scale_row_stride_elements,
+    const Qwen36MoeG32Matrix matrix = {
+        packed + static_cast<size_t>(expert) * desc.packed_expert_stride_bytes,
+        scales + static_cast<size_t>(expert) * desc.scale_expert_stride_elements,
+        desc.packed_row_stride_bytes,
+        desc.scale_row_stride_elements,
     };
+    return qwen36_g32_matrix_row_bases(matrix, row);
 }
 
 // Dequantize one aligned 8-nibble span from a canonical G32 row. The caller
@@ -175,6 +213,65 @@ __device__ __forceinline__ void qwen36_g32_dequant_span_8(
         const int code = static_cast<int>((packed_word >> (i * 4)) & 0x0f);
         out[i] = (static_cast<float>(code) - 8.0f) * scale;
     }
+}
+
+struct qwen36_float_pair {
+    float first;
+    float second;
+};
+
+__device__ __forceinline__ float qwen36_g32_matvec_partial(
+    const Qwen36MoeG32Matrix& matrix,
+    const float* __restrict__ x,
+    int row,
+    int cols,
+    int tid,
+    int block_size
+) {
+    const Qwen36MoeG32RowBases bases =
+        qwen36_g32_matrix_row_bases(matrix, row);
+    float partial = 0.0f;
+    for (int col = tid * 8; col < cols; col += block_size * 8) {
+        float values[8];
+        qwen36_g32_dequant_span_8(
+            bases.packed_row, bases.scale_row, col, values);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) partial += values[i] * x[col + i];
+    }
+    return partial;
+}
+
+__device__ __forceinline__ qwen36_float_pair
+qwen36_g32_pair_matvec_partial_same_row(
+    const Qwen36MoeG32Matrix& matrix_a,
+    const Qwen36MoeG32Matrix& matrix_b,
+    const float* __restrict__ x,
+    int row,
+    int cols,
+    int tid,
+    int block_size
+) {
+    const Qwen36MoeG32RowBases bases_a =
+        qwen36_g32_matrix_row_bases(matrix_a, row);
+    const Qwen36MoeG32RowBases bases_b =
+        qwen36_g32_matrix_row_bases(matrix_b, row);
+    float partial_a = 0.0f;
+    float partial_b = 0.0f;
+    for (int col = tid * 8; col < cols; col += block_size * 8) {
+        float values_a[8];
+        float values_b[8];
+        qwen36_g32_dequant_span_8(
+            bases_a.packed_row, bases_a.scale_row, col, values_a);
+        qwen36_g32_dequant_span_8(
+            bases_b.packed_row, bases_b.scale_row, col, values_b);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float value = x[col + i];
+            partial_a += values_a[i] * value;
+            partial_b += values_b[i] * value;
+        }
+    }
+    return {partial_a, partial_b};
 }
 
 __device__ inline void qwen36_int4_dequant_8(
@@ -253,11 +350,6 @@ __device__ inline void qwen36_int4_pair_dequant_8(
     }
 }
 
-struct qwen36_float_pair {
-    float first;
-    float second;
-};
-
 __device__ inline float qwen36_int4_dq8_matvec_partial(
     const uint8_t* packed,
     const Qwen36MoeInt4WeightDesc& desc,
@@ -269,21 +361,16 @@ __device__ inline float qwen36_int4_dq8_matvec_partial(
     int block_size
 ) {
     const bool fast = qwen36_g32_descriptor_is_canonical(desc, cols);
-    Qwen36MoeG32RowBases bases{};
     if (fast) {
-        const hip_bfloat16* __restrict__ scales =
-            static_cast<const hip_bfloat16*>(desc.scale);
-        bases = qwen36_g32_row_bases(packed, scales, desc, expert, row);
+        const Qwen36MoeG32Matrix matrix =
+            qwen36_g32_matrix_from_desc(packed, desc, expert);
+        return qwen36_g32_matvec_partial(
+            matrix, x, row, cols, tid, block_size);
     }
     float partial = 0.0f;
     for (int col = tid * 8; col < cols; col += block_size * 8) {
         float values[8];
-        if (fast) {
-            qwen36_g32_dequant_span_8(
-                bases.packed_row, bases.scale_row, col, values);
-        } else {
-            qwen36_int4_dequant_8(packed, desc, expert, row, col, values);
-        }
+        qwen36_int4_dequant_8(packed, desc, expert, row, col, values);
         #pragma unroll
         for (int i = 0; i < 8; ++i) partial += values[i] * x[col + i];
     }

@@ -70,9 +70,10 @@ bool device_supports_wmma_bf16(int device_ordinal) {
 }
 
 bool ffn_step_supports_wmma_bf16(int device_ordinal) {
-    const char* enabled = std::getenv("SUPERSONIC_QWEN36_ENABLE_FFN_STEP_WMMA");
-    return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0' &&
-           device_supports_wmma_bf16(device_ordinal);
+    // The caller supplies descriptor qualification. This hardware check is
+    // safe to enable by default because encoding-1 and unusual layouts never
+    // reach the G32 WMMA dispatch policy.
+    return device_supports_wmma_bf16(device_ordinal);
 }
 
 bool sync_each_kernel_enabled() {
@@ -226,6 +227,51 @@ bool is_row_group_execution_desc(const Qwen36Int4WeightDesc& desc) {
     return desc.encoding == 2;
 }
 
+bool is_canonical_g32_execution_desc(
+    const Qwen36Int4WeightDesc& desc,
+    int                              experts,
+    int                              out_rows,
+    int                              in_cols
+) {
+    if (experts <= 0 || out_rows <= 0 || in_cols < 32 || (in_cols & 31) != 0 ||
+        desc.encoding != 2 || desc.scale == nullptr || desc.zero != nullptr ||
+        desc.input_group_size != 32 || desc.output_group_size != 1 ||
+        desc.implicit_zero_code != 8 ||
+        desc.packed_row_stride_bytes != static_cast<uint64_t>(in_cols / 2) ||
+        desc.scale_row_stride_elements != static_cast<uint64_t>(in_cols / 32)) {
+        return false;
+    }
+
+    uint64_t packed_extent = 0;
+    uint64_t scale_extent = 0;
+    if (!checked_strided_extent(
+            static_cast<uint64_t>(out_rows),
+            desc.packed_row_stride_bytes,
+            static_cast<uint64_t>(in_cols / 2),
+            &packed_extent) ||
+        !checked_strided_extent(
+            static_cast<uint64_t>(out_rows),
+            desc.scale_row_stride_elements,
+            static_cast<uint64_t>(in_cols / 32),
+            &scale_extent)) {
+        return false;
+    }
+
+    const bool rank2 = desc.packed_expert_stride_bytes == 0 &&
+                       desc.scale_expert_stride_elements == 0;
+    if (rank2) return experts == 1;
+    if (desc.packed_expert_stride_bytes < packed_extent ||
+        desc.scale_expert_stride_elements < scale_extent ||
+        desc.packed_expert_stride_bytes % desc.packed_row_stride_bytes != 0 ||
+        desc.scale_expert_stride_elements % desc.scale_row_stride_elements != 0) {
+        return false;
+    }
+    return experts > 1 &&
+           desc.packed_expert_stride_bytes / desc.packed_row_stride_bytes ==
+               desc.scale_expert_stride_elements /
+                   desc.scale_row_stride_elements;
+}
+
 enum class Int4DispatchPolicy : int {
     Scalar = 0,
     Wmma = 1,
@@ -258,6 +304,136 @@ Int4DispatchPolicy select_ffn_int4_dispatch(
     return routed_int4 && shape_valid && wmma_supported
         ? Int4DispatchPolicy::Wmma
         : Int4DispatchPolicy::Scalar;
+}
+
+Int4DispatchPolicy select_g32_ffn_int4_dispatch(
+    bool routed_g32_wmma,
+    bool shared_down_wmma_compatible,
+    bool shape_valid,
+    bool wmma_supported
+) {
+    return routed_g32_wmma && shared_down_wmma_compatible && shape_valid &&
+            wmma_supported
+        ? Int4DispatchPolicy::Wmma
+        : Int4DispatchPolicy::Scalar;
+}
+
+struct PersistentFfnWmmaCacheEntry {
+    const Qwen36Int4ScaleDesc* int4_scales;
+    size_t                     device_ordinal;
+    int                        num_layers;
+    int                        start_layer;
+    int                        end_layer_exclusive;
+    int                        hidden;
+    int                        num_experts;
+    int                        moe_intermediate;
+    int                        shared_intermediate;
+    bool                       qualified;
+};
+
+bool persistent_ffn_wmma_qualified(
+    const Qwen36Int4ScaleDesc* int4_scales,
+    size_t                      device_ordinal,
+    int                         num_layers,
+    int                         start_layer,
+    int                         end_layer_exclusive,
+    int                         hidden,
+    int                         num_experts,
+    int                         moe_intermediate,
+    int                         shared_intermediate
+) {
+    if (int4_scales == nullptr || num_layers <= 0 || start_layer < 0 ||
+        end_layer_exclusive <= start_layer || end_layer_exclusive > num_layers ||
+        hidden <= 0 || num_experts <= 0 || moe_intermediate <= 0 ||
+        shared_intermediate <= 0) {
+        return false;
+    }
+
+    const bool shape_valid = hidden % 16 == 0 && moe_intermediate % 16 == 0;
+    const bool wmma_supported = ffn_step_supports_wmma_bf16(
+        static_cast<int>(device_ordinal));
+    if (!shape_valid || !wmma_supported) return false;
+
+    static std::mutex cache_mutex;
+    static std::vector<PersistentFfnWmmaCacheEntry> cache;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        for (const auto& entry : cache) {
+            if (entry.int4_scales == int4_scales &&
+                entry.device_ordinal == device_ordinal &&
+                entry.num_layers == num_layers &&
+                entry.start_layer == start_layer &&
+                entry.end_layer_exclusive == end_layer_exclusive &&
+                entry.hidden == hidden &&
+                entry.num_experts == num_experts &&
+                entry.moe_intermediate == moe_intermediate &&
+                entry.shared_intermediate == shared_intermediate) {
+                return entry.qualified;
+            }
+        }
+    }
+
+    // The persistent kernel receives descriptors in device memory. Qualify the
+    // whole range once, then cache the result by the stable descriptor address;
+    // decode tokens reuse the same uploaded descriptor array.
+    std::vector<Qwen36Int4ScaleDesc> host_scales(
+        static_cast<size_t>(num_layers));
+    if (hipMemcpy(
+            host_scales.data(),
+            int4_scales,
+            host_scales.size() * sizeof(Qwen36Int4ScaleDesc),
+            hipMemcpyDeviceToHost) != hipSuccess) {
+        return false;
+    }
+
+    bool qualified = true;
+    for (int li = start_layer; li < end_layer_exclusive; ++li) {
+        const auto& quant = host_scales[static_cast<size_t>(li)];
+        const bool routed_g32_wmma =
+            is_canonical_g32_execution_desc(
+                quant.experts_gate_up,
+                num_experts,
+                2 * moe_intermediate,
+                hidden) &&
+            is_canonical_g32_execution_desc(
+                quant.experts_down,
+                num_experts,
+                hidden,
+                moe_intermediate);
+        const bool shared_down_g32 = is_canonical_g32_execution_desc(
+            quant.shared_expert_down_proj,
+            1,
+            hidden,
+            shared_intermediate);
+        const bool shared_down_wmma_compatible =
+            quant.shared_expert_down_proj.encoding == 0 || shared_down_g32;
+        if (select_g32_ffn_int4_dispatch(
+                routed_g32_wmma,
+                shared_down_wmma_compatible,
+                shape_valid,
+                wmma_supported) != Int4DispatchPolicy::Wmma) {
+            qualified = false;
+            break;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.push_back({
+            int4_scales,
+            device_ordinal,
+            num_layers,
+            start_layer,
+            end_layer_exclusive,
+            hidden,
+            num_experts,
+            moe_intermediate,
+            shared_intermediate,
+            qualified,
+        });
+        if (cache.size() > 32) cache.erase(cache.begin());
+    }
+    return qualified;
 }
 
 bool attention_desc_has_row_group(const Qwen36Int4ScaleDesc& desc) {
@@ -868,27 +1044,28 @@ extern "C" uint64_t qwen36_moe_hip_ffn_step_launch(
     //   - hidden % 16 == 0 (Phase G K-chunk + Phase I output rows)
     //   - moe_intermediate % 16 == 0 (Phase G output rows ÷ 2 + Phase I K-chunk)
     //   - int4_group_size % 16 == 0  (one scale per 16-element K-chunk)
-    //   - INT4 routed weights present (gate_up_proj_scale / down_proj_scale)
+    //   - canonical G32 routed weights present (gate_up_proj_scale /
+    //     down_proj_scale); encoding-1 and unusual layouts remain scalar
     // 35B-A3B (hidden=2048, I=512, group_size=32 or 128) satisfies all of these;
-    // synthetic fixtures use 16-divisible dims too. The shared expert path
-    // (Phase D/F) stays scalar in both variants — Phase 2 of the roadmap.
-    const bool routed_int4 =
-        is_int4_execution_desc(quant.experts_gate_up) &&
-        is_int4_execution_desc(quant.experts_down);
-    const bool any_row_group_ffn =
-        is_row_group_execution_desc(quant.experts_gate_up) ||
-        is_row_group_execution_desc(quant.experts_down) ||
-        is_row_group_execution_desc(quant.shared_expert_gate_proj) ||
-        is_row_group_execution_desc(quant.shared_expert_up_proj) ||
-        is_row_group_execution_desc(quant.shared_expert_down_proj);
+    // synthetic fixtures use 16-divisible dims too. Shared gate/up remains
+    // scalar; shared down may use WMMA only when it is canonical G32.
     const bool wmma_dims_ok =
         (hidden % 16 == 0) &&
         (moe_intermediate % 16 == 0) &&
         (quant.experts_gate_up.input_group_size % 16 == 0) &&
         (quant.experts_down.input_group_size % 16 == 0);
-    const bool use_wmma = select_ffn_int4_dispatch(
-        routed_int4,
-        any_row_group_ffn,
+    const bool routed_g32_wmma =
+        is_canonical_g32_execution_desc(
+            quant.experts_gate_up, num_experts, 2 * moe_intermediate, hidden) &&
+        is_canonical_g32_execution_desc(
+            quant.experts_down, num_experts, hidden, moe_intermediate);
+    const bool shared_down_g32 = is_canonical_g32_execution_desc(
+        quant.shared_expert_down_proj, 1, hidden, shared_intermediate);
+    const bool shared_down_wmma_compatible =
+        quant.shared_expert_down_proj.encoding == 0 || shared_down_g32;
+    const bool use_wmma = select_g32_ffn_int4_dispatch(
+        routed_g32_wmma,
+        shared_down_wmma_compatible,
         wmma_dims_ok,
         ffn_step_supports_wmma_bf16(static_cast<int>(device_ordinal))) ==
         Int4DispatchPolicy::Wmma;
@@ -1538,10 +1715,9 @@ extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
     const size_t lds_bytes =
         static_cast<size_t>(hidden + block_size) * sizeof(float);
 
-    // The persistent kernel used to share one WMMA template bit across
-    // attention, linear attention, FFN, and lm-head. Their independent
-    // parity results differ: attention/linear are qualified, while FFN
-    // and lm-head remain on the scalar path pending qualification.
+    // The persistent kernel carries independent WMMA template bits. Attention
+    // and FFN are qualified separately; lm-head remains scalar until its own
+    // numerical gate is complete.
     const bool disable_wmma =
         std::getenv("SUPERSONIC_QWEN36_DISABLE_PERSISTENT_WMMA") != nullptr;
     const int64_t full_attn_width =
@@ -1554,6 +1730,18 @@ extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
     const bool use_attn_wmma =
         !disable_wmma && persistent_wmma_dims_ok &&
         device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+    const bool use_ffn_wmma =
+        !disable_wmma &&
+        persistent_ffn_wmma_qualified(
+            int4_scales,
+            device_ordinal,
+            num_layers,
+            start_layer,
+            end_layer_exclusive,
+            hidden,
+            num_experts,
+            moe_intermediate,
+            shared_intermediate);
 
     // Encoding 2 is qualified only through BF16-WMMA reconstruction. The
     // descriptors live on device, so inspect them only on the exceptional
@@ -1577,10 +1765,56 @@ extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
         }
     }
 
-    if (use_attn_wmma) {
+    if (use_attn_wmma && use_ffn_wmma) {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<
+                hip_bfloat16, true, true, false>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            num_layers, start_layer, end_layer_exclusive, mode,
+            layers, int4_scales, kv_fp8_descs,
+            hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
+            num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
+            num_experts, moe_intermediate, shared_intermediate, top_k,
+            vocab, rope_theta, rms_norm_eps, position, cache_pos,
+            static_cast<const hip_bfloat16*>(embed_w), token_id,
+            token_ids, prefill_len,
+            static_cast<hip_bfloat16*>(hidden_ping),
+            static_cast<hip_bfloat16*>(hidden_pong),
+            workspace, ffn_topk_idx_scratch,
+            static_cast<const hip_bfloat16*>(final_norm_w),
+            static_cast<const hip_bfloat16*>(lm_head_w),
+            static_cast<hip_bfloat16*>(logits_out),
+            top1_out,
+            counters, barrier_counter, barrier_flag);
+    } else if (use_attn_wmma) {
         hipLaunchKernelGGL(
             (qwen36_moe::qwen36_moe_persistent_decode_kernel<
                 hip_bfloat16, true, false, false>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            num_layers, start_layer, end_layer_exclusive, mode,
+            layers, int4_scales, kv_fp8_descs,
+            hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
+            num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
+            num_experts, moe_intermediate, shared_intermediate, top_k,
+            vocab, rope_theta, rms_norm_eps, position, cache_pos,
+            static_cast<const hip_bfloat16*>(embed_w), token_id,
+            token_ids, prefill_len,
+            static_cast<hip_bfloat16*>(hidden_ping),
+            static_cast<hip_bfloat16*>(hidden_pong),
+            workspace, ffn_topk_idx_scratch,
+            static_cast<const hip_bfloat16*>(final_norm_w),
+            static_cast<const hip_bfloat16*>(lm_head_w),
+            static_cast<hip_bfloat16*>(logits_out),
+            top1_out,
+            counters, barrier_counter, barrier_flag);
+    } else if (use_ffn_wmma) {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<
+                hip_bfloat16, false, true, false>),
             dim3(static_cast<unsigned int>(num_blocks)),
             dim3(block_size),
             lds_bytes, 0,

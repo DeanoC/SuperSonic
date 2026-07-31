@@ -330,6 +330,20 @@ __device__ inline void qwen36_moe_ffn_step_device(
          shared_gate_proj_desc.encoding == 2) &&
         (shared_up_proj_desc.encoding == 1 ||
          shared_up_proj_desc.encoding == 2);
+    const bool shared_gate_g32 =
+        qwen36_g32_descriptor_is_canonical(shared_gate_proj_desc, hidden);
+    const bool shared_up_g32 =
+        qwen36_g32_descriptor_is_canonical(shared_up_proj_desc, hidden);
+    const Qwen36MoeG32Matrix shared_gate_g32_matrix = shared_gate_g32
+        ? qwen36_g32_matrix_from_desc(
+              reinterpret_cast<const uint8_t*>(shared_gate_proj_w),
+              shared_gate_proj_desc, 0)
+        : Qwen36MoeG32Matrix{};
+    const Qwen36MoeG32Matrix shared_up_g32_matrix = shared_up_g32
+        ? qwen36_g32_matrix_from_desc(
+              reinterpret_cast<const uint8_t*>(shared_up_proj_w),
+              shared_up_proj_desc, 0)
+        : Qwen36MoeG32Matrix{};
     if (shared_direct_mid_scalar) {
         const uint8_t* gate_slab =
             reinterpret_cast<const uint8_t*>(shared_gate_proj_w);
@@ -346,13 +360,19 @@ __device__ inline void qwen36_moe_ffn_step_device(
             if (my_row > Is_) break;
 
             if (my_row < Is_) {
-                qwen36_float_pair partials =
-                    qwen36_int4_dq8_pair_matvec_partial_same_row(
-                    gate_slab, shared_gate_proj_desc, 0,
-                    up_slab, shared_up_proj_desc, 0,
-                    h_norm_lds,
-                    my_row, hidden,
-                    tid, block_size);
+                qwen36_float_pair partials;
+                if (shared_gate_g32 && shared_up_g32) {
+                    partials = qwen36_g32_pair_matvec_partial_same_row(
+                        shared_gate_g32_matrix, shared_up_g32_matrix,
+                        h_norm_lds, my_row, hidden, tid, block_size);
+                } else {
+                    partials = qwen36_int4_dq8_pair_matvec_partial_same_row(
+                        gate_slab, shared_gate_proj_desc, 0,
+                        up_slab, shared_up_proj_desc, 0,
+                        h_norm_lds,
+                        my_row, hidden,
+                        tid, block_size);
+                }
                 shared_scratch[tid] = partials.first;
                 shared_scratch_up[tid] = partials.second;
                 __syncthreads();
@@ -494,11 +514,17 @@ __device__ inline void qwen36_moe_ffn_step_device(
 
     {
         const float sg_scalar = workspace[OFF_SG_SCALAR];
+        const bool shared_down_g32 =
+            qwen36_g32_descriptor_is_canonical(shared_down_proj_desc, Is_);
+        const Qwen36MoeG32Matrix shared_down_g32_matrix = shared_down_g32
+            ? qwen36_g32_matrix_from_desc(
+                  reinterpret_cast<const uint8_t*>(shared_down_proj_w),
+                  shared_down_proj_desc, 0)
+            : Qwen36MoeG32Matrix{};
         bool wmma_handled_f = false;
 #ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
         if constexpr (USE_WMMA) {
-            if (shared_down_proj_desc.encoding == 1 ||
-                shared_down_proj_desc.encoding == 2) {
+            if (shared_down_g32) {
                 const int wave_id = tid >> 5;
                 const int lane = tid & 31;
                 const int lane_row = lane & 15;
@@ -548,12 +574,19 @@ __device__ inline void qwen36_moe_ffn_step_device(
                 float partial = 0.0f;
                 if (shared_down_proj_desc.encoding == 1 ||
                     shared_down_proj_desc.encoding == 2) {
-                    partial = qwen36_int4_dq8_matvec_partial(
-                        reinterpret_cast<const uint8_t*>(shared_down_proj_w),
-                        shared_down_proj_desc, 0,
-                        workspace + OFF_SHARED_MID,
-                        my_row, Is_,
-                        tid, block_size);
+                    if (shared_down_g32) {
+                        partial = qwen36_g32_matvec_partial(
+                            shared_down_g32_matrix,
+                            workspace + OFF_SHARED_MID,
+                            my_row, Is_, tid, block_size);
+                    } else {
+                        partial = qwen36_int4_dq8_matvec_partial(
+                            reinterpret_cast<const uint8_t*>(shared_down_proj_w),
+                            shared_down_proj_desc, 0,
+                            workspace + OFF_SHARED_MID,
+                            my_row, Is_,
+                            tid, block_size);
+                    }
                 } else if (shared_down_proj_desc.encoding == 3) {
                     partial = fp8_matvec_partial(
                         reinterpret_cast<const void*>(shared_down_proj_w),
@@ -632,7 +665,10 @@ __device__ inline void qwen36_moe_ffn_step_device(
         // profiles only group 0 and all blocks must agree on barrier count.
         direct_mid_wmma =
             (stage > 3) &&
-            (gate_up_proj_desc.encoding == 1 || gate_up_proj_desc.encoding == 2);
+            qwen36_g32_descriptor_is_canonical(
+                gate_up_proj_desc, hidden) &&
+            qwen36_g32_descriptor_is_canonical(
+                down_proj_desc, I_);
     }
 #endif
 
@@ -650,6 +686,9 @@ __device__ inline void qwen36_moe_ffn_step_device(
         const bool gu_quant = gate_up_proj_desc.encoding != 0;
         const bool gu_int4 =
             gate_up_proj_desc.encoding == 1 || gate_up_proj_desc.encoding == 2;
+        const bool gu_g32 =
+            gu_int4 && qwen36_g32_descriptor_is_canonical(
+                gate_up_proj_desc, hidden);
         const T* gu_slab_bf16 =
             gate_up_proj_w + static_cast<size_t>(e) * two_I * hidden;
         const uint8_t*      gu_slab_packed = nullptr;
@@ -667,6 +706,11 @@ __device__ inline void qwen36_moe_ffn_step_device(
                 static_cast<size_t>(e) *
                 gate_up_proj_desc.scale_expert_stride_elements;
         }
+        const Qwen36MoeG32Matrix gu_g32_matrix = gu_g32
+            ? qwen36_g32_matrix_from_desc(
+                  reinterpret_cast<const uint8_t*>(gate_up_proj_w),
+                  gate_up_proj_desc, e)
+            : Qwen36MoeG32Matrix{};
         const int gu_off = OFF_EXPERT_GU + group_id * two_I;
 
         // WMMA path: 128 rows per atomicAdd; 8 waves do 16-row WMMA tiles
@@ -675,7 +719,7 @@ __device__ inline void qwen36_moe_ffn_step_device(
         bool wmma_handled_g = false;
 #ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
         if constexpr (USE_WMMA) {
-            if (gu_int4) {
+            if (gu_g32) {
                 const int wave_id = tid >> 5;
                 const int lane = tid & 31;
                 const int lane_row = lane & 15;
@@ -754,11 +798,17 @@ __device__ inline void qwen36_moe_ffn_step_device(
 
                 float partial = 0.0f;
                 if (gu_int4) {
-                    partial = qwen36_int4_dq8_matvec_partial(
-                        gu_slab_packed, gate_up_proj_desc, e,
-                        h_norm_lds,
-                        my_row, hidden,
-                        tid, block_size);
+                    if (gu_g32) {
+                        partial = qwen36_g32_matvec_partial(
+                            gu_g32_matrix, h_norm_lds,
+                            my_row, hidden, tid, block_size);
+                    } else {
+                        partial = qwen36_int4_dq8_matvec_partial(
+                            gu_slab_packed, gate_up_proj_desc, e,
+                            h_norm_lds,
+                            my_row, hidden,
+                            tid, block_size);
+                    }
                 } else if (gu_quant) {
                     partial = fp8_matvec_partial(
                         gu_slab_packed, gu_slab_scale,
@@ -820,6 +870,9 @@ __device__ inline void qwen36_moe_ffn_step_device(
         const bool dp_quant = down_proj_desc.encoding != 0;
         const bool dp_int4 =
             down_proj_desc.encoding == 1 || down_proj_desc.encoding == 2;
+        const bool dp_g32 =
+            dp_int4 && qwen36_g32_descriptor_is_canonical(
+                down_proj_desc, I_);
         const T* dp_slab_bf16 =
             down_proj_w + static_cast<size_t>(e) * hidden * I_;
         const uint8_t*      dp_slab_packed = nullptr;
@@ -837,13 +890,18 @@ __device__ inline void qwen36_moe_ffn_step_device(
                 static_cast<size_t>(e) *
                 down_proj_desc.scale_expert_stride_elements;
         }
+        const Qwen36MoeG32Matrix dp_g32_matrix = dp_g32
+            ? qwen36_g32_matrix_from_desc(
+                  reinterpret_cast<const uint8_t*>(down_proj_w),
+                  down_proj_desc, e)
+            : Qwen36MoeG32Matrix{};
         const int slot_off = OFF_EXPERT_STACK + group_id * hidden;
         const int mid_off  = OFF_EXPERT_MID   + group_id * I_;
 
         bool wmma_handled_i = false;
 #ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
         if constexpr (USE_WMMA) {
-            if (dp_int4) {
+            if (dp_g32) {
                 const int wave_id = tid >> 5;
                 const int lane = tid & 31;
                 const int lane_row = lane & 15;
@@ -893,11 +951,17 @@ __device__ inline void qwen36_moe_ffn_step_device(
 
                 float partial = 0.0f;
                 if (dp_int4) {
-                    partial = qwen36_int4_dq8_matvec_partial(
-                        dp_slab_packed, down_proj_desc, e,
-                        workspace + mid_off,
-                        my_row, I_,
-                        tid, block_size);
+                    if (dp_g32) {
+                        partial = qwen36_g32_matvec_partial(
+                            dp_g32_matrix, workspace + mid_off,
+                            my_row, I_, tid, block_size);
+                    } else {
+                        partial = qwen36_int4_dq8_matvec_partial(
+                            dp_slab_packed, down_proj_desc, e,
+                            workspace + mid_off,
+                            my_row, I_,
+                            tid, block_size);
+                    }
                 } else if (dp_quant) {
                     partial = fp8_matvec_partial(
                         dp_slab_packed, dp_slab_scale,
