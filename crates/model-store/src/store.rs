@@ -639,9 +639,13 @@ fn flm_read_index_entries(
         let dtype = read_u16(rec, 36, "FLM tensor dtype")?;
         let codec = rec[40];
         let n_dims = rec[41] as usize;
-        let inline_dims = n_dims.min(4);
-        let mut shape = Vec::with_capacity(inline_dims);
-        for dim_idx in 0..inline_dims {
+        if n_dims > 4 {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} has rank {n_dims}; index records support at most 4 dimensions"
+            )));
+        }
+        let mut shape = Vec::with_capacity(n_dims);
+        for dim_idx in 0..n_dims {
             shape.push(read_u32(rec, 42 + dim_idx * 4, "FLM tensor shape")? as usize);
         }
         let shard = shards.get(&shard_id).ok_or_else(|| {
@@ -685,6 +689,82 @@ fn flm_read_index_entries(
         );
     }
     Ok(entries)
+}
+
+fn validate_row_group_storage_plane_overlaps(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index_entries: &HashMap<String, FlmIndexEntry>,
+) -> Result<(), Error> {
+    let mut intervals = Vec::new();
+    for logical in runtime.logical_tensors() {
+        if logical.value_format_id != crate::flm::VALUE_FORMAT_SYM_INT4
+            || runtime.stage3_direct_weight_kind(&logical.name)?
+                != Some(crate::flm::FlmStage3DirectWeightKind::RowGroupInt4)
+        {
+            continue;
+        }
+
+        for storage_role in [
+            crate::flm::STORAGE_ROLE_PACKED,
+            crate::flm::STORAGE_ROLE_SCALE,
+        ] {
+            let binding = runtime
+                .storage_bindings()
+                .iter()
+                .find(|binding| {
+                    binding.logical_tensor_id == logical.tensor_id
+                        && binding.storage_role == storage_role
+                })
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 row-group tensor {} is missing required storage role {}",
+                        logical.name, storage_role
+                    ))
+                })?;
+            let entry = index_entries.get(&binding.tensor_name).ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 row-group tensor {} binding {} is missing from the index",
+                    logical.name, binding.tensor_name
+                ))
+            })?;
+            let end = entry
+                .file_offset
+                .checked_add(entry.stored_len)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 row-group tensor {} binding {} absolute range overflows",
+                        logical.name, binding.tensor_name
+                    ))
+                })?;
+            intervals.push((
+                entry.file_offset,
+                end,
+                logical.name.clone(),
+                binding.tensor_name.clone(),
+                storage_role,
+            ));
+        }
+    }
+
+    intervals
+        .sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    for pair in intervals.windows(2) {
+        let (previous_start, previous_end, previous_logical, previous_tensor, previous_role) =
+            &pair[0];
+        let (current_start, current_end, current_logical, current_tensor, current_role) = &pair[1];
+        if previous_end > current_start {
+            return Err(Error::Other(format!(
+                "overlapping row-group storage planes: {} ({}) role {} [{previous_start:#x}, {previous_end:#x}) and {} ({}) role {} [{current_start:#x}, {current_end:#x})",
+                previous_tensor,
+                previous_logical,
+                previous_role,
+                current_tensor,
+                current_logical,
+                current_role,
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn flm_build_index(
@@ -2236,6 +2316,7 @@ impl BakedStore {
                     &index_entries,
                     options.flm_int4_logical_aliases,
                 )?;
+                validate_row_group_storage_plane_overlaps(runtime, &index_entries)?;
                 if options.flm_int4_logical_aliases {
                     add_stage3_raw_value_aliases(runtime, &mut index, &mut upload_views)?;
                     add_stage3_lowbit_aliases(runtime, &mut index, &mut upload_views)?;
@@ -4072,6 +4153,182 @@ mod tests {
         out
     }
 
+    fn runtime_stage3_row_group_logical_tensor_section_for_fixtures(
+        fixtures: &[TestRowGroupStage3],
+    ) -> Vec<u8> {
+        let mut string_pool = Vec::new();
+        let mut names = Vec::with_capacity(fixtures.len());
+        for fixture in fixtures {
+            let offset = string_pool.len() as u32;
+            string_pool.extend_from_slice(fixture.logical_name.as_bytes());
+            names.push((offset, fixture.logical_name.len() as u16));
+        }
+
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, fixtures.len() as u32);
+        push_u32(&mut out, string_pool.len() as u32);
+        for (idx, (fixture, (name_offset, name_len))) in fixtures.iter().zip(names).enumerate() {
+            assert_eq!(fixture.rank, 2);
+            assert!(fixture.include_scale);
+            assert!(!fixture.include_zero);
+            push_u32(&mut out, (idx + 1) as u32);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name_len);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+            out.push(fixture.rank);
+            out.push(0);
+            for dim in fixture.logical_shape {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, crate::flm::VALUE_FORMAT_SYM_INT4);
+            push_u16(&mut out, FLM_DTYPE_BF16);
+            push_u32(&mut out, (idx * 2) as u32);
+            push_u16(&mut out, 2);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+        }
+        out.extend_from_slice(&string_pool);
+        out
+    }
+
+    fn runtime_stage3_row_group_storage_binding_section_for_fixtures(
+        fixtures: &[TestRowGroupStage3],
+    ) -> Vec<u8> {
+        let mut rows = Vec::with_capacity(fixtures.len() * 2);
+        for (idx, fixture) in fixtures.iter().enumerate() {
+            let logical_id = (idx + 1) as u32;
+            rows.push((
+                logical_id,
+                fixture.packed_name.as_bytes(),
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                crate::flm::STORAGE_ABI_ID_ROW_GROUP_INT4_G32,
+            ));
+            rows.push((
+                logical_id,
+                fixture.scale_name.as_bytes(),
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                fixture.scale_abi_id,
+            ));
+        }
+        let pool_len: usize = rows.iter().map(|(_, name, _, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::with_capacity(pool_len);
+        let mut name_offset = 0u32;
+        for (logical_id, name, role, dtype, abi_id) in rows {
+            push_u32(&mut out, logical_id);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, role);
+            push_u16(&mut out, dtype);
+            push_u16(&mut out, abi_id);
+            push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name);
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_row_group_plan_step_section_for_fixtures(
+        fixtures: &[TestRowGroupStage3],
+    ) -> Vec<u8> {
+        let mut rows = Vec::with_capacity(fixtures.len() * 2);
+        for (idx, fixture) in fixtures.iter().enumerate() {
+            let (packed_shape, scale_shape) = fixture.physical_shapes();
+            rows.push((
+                (idx + 1) as u32,
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                packed_shape,
+            ));
+            rows.push((
+                (idx + 1) as u32,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                scale_shape,
+            ));
+        }
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, rows.len() as u32);
+        for (logical_id, role, dtype, shape) in rows {
+            push_u32(&mut out, logical_id);
+            push_u16(&mut out, role);
+            push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+            push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+            push_u16(&mut out, dtype);
+            out.push(shape.len() as u8);
+            out.push(0);
+            for dim in shape.iter().copied().chain(std::iter::repeat(0)).take(4) {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+            push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+            push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_two_row_group_stage3_tables(
+        fixtures: &[TestRowGroupStage3],
+    ) -> Vec<u8> {
+        assert_eq!(fixtures.len(), 2);
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_row_group_codec_section(&fixtures[0])),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (
+                9u32,
+                runtime_stage3_row_group_storage_abi_section(&fixtures[0]),
+            ),
+            (
+                10u32,
+                runtime_stage3_row_group_logical_tensor_section_for_fixtures(fixtures),
+            ),
+            (
+                11u32,
+                runtime_stage3_row_group_storage_binding_section_for_fixtures(fixtures),
+            ),
+            (
+                12u32,
+                runtime_stage3_row_group_plan_step_section_for_fixtures(fixtures),
+            ),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
     fn build_test_runtime_directory_with_stage3_tables() -> Vec<u8> {
         let (asset_table, asset_payloads) = runtime_asset_sections();
         let sections = [
@@ -5056,6 +5313,34 @@ mod tests {
         data
     }
 
+    fn build_test_flm_with_two_row_group_bindings(fixtures: &[TestRowGroupStage3]) -> Vec<u8> {
+        assert_eq!(fixtures.len(), 2);
+        let mut tensors = Vec::with_capacity(4);
+        for fixture in fixtures {
+            let (packed_shape, scale_shape) = fixture.physical_shapes();
+            let packed_elements: usize = packed_shape.iter().map(|dim| *dim as usize).product();
+            let scale_elements: usize = scale_shape.iter().map(|dim| *dim as usize).product();
+            tensors.push(TestFlmTensor {
+                name: fixture.packed_name,
+                shape: packed_shape,
+                dtype: fixture.packed_index_dtype,
+                codec: 10,
+                payload: vec![0x88; packed_elements],
+            });
+            tensors.push(TestFlmTensor {
+                name: fixture.scale_name,
+                shape: scale_shape,
+                dtype: FLM_DTYPE_BF16,
+                codec: fixture.scale_index_codec,
+                payload: test_bf16_bytes(std::iter::repeat(1.0).take(scale_elements)),
+            });
+        }
+        let mut data = build_test_flm(&tensors);
+        let runtime = build_test_runtime_directory_with_two_row_group_stage3_tables(fixtures);
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
     fn copy_test_flm_index_extent(data: &mut [u8], source_idx: usize, target_idx: usize) {
         let index_offset =
             read_u64(data, 24, "test FLM index offset").expect("test FLM index offset") as usize;
@@ -5063,6 +5348,14 @@ mod tests {
         let target = index_offset + target_idx * TEST_FLM_INDEX_RECORD_SIZE;
         let extent = data[source + 12..source + 36].to_vec();
         data[target + 12..target + 36].copy_from_slice(&extent);
+        put_head_crc64(data);
+    }
+
+    fn set_test_flm_index_shard_offset(data: &mut [u8], target_idx: usize, shard_offset: u64) {
+        let index_offset =
+            read_u64(data, 24, "test FLM index offset").expect("test FLM index offset") as usize;
+        let target = index_offset + target_idx * TEST_FLM_INDEX_RECORD_SIZE;
+        put_u64(data, target + 12, shard_offset);
         put_head_crc64(data);
     }
 
@@ -5271,6 +5564,31 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_rejects_tensor_index_rank_above_four() {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "rank.five.tensor",
+            shape: vec![1, 2, 3, 4],
+            dtype: FLM_DTYPE_UINT8,
+            codec: 0,
+            payload: vec![0; 24],
+        }]);
+        let index_offset =
+            read_u64(&data, 24, "test FLM index offset").expect("test FLM index offset") as usize;
+        data[index_offset + 41] = 5;
+        put_head_crc64(&mut data);
+        let file = write_temp_flm(&data);
+
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("tensor index rank above four must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("rank 5") && err.to_string().contains("4 dimensions"),
+            "unexpected rank error: {err}"
+        );
+    }
+
+    #[test]
     fn open_flm_exposes_file_storage_extent_for_direct_tensor() {
         let data = build_test_flm(&[
             TestFlmTensor {
@@ -5298,7 +5616,7 @@ mod tests {
             .expect("direct FLM tensor should expose a file extent");
 
         assert_eq!(extent.source_kind, TensorStorageSourceKind::FlmContainer);
-        assert_eq!(extent.source_path, file.path());
+        assert_eq!(extent.source_path, file.path().canonicalize().unwrap());
         assert_eq!(extent.name, "model.norm.weight");
         assert_eq!(extent.file_offset, meta.offset);
         assert_eq!(extent.byte_len, meta.byte_len);
@@ -5331,7 +5649,10 @@ mod tests {
             range.extent.source_kind,
             TensorStorageSourceKind::FlmContainer
         );
-        assert_eq!(range.extent.source_path, file.path());
+        assert_eq!(
+            range.extent.source_path,
+            file.path().canonicalize().unwrap()
+        );
         assert_eq!(range.extent.name, "model.norm.weight");
         assert_eq!(range.extent.file_offset, meta.offset);
         assert_eq!(range.extent.byte_len, meta.byte_len);
@@ -6230,6 +6551,55 @@ mod tests {
         );
     }
 
+    fn assert_row_group_storage_overlap_is_rejected(
+        target_index: usize,
+        target_shard_offset: u64,
+        overlap_kind: &str,
+    ) {
+        let mut first = TestRowGroupStage3::rank2();
+        first.logical_name = "semantic.row_group.first";
+        first.packed_name = "storage/row_group_first_packed";
+        first.scale_name = "storage/row_group_first_scale";
+        let mut second = TestRowGroupStage3::rank2();
+        second.logical_name = "semantic.row_group.second";
+        second.packed_name = "storage/row_group_second_packed";
+        second.scale_name = "storage/row_group_second_scale";
+
+        let mut data = build_test_flm_with_two_row_group_bindings(&[first, second]);
+        set_test_flm_index_shard_offset(&mut data, target_index, target_shard_offset);
+        let file = write_temp_flm(&data);
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("{overlap_kind} row-group storage overlap must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("overlapping row-group storage planes"),
+            "unexpected {overlap_kind} overlap error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_exact_row_group_storage_plane_overlap() {
+        assert_row_group_storage_overlap_is_rejected(2, 0, "exact");
+    }
+
+    #[test]
+    fn open_flm_rejects_partial_row_group_storage_plane_overlap() {
+        assert_row_group_storage_overlap_is_rejected(2, 64, "partial");
+    }
+
+    #[test]
+    fn open_flm_rejects_contained_row_group_storage_plane_overlap() {
+        assert_row_group_storage_overlap_is_rejected(3, 8, "contained");
+    }
+
     #[test]
     fn open_flm_builds_rank2_row_group_int4_view_from_opaque_bindings() {
         let fixture = TestRowGroupStage3::rank2();
@@ -6652,7 +7022,7 @@ mod tests {
             .expect("native INT4 extent")
             .expect("native INT4 direct tensor should expose file extent");
         assert_eq!(extent.source_kind, TensorStorageSourceKind::FlmContainer);
-        assert_eq!(extent.source_path, file.path());
+        assert_eq!(extent.source_path, file.path().canonicalize().unwrap());
         assert_eq!(extent.storage_dtype, "u8");
         assert_eq!(extent.storage_shape, vec![2, 256, 64]);
         assert_eq!(extent.layout, LayoutTag::Int4Quantized);
