@@ -120,6 +120,11 @@ __global__ void qwen36_moe_batched_prefill_grouped_expert_kernel(
     float* gu_lds       = x_lds + hidden;
     float* silu_mul_lds = gu_lds + two_I;
 
+    const bool gate_up_tile_v1 = qwen36_tile_v1_descriptor_is_canonical(
+        experts_gate_up_desc, two_I, hidden);
+    const bool down_tile_v1 = qwen36_tile_v1_descriptor_is_canonical(
+        experts_down_desc, hidden, I_);
+
     // Persistent loop — claim experts via atomic counter.
     for (;;) {
         __shared__ unsigned int s_expert_id;
@@ -133,6 +138,41 @@ __global__ void qwen36_moe_batched_prefill_grouped_expert_kernel(
         const int seg_start = expert_offsets[e];
         const int seg_end   = expert_offsets[e + 1];
         if (seg_start == seg_end) continue;   // empty segment — try next expert.
+
+        // Resolve canonical tile-v1 slabs once per expert. The compatibility
+        // API uses this layout, and the slab-based helpers retain the
+        // optimized legacy benchmark path while descriptor-native layouts
+        // continue through the general helpers below.
+        const uint8_t* gu_slab_packed = nullptr;
+        const hip_bfloat16* gu_slab_scale = nullptr;
+        const hip_bfloat16* gu_slab_zero = nullptr;
+        if (gate_up_tile_v1) {
+            gu_slab_packed = experts_gate_up_w +
+                static_cast<size_t>(e) * experts_gate_up_desc.packed_expert_stride_bytes;
+            gu_slab_scale = static_cast<const hip_bfloat16*>(
+                experts_gate_up_desc.scale) +
+                static_cast<size_t>(e) *
+                    experts_gate_up_desc.scale_expert_stride_elements;
+            gu_slab_zero = static_cast<const hip_bfloat16*>(
+                experts_gate_up_desc.zero) +
+                static_cast<size_t>(e) *
+                    experts_gate_up_desc.scale_expert_stride_elements;
+        }
+        const uint8_t* dp_slab_packed = nullptr;
+        const hip_bfloat16* dp_slab_scale = nullptr;
+        const hip_bfloat16* dp_slab_zero = nullptr;
+        if (down_tile_v1) {
+            dp_slab_packed = experts_down_w +
+                static_cast<size_t>(e) * experts_down_desc.packed_expert_stride_bytes;
+            dp_slab_scale = static_cast<const hip_bfloat16*>(
+                experts_down_desc.scale) +
+                static_cast<size_t>(e) *
+                    experts_down_desc.scale_expert_stride_elements;
+            dp_slab_zero = static_cast<const hip_bfloat16*>(
+                experts_down_desc.zero) +
+                static_cast<size_t>(e) *
+                    experts_down_desc.scale_expert_stride_elements;
+        }
 
         // Walk the assigned rows for this expert.
         for (int row = seg_start; row < seg_end; ++row) {
@@ -179,11 +219,23 @@ __global__ void qwen36_moe_batched_prefill_grouped_expert_kernel(
                 for (int row_base = 0; row_base < two_I; row_base += 128) {
                     const int rhs_row_idx = row_base + wave_id * 16 + lane_row;
                     const bool rhs_in_range = rhs_row_idx < two_I;
-                    qwen36_float8 acc =
-                        qwen36_wmma_int4_matvec_partial_16rows(
-                        experts_gate_up_w, experts_gate_up_desc, e,
-                        rhs_row_idx, rhs_in_range,
-                        x_lds, hidden, lane_row);
+                    qwen36_float8 acc;
+                    if (gate_up_tile_v1) {
+                        const uint8_t* slab_row = rhs_in_range
+                            ? gu_slab_packed + static_cast<size_t>(rhs_row_idx) *
+                                  experts_gate_up_desc.packed_row_stride_bytes
+                            : nullptr;
+                        acc = wmma_int4_matvec_partial_16rows(
+                            slab_row, gu_slab_scale, gu_slab_zero,
+                            rhs_row_idx, rhs_in_range, x_lds, hidden,
+                            hidden / experts_gate_up_desc.input_group_size,
+                            experts_gate_up_desc.input_group_size, lane_row);
+                    } else {
+                        acc = qwen36_wmma_int4_matvec_partial_16rows(
+                            experts_gate_up_w, experts_gate_up_desc, e,
+                            rhs_row_idx, rhs_in_range,
+                            x_lds, hidden, lane_row);
+                    }
 
                     if (lane_half == 0 && rhs_in_range) {
                         gu_lds[rhs_row_idx] = acc[0];
@@ -213,9 +265,21 @@ __global__ void qwen36_moe_batched_prefill_grouped_expert_kernel(
                             // strip-mine across threads on a row-major basis
                             // — see below for an alternate formulation.
                             float dq[8];
-                            qwen36_int4_dequant_8(
-                                experts_gate_up_w, experts_gate_up_desc,
-                                e, my_row, col, dq);
+                            if (gate_up_tile_v1) {
+                                const uint32_t pk = *reinterpret_cast<const uint32_t*>(
+                                    &gu_slab_packed[static_cast<size_t>(my_row) *
+                                        (hidden / 2) + col / 2]);
+                                int4_dequant_8(
+                                    pk, gu_slab_scale, gu_slab_zero,
+                                    my_row / experts_gate_up_desc.output_group_size,
+                                    col,
+                                    hidden / experts_gate_up_desc.input_group_size,
+                                    experts_gate_up_desc.input_group_size, dq);
+                            } else {
+                                qwen36_int4_dequant_8(
+                                    experts_gate_up_w, experts_gate_up_desc,
+                                    e, my_row, col, dq);
+                            }
                             #pragma unroll
                             for (int i = 0; i < 8; ++i) {
                                 partial += dq[i] * x_lds[col + i];
@@ -273,11 +337,23 @@ __global__ void qwen36_moe_batched_prefill_grouped_expert_kernel(
                 for (int row_base = 0; row_base < hidden; row_base += 128) {
                     const int rhs_row_idx = row_base + wave_id * 16 + lane_row;
                     const bool rhs_in_range = rhs_row_idx < hidden;
-                    qwen36_float8 acc =
-                        qwen36_wmma_int4_matvec_partial_16rows(
-                        experts_down_w, experts_down_desc, e,
-                        rhs_row_idx, rhs_in_range,
-                        silu_mul_lds, I_, lane_row);
+                    qwen36_float8 acc;
+                    if (down_tile_v1) {
+                        const uint8_t* slab_row = rhs_in_range
+                            ? dp_slab_packed + static_cast<size_t>(rhs_row_idx) *
+                                  experts_down_desc.packed_row_stride_bytes
+                            : nullptr;
+                        acc = wmma_int4_matvec_partial_16rows(
+                            slab_row, dp_slab_scale, dp_slab_zero,
+                            rhs_row_idx, rhs_in_range, silu_mul_lds, I_,
+                            I_ / experts_down_desc.input_group_size,
+                            experts_down_desc.input_group_size, lane_row);
+                    } else {
+                        acc = qwen36_wmma_int4_matvec_partial_16rows(
+                            experts_down_w, experts_down_desc, e,
+                            rhs_row_idx, rhs_in_range,
+                            silu_mul_lds, I_, lane_row);
+                    }
 
                     if (lane_half == 0 && rhs_in_range) {
                         const float val = acc[0];
@@ -296,9 +372,21 @@ __global__ void qwen36_moe_batched_prefill_grouped_expert_kernel(
                     if (my_row < hidden) {
                         for (int col = 0; col < I_; col += 8) {
                             float dq[8];
-                            qwen36_int4_dequant_8(
-                                experts_down_w, experts_down_desc,
-                                e, my_row, col, dq);
+                            if (down_tile_v1) {
+                                const uint32_t pk = *reinterpret_cast<const uint32_t*>(
+                                    &dp_slab_packed[static_cast<size_t>(my_row) *
+                                        (I_ / 2) + col / 2]);
+                                int4_dequant_8(
+                                    pk, dp_slab_scale, dp_slab_zero,
+                                    my_row / experts_down_desc.output_group_size,
+                                    col,
+                                    I_ / experts_down_desc.input_group_size,
+                                    experts_down_desc.input_group_size, dq);
+                            } else {
+                                qwen36_int4_dequant_8(
+                                    experts_down_w, experts_down_desc,
+                                    e, my_row, col, dq);
+                            }
                             #pragma unroll
                             for (int i = 0; i < 8; ++i) {
                                 partial += dq[i] * silu_mul_lds[col + i];

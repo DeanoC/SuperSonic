@@ -136,6 +136,34 @@ __device__ __forceinline__ bool qwen36_g32_descriptor_is_canonical(
            qwen36_g32_descriptor_layout_is_canonical(desc);
 }
 
+// The compatibility tile-v1 launcher has the same tightly packed geometry
+// as the original grouped-expert kernel. Keep that case on the old slab-based
+// helpers: unlike the general descriptor path, they resolve expert and row
+// bases once and use the specialized WMMA operand loader.
+__device__ __forceinline__ bool qwen36_tile_v1_descriptor_is_canonical(
+    const Qwen36MoeInt4WeightDesc& desc,
+    int rows,
+    int cols
+) {
+    if (desc.encoding != 1 || desc.scale == nullptr || desc.zero == nullptr ||
+        desc.implicit_zero_code >= 0 || rows <= 0 || cols <= 0 ||
+        desc.input_group_size <= 0 || desc.output_group_size <= 0 ||
+        cols % 2 != 0 || cols % desc.input_group_size != 0 ||
+        rows % desc.output_group_size != 0) {
+        return false;
+    }
+    const uint64_t packed_row_stride = static_cast<uint64_t>(cols / 2);
+    const uint64_t scale_row_stride =
+        static_cast<uint64_t>(cols / desc.input_group_size);
+    return desc.packed_row_stride_bytes == packed_row_stride &&
+           desc.packed_expert_stride_bytes ==
+               static_cast<uint64_t>(rows) * packed_row_stride &&
+           desc.scale_row_stride_elements == scale_row_stride &&
+           desc.scale_expert_stride_elements ==
+               static_cast<uint64_t>(rows / desc.output_group_size) *
+                   scale_row_stride;
+}
+
 struct Qwen36MoeG32RowBases {
     const uint8_t* packed_row;
     const hip_bfloat16* scale_row;
