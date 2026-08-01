@@ -17,6 +17,7 @@ pub const CODEC_FP8_E4M3_F32: u16 = 7;
 pub const CODEC_FP8_E4M3_B128_BF16_INV: u16 = 8;
 pub const CODEC_FP8_E4M3_B64_BF16: u16 = 9;
 pub const CODEC_SUPERSONIC_NATIVE_INT4_G128_BF16: u16 = 10;
+pub const CODEC_ROW_GROUP_INT4_BF16_SYM: u16 = 11;
 pub const MODEL_QWEN3_6_DENSE_V1: u16 = 1;
 pub const MODEL_QWEN3_6_MOE_V1: u16 = 2;
 pub const QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1: u32 = 1;
@@ -25,10 +26,12 @@ pub const ASSET_TOKENIZER_VOCAB: u16 = 1;
 pub const ASSET_TOKENIZER_MERGES: u16 = 2;
 pub const ASSET_TOKENIZER_ADDED_TOKENS: u16 = 3;
 pub const ASSET_TOKENIZER_REGEX: u16 = 4;
+pub const ASSET_CHAT_TEMPLATE_UTF8: u16 = 5;
 pub const ASSET_HF_CONFIG_JSON: u16 = 101;
 pub const ASSET_HF_TOKENIZER_JSON: u16 = 102;
 pub const ASSET_FLAG_REQUIRED_FOR_RUNTIME: u16 = 1 << 0;
 pub const ASSET_FLAG_COMPATIBILITY_ONLY: u16 = 1 << 1;
+pub const ASSET_FLAG_TEXT_UTF8: u16 = 1 << 2;
 pub const MANIFEST_COMPANION_NONE: u8 = 0;
 pub const MANIFEST_COMPANION_PACKED: u8 = 1;
 pub const MANIFEST_COMPANION_SCALE: u8 = 2;
@@ -47,8 +50,13 @@ pub const STORAGE_ROLE_INPUT_SCALE: u16 = 7;
 pub const STORAGE_ABI_KIND_GROUP_QUANT: u16 = 1;
 pub const STORAGE_ABI_KIND_SCALED_FLOAT: u16 = 2;
 pub const STORAGE_ABI_ID_NONE: u16 = 0;
+pub const STORAGE_ABI_ID_ROW_GROUP_INT4_G32: u16 = 9;
 pub const LAYOUT_ID_DEFAULT: u16 = 0;
+pub const LAYOUT_ROW_MAJOR_UINT4_LOW_EVEN: u16 = 1;
 pub const QUANT_FLAG_SYMMETRIC: u16 = 1 << 0;
+pub const QUANT_FLAG_IMPLICIT_ZERO_8: u16 = 1 << 2;
+pub const SCALE_GRANULARITY_OUTPUT_ROW_REDUCTION_GROUP: u8 = 1;
+pub const ZERO_REPRESENTATION_IMPLICIT_CODE: u16 = 1;
 pub const LOGICAL_TENSOR_ROLE_WEIGHT: u16 = 1;
 pub const LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT: u16 = 2;
 pub const LOGICAL_TENSOR_FLAG_REQUIRED: u16 = 1 << 0;
@@ -242,6 +250,86 @@ pub struct FlmStorageAbi {
     pub params: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlmRowGroupQuantParams {
+    pub version: u16,
+    pub group_axis_from_end: u8,
+    pub scale_granularity: u8,
+    pub scale_dtype: u16,
+    pub reconstruction_dtype: u16,
+    pub zero_representation: u16,
+}
+
+impl FlmRowGroupQuantParams {
+    pub fn parse(params: &[u8]) -> Result<Self, Error> {
+        if params.len() != 12 {
+            return Err(Error::Other(format!(
+                "FLM row-group INT4 params must be exactly 12 bytes, got {}",
+                params.len()
+            )));
+        }
+        let parsed = Self {
+            version: read_u16(params, 0, "FLM row-group INT4 params version")?,
+            group_axis_from_end: params[2],
+            scale_granularity: params[3],
+            scale_dtype: read_u16(params, 4, "FLM row-group INT4 params scale_dtype")?,
+            reconstruction_dtype: read_u16(
+                params,
+                6,
+                "FLM row-group INT4 params reconstruction_dtype",
+            )?,
+            zero_representation: read_u16(
+                params,
+                8,
+                "FLM row-group INT4 params zero_representation",
+            )?,
+        };
+        let reserved = read_u16(params, 10, "FLM row-group INT4 params reserved")?;
+        if parsed.version != 1 {
+            return Err(Error::Other(format!(
+                "FLM row-group INT4 params version={} is unsupported; expected 1",
+                parsed.version
+            )));
+        }
+        if parsed.group_axis_from_end != 1 {
+            return Err(Error::Other(format!(
+                "FLM row-group INT4 params group_axis_from_end={}; expected 1",
+                parsed.group_axis_from_end
+            )));
+        }
+        if parsed.scale_granularity != SCALE_GRANULARITY_OUTPUT_ROW_REDUCTION_GROUP {
+            return Err(Error::Other(format!(
+                "FLM row-group INT4 params scale_granularity={}; expected {}",
+                parsed.scale_granularity, SCALE_GRANULARITY_OUTPUT_ROW_REDUCTION_GROUP
+            )));
+        }
+        if parsed.scale_dtype != FLM_DTYPE_BF16 {
+            return Err(Error::Other(format!(
+                "FLM row-group INT4 params scale_dtype={}; expected BF16 ({FLM_DTYPE_BF16})",
+                parsed.scale_dtype
+            )));
+        }
+        if parsed.reconstruction_dtype != FLM_DTYPE_BF16 {
+            return Err(Error::Other(format!(
+                "FLM row-group INT4 params reconstruction_dtype={}; expected BF16 ({FLM_DTYPE_BF16})",
+                parsed.reconstruction_dtype
+            )));
+        }
+        if parsed.zero_representation != ZERO_REPRESENTATION_IMPLICIT_CODE {
+            return Err(Error::Other(format!(
+                "FLM row-group INT4 params zero_representation={}; expected implicit code ({ZERO_REPRESENTATION_IMPLICIT_CODE})",
+                parsed.zero_representation
+            )));
+        }
+        if reserved != 0 {
+            return Err(Error::Other(format!(
+                "FLM row-group INT4 params reserved={reserved}; expected 0"
+            )));
+        }
+        Ok(parsed)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlmLogicalTensor {
     pub tensor_id: u32,
@@ -291,6 +379,7 @@ pub enum FlmStage3DirectWeightKind {
     RawDense,
     CtInt4Bf16Fallback,
     NativeInt4,
+    RowGroupInt4,
 }
 
 #[derive(Debug, Clone)]
@@ -511,6 +600,53 @@ impl FlmRuntimeDirectory {
         self.assets.values().find(|asset| asset.name == kind)
     }
 
+    pub fn required_chat_template_source(&self) -> Result<&str, Error> {
+        let matches: Vec<&FlmAsset> = self
+            .assets
+            .values()
+            .filter(|asset| asset.kind_id == ASSET_CHAT_TEMPLATE_UTF8)
+            .collect();
+        let asset = match matches.as_slice() {
+            [] => {
+                return Err(Error::Other(format!(
+                    "Qwen3.6 runtime requires one native chat template asset with kind_id={ASSET_CHAT_TEMPLATE_UTF8}"
+                )));
+            }
+            [asset] => *asset,
+            _ => {
+                return Err(Error::Other(format!(
+                    "Qwen3.6 runtime requires exactly one native chat template asset with kind_id={ASSET_CHAT_TEMPLATE_UTF8}, found {}",
+                    matches.len()
+                )));
+            }
+        };
+
+        if asset.name != "chat_template" {
+            return Err(Error::Other(format!(
+                "Qwen3.6 native chat template asset must be named 'chat_template', got {:?}",
+                asset.name
+            )));
+        }
+        let expected_flags = ASSET_FLAG_REQUIRED_FOR_RUNTIME | ASSET_FLAG_TEXT_UTF8;
+        if asset.flags != expected_flags {
+            return Err(Error::Other(format!(
+                "Qwen3.6 native chat template asset must have exactly flags={expected_flags}, got {}",
+                asset.flags
+            )));
+        }
+        let source = std::str::from_utf8(&asset.payload).map_err(|err| {
+            Error::Other(format!(
+                "Qwen3.6 runtime chat template asset: chat template is not UTF-8: {err}"
+            ))
+        })?;
+        if source.trim().is_empty() {
+            return Err(Error::Other(
+                "Qwen3.6 runtime chat template asset: chat template is empty".into(),
+            ));
+        }
+        Ok(source)
+    }
+
     pub fn codecs(&self) -> &[FlmCodecDescriptor] {
         &self.codecs
     }
@@ -599,6 +735,18 @@ impl FlmRuntimeDirectory {
                 ))
             })?;
 
+        if storage_abi.codec_semantic_id == CODEC_ROW_GROUP_INT4_BF16_SYM {
+            self.validate_row_group_int4_direct_contract(
+                logical,
+                packed,
+                scale,
+                packed_step,
+                scale_step,
+                storage_abi,
+            )?;
+            return Ok(Some(FlmStage3DirectWeightKind::RowGroupInt4));
+        }
+
         if packed.storage_dtype == FLM_DTYPE_INT32 {
             self.required_storage_binding(logical, STORAGE_ROLE_SHAPE)?;
             if scale.storage_dtype != FLM_DTYPE_BF16 || scale_step.target_dtype != FLM_DTYPE_BF16 {
@@ -627,7 +775,7 @@ impl FlmRuntimeDirectory {
             || storage_abi.group_size != 128
         {
             return Err(Error::Other(format!(
-                "FLM Stage 3 native INT4 tensor {} uses unsupported ABI codec={} bits={} group_size={}",
+                "FLM Stage 3 native INT4 tensor {} uses unsupported native INT4 ABI codec={} bits={} group_size={}",
                 logical.name,
                 storage_abi.codec_semantic_id,
                 storage_abi.bits,
@@ -647,6 +795,235 @@ impl FlmRuntimeDirectory {
             )));
         }
         Ok(Some(FlmStage3DirectWeightKind::NativeInt4))
+    }
+
+    fn validate_row_group_int4_direct_contract(
+        &self,
+        logical: &FlmLogicalTensor,
+        packed: &FlmStorageBinding,
+        scale: &FlmStorageBinding,
+        packed_step: &FlmPlanStep,
+        scale_step: &FlmPlanStep,
+        storage_abi: &FlmStorageAbi,
+    ) -> Result<(), Error> {
+        if logical.role_id != LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT
+            || logical.reconstruction_dtype != FLM_DTYPE_BF16
+            || logical.flags != LOGICAL_TENSOR_FLAG_REQUIRED
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} has unsupported logical fields role={} reconstruction_dtype={} flags={}",
+                logical.name, logical.role_id, logical.reconstruction_dtype, logical.flags
+            )));
+        }
+
+        let owned = self.storage_bindings_for_logical(logical)?;
+        if owned.len() != 2
+            || owned.iter().any(|binding| {
+                !matches!(
+                    binding.storage_role,
+                    STORAGE_ROLE_PACKED | STORAGE_ROLE_SCALE
+                )
+            })
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} requires PACKED and SCALE only",
+                logical.name
+            )));
+        }
+        if packed.storage_abi_id != STORAGE_ABI_ID_ROW_GROUP_INT4_G32
+            || scale.storage_abi_id != STORAGE_ABI_ID_ROW_GROUP_INT4_G32
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} requires PACKED and SCALE to use the same storage ABI id 9, got packed={} scale={}",
+                logical.name, packed.storage_abi_id, scale.storage_abi_id
+            )));
+        }
+        if packed.flags != STORAGE_BINDING_FLAG_REQUIRED
+            || scale.flags != STORAGE_BINDING_FLAG_REQUIRED
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} requires exactly required PACKED/SCALE bindings",
+                logical.name
+            )));
+        }
+        if packed.storage_dtype != FLM_DTYPE_UINT8
+            || scale.storage_dtype != FLM_DTYPE_BF16
+            || packed_step.target_dtype != FLM_DTYPE_UINT8
+            || scale_step.target_dtype != FLM_DTYPE_BF16
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} requires direct UINT8 PACKED and BF16 SCALE dtypes",
+                logical.name
+            )));
+        }
+
+        let expected_flags = QUANT_FLAG_SYMMETRIC | QUANT_FLAG_IMPLICIT_ZERO_8;
+        if storage_abi.storage_abi_id != STORAGE_ABI_ID_ROW_GROUP_INT4_G32
+            || storage_abi.abi_kind_id != STORAGE_ABI_KIND_GROUP_QUANT
+            || storage_abi.layout_id != LAYOUT_ROW_MAJOR_UINT4_LOW_EVEN
+            || storage_abi.bits != 4
+            || storage_abi.group_size != 32
+            || storage_abi.quant_flags != expected_flags
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} uses unsupported ABI id={} kind={} codec={} layout={} bits={} group_size={} quant_flags={}",
+                logical.name,
+                storage_abi.storage_abi_id,
+                storage_abi.abi_kind_id,
+                storage_abi.codec_semantic_id,
+                storage_abi.layout_id,
+                storage_abi.bits,
+                storage_abi.group_size,
+                storage_abi.quant_flags
+            )));
+        }
+        FlmRowGroupQuantParams::parse(&storage_abi.params)?;
+
+        let matching_codecs: Vec<&FlmCodecDescriptor> = self
+            .codecs
+            .iter()
+            .filter(|codec| codec.semantic_id as u16 == CODEC_ROW_GROUP_INT4_BF16_SYM)
+            .collect();
+        let [codec] = matching_codecs.as_slice() else {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} requires exactly one semantic codec 11 descriptor, found {}",
+                logical.name,
+                matching_codecs.len()
+            )));
+        };
+        if codec.layout_id != LAYOUT_ROW_MAJOR_UINT4_LOW_EVEN
+            || codec.decoder_id != 1
+            || codec.flags != u32::from(expected_flags)
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} uses unsupported codec descriptor layout={} decoder={} flags={}",
+                logical.name, codec.layout_id, codec.decoder_id, codec.flags
+            )));
+        }
+
+        let rank = usize::from(logical.rank);
+        if !(2..=3).contains(&rank) {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} rank {} is unsupported; expected rank 2 or 3",
+                logical.name, logical.rank
+            )));
+        }
+        let logical_shape = &logical.shape[..rank];
+        if logical_shape.contains(&0) {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} has a zero logical dimension",
+                logical.name
+            )));
+        }
+        let k = logical_shape[rank - 1];
+        if k % 2 != 0 {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} has odd final dimension {k}",
+                logical.name
+            )));
+        }
+        if k % u32::from(storage_abi.group_size) != 0 {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} final dimension {k} is not divisible by group size {}",
+                logical.name, storage_abi.group_size
+            )));
+        }
+
+        let mut expected_packed = logical.shape;
+        expected_packed[rank - 1] = k / 2;
+        let mut expected_scale = logical.shape;
+        expected_scale[rank - 1] = k / u32::from(storage_abi.group_size);
+        for (step, role, dtype, expected) in [
+            (
+                packed_step,
+                STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                expected_packed,
+            ),
+            (
+                scale_step,
+                STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                expected_scale,
+            ),
+        ] {
+            if step.storage_role != role
+                || step.target_layout_id != LAYOUT_ID_DEFAULT
+                || step.target_dtype != dtype
+                || usize::from(step.target_rank) != rank
+                || step.target_shape != expected
+                || step.stream_id != PLAN_STREAM_DEFAULT
+                || step.priority != PLAN_PRIORITY_DEFAULT
+                || step.flags != PLAN_STEP_FLAG_NONE
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 row-group INT4 tensor {} has unsupported direct plan for role {role}",
+                    logical.name
+                )));
+            }
+        }
+        let direct_roles: Vec<u16> = self
+            .plan_steps
+            .iter()
+            .filter(|step| {
+                step.logical_tensor_id == logical.tensor_id
+                    && step.consume_strategy == CONSUME_STRATEGY_DIRECT
+            })
+            .map(|step| step.storage_role)
+            .collect();
+        if direct_roles.len() != 2
+            || !direct_roles.contains(&STORAGE_ROLE_PACKED)
+            || !direct_roles.contains(&STORAGE_ROLE_SCALE)
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 row-group INT4 tensor {} requires exactly PACKED and SCALE direct plans",
+                logical.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn storage_bindings_for_logical(
+        &self,
+        logical: &FlmLogicalTensor,
+    ) -> Result<&[FlmStorageBinding], Error> {
+        let start = usize::try_from(logical.storage_binding_start).map_err(|_| {
+            Error::Other(format!(
+                "FLM Stage 3 tensor {} storage binding start does not fit usize",
+                logical.name
+            ))
+        })?;
+        let count = usize::from(logical.storage_binding_count);
+        let end = start.checked_add(count).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 tensor {} storage binding range overflows",
+                logical.name
+            ))
+        })?;
+        let owned = self.storage_bindings.get(start..end).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 tensor {} storage binding range [{start}, {end}) exceeds table length {}",
+                logical.name,
+                self.storage_bindings.len()
+            ))
+        })?;
+        if owned
+            .iter()
+            .any(|binding| binding.logical_tensor_id != logical.tensor_id)
+            || self
+                .storage_bindings
+                .iter()
+                .enumerate()
+                .any(|(idx, binding)| {
+                    binding.logical_tensor_id == logical.tensor_id && !(start..end).contains(&idx)
+                })
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 tensor {} has contradictory storage binding ownership",
+                logical.name
+            )));
+        }
+        Ok(owned)
     }
 
     fn required_storage_binding(
@@ -1511,6 +1888,9 @@ fn parse_storage_abis(buf: &[u8]) -> Result<Vec<FlmStorageAbi>, Error> {
             "FLM storage ABI params range",
         )?
         .to_vec();
+        if codec_semantic_id == CODEC_ROW_GROUP_INT4_BF16_SYM {
+            FlmRowGroupQuantParams::parse(&param_bytes)?;
+        }
         rows.push(FlmStorageAbi {
             storage_abi_id,
             abi_kind_id,
@@ -1944,6 +2324,69 @@ fn u32_to_usize(value: u32) -> Result<usize, Error> {
 mod tests {
     use super::*;
 
+    const ROW_GROUP_INT4_PARAMS_V1: [u8; 12] = [
+        0x01, 0x00, 0x01, 0x01, 0x02, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn row_group_int4_params_parse_exact_v1_bytes() {
+        let params_bytes = ROW_GROUP_INT4_PARAMS_V1;
+        let params = FlmRowGroupQuantParams::parse(&params_bytes).expect("parse row-group params");
+
+        assert_eq!(
+            params_bytes,
+            [0x01, 0x00, 0x01, 0x01, 0x02, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00,]
+        );
+        assert_eq!(params.version, 1);
+        assert_eq!(params.group_axis_from_end, 1);
+        assert_eq!(
+            params.scale_granularity,
+            SCALE_GRANULARITY_OUTPUT_ROW_REDUCTION_GROUP
+        );
+        assert_eq!(params.scale_dtype, FLM_DTYPE_BF16);
+        assert_eq!(params.reconstruction_dtype, FLM_DTYPE_BF16);
+        assert_eq!(
+            params.zero_representation,
+            ZERO_REPRESENTATION_IMPLICIT_CODE
+        );
+    }
+
+    #[test]
+    fn row_group_int4_params_reject_every_malformed_v1_field() {
+        let mut cases = Vec::new();
+        cases.push((ROW_GROUP_INT4_PARAMS_V1[..11].to_vec(), "exactly 12 bytes"));
+        let mut thirteen = ROW_GROUP_INT4_PARAMS_V1.to_vec();
+        thirteen.push(0);
+        cases.push((thirteen, "exactly 12 bytes"));
+
+        for (offset, replacement, expected) in [
+            (0usize, 2u16.to_le_bytes(), "version"),
+            (2, 0u16.to_le_bytes(), "group_axis_from_end"),
+            (3, 0xffu16.to_le_bytes(), "scale_granularity"),
+            (4, u16::MAX.to_le_bytes(), "scale_dtype"),
+            (6, u16::MAX.to_le_bytes(), "reconstruction_dtype"),
+            (8, 2u16.to_le_bytes(), "zero_representation"),
+            (10, 1u16.to_le_bytes(), "reserved"),
+        ] {
+            let mut bytes = ROW_GROUP_INT4_PARAMS_V1.to_vec();
+            if offset == 2 || offset == 3 {
+                bytes[offset] = replacement[0];
+            } else {
+                bytes[offset..offset + 2].copy_from_slice(&replacement);
+            }
+            cases.push((bytes, expected));
+        }
+
+        for (bytes, expected) in cases {
+            let err = FlmRowGroupQuantParams::parse(&bytes)
+                .expect_err("malformed row-group params must fail");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?} in error for {bytes:02x?}, got {err}"
+            );
+        }
+    }
+
     fn write_u16(out: &mut Vec<u8>, value: u16) {
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -2080,51 +2523,64 @@ mod tests {
         out
     }
 
-    fn build_asset_sections() -> (Vec<u8>, Vec<u8>) {
-        let assets = [
-            (
-                1u32,
-                ASSET_TOKENIZER_VOCAB,
-                ASSET_FLAG_REQUIRED_FOR_RUNTIME,
-                "tokenizer_vocab",
-                br#"{"hello":0}"#.as_slice(),
-            ),
-            (
-                2u32,
-                ASSET_TOKENIZER_MERGES,
-                ASSET_FLAG_REQUIRED_FOR_RUNTIME,
-                "tokenizer_merges",
-                b"#version: 0.2\n".as_slice(),
-            ),
-            (
-                3u32,
-                ASSET_TOKENIZER_ADDED_TOKENS,
-                0,
-                "tokenizer_added_tokens",
-                b"[]".as_slice(),
-            ),
-            (
-                4u32,
-                ASSET_TOKENIZER_REGEX,
-                ASSET_FLAG_REQUIRED_FOR_RUNTIME,
-                "tokenizer_regex",
-                br#"\p{L}+"#.as_slice(),
-            ),
-        ];
+    fn build_asset_sections(assets: &[FlmAsset]) -> (Vec<u8>, Vec<u8>) {
         let mut table = Vec::new();
         let mut payloads = Vec::new();
         write_u32(&mut table, assets.len() as u32);
-        for (asset_id, kind_id, flags, name, payload) in assets {
-            write_u32(&mut table, asset_id);
+        for asset in assets {
+            write_u32(&mut table, asset.asset_id);
             write_u32(&mut table, payloads.len() as u32);
-            write_u32(&mut table, payload.len() as u32);
-            write_u16(&mut table, kind_id);
-            write_u16(&mut table, flags);
-            write_u32(&mut table, name.len() as u32);
-            table.extend_from_slice(name.as_bytes());
-            payloads.extend_from_slice(payload);
+            write_u32(&mut table, asset.payload.len() as u32);
+            write_u16(&mut table, asset.kind_id);
+            write_u16(&mut table, asset.flags);
+            write_u32(&mut table, asset.name.len() as u32);
+            table.extend_from_slice(asset.name.as_bytes());
+            payloads.extend_from_slice(&asset.payload);
         }
         (table, payloads)
+    }
+
+    fn base_assets() -> Vec<FlmAsset> {
+        vec![
+            FlmAsset {
+                asset_id: 1,
+                kind_id: ASSET_TOKENIZER_VOCAB,
+                flags: ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                name: "tokenizer_vocab".into(),
+                payload: br#"{"hello":0}"#.to_vec(),
+            },
+            FlmAsset {
+                asset_id: 2,
+                kind_id: ASSET_TOKENIZER_MERGES,
+                flags: ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                name: "tokenizer_merges".into(),
+                payload: b"#version: 0.2\n".to_vec(),
+            },
+            FlmAsset {
+                asset_id: 3,
+                kind_id: ASSET_TOKENIZER_ADDED_TOKENS,
+                flags: 0,
+                name: "tokenizer_added_tokens".into(),
+                payload: b"[]".to_vec(),
+            },
+            FlmAsset {
+                asset_id: 4,
+                kind_id: ASSET_TOKENIZER_REGEX,
+                flags: ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                name: "tokenizer_regex".into(),
+                payload: br#"\p{L}+"#.to_vec(),
+            },
+        ]
+    }
+
+    fn chat_template_asset() -> FlmAsset {
+        FlmAsset {
+            asset_id: 5,
+            kind_id: ASSET_CHAT_TEMPLATE_UTF8,
+            flags: ASSET_FLAG_REQUIRED_FOR_RUNTIME | ASSET_FLAG_TEXT_UTF8,
+            name: "chat_template".into(),
+            payload: b"{% for message in messages %}{{ message.content }}{% endfor %}".to_vec(),
+        }
     }
 
     fn build_model_descriptor_section() -> Vec<u8> {
@@ -2325,7 +2781,8 @@ mod tests {
     }
 
     fn build_test_runtime_directory_with_stage3_tables() -> Vec<u8> {
-        let (asset_table, asset_payloads) = build_asset_sections();
+        let assets = base_assets();
+        let (asset_table, asset_payloads) = build_asset_sections(&assets);
         let sections = [
             (1u32, build_qwen_config_section()),
             (2u32, build_tokenizer_section()),
@@ -2359,8 +2816,8 @@ mod tests {
         out
     }
 
-    fn build_test_runtime_directory() -> Vec<u8> {
-        let (asset_table, asset_payloads) = build_asset_sections();
+    fn build_test_runtime_directory_with_assets(assets: &[FlmAsset]) -> Vec<u8> {
+        let (asset_table, asset_payloads) = build_asset_sections(assets);
         let sections = [
             (1u32, build_qwen_config_section()),
             (2u32, build_tokenizer_section()),
@@ -2390,8 +2847,13 @@ mod tests {
         out
     }
 
+    fn build_test_runtime_directory() -> Vec<u8> {
+        build_test_runtime_directory_with_assets(&base_assets())
+    }
+
     fn build_test_moe_runtime_directory() -> Vec<u8> {
-        let (asset_table, asset_payloads) = build_asset_sections();
+        let assets = base_assets();
+        let (asset_table, asset_payloads) = build_asset_sections(&assets);
         let sections = [
             (SECTION_CONFIG_QWEN36_MOE, build_qwen_moe_config_section()),
             (2u32, build_tokenizer_section()),
@@ -2810,5 +3272,127 @@ mod tests {
         let (abi_offset, _) = section_range(&runtime, SECTION_TENSOR_ABI);
         put_u32_at(&mut runtime, abi_offset + 4, 999_999);
         expect_parse_error_contains(&runtime, "FLM tensor ABI weight_prefix");
+    }
+
+    #[test]
+    fn flm_chat_template_round_trips_exact_source() {
+        let mut assets = base_assets();
+        assets.push(chat_template_asset());
+        let runtime = build_test_runtime_directory_with_assets(&assets);
+
+        let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse runtime");
+
+        assert_eq!(
+            parsed
+                .required_chat_template_source()
+                .expect("chat template"),
+            "{% for message in messages %}{{ message.content }}{% endfor %}"
+        );
+    }
+
+    #[test]
+    fn flm_chat_template_rejects_missing_duplicate_and_invalid_metadata() {
+        let missing = FlmRuntimeDirectory::parse(&build_test_runtime_directory())
+            .expect("parse runtime")
+            .required_chat_template_source()
+            .expect_err("missing chat template must fail");
+        assert_eq!(
+            missing.to_string(),
+            "Qwen3.6 runtime requires one native chat template asset with kind_id=5"
+        );
+
+        let mut duplicate_assets = base_assets();
+        duplicate_assets.push(chat_template_asset());
+        let mut duplicate = chat_template_asset();
+        duplicate.asset_id = 6;
+        duplicate_assets.push(duplicate);
+        let duplicate = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(
+            &duplicate_assets,
+        ))
+        .expect("parse runtime")
+        .required_chat_template_source()
+        .expect_err("duplicate chat templates must fail");
+        assert_eq!(
+            duplicate.to_string(),
+            "Qwen3.6 runtime requires exactly one native chat template asset with kind_id=5, found 2"
+        );
+
+        let mut wrong_name_assets = base_assets();
+        let mut wrong_name = chat_template_asset();
+        wrong_name.name = "template".into();
+        wrong_name_assets.push(wrong_name);
+        let wrong_name = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(
+            &wrong_name_assets,
+        ))
+        .expect("parse runtime")
+        .required_chat_template_source()
+        .expect_err("wrong chat template name must fail");
+        assert_eq!(
+            wrong_name.to_string(),
+            "Qwen3.6 native chat template asset must be named 'chat_template', got \"template\""
+        );
+
+        let mut wrong_flags_assets = base_assets();
+        let mut wrong_flags = chat_template_asset();
+        wrong_flags.flags = ASSET_FLAG_REQUIRED_FOR_RUNTIME;
+        wrong_flags_assets.push(wrong_flags);
+        let wrong_flags = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(
+            &wrong_flags_assets,
+        ))
+        .expect("parse runtime")
+        .required_chat_template_source()
+        .expect_err("wrong chat template flags must fail");
+        assert_eq!(
+            wrong_flags.to_string(),
+            "Qwen3.6 native chat template asset must have exactly flags=5, got 1"
+        );
+    }
+
+    #[test]
+    fn flm_chat_template_rejects_invalid_utf8_and_empty_source() {
+        let mut invalid_utf8_assets = base_assets();
+        let mut invalid_utf8 = chat_template_asset();
+        invalid_utf8.payload = vec![0xff];
+        invalid_utf8_assets.push(invalid_utf8);
+        let invalid_utf8 = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(
+            &invalid_utf8_assets,
+        ))
+        .expect("parse runtime")
+        .required_chat_template_source()
+        .expect_err("invalid UTF-8 chat template must fail");
+        assert!(invalid_utf8
+            .to_string()
+            .starts_with("Qwen3.6 runtime chat template asset: chat template is not UTF-8:"));
+
+        let mut empty_assets = base_assets();
+        let mut empty = chat_template_asset();
+        empty.payload = b" \n\t".to_vec();
+        empty_assets.push(empty);
+        let empty =
+            FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(&empty_assets))
+                .expect("parse runtime")
+                .required_chat_template_source()
+                .expect_err("empty chat template must fail");
+        assert_eq!(
+            empty.to_string(),
+            "Qwen3.6 runtime chat template asset: chat template is empty"
+        );
+    }
+
+    #[test]
+    fn flm_chat_template_keeps_unknown_asset_kinds_parseable() {
+        let mut assets = base_assets();
+        assets.push(FlmAsset {
+            asset_id: 99,
+            kind_id: u16::MAX,
+            flags: 0,
+            name: "future_asset".into(),
+            payload: Vec::new(),
+        });
+
+        let parsed = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(&assets))
+            .expect("unknown future asset kind must remain parseable");
+
+        assert_eq!(parsed.asset(99).expect("future asset").kind_id, u16::MAX);
     }
 }

@@ -18,6 +18,20 @@ static inline cudaError_t supersonic_cuda_malloc(void** ptr, size_t size) { retu
 
 namespace {
 
+int backend_failure(int project_status, cudaError_t native_status) {
+    return static_cast<int>(
+        0x80000000u
+        | ((static_cast<uint32_t>(project_status) & 0x7fffu) << 16)
+        | (static_cast<uint32_t>(native_status) & 0xffffu));
+}
+
+int launch_result(int project_status) {
+    const cudaError_t launch_status = cudaGetLastError();
+    return launch_status == cudaSuccess
+        ? 0
+        : backend_failure(project_status, launch_status);
+}
+
 struct ScopedHipDevice {
     int previous = -1;
     bool changed = false;
@@ -43,8 +57,7 @@ int element_add_device(int device_ordinal, size_t total_elems,
         static_cast<const T*>(lhs),
         static_cast<const T*>(rhs),
         static_cast<T*>(out));
-    if (cudaGetLastError() != cudaSuccess) return 301;
-    return 0;
+    return launch_result(301);
 }
 
 // ---- apply_rope_prefill ----
@@ -64,8 +77,7 @@ int apply_rope_prefill_device(int device_ordinal,
         static_cast<const T*>(cos_table),
         static_cast<const T*>(sin_table),
         static_cast<T*>(data));
-    if (cudaGetLastError() != cudaSuccess) return 311;
-    return 0;
+    return launch_result(311);
 }
 
 // ---- apply_rope_prefill_indirect ----
@@ -87,8 +99,7 @@ int apply_rope_prefill_indirect_device(int device_ordinal,
         static_cast<const T*>(sin_table),
         pos_ids,
         static_cast<T*>(data));
-    if (cudaGetLastError() != cudaSuccess) return 313;
-    return 0;
+    return launch_result(313);
 }
 
 // ---- transpose [S,H,D] -> [H,S,D] ----
@@ -107,8 +118,7 @@ int transpose_shd_hsd_device(int device_ordinal,
         S, H, D,
         static_cast<const T*>(src),
         static_cast<T*>(dst));
-    if (cudaGetLastError() != cudaSuccess) return 321;
-    return 0;
+    return launch_result(321);
 }
 
 int transpose_shd_to_cache_bf16_device(int device_ordinal,
@@ -127,8 +137,7 @@ int transpose_shd_to_cache_bf16_device(int device_ordinal,
         S, H, D, cache_len, dst_pos,
         static_cast<const hip_bfloat16*>(src),
         static_cast<hip_bfloat16*>(cache));
-    if (cudaGetLastError() != cudaSuccess) return 323;
-    return 0;
+    return launch_result(323);
 }
 
 // ---- transpose + pad for conv ----
@@ -140,7 +149,8 @@ int transpose_pad_conv_device(int device_ordinal,
     ScopedHipDevice scoped(device_ordinal);
     // Zero the entire dst buffer first (to get zero-padding)
     const size_t dst_bytes = static_cast<size_t>(C) * (pad + S) * sizeof(T);
-    if (cudaMemset(dst, 0, dst_bytes) != cudaSuccess) return 330;
+    const cudaError_t memset_status = cudaMemset(dst, 0, dst_bytes);
+    if (memset_status != cudaSuccess) return backend_failure(330, memset_status);
 
     const size_t total = static_cast<size_t>(S) * C;
     constexpr int block = 256;
@@ -151,8 +161,7 @@ int transpose_pad_conv_device(int device_ordinal,
         S, C, pad,
         static_cast<const T*>(src),
         static_cast<T*>(dst));
-    if (cudaGetLastError() != cudaSuccess) return 331;
-    return 0;
+    return launch_result(331);
 }
 
 // ---- extract conv state ----
@@ -171,8 +180,7 @@ int extract_conv_state_device(int device_ordinal,
         S, C, kern_minus_1,
         static_cast<const T*>(src),
         static_cast<T*>(dst));
-    if (cudaGetLastError() != cudaSuccess) return 341;
-    return 0;
+    return launch_result(341);
 }
 
 // ---- prepare conv input and next tail ----
@@ -199,8 +207,7 @@ int prepare_conv_input_tail_device(int device_ordinal,
         static_cast<const T*>(old_tail),
         static_cast<T*>(conv_input),
         static_cast<T*>(new_tail));
-    if (cudaGetLastError() != cudaSuccess) return 344;
-    return 0;
+    return launch_result(344);
 }
 
 // ---- sigmoid_mul ----
@@ -218,8 +225,7 @@ int sigmoid_mul_device(int device_ordinal, size_t total_elems,
         static_cast<const T*>(data),
         static_cast<const T*>(gate),
         static_cast<T*>(out));
-    if (cudaGetLastError() != cudaSuccess) return 351;
-    return 0;
+    return launch_result(351);
 }
 
 int cast_transpose_gate_bf16_device(int device_ordinal,
@@ -238,8 +244,7 @@ int cast_transpose_gate_bf16_device(int device_ordinal,
         static_cast<const float*>(attn_hsd),
         static_cast<const hip_bfloat16*>(gate_shd),
         static_cast<hip_bfloat16*>(out_shd));
-    if (cudaGetLastError() != cudaSuccess) return 353;
-    return 0;
+    return launch_result(353);
 }
 
 // ---- compute_beta_g ----
@@ -264,8 +269,7 @@ int compute_beta_g_device(int device_ordinal,
         static_cast<const T*>(a_log_exp),
         static_cast<T*>(beta),
         static_cast<T*>(g));
-    if (cudaGetLastError() != cudaSuccess) return 361;
-    return 0;
+    return launch_result(361);
 }
 
 int compute_beta_g_ba_bf16_device(int device_ordinal,
@@ -287,8 +291,7 @@ int compute_beta_g_ba_bf16_device(int device_ordinal,
         static_cast<const hip_bfloat16*>(a_log_exp),
         static_cast<float*>(beta),
         static_cast<float*>(g));
-    if (cudaGetLastError() != cudaSuccess) return 363;
-    return 0;
+    return launch_result(363);
 }
 
 // ---- split_qgate ----
@@ -308,8 +311,7 @@ int split_qgate_device(int device_ordinal,
         static_cast<const T*>(src),
         static_cast<T*>(query_out),
         static_cast<T*>(gate_out));
-    if (cudaGetLastError() != cudaSuccess) return 371;
-    return 0;
+    return launch_result(371);
 }
 
 int split_qgate_norm_bf16_device(
@@ -341,8 +343,7 @@ int split_qgate_norm_bf16_device(
         static_cast<const hip_bfloat16*>(norm_w),
         static_cast<hip_bfloat16*>(query_out),
         static_cast<hip_bfloat16*>(gate_out));
-    if (cudaGetLastError() != cudaSuccess) return 374;
-    return 0;
+    return launch_result(374);
 }
 
 // ---- split_qkv ----
@@ -364,8 +365,7 @@ int split_qkv_device(int device_ordinal,
         static_cast<T*>(Q),
         static_cast<T*>(K),
         static_cast<T*>(V));
-    if (cudaGetLastError() != cudaSuccess) return 381;
-    return 0;
+    return launch_result(381);
 }
 
 // ---- repeat_interleave heads ----
@@ -385,8 +385,7 @@ int repeat_interleave_heads_device(int device_ordinal,
         S, n_heads, head_dim, repeats,
         static_cast<const T*>(src),
         static_cast<T*>(dst));
-    if (cudaGetLastError() != cudaSuccess) return 391;
-    return 0;
+    return launch_result(391);
 }
 
 // ---- pflash_cosine_score (SpecPrefill Phase D scoring) ----
@@ -405,8 +404,9 @@ int pflash_cosine_score_device(int device_ordinal,
     }
     ScopedHipDevice scoped(device_ordinal);
     cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, device_ordinal) != cudaSuccess) {
-        return 328;
+    const cudaError_t properties_status = cudaGetDeviceProperties(&prop, device_ordinal);
+    if (properties_status != cudaSuccess) {
+        return backend_failure(328, properties_status);
     }
     if (prop.warpSize != 32) {
         return 333;
@@ -417,8 +417,7 @@ int pflash_cosine_score_device(int device_ordinal,
         static_cast<const T*>(k_cache),
         static_cast<float*>(scores),
         n_pos, kv_heads, cap, head_dim, block_size, n_blocks, last_pos);
-    if (cudaGetLastError() != cudaSuccess) return 334;
-    return 0;
+    return launch_result(334);
 }
 
 // ---- single-row argmax (BF16 logits) ----
@@ -783,6 +782,15 @@ int lm_head_argmax_bf16_device(
 } // namespace
 
 // ---- extern "C" wrappers ----
+
+extern "C" int supersonic_prefill_encode_bridge_status(
+    int project_status,
+    int native_status
+) {
+    return native_status == 0
+        ? project_status
+        : backend_failure(project_status, static_cast<cudaError_t>(native_status));
+}
 
 extern "C" int supersonic_qwen35_hip_element_add(
     int dtype, size_t device_ordinal, size_t total_elems,

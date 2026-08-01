@@ -5,6 +5,16 @@
 #include <mutex>
 #include <stdint.h>
 
+extern "C" int supersonic_prefill_encode_bridge_status(
+    int project_status,
+    int native_status);
+
+extern "C" int supersonic_qwen35_4b_bf16_matmul_bridge_status(
+    int project_status,
+    int native_status) {
+    return supersonic_prefill_encode_bridge_status(project_status, native_status);
+}
+
 namespace {
 
 // Per-model launch preset, set once at startup by the Rust registry via
@@ -27,6 +37,13 @@ extern "C" void supersonic_qwen35_4b_hip_set_launch_preset(int blocks, int coop)
 }
 
 namespace {
+
+int prefill_backend_failure(int project_status, hipError_t native_status) {
+    return static_cast<int>(
+        0x80000000u
+        | ((static_cast<uint32_t>(project_status) & 0x7fffu) << 16)
+        | (static_cast<uint32_t>(native_status) & 0xffffu));
+}
 
 struct ScopedHipDevice {
     int previous = -1;
@@ -3611,8 +3628,8 @@ int matmul_rhs_transposed_tiled_device(
         static_cast<T*>(out));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = maybe_sync();
-    if (launch_err != hipSuccess) return 270;
-    if (sync_err != hipSuccess) return 271;
+    if (launch_err != hipSuccess) return prefill_backend_failure(270, launch_err);
+    if (sync_err != hipSuccess) return prefill_backend_failure(271, sync_err);
     return 0;
 }
 
@@ -3734,8 +3751,14 @@ static int matmul_rhs_transposed_tiled_wmma_bf16_device(
         static_cast<hip_bfloat16*>(out));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = maybe_sync();
-    if (launch_err != hipSuccess) return 280;
-    if (sync_err != hipSuccess) return 281;
+    if (launch_err != hipSuccess) {
+        return supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            280, static_cast<int>(launch_err));
+    }
+    if (sync_err != hipSuccess) {
+        return supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            281, static_cast<int>(sync_err));
+    }
     return 0;
 }
 
@@ -3785,8 +3808,14 @@ static int matmul_rhs_transposed_wmma_small_m_bf16_device(
     }
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = maybe_sync();
-    if (launch_err != hipSuccess) return 282;
-    if (sync_err != hipSuccess) return 283;
+    if (launch_err != hipSuccess) {
+        return supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            282, static_cast<int>(launch_err));
+    }
+    if (sync_err != hipSuccess) {
+        return supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            283, static_cast<int>(sync_err));
+    }
     return 0;
 }
 
@@ -3966,8 +3995,8 @@ int matmul_int4_dequant_device(
         static_cast<T*>(out));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 270;
-    if (sync_err != hipSuccess) return 271;
+    if (launch_err != hipSuccess) return prefill_backend_failure(270, launch_err);
+    if (sync_err != hipSuccess) return prefill_backend_failure(271, sync_err);
     return 0;
 }
 
@@ -4031,8 +4060,8 @@ static int matmul_int4_dequant_wmma_bf16_device(
                 static_cast<hip_bfloat16*>(out));
             hipError_t launch_err = hipGetLastError();
             hipError_t sync_err = maybe_sync();
-            if (launch_err != hipSuccess) return 292;
-            if (sync_err != hipSuccess) return 293;
+            if (launch_err != hipSuccess) return prefill_backend_failure(292, launch_err);
+            if (sync_err != hipSuccess) return prefill_backend_failure(293, sync_err);
             return 0;
         }
 
@@ -4228,8 +4257,8 @@ static int matmul_int4_dequant_wmma_bf16_device(
                 }
                 hipError_t launch_err = hipGetLastError();
                 hipError_t sync_err = maybe_sync();
-                if (launch_err != hipSuccess) return 298;
-                if (sync_err != hipSuccess) return 299;
+                if (launch_err != hipSuccess) return prefill_backend_failure(298, launch_err);
+                if (sync_err != hipSuccess) return prefill_backend_failure(299, sync_err);
                 return 0;
             }
             if (enable_m8_block) {
@@ -4391,8 +4420,8 @@ static int matmul_int4_dequant_wmma_bf16_device(
                 }
                 hipError_t launch_err = hipGetLastError();
                 hipError_t sync_err = maybe_sync();
-                if (launch_err != hipSuccess) return 296;
-                if (sync_err != hipSuccess) return 297;
+                if (launch_err != hipSuccess) return prefill_backend_failure(296, launch_err);
+                if (sync_err != hipSuccess) return prefill_backend_failure(297, sync_err);
                 return 0;
             }
             if (quant_type == QWEN35_LOWBIT_GGML_Q8_0) {
@@ -4478,8 +4507,8 @@ static int matmul_int4_dequant_wmma_bf16_device(
             }
             hipError_t launch_err = hipGetLastError();
             hipError_t sync_err = maybe_sync();
-            if (launch_err != hipSuccess) return 294;
-            if (sync_err != hipSuccess) return 295;
+            if (launch_err != hipSuccess) return prefill_backend_failure(294, launch_err);
+            if (sync_err != hipSuccess) return prefill_backend_failure(295, sync_err);
             return 0;
         }
 
@@ -4503,8 +4532,8 @@ static int matmul_int4_dequant_wmma_bf16_device(
             static_cast<hip_bfloat16*>(out));
         hipError_t launch_err = hipGetLastError();
         hipError_t sync_err = maybe_sync();
-        if (launch_err != hipSuccess) return 290;
-        if (sync_err != hipSuccess) return 291;
+        if (launch_err != hipSuccess) return prefill_backend_failure(290, launch_err);
+        if (sync_err != hipSuccess) return prefill_backend_failure(291, sync_err);
         return 0;
     }
 
@@ -4532,8 +4561,8 @@ static int matmul_int4_dequant_wmma_bf16_device(
             static_cast<hip_bfloat16*>(out));
         hipError_t launch_err = hipGetLastError();
         hipError_t sync_err = maybe_sync();
-        if (launch_err != hipSuccess) return 300;
-        if (sync_err != hipSuccess) return 301;
+        if (launch_err != hipSuccess) return prefill_backend_failure(300, launch_err);
+        if (sync_err != hipSuccess) return prefill_backend_failure(301, sync_err);
         return 0;
     }
     hipLaunchKernelGGL(
@@ -4550,8 +4579,8 @@ static int matmul_int4_dequant_wmma_bf16_device(
         static_cast<hip_bfloat16*>(out));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = maybe_sync();
-    if (launch_err != hipSuccess) return 290;
-    if (sync_err != hipSuccess) return 291;
+    if (launch_err != hipSuccess) return prefill_backend_failure(290, launch_err);
+    if (sync_err != hipSuccess) return prefill_backend_failure(291, sync_err);
     return 0;
 }
 

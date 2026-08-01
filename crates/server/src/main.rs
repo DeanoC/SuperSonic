@@ -18,12 +18,17 @@ use server::state::{self, LoaderConfig};
 struct Cli {
     /// Model variant (e.g. "qwen3.5-0.8b", "gemma4-e2b").
     #[arg(long)]
-    model: String,
+    model: Option<String>,
 
     /// Path to the HuggingFace model directory (config.json + safetensors
-    /// or a pre-baked `.supersonic/` subdirectory).
+    /// or a pre-baked `.supersonic/` subdirectory). A `.flm` file remains
+    /// accepted as a compatibility spelling for `--flm-file`.
     #[arg(long)]
-    model_dir: PathBuf,
+    model_dir: Option<PathBuf>,
+
+    /// Path to a native FLM model.
+    #[arg(long)]
+    flm_file: Option<PathBuf>,
 
     /// Compute backend (`auto`, `hip`, `cuda`, `metal`).
     #[arg(long, default_value = "auto")]
@@ -171,9 +176,19 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let resolved = state::model_source::resolve_model_source(
+        cli.flm_file,
+        cli.model_dir,
+        cli.model.as_deref(),
+    )
+    .context("resolve model source")?;
+    let model_dir = match &resolved.source {
+        state::model_source::ModelSource::Directory(path)
+        | state::model_source::ModelSource::Flm(path) => path.clone(),
+    };
     let loader = LoaderConfig {
-        model: cli.model,
-        model_dir: cli.model_dir,
+        model: resolved.model.to_string(),
+        model_dir,
         backend: cli.backend,
         device: cli.device,
         max_context: cli.max_context,
@@ -201,7 +216,7 @@ fn main() -> Result<()> {
         prefix_cache_disk_ttl_secs: cli.prefix_cache_disk_ttl_secs,
     };
 
-    let st = state::build(loader).context("build server state")?;
+    let st = state::build_resolved(loader, resolved).context("build server state")?;
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port)
         .parse()
         .with_context(|| format!("invalid --host/--port: {}:{}", cli.host, cli.port))?;
@@ -229,4 +244,38 @@ fn main() -> Result<()> {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("ctrl-c received, shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_first_class_flm_source_without_model_or_directory() {
+        let cli = Cli::try_parse_from(["supersonic-serve", "--flm-file", "/models/qwen36.flm"])
+            .expect("first-class FLM CLI");
+
+        assert_eq!(cli.flm_file, Some(PathBuf::from("/models/qwen36.flm")));
+        assert_eq!(cli.model_dir, None);
+        assert_eq!(cli.model, None);
+    }
+
+    #[test]
+    fn cli_accepts_file_valued_model_dir_without_explicit_model() {
+        let cli = Cli::try_parse_from(["supersonic-serve", "--model-dir", "/models/qwen36.flm"])
+            .expect("compatibility FLM CLI");
+
+        assert_eq!(cli.flm_file, None);
+        assert_eq!(cli.model_dir, Some(PathBuf::from("/models/qwen36.flm")));
+        assert_eq!(cli.model, None);
+    }
+
+    #[test]
+    fn cli_defers_directory_model_requirement_to_source_resolution() {
+        let cli = Cli::try_parse_from(["supersonic-serve", "--model-dir", "/models/qwen35"])
+            .expect("directory CLI syntax");
+
+        assert_eq!(cli.model_dir, Some(PathBuf::from("/models/qwen35")));
+        assert_eq!(cli.model, None);
+    }
 }

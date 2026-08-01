@@ -6,22 +6,27 @@
 //! GPU launch details live in the lower-level chain, persistent-decode,
 //! generation, and spec-verify modules.
 
-use std::{path::Path, ptr};
+use std::{io::Write as _, path::Path, ptr};
 
 use anyhow::{Context, Result};
 use gpu_hal::{set_backend, Backend};
-use kernel_ffi::qwen36_moe::{
-    Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
-};
+use kernel_ffi::qwen36_moe::{Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights};
 use model_store::manifest::QuantProfile;
 use model_store::BakedStore;
+use supersonic_runtime::qwen36_moe::persistent_decode::build_ffn_step_int4;
+use supersonic_runtime::qwen36_moe_config::qwen36_kv_vmm_mode_from_env_value;
 
+use crate::bakes::{
+    effective_flm_source, flm_source_open_options, validate_effective_flm_source_model,
+    validate_flm_weight_source_options,
+};
 use crate::profiling::{PrefillProfileScope, Qwen36DecodeProfileScope};
 use crate::qwen36_moe_cli::bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_cli::chain::{run_chain_step, Qwen36ChainStep};
 use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_cli::dry_run::{
-    print_report, run_qwen36_moe_dry_run, run_qwen36_moe_dry_run_with_config, DryRunReport,
+    print_report, run_qwen36_moe_dry_run, run_qwen36_moe_dry_run_with_config, ContextSizeSource,
+    DryRunReport,
 };
 use crate::qwen36_moe_cli::flm_source::{open_qwen36_moe_flm_source, Qwen36MoeFlmSource};
 use crate::qwen36_moe_cli::generation::{run_generation_step, Qwen36GenerationStep};
@@ -29,8 +34,8 @@ use crate::qwen36_moe_cli::geom::build_multi_layer_geom;
 use crate::qwen36_moe_cli::host::{lookup_embed_row, lookup_embed_row_timed};
 use crate::qwen36_moe_cli::layers::Qwen36WeightMode;
 use crate::qwen36_moe_cli::output::{
-    print_decode_stream_start, print_generation_summary, print_last_logits_if_requested,
-    print_sampling_summary,
+    print_decode_stream_start, print_decoded_token, print_generation_summary,
+    print_last_logits_if_requested, print_runtime_engine_load_evidence, print_sampling_summary,
 };
 use crate::qwen36_moe_cli::policy::{
     max_speculative_tokens_for_backend, metal_mtp_experiment_enabled, resolve_context_size,
@@ -52,11 +57,12 @@ use crate::qwen36_moe_cli::vmm_config::{
     effective_moe_expert_vmm_mode_for_transfer_backend, prepare_moe_runtime_config,
     should_use_qwen36_kv_vmm,
 };
-use crate::qwen36_moe_logits::XorshiftRng;
+use crate::qwen36_moe_cli::{Qwen36MoeEngine, Qwen36MoeLoadConfig, Qwen36MoeLoadPolicy};
+use crate::qwen36_moe_logits::{f32_to_bf16_bytes, sample_bf16_logits, XorshiftRng};
 use crate::qwen36_moe_speculative::SpeculativeStepResult;
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
 use crate::qwen36_moe_types::{LayerBuffers, PositionPair};
-use crate::registry::RegistryEntry;
+use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 
 fn prewarm_qwen36_mps_static_topn_if_requested(
     ordinal: usize,
@@ -104,45 +110,8 @@ fn prewarm_qwen36_mps_static_topn_if_requested(
             shared_down_proj_w: ffn.shared_down_proj_w.as_ptr(),
             shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
         };
-        let fp8 = int4.group_size < 0;
-        let int4_ptrs = Qwen36MoeFfnStepInt4 {
-            group_size: int4.group_size,
-            gate_up_proj_type: int4.gate_up_proj_type,
-            gate_up_proj_scale: int4.gate_up_proj_scale.as_ptr(),
-            gate_up_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.gate_up_proj_zero.as_ptr()
-            },
-            down_proj_type: int4.down_proj_type,
-            down_proj_scale: int4.down_proj_scale.as_ptr(),
-            down_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.down_proj_zero.as_ptr()
-            },
-            shared_gate_proj_type: int4.shared_gate_proj_type,
-            shared_gate_proj_scale: int4.shared_gate_proj_scale.as_ptr(),
-            shared_gate_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.shared_gate_proj_zero.as_ptr()
-            },
-            shared_up_proj_type: int4.shared_up_proj_type,
-            shared_up_proj_scale: int4.shared_up_proj_scale.as_ptr(),
-            shared_up_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.shared_up_proj_zero.as_ptr()
-            },
-            shared_down_proj_type: int4.shared_down_proj_type,
-            shared_down_proj_scale: int4.shared_down_proj_scale.as_ptr(),
-            shared_down_proj_zero: if fp8 {
-                ptr::null()
-            } else {
-                int4.shared_down_proj_zero.as_ptr()
-            },
-        };
+        let int4_ptrs = build_ffn_step_int4(int4)
+            .with_context(|| format!("build Qwen3.6 FFN descriptors for layer {layer_idx}"))?;
         if let Some(stats) = kernel_ffi::qwen36_moe::qwen36_prewarm_mps_static_topn_rhs_for_metal(
             ordinal, params, &weights, &int4_ptrs,
         )
@@ -264,6 +233,30 @@ fn format_qwen36_startup_timings(timings: &Qwen36StartupTimings) -> String {
     )
 }
 
+fn runtime_startup_timings_from_evidence(
+    evidence: &supersonic_runtime::qwen36_moe::engine::Qwen36MoeLoadEvidence,
+    dry_run: std::time::Duration,
+) -> Qwen36StartupTimings {
+    let tokenizer = evidence.tokenizer_timings;
+    Qwen36StartupTimings {
+        flm_source_open: evidence.source_open_duration,
+        flm_store_open: evidence.store_open_duration,
+        flm_config: evidence.config_duration,
+        flm_tokenizer: evidence.tokenizer_duration,
+        flm_tokenizer_assets: tokenizer.asset_lookup,
+        flm_tokenizer_parse: tokenizer.parse,
+        flm_tokenizer_parse_vocab: tokenizer.parse_vocab,
+        flm_tokenizer_parse_vocab_ids: tokenizer.parse_vocab_ids,
+        flm_tokenizer_parse_merges: tokenizer.parse_merges,
+        flm_tokenizer_parse_added_tokens: tokenizer.parse_added_tokens,
+        flm_tokenizer_parse_regex: tokenizer.parse_regex,
+        flm_tokenizer_build: tokenizer.build,
+        flm_direct_plan: evidence.plan_duration,
+        dry_run,
+        ..Default::default()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Qwen36LifecycleTimings {
     prompt_setup: std::time::Duration,
@@ -294,6 +287,16 @@ impl Qwen36LifecycleTimings {
 }
 
 fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
+    let duration = |available: bool, value: std::time::Duration| {
+        available
+            .then(|| format!("{:.3}", qwen36_duration_ms(value)))
+            .unwrap_or_else(|| "unavailable".to_string())
+    };
+    let bytes = |available: bool, value: u64| {
+        available
+            .then(|| value.to_string())
+            .unwrap_or_else(|| "unavailable".to_string())
+    };
     format!(
         "prompt_setup_ms={:.3} flm_tokenizer_ms={:.3} \
          flm_tokenizer_assets_ms={:.3} flm_tokenizer_parse_ms={:.3} \
@@ -303,11 +306,11 @@ fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
          flm_tokenizer_parse_added_tokens_ms={:.3} \
          flm_tokenizer_parse_regex_ms={:.3} \
          flm_tokenizer_build_ms={:.3} model_source_ms={:.3} \
-         layer_load_ms={:.3} layer_load_buffers_ms={:.3} \
-         layer_load_vmm_setup_ms={:.3} layer_load_prewarm_ms={:.3} \
-         layer_load_hal_ms={:.3} layer_load_alloc_ms={:.3} \
-         layer_load_copy_h_to_d_ms={:.3} layer_load_memset_ms={:.3} \
-         layer_load_vmm_ms={:.3} layer_load_alloc_bytes={} \
+         layer_load_ms={:.3} layer_load_buffers_ms={} \
+         layer_load_vmm_setup_ms={} layer_load_prewarm_ms={} \
+         layer_load_hal_ms={} layer_load_alloc_ms={} \
+         layer_load_copy_h_to_d_ms={} layer_load_memset_ms={} \
+         layer_load_vmm_ms={} layer_load_alloc_bytes={} \
          layer_load_copy_h_to_d_bytes={} layer_load_memset_bytes={} \
          layer_load_vmm_bytes={} session_ms={:.3} prefill_steps={} \
          prefill_embed_ms={:.3} prefill_chain_ms={:.3} \
@@ -324,18 +327,54 @@ fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
         qwen36_duration_ms(timings.flm_tokenizer_build),
         qwen36_duration_ms(timings.model_source),
         qwen36_duration_ms(timings.layer_load),
-        qwen36_duration_ms(timings.layer_load_profile.buffers),
-        qwen36_duration_ms(timings.layer_load_profile.vmm_setup),
-        qwen36_duration_ms(timings.layer_load_profile.prewarm),
-        qwen36_duration_ms(timings.layer_load_profile.hal_total),
-        qwen36_duration_ms(timings.layer_load_profile.hal_alloc),
-        qwen36_duration_ms(timings.layer_load_profile.hal_copy_h_to_d),
-        qwen36_duration_ms(timings.layer_load_profile.hal_memset),
-        qwen36_duration_ms(timings.layer_load_profile.hal_vmm),
-        timings.layer_load_profile.hal_alloc_bytes,
-        timings.layer_load_profile.hal_copy_h_to_d_bytes,
-        timings.layer_load_profile.hal_memset_bytes,
-        timings.layer_load_profile.hal_vmm_bytes,
+        duration(
+            timings.layer_load_profile.detail_available,
+            timings.layer_load_profile.buffers
+        ),
+        duration(
+            timings.layer_load_profile.detail_available,
+            timings.layer_load_profile.vmm_setup
+        ),
+        duration(
+            timings.layer_load_profile.detail_available,
+            timings.layer_load_profile.prewarm
+        ),
+        duration(
+            timings.layer_load_profile.hal_available,
+            timings.layer_load_profile.hal_total
+        ),
+        duration(
+            timings.layer_load_profile.hal_available,
+            timings.layer_load_profile.hal_alloc
+        ),
+        duration(
+            timings.layer_load_profile.hal_available,
+            timings.layer_load_profile.hal_copy_h_to_d
+        ),
+        duration(
+            timings.layer_load_profile.hal_available,
+            timings.layer_load_profile.hal_memset
+        ),
+        duration(
+            timings.layer_load_profile.hal_available,
+            timings.layer_load_profile.hal_vmm
+        ),
+        bytes(
+            timings.layer_load_profile.hal_available,
+            timings.layer_load_profile.hal_alloc_bytes
+        ),
+        bytes(
+            timings.layer_load_profile.hal_available,
+            timings.layer_load_profile.hal_copy_h_to_d_bytes
+        ),
+        bytes(
+            timings.layer_load_profile.hal_available,
+            timings.layer_load_profile.hal_memset_bytes
+        ),
+        bytes(
+            timings.layer_load_profile.hal_available,
+            timings.layer_load_profile.hal_vmm_bytes
+        ),
         qwen36_duration_ms(timings.session),
         timings.prefill_steps,
         qwen36_duration_ms(timings.prefill_embed),
@@ -348,6 +387,7 @@ fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
 
 fn qwen36_layer_load_hal_timings(snapshot: &gpu_hal::HalProfileSnapshot) -> Qwen36LayerLoadTimings {
     let mut timings = Qwen36LayerLoadTimings {
+        hal_available: true,
         hal_total: std::time::Duration::from_secs_f64(snapshot.total_ms / 1000.0),
         hal_alloc_bytes: snapshot.alloc_bytes,
         hal_copy_h_to_d_bytes: snapshot.h2d_bytes,
@@ -388,6 +428,7 @@ fn qwen36_external_hal_profile_env_active() -> bool {
 mod tests {
     use super::*;
     use crate::qwen36_moe_cli::layers::Qwen36WeightMode;
+    use clap::Parser;
 
     #[test]
     fn cuda_decode_rejects_non_int4_flm_source_weight_mode_with_source_label() {
@@ -444,6 +485,46 @@ mod tests {
     }
 
     #[test]
+    fn runtime_startup_timings_use_measured_store_and_config_evidence() {
+        let evidence = supersonic_runtime::qwen36_moe::engine::Qwen36MoeLoadEvidence {
+            flm_path: std::path::PathBuf::new(),
+            architecture_id: 0,
+            model_id: 0,
+            storage_abi_ids: Vec::new(),
+            direct_profile: supersonic_runtime::qwen36_moe::engine::Qwen36MoeDirectProfile::default(
+            ),
+            transfer_backend: model_store::VirtualArenaTransferBackend::PageableH2d,
+            source_bytes: 1,
+            device_upload_bytes: 1,
+            source_open_duration: std::time::Duration::from_micros(1_500),
+            store_open_duration: std::time::Duration::from_micros(1_250),
+            config_duration: std::time::Duration::from_micros(25),
+            descriptor_duration: std::time::Duration::ZERO,
+            tokenizer_duration: std::time::Duration::from_micros(500),
+            plan_duration: std::time::Duration::from_micros(100),
+            allocation_duration: std::time::Duration::ZERO,
+            upload_duration: std::time::Duration::ZERO,
+            total_duration: std::time::Duration::from_micros(2_500),
+            load_sequence: 1,
+            source_open_count: 1,
+            resident_allocation_count: 0,
+            resident_allocation_pointers: Vec::new(),
+            mapped_virtual_ranges: Vec::new(),
+            config: None,
+            tokenizer_timings: supersonic_runtime::flm_tokenizer::QwenBpeTokenizerTimings::default(
+            ),
+            hal_profile: gpu_hal::HalProfileSnapshot::default(),
+        };
+
+        let timings =
+            runtime_startup_timings_from_evidence(&evidence, std::time::Duration::from_micros(750));
+        let formatted = format_qwen36_startup_timings(&timings);
+
+        assert!(formatted.contains("flm_store_open_ms=1.250"));
+        assert!(formatted.contains("flm_config_ms=0.025"));
+    }
+
+    #[test]
     fn formats_lifecycle_timings_with_lazy_flm_tokenizer_breakdown() {
         let timings = Qwen36LifecycleTimings {
             prompt_setup: std::time::Duration::from_micros(5_000),
@@ -459,6 +540,8 @@ mod tests {
             model_source: std::time::Duration::from_micros(1_500),
             layer_load: std::time::Duration::from_micros(2_500),
             layer_load_profile: Qwen36LayerLoadTimings {
+                detail_available: true,
+                hal_available: true,
                 buffers: std::time::Duration::from_micros(1_100),
                 vmm_setup: std::time::Duration::from_micros(200),
                 prewarm: std::time::Duration::from_micros(300),
@@ -501,6 +584,26 @@ mod tests {
              prefill_total_ms=0.300 generation_wall_ms=4.500 \
              total_wall_ms=9.000"
         );
+    }
+
+    #[test]
+    fn lifecycle_timings_mark_unmeasured_layer_load_subphases_unavailable() {
+        let formatted = format_qwen36_lifecycle_timings(&Qwen36LifecycleTimings {
+            layer_load_profile: Qwen36LayerLoadTimings {
+                hal_available: true,
+                hal_total: std::time::Duration::from_micros(1_000),
+                hal_alloc: std::time::Duration::from_micros(400),
+                hal_alloc_bytes: 1_024,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        assert!(formatted.contains("layer_load_buffers_ms=unavailable"));
+        assert!(formatted.contains("layer_load_vmm_setup_ms=unavailable"));
+        assert!(formatted.contains("layer_load_prewarm_ms=unavailable"));
+        assert!(formatted.contains("layer_load_hal_ms=1.000"));
+        assert!(formatted.contains("layer_load_alloc_bytes=1024"));
     }
 
     #[test]
@@ -576,6 +679,114 @@ mod tests {
         assert!(qwen36_should_profile_layer_load_hal(true, false));
         assert!(!qwen36_should_profile_layer_load_hal(false, false));
         assert!(!qwen36_should_profile_layer_load_hal(true, true));
+    }
+
+    #[test]
+    fn multi_token_runtime_prefill_accounting_does_not_double_count_final_production() {
+        let accounting = runtime_prefill_accounting(
+            3,
+            std::time::Duration::from_millis(12),
+            std::time::Duration::from_millis(5),
+        );
+
+        assert_eq!(accounting.prefill_steps, 2);
+        assert_eq!(
+            accounting.prefill_chain,
+            std::time::Duration::from_millis(12)
+        );
+        assert_eq!(
+            accounting.first_generation_inference,
+            std::time::Duration::from_millis(5)
+        );
+        assert_eq!(
+            accounting.prefill_chain + accounting.first_generation_inference,
+            std::time::Duration::from_millis(17)
+        );
+    }
+
+    #[test]
+    fn runtime_request_adapter_delegates_one_load_reset_and_request_sequence() {
+        #[derive(Default)]
+        struct FakeEngine {
+            reset_calls: usize,
+            prefill_calls: usize,
+            decode_calls: usize,
+        }
+
+        let mut load_calls = 0;
+        let mut request = Qwen36RuntimeRequestAdapter::load(
+            || {
+                load_calls += 1;
+                Ok(FakeEngine::default())
+            },
+            |engine| {
+                engine.reset_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("load fake runtime request");
+
+        request
+            .prefill(|engine| {
+                engine.prefill_calls += 1;
+                Ok(())
+            })
+            .expect("prefill fake runtime request");
+        request
+            .decode_step(|engine| {
+                engine.decode_calls += 1;
+                Ok(())
+            })
+            .expect("first fake decode");
+        request
+            .decode_step(|engine| {
+                engine.decode_calls += 1;
+                Ok(())
+            })
+            .expect("second fake decode");
+
+        assert_eq!(load_calls, 1);
+        let engine = request.into_inner();
+        assert_eq!(engine.reset_calls, 1);
+        assert_eq!(engine.prefill_calls, 1);
+        assert_eq!(engine.decode_calls, 2);
+    }
+
+    #[test]
+    fn plain_flm_selector_deterministically_routes_only_compatible_cli_requests() {
+        let cli = crate::Cli::parse_from([
+            "supersonic",
+            "--model",
+            "qwen3.6-35b-a3b",
+            "--model-dir",
+            "/tmp/prevalidated.flm",
+            "--backend",
+            "hip",
+            "--prompt",
+            "Hello",
+        ]);
+        let entry = crate::registry::lookup(
+            &ModelVariant::Qwen3_6_35B_A3B,
+            &Backend::Hip,
+            &crate::registry::GpuArch::Gfx1100,
+        )
+        .expect("Qwen3.6 HIP gfx1100 registry entry");
+        let compatible = crate::qwen36_moe_cli::options::Qwen36RunnerModeOptions::default();
+
+        assert!(qwen36_plain_flm_runtime_path(
+            &cli,
+            entry,
+            None,
+            &compatible
+        ));
+
+        let segmented = crate::qwen36_moe_cli::options::Qwen36RunnerModeOptions {
+            segmented_profile: true,
+            ..Default::default()
+        };
+        assert!(!qwen36_plain_flm_runtime_path(
+            &cli, entry, None, &segmented
+        ));
     }
 }
 
@@ -710,6 +921,419 @@ impl Qwen36MtpAcceptanceStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimePrefillAccounting {
+    prefill_steps: usize,
+    prefill_chain: std::time::Duration,
+    first_generation_inference: std::time::Duration,
+}
+
+struct Qwen36RuntimeRequestAdapter<E> {
+    engine: E,
+    prefilled: bool,
+}
+
+impl<E> Qwen36RuntimeRequestAdapter<E> {
+    fn load(
+        load: impl FnOnce() -> Result<E>,
+        reset: impl FnOnce(&mut E) -> Result<()>,
+    ) -> Result<Self> {
+        let mut engine = load()?;
+        reset(&mut engine)?;
+        Ok(Self {
+            engine,
+            prefilled: false,
+        })
+    }
+
+    fn engine(&self) -> &E {
+        &self.engine
+    }
+
+    fn prefill<T>(&mut self, prefill: impl FnOnce(&mut E) -> Result<T>) -> Result<T> {
+        if self.prefilled {
+            anyhow::bail!("Qwen3.6 runtime CLI request prefill may only run once");
+        }
+        let output = prefill(&mut self.engine)?;
+        self.prefilled = true;
+        Ok(output)
+    }
+
+    fn decode_step<T>(&mut self, decode: impl FnOnce(&mut E) -> Result<T>) -> Result<T> {
+        if !self.prefilled {
+            anyhow::bail!("Qwen3.6 runtime CLI request decode requires prefill");
+        }
+        decode(&mut self.engine)
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> E {
+        self.engine
+    }
+}
+
+fn runtime_prefill_accounting(
+    prompt_len: usize,
+    prefix_duration: std::time::Duration,
+    final_production_duration: std::time::Duration,
+) -> RuntimePrefillAccounting {
+    RuntimePrefillAccounting {
+        prefill_steps: prompt_len.saturating_sub(1),
+        prefill_chain: prefix_duration,
+        first_generation_inference: final_production_duration,
+    }
+}
+
+fn qwen36_plain_flm_runtime_path(
+    cli: &crate::Cli,
+    entry: &RegistryEntry,
+    keep_mask: Option<&Vec<bool>>,
+    modes: &crate::qwen36_moe_cli::options::Qwen36RunnerModeOptions,
+) -> bool {
+    !cli.dry_run
+        && entry.backend == Backend::Hip
+        && effective_flm_source(cli).is_some()
+        && !cli.speculative_decode
+        && keep_mask.is_none()
+        && !cli.no_persistent_decode
+        && cli.batch_size.max(1) == 1
+        && modes.runtime_engine_compatible()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_runtime_engine(
+    cli: &crate::Cli,
+    entry: &RegistryEntry,
+    flm_path: &Path,
+    context_size: usize,
+    context_size_source: ContextSizeSource,
+    total_vram: u64,
+    sampling: SamplingParams,
+    execution_options: supersonic_runtime::qwen36_moe::decode::Qwen36ExecutionOptions,
+) -> Result<()> {
+    validate_decode_backend(entry)?;
+    validate_effective_flm_source_model(cli, &ModelVariant::Qwen3_6_35B_A3B)?;
+    validate_flm_weight_source_options(cli, crate::policy::q4km_like(cli))?;
+    let source_options = flm_source_open_options(cli)?;
+    let kernel_params = match entry.params {
+        FamilyParams::Qwen36Moe(params) => params,
+        _ => anyhow::bail!("registry entry is not Qwen36Moe family"),
+    };
+
+    let mut moe_runtime = prepare_moe_runtime_config(
+        false,
+        true,
+        entry.backend,
+        kernel_params.top_k as usize,
+        cli.flm_virtual_transfer_backend.as_deref(),
+    )?;
+    moe_runtime.vmm_mode = effective_moe_expert_vmm_mode_for_transfer_backend(
+        moe_runtime.vmm_mode,
+        moe_runtime.island_cap_experts,
+        moe_runtime.virtual_transfer_backend,
+    )?;
+    let virtual_transfer_backend = moe_runtime.virtual_transfer_backend;
+    let moe_policy = (*moe_runtime).clone();
+    let _sparse_telemetry = moe_runtime.sparse_telemetry.take();
+    let kv_vmm_env = std::env::var("SUPERSONIC_VMM_KV").ok();
+    let kv_vmm = qwen36_kv_vmm_mode_from_env_value(kv_vmm_env.as_deref(), entry.backend)?;
+    let load_config = Qwen36MoeLoadConfig {
+        flm_path: flm_path.to_owned(),
+        backend: entry.backend,
+        device_ordinal: cli.device,
+        max_context_len: context_size,
+        policy: Qwen36MoeLoadPolicy {
+            persistent_decode: true,
+            kv_fp8: cli.kv_fp8,
+            kv_vmm,
+            moe: moe_policy,
+            virtual_transfer_backend,
+        },
+        verify_block_hashes: source_options.verify_block_hashes,
+        execution_options,
+        accurate_stage_timings: cli.emit_stage_timings,
+    };
+
+    let runtime_wall_start = std::time::Instant::now();
+    let progress_interval = (cli.progress_heartbeat_seconds > 0.0)
+        .then(|| std::time::Duration::from_secs_f64(cli.progress_heartbeat_seconds));
+    let mut last_progress = runtime_wall_start
+        .checked_sub(progress_interval.unwrap_or(std::time::Duration::ZERO))
+        .unwrap_or(runtime_wall_start);
+    let mut progress = |phase: &str, detail: String, force: bool| {
+        let Some(interval) = progress_interval else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if force || now.duration_since(last_progress) >= interval {
+            eprintln!(
+                "[qwen36-moe progress] phase={phase} elapsed_ms={} {detail}",
+                now.duration_since(runtime_wall_start).as_millis()
+            );
+            last_progress = now;
+        }
+    };
+
+    eprintln!(
+        "[flm] opening model source at {}{}{}",
+        flm_path.display(),
+        if source_options.int4_runtime {
+            " (FLM logical INT4 aliases enabled)"
+        } else {
+            ""
+        },
+        if source_options.verify_block_hashes {
+            " (BLAKE3 hash verification enabled)"
+        } else {
+            ""
+        }
+    );
+    eprintln!("[qwen36-moe] loading config from FLM runtime descriptor");
+    eprintln!("[qwen36-moe] loading tokenizer from FLM assets");
+    progress("runtime_engine_load", "start".to_string(), true);
+    let mut reset_elapsed = std::time::Duration::ZERO;
+    let mut request = Qwen36RuntimeRequestAdapter::load(
+        || Qwen36MoeEngine::load(load_config).context("load Qwen3.6 runtime engine"),
+        |engine| {
+            let reset_start = std::time::Instant::now();
+            engine
+                .reset()
+                .context("reset Qwen3.6 runtime engine for CLI request")?;
+            reset_elapsed = reset_start.elapsed();
+            Ok(())
+        },
+    )?;
+    let evidence = request.engine().load_evidence().clone();
+    if evidence.source_open_count != 1 {
+        anyhow::bail!(
+            "Qwen3.6 CLI runtime engine must own exactly one FLM source open, observed {}",
+            evidence.source_open_count
+        );
+    }
+    progress(
+        "runtime_engine_load",
+        format!(
+            "done load_sequence={} source_open_count={} elapsed_ms={}",
+            evidence.load_sequence,
+            evidence.source_open_count,
+            evidence.total_duration.as_millis()
+        ),
+        true,
+    );
+
+    let dry_run_start = std::time::Instant::now();
+    let dry_run_report = run_qwen36_moe_dry_run_with_config(
+        &cli.model_dir,
+        Some(flm_path),
+        Some(evidence.direct_profile),
+        evidence
+            .config
+            .clone()
+            .context("Qwen3.6 runtime load evidence did not retain the FLM config")?,
+        entry,
+        total_vram,
+        context_size,
+        context_size_source,
+        cli.batch_size.max(1),
+        cli.kv_fp8,
+        cli.no_bake,
+        cli.device,
+    )?;
+    print_report(&dry_run_report);
+    let dry_run_elapsed = dry_run_start.elapsed();
+    print_runtime_engine_load_evidence(&evidence);
+    let tokenizer_timings = evidence.tokenizer_timings;
+    runtime_startup_timings_from_evidence(&evidence, dry_run_elapsed)
+        .print_if_requested(cli.emit_stage_timings);
+
+    println!();
+    println!("=== Decode (Qwen3.6-MoE) ===");
+    let prompt_setup_start = std::time::Instant::now();
+    let tokenizer = request.engine().tokenizer().clone();
+    let prompt_ids = if cli.prompt.is_empty() {
+        vec![0]
+    } else {
+        let encoding = tokenizer
+            .encode(cli.prompt.as_str(), true)
+            .map_err(|err| anyhow::anyhow!("tokenize prompt: {err}"))?;
+        let ids = encoding.get_ids().to_vec();
+        if ids.is_empty() {
+            vec![0]
+        } else {
+            ids
+        }
+    };
+    let eos_id = if cli.ignore_eos {
+        None
+    } else {
+        request.engine().eos_ids().first().copied()
+    };
+    let prompt_setup_elapsed = prompt_setup_start.elapsed();
+    print_prompt_summary(&cli.prompt, &prompt_ids);
+    print_decode_stream_start(Some(&tokenizer), &prompt_ids, cli.max_new_tokens.max(1));
+    print_sampling_summary(sampling);
+
+    let backend_label = format!("{:?}", entry.backend);
+    let mut prefill_profile = Some(PrefillProfileScope::new(
+        cli.profile_prefill,
+        cli.profile_prefill_json.as_deref(),
+        "qwen3.6-moe",
+        &cli.model,
+        &backend_label,
+        prompt_ids.len(),
+    ));
+    let mut generation_wall_start = None;
+    let mut decode_profile = None;
+    progress(
+        "prefill",
+        format!("start prompt_tokens={}", prompt_ids.len()),
+        true,
+    );
+    let prefill_start = std::time::Instant::now();
+    let prefill_output = request
+        .prefill(|engine| engine.prefill_with_boundaries(&prompt_ids, |boundary| {
+            if boundary
+                == supersonic_runtime::qwen36_moe::engine::Qwen36MoePrefillBoundary::FinalProductionStarted
+            {
+                if let Some(profile) = prefill_profile.take() {
+                    profile.finish()?;
+                }
+                generation_wall_start = Some(std::time::Instant::now());
+                decode_profile = Some(Qwen36DecodeProfileScope::new_from_env());
+            }
+            Ok(())
+        }))
+        .context("prefill Qwen3.6 runtime engine")?;
+    let prefill_elapsed = prefill_start.elapsed();
+    if let Some(profile) = prefill_profile.take() {
+        profile.finish()?;
+    }
+    let accounting = runtime_prefill_accounting(
+        prompt_ids.len(),
+        prefill_output.prefix_duration,
+        prefill_output.final_production_duration,
+    );
+    let mut logits = prefill_output.logits;
+    progress(
+        "prefill",
+        format!(
+            "done prompt_tokens={} elapsed_ms={}",
+            prompt_ids.len(),
+            prefill_elapsed.as_millis()
+        ),
+        true,
+    );
+
+    let mut rng = XorshiftRng::new(sampling.seed);
+    let mut generated_ids = Vec::with_capacity(cli.max_new_tokens.max(1));
+    let mut last_logits_bytes = Vec::new();
+    let mut pending_inference = accounting.first_generation_inference;
+    let mut stage_timings = Qwen36StageTimingTotals::default();
+    let max_new = cli.max_new_tokens.max(1);
+
+    for gen_index in 0..max_new {
+        progress(
+            "generate",
+            format!(
+                "step={} generated={} absolute_position={}",
+                gen_index,
+                generated_ids.len(),
+                prompt_ids.len() + gen_index
+            ),
+            false,
+        );
+        let sample_start = std::time::Instant::now();
+        let logits_bytes = f32_to_bf16_bytes(&logits);
+        let next_token = sample_bf16_logits(
+            &logits_bytes,
+            sampling.temperature,
+            sampling.top_k,
+            sampling.top_p,
+            &mut rng,
+        );
+        let sample_elapsed = sample_start.elapsed();
+        if cli.dump_last_logits {
+            last_logits_bytes = logits_bytes;
+        }
+        generated_ids.push(next_token);
+
+        let detok_start = std::time::Instant::now();
+        print_decoded_token(Some(&tokenizer), next_token);
+        std::io::stdout().flush().ok();
+        let detok_elapsed = detok_start.elapsed();
+        stage_timings.record_runtime_generation_step(
+            pending_inference,
+            sample_elapsed,
+            detok_elapsed,
+        );
+
+        if Some(next_token) == eos_id || gen_index + 1 == max_new {
+            break;
+        }
+
+        let decode_start = std::time::Instant::now();
+        logits = request
+            .decode_step(|engine| engine.decode_step(next_token, prompt_ids.len() + gen_index))
+            .with_context(|| {
+                format!(
+                    "decode Qwen3.6 runtime engine at absolute position {}",
+                    prompt_ids.len() + gen_index
+                )
+            })?;
+        pending_inference = decode_start.elapsed();
+    }
+
+    if let Some(profile) = decode_profile.take() {
+        profile.finish();
+    }
+    print_last_logits_if_requested(cli.dump_last_logits, &last_logits_bytes);
+    let generation_wall_ms = generation_wall_start
+        .as_ref()
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0);
+    print_generation_summary(&generated_ids, prompt_ids.len(), eos_id, generation_wall_ms);
+    stage_timings.print_if_requested(cli.emit_stage_timings);
+    if cli.emit_stage_timings {
+        let layer_load_elapsed = evidence
+            .total_duration
+            .saturating_sub(evidence.source_open_duration)
+            .saturating_sub(evidence.tokenizer_duration);
+        let lifecycle_timings = Qwen36LifecycleTimings {
+            prompt_setup: prompt_setup_elapsed,
+            flm_tokenizer: evidence.tokenizer_duration,
+            flm_tokenizer_assets: tokenizer_timings.asset_lookup,
+            flm_tokenizer_parse: tokenizer_timings.parse,
+            flm_tokenizer_parse_vocab: tokenizer_timings.parse_vocab,
+            flm_tokenizer_parse_vocab_ids: tokenizer_timings.parse_vocab_ids,
+            flm_tokenizer_parse_merges: tokenizer_timings.parse_merges,
+            flm_tokenizer_parse_added_tokens: tokenizer_timings.parse_added_tokens,
+            flm_tokenizer_parse_regex: tokenizer_timings.parse_regex,
+            flm_tokenizer_build: tokenizer_timings.build,
+            model_source: evidence.source_open_duration,
+            layer_load: layer_load_elapsed,
+            layer_load_profile: qwen36_layer_load_hal_timings(&evidence.hal_profile),
+            session: reset_elapsed,
+            prefill_steps: accounting.prefill_steps,
+            prefill_chain: accounting.prefill_chain,
+            generation_wall: generation_wall_ms,
+            total_wall: runtime_wall_start.elapsed(),
+            ..Default::default()
+        };
+        eprintln!(
+            "[qwen36-moe lifecycle-timings] {}",
+            format_qwen36_lifecycle_timings(&lifecycle_timings),
+        );
+    }
+    eprintln!(
+        "[qwen36-moe runtime telemetry] resident_allocations={} mapped_virtual_ranges={} source_bytes={} device_upload_bytes={}",
+        evidence.resident_allocation_count,
+        evidence.mapped_virtual_ranges.len(),
+        evidence.source_bytes,
+        evidence.device_upload_bytes
+    );
+
+    Ok(())
+}
+
 pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
     run_inner(cli, entry, total_vram, None)
 }
@@ -742,6 +1366,29 @@ fn run_inner(
     validate_persistent_kv_fp8_flags(cli)?;
     validate_cuda_v1_flags(cli, entry)?;
     validate_metal_v1_flags(cli, entry)?;
+
+    let sampling = SamplingParams {
+        temperature: cli.temperature,
+        top_k: cli.top_k,
+        top_p: cli.top_p,
+        seed: cli.sampling_seed,
+    };
+    let runtime_modes = crate::qwen36_moe_cli::options::runner_mode_options_from_environment();
+    if qwen36_plain_flm_runtime_path(cli, entry, keep_mask.as_ref(), &runtime_modes) {
+        let flm_path = effective_flm_source(cli)
+            .expect("plain FLM runtime path requires an effective FLM source")
+            .to_owned();
+        return run_with_runtime_engine(
+            cli,
+            entry,
+            &flm_path,
+            context_size,
+            context_size_source,
+            total_vram,
+            sampling,
+            runtime_modes.execution,
+        );
+    }
 
     let mut startup_timings = Qwen36StartupTimings::default();
     let flm_source_open_start = std::time::Instant::now();
@@ -802,12 +1449,6 @@ fn run_inner(
 
     println!();
     println!("=== Decode (Qwen3.6-MoE) ===");
-    let sampling = SamplingParams {
-        temperature: cli.temperature,
-        top_k: cli.top_k,
-        top_p: cli.top_p,
-        seed: cli.sampling_seed,
-    };
     let requires_int4_bake = cli.int4 || matches!(entry.backend, Backend::Cuda | Backend::Metal);
     decode_text(
         &cli.model_dir,
@@ -883,6 +1524,8 @@ fn decode_text(
     progress_heartbeat_seconds: f64,
     flm_virtual_transfer_backend_cli: Option<&str>,
 ) -> Result<()> {
+    let runtime_options = crate::qwen36_moe_cli::options::execution_options_from_environment();
+
     validate_speculative_sampling(speculative_decode, sampling)?;
 
     if keep_mask.is_some() && speculative_decode {
@@ -951,13 +1594,6 @@ fn decode_text(
     // [kv_max_t, Hkv*d=512] BF16 = 10 KiB per token of context).
     let kv_max_t = prompt_ids.len() + max_new;
 
-    let mut moe_runtime = prepare_moe_runtime_config(
-        speculative_decode,
-        persistent_decode,
-        backend,
-        geom.top_k as usize,
-        flm_virtual_transfer_backend_cli,
-    )?;
     let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
 
     progress(
@@ -1000,6 +1636,22 @@ fn decode_text(
     let store = decode_store.as_store();
     let model_source_elapsed = source_open_start.elapsed();
     progress(source_phase, format!("done source={source_label}"), true);
+    let persistent_decode = if persistent_decode && !weight_mode.supports_persistent_decode() {
+        eprintln!(
+            "  persistent decode is unavailable for {}; routing through runtime chained decode",
+            weight_mode.display_name()
+        );
+        false
+    } else {
+        persistent_decode
+    };
+    let mut moe_runtime = prepare_moe_runtime_config(
+        speculative_decode,
+        persistent_decode,
+        backend,
+        geom.top_k as usize,
+        flm_virtual_transfer_backend_cli,
+    )?;
 
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
@@ -1067,18 +1719,22 @@ fn decode_text(
             return Err(err);
         }
     };
-    let mut layers = loaded_layers.layers;
     let mut layer_load_profile = loaded_layers.timings;
-    let ffn_prewarm_elapsed =
-        match prewarm_qwen36_mps_static_topn_if_requested(ordinal, backend, &geom, &mut layers) {
-            Ok(elapsed) => elapsed,
-            Err(err) => {
-                if profile_layer_load_hal {
-                    gpu_hal::hal_profile_set_enabled(false);
-                }
-                return Err(err);
+    let mut loaded_layers = loaded_layers.loaded;
+    let ffn_prewarm_elapsed = match prewarm_qwen36_mps_static_topn_if_requested(
+        ordinal,
+        backend,
+        &geom,
+        loaded_layers.layers_mut_before_persistent()?,
+    ) {
+        Ok(elapsed) => elapsed,
+        Err(err) => {
+            if profile_layer_load_hal {
+                gpu_hal::hal_profile_set_enabled(false);
             }
-        };
+            return Err(err);
+        }
+    };
     layer_load_profile.prewarm = ffn_prewarm_elapsed;
     if profile_layer_load_hal {
         let hal_timings = qwen36_layer_load_hal_timings(&gpu_hal::hal_profile_snapshot());
@@ -1097,9 +1753,7 @@ fn decode_text(
         gpu_hal::hal_profile_set_enabled(false);
     }
     let layer_load_elapsed = layer_load_start.elapsed();
-    let _moe_expert_arena = loaded_layers.moe_expert_arena;
-    let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
-    let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);
+    let virtual_kv_stats = virtual_kv_stats_for_layers(loaded_layers.layers());
     print_virtual_kv_stats_if_active(virtual_kv_stats, kv_fp8, backend, ordinal);
     progress(
         "layer_load",
@@ -1126,7 +1780,7 @@ fn decode_text(
         batched_spec_verify,
         persistent_decode,
         max_speculative_tokens,
-        &mut layers,
+        &mut loaded_layers,
     )?;
     let session_elapsed = session_start.elapsed();
     progress(
@@ -1145,7 +1799,6 @@ fn decode_text(
         mut mtp_chain_scratch,
         embed_w_buf,
         mut linear_attn_snapshot,
-        mut persistent_scratch,
     } = session;
 
     print_decode_stream_start(tokenizer.as_ref(), &prompt_ids, max_new);
@@ -1195,7 +1848,7 @@ fn decode_text(
     }
     if kernel_ffi::qwen36_moe::qwen36_batched_prefill_feasibility_profile_enabled() {
         kernel_ffi::qwen36_moe::qwen36_batched_prefill_feasibility_profile_configure(
-            layers.len(),
+            loaded_layers.len(),
             geom.top_k as usize,
             geom.num_experts as usize,
             crate::qwen36_moe_cli::batched_prefill::PREFILL_CHUNK_SIZE_WMMA_FULL,
@@ -1271,13 +1924,15 @@ fn decode_text(
     if batched_prefill_disabled
         && dense_prefill_token_loop
         && keep_mask.is_none()
-        && _moe_expert_residency.is_none()
+        && !loaded_layers.has_sparse_expert_residency()
         && effective_prompt_len > 1
     {
-        if let (Some(scratch), Some(embed_w)) = (persistent_scratch.as_mut(), embed_w_buf.as_ref())
+        if let Some(embed_w) = embed_w_buf
+            .as_ref()
+            .filter(|_| loaded_layers.persistent_enabled())
         {
             let dense_prefill_count = effective_prompt_len - 1;
-            let t_prefill = scratch
+            let t_prefill = loaded_layers
                 .run_dense_prefill_tokens_from_device_embedding(
                     ordinal,
                     embed_w,
@@ -1311,9 +1966,7 @@ fn decode_text(
             &geom,
             &store,
             weight_prefix,
-            &mut layers,
-            persistent_scratch.as_mut(),
-            _moe_expert_residency.as_mut(),
+            &mut loaded_layers,
             &mut moe_runtime,
             &mut moe_routes,
             &mut loop_state,
@@ -1322,6 +1975,7 @@ fn decode_text(
             &kept_positions,
             effective_prompt_len,
             emit_stage_timings,
+            &runtime_options,
         )?;
         eprintln!(
             "[qwen36-moe batched-prefill] chunks={} tokens={} embed_ms={:.1} chain_ms={:.1}",
@@ -1391,12 +2045,13 @@ fn decode_text(
             && dense_prefill_token_loop
             && !is_gen_step
             && keep_mask.is_none()
-            && _moe_expert_residency.is_none()
+            && !loaded_layers.has_sparse_expert_residency()
         {
-            if let (Some(scratch), Some(embed_w)) =
-                (persistent_scratch.as_mut(), embed_w_buf.as_ref())
+            if let Some(embed_w) = embed_w_buf
+                .as_ref()
+                .filter(|_| loaded_layers.persistent_enabled())
             {
-                let t_chain_step = scratch
+                let t_chain_step = loaded_layers
                     .run_from_device_embedding_no_download(
                         ordinal,
                         embed_w,
@@ -1514,9 +2169,7 @@ fn decode_text(
             ordinal,
             geom: &geom,
             store: &store,
-            layers: &mut layers,
-            persistent_scratch: persistent_scratch.as_mut(),
-            moe_expert_residency: _moe_expert_residency.as_mut(),
+            loaded_layers: &mut loaded_layers,
             moe_runtime: &mut moe_runtime,
             moe_routes: &mut moe_routes,
             initial_hidden: &initial_hidden,
@@ -1526,6 +2179,7 @@ fn decode_text(
             emit_stage_timings,
             fold,
             download_final_hidden,
+            execution: &runtime_options,
         })?;
         let outputs = chain_step.outputs;
         let lm_head_folded = chain_step.lm_head_folded;
@@ -1563,6 +2217,7 @@ fn decode_text(
             embed_lookup_timing,
             t_chain_step,
             outputs: &outputs,
+            execution: &runtime_options,
             final_norm_w_buf: &final_norm_w_buf,
             lm_head_w_buf: &lm_head_w_buf,
             final_hidden_buf: &mut final_hidden_buf,
@@ -1594,31 +2249,36 @@ fn decode_text(
             let h_base = outputs.final_hidden_bytes.clone();
             // Runs either batched or sequential speculative verify depending on
             // whether session setup allocated a linear-attn snapshot.
-            let result = run_speculative_extension(Qwen36SpeculativeExtension {
-                ordinal,
-                geom: &geom,
-                store: &store,
-                weight_prefix,
-                layers: &mut layers,
-                persistent_scratch: persistent_scratch.as_mut(),
-                mtp,
-                forward_scratch: fwd_scratch,
-                chain_scratch,
-                embed_w,
-                final_norm_w: &final_norm_w_buf,
-                lm_head_w: &lm_head_w_buf,
-                final_hidden: &mut final_hidden_buf,
-                logits: &mut logits_buf,
-                counter: &mut counter_buf,
-                linear_attn_snapshot: linear_attn_snapshot.as_mut(),
-                loop_state: &loop_state,
-                base_position: position,
-                h_base_in: &h_base,
-                first_token: next_token,
-                stage_timings: &mut stage_timings,
-                emit_stage_timings,
-                max_drafts: max_speculative_tokens,
-            })?;
+            let result = unsafe {
+                loaded_layers.with_experimental_parts(|layers, persistent_scratch| {
+                    run_speculative_extension(Qwen36SpeculativeExtension {
+                        ordinal,
+                        geom: &geom,
+                        store: &store,
+                        weight_prefix,
+                        layers,
+                        execution: &runtime_options,
+                        persistent_scratch,
+                        mtp,
+                        forward_scratch: fwd_scratch,
+                        chain_scratch,
+                        embed_w,
+                        final_norm_w: &final_norm_w_buf,
+                        lm_head_w: &lm_head_w_buf,
+                        final_hidden: &mut final_hidden_buf,
+                        logits: &mut logits_buf,
+                        counter: &mut counter_buf,
+                        linear_attn_snapshot: linear_attn_snapshot.as_mut(),
+                        loop_state: &loop_state,
+                        base_position: position,
+                        h_base_in: &h_base,
+                        first_token: next_token,
+                        stage_timings: &mut stage_timings,
+                        emit_stage_timings,
+                        max_drafts: max_speculative_tokens,
+                    })
+                })?
+            };
 
             if let Some(stats) = mtp_acceptance_stats.as_mut() {
                 stats.record(&result);
@@ -1646,7 +2306,7 @@ fn decode_text(
         eos_id,
         generation_wall_ms,
     );
-    if let Some(manager) = _moe_expert_residency.as_ref() {
+    if let Some(manager) = loaded_layers.sparse_expert_residency() {
         print_and_write_moe_residency_summary(
             manager,
             virtual_kv_stats,

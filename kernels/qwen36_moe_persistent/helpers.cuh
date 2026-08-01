@@ -14,16 +14,31 @@
 // namespace and translation unit; they are NOT shared with the qwen35
 // kernels.
 //
-// The production decode path intentionally uses a fast reconstruction:
-//   recon = nibble * scale - zero * scale
-// This differs from the original oracle's per-nibble BF16 RNE but was kept
-// after 35B A3B full-harness benchmarking as a measured decode win.
+// The production decode path uses the same BF16 reconstruction contract as
+// the WMMA operand builder: each dequantized weight is rounded to BF16 before
+// it participates in the F32 accumulation.
 
 #pragma once
 
 #include "../qwen36_moe_cuda_prelude.cuh"
 
 namespace qwen36_moe {
+
+// Explicit quantized-weight geometry shared by every descriptor-driven INT4
+// reconstruction path. This definition lives with the primitive so phase
+// headers cannot accidentally acquire a second storage-layout contract.
+struct Qwen36MoeInt4WeightDesc {
+    const void* scale;
+    const void* zero;
+    uint64_t    packed_row_stride_bytes;
+    uint64_t    packed_expert_stride_bytes;
+    uint64_t    scale_row_stride_elements;
+    uint64_t    scale_expert_stride_elements;
+    int         input_group_size;
+    int         output_group_size;
+    int         implicit_zero_code;
+    int         encoding;
+};
 
 __device__ __forceinline__ float qwen36_wave_sum(float value) {
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
@@ -48,13 +63,417 @@ __device__ __forceinline__ float bf16_round_rne_f32(float x) {
     return y;
 }
 
+// Canonical descriptor-driven INT4 reconstruction contract. Encoding 1
+// (tile-v1) supplies an explicit BF16 zero plane; encoding 2 (row-group)
+// supplies an integer zero code. Host launch validation keeps encoding 3
+// (FP8 block) out of this primitive.
+__device__ inline float qwen36_int4_value(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    int row,
+    int col
+) {
+    const size_t packed_index =
+        static_cast<size_t>(expert) * desc.packed_expert_stride_bytes +
+        static_cast<size_t>(row) * desc.packed_row_stride_bytes +
+        static_cast<size_t>(col / 2);
+    const uint8_t packed_byte = packed[packed_index];
+    const int nibble = (col & 1) != 0
+        ? static_cast<int>((packed_byte >> 4) & 0x0f)
+        : static_cast<int>(packed_byte & 0x0f);
+    const size_t scale_index =
+        static_cast<size_t>(expert) * desc.scale_expert_stride_elements +
+        static_cast<size_t>(row / desc.output_group_size) *
+            desc.scale_row_stride_elements +
+        static_cast<size_t>(col / desc.input_group_size);
+    const hip_bfloat16* scales =
+        static_cast<const hip_bfloat16*>(desc.scale);
+    const float scale = static_cast<float>(scales[scale_index]);
+    const float zero = desc.implicit_zero_code >= 0
+        ? static_cast<float>(desc.implicit_zero_code)
+        : static_cast<float>(
+              static_cast<const hip_bfloat16*>(desc.zero)[scale_index]);
+    return (static_cast<float>(nibble) - zero) * scale;
+}
+
+// The row-group fast path is deliberately narrower than the descriptor
+// primitive. It is valid only for the canonical encoding-2 layout emitted by
+// the G32 bake: one input group of 32, one output row per scale, implicit code
+// 8, no zero plane, and packed/scale row strides with no padding. The generic
+// descriptor path remains the fallback for tile-v1 and every unusual shape.
+__device__ __forceinline__ bool qwen36_g32_descriptor_layout_is_canonical(
+    const Qwen36MoeInt4WeightDesc& desc
+) {
+    if (desc.encoding != 2 || desc.scale == nullptr || desc.zero != nullptr ||
+        desc.input_group_size != 32 || desc.output_group_size != 1 ||
+        desc.implicit_zero_code != 8 || desc.scale_row_stride_elements == 0 ||
+        desc.packed_row_stride_bytes == 0 ||
+        desc.packed_row_stride_bytes !=
+            desc.scale_row_stride_elements * static_cast<uint64_t>(16)) {
+        return false;
+    }
+    const bool rank2 = desc.packed_expert_stride_bytes == 0 &&
+                       desc.scale_expert_stride_elements == 0;
+    if (rank2) return true;
+    if (desc.packed_expert_stride_bytes == 0 ||
+        desc.scale_expert_stride_elements == 0 ||
+        desc.packed_expert_stride_bytes % desc.packed_row_stride_bytes != 0 ||
+        desc.scale_expert_stride_elements % desc.scale_row_stride_elements != 0) {
+        return false;
+    }
+    return desc.packed_expert_stride_bytes / desc.packed_row_stride_bytes ==
+           desc.scale_expert_stride_elements / desc.scale_row_stride_elements;
+}
+
+__device__ __forceinline__ bool qwen36_g32_descriptor_is_canonical(
+    const Qwen36MoeInt4WeightDesc& desc,
+    int cols
+) {
+    return cols >= 32 && (cols & 31) == 0 &&
+           desc.packed_row_stride_bytes == static_cast<uint64_t>(cols >> 1) &&
+           desc.scale_row_stride_elements == static_cast<uint64_t>(cols >> 5) &&
+           qwen36_g32_descriptor_layout_is_canonical(desc);
+}
+
+// The compatibility tile-v1 launcher has the same tightly packed geometry
+// as the original grouped-expert kernel. Keep that case on the old slab-based
+// helpers: unlike the general descriptor path, they resolve expert and row
+// bases once and use the specialized WMMA operand loader.
+__device__ __forceinline__ bool qwen36_tile_v1_descriptor_is_canonical(
+    const Qwen36MoeInt4WeightDesc& desc,
+    int rows,
+    int cols
+) {
+    if (desc.encoding != 1 || desc.scale == nullptr || desc.zero == nullptr ||
+        desc.implicit_zero_code >= 0 || rows <= 0 || cols <= 0 ||
+        desc.input_group_size <= 0 || desc.output_group_size <= 0 ||
+        cols % 2 != 0 || cols % desc.input_group_size != 0 ||
+        rows % desc.output_group_size != 0) {
+        return false;
+    }
+    const uint64_t packed_row_stride = static_cast<uint64_t>(cols / 2);
+    const uint64_t scale_row_stride =
+        static_cast<uint64_t>(cols / desc.input_group_size);
+    return desc.packed_row_stride_bytes == packed_row_stride &&
+           desc.packed_expert_stride_bytes ==
+               static_cast<uint64_t>(rows) * packed_row_stride &&
+           desc.scale_row_stride_elements == scale_row_stride &&
+           desc.scale_expert_stride_elements ==
+               static_cast<uint64_t>(rows / desc.output_group_size) *
+                   scale_row_stride;
+}
+
+struct Qwen36MoeG32RowBases {
+    const uint8_t* packed_row;
+    const hip_bfloat16* scale_row;
+};
+
+// A canonical G32 matrix is bound to one expert before its row work pool
+// starts. This keeps expert base arithmetic and descriptor field loads out of
+// every row's per-thread matvec call.
+struct Qwen36MoeG32Matrix {
+    const uint8_t* packed_base;
+    const hip_bfloat16* scale_base;
+    uint64_t packed_row_stride_bytes;
+    uint64_t scale_row_stride_elements;
+};
+
+__device__ __forceinline__ Qwen36MoeG32Matrix qwen36_g32_matrix_from_desc(
+    const uint8_t* __restrict__ packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert
+) {
+    const hip_bfloat16* __restrict__ scales =
+        static_cast<const hip_bfloat16*>(desc.scale);
+    return {
+        packed + static_cast<size_t>(expert) * desc.packed_expert_stride_bytes,
+        scales + static_cast<size_t>(expert) * desc.scale_expert_stride_elements,
+        desc.packed_row_stride_bytes,
+        desc.scale_row_stride_elements,
+    };
+}
+
+__device__ __forceinline__ Qwen36MoeG32RowBases qwen36_g32_matrix_row_bases(
+    const Qwen36MoeG32Matrix& matrix,
+    int row
+) {
+    return {
+        matrix.packed_base +
+            static_cast<size_t>(row) * matrix.packed_row_stride_bytes,
+        matrix.scale_base +
+            static_cast<size_t>(row) * matrix.scale_row_stride_elements,
+    };
+}
+
+__device__ __forceinline__ Qwen36MoeG32RowBases qwen36_g32_row_bases(
+    const uint8_t* __restrict__ packed,
+    const hip_bfloat16* __restrict__ scales,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    int row
+) {
+    const Qwen36MoeG32Matrix matrix = {
+        packed + static_cast<size_t>(expert) * desc.packed_expert_stride_bytes,
+        scales + static_cast<size_t>(expert) * desc.scale_expert_stride_elements,
+        desc.packed_row_stride_bytes,
+        desc.scale_row_stride_elements,
+    };
+    return qwen36_g32_matrix_row_bases(matrix, row);
+}
+
+// Dequantize one aligned 8-nibble span from a canonical G32 row. The caller
+// supplies row bases so expert/row address arithmetic is outside the hot loop.
+// `col` is an 8-aligned offset that does not cross a 32-value group boundary.
+__device__ __forceinline__ void qwen36_g32_dequant_span_8(
+    const uint8_t* __restrict__ packed_row,
+    const hip_bfloat16* __restrict__ scale_row,
+    int col,
+    float out[8]
+) {
+    const uint32_t* __restrict__ packed_words =
+        reinterpret_cast<const uint32_t*>(packed_row);
+    const uint32_t packed_word = packed_words[col >> 3];
+    const float scale = static_cast<float>(scale_row[col >> 5]);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int code = static_cast<int>((packed_word >> (i * 4)) & 0x0f);
+        out[i] = bf16_round_rne_f32(
+            (static_cast<float>(code) - 8.0f) * scale);
+    }
+}
+
+struct qwen36_float_pair {
+    float first;
+    float second;
+};
+
+__device__ __forceinline__ float qwen36_g32_matvec_partial(
+    const Qwen36MoeG32Matrix& matrix,
+    const float* __restrict__ x,
+    int row,
+    int cols,
+    int tid,
+    int block_size
+) {
+    const Qwen36MoeG32RowBases bases =
+        qwen36_g32_matrix_row_bases(matrix, row);
+    float partial = 0.0f;
+    for (int col = tid * 8; col < cols; col += block_size * 8) {
+        float values[8];
+        qwen36_g32_dequant_span_8(
+            bases.packed_row, bases.scale_row, col, values);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) partial += values[i] * x[col + i];
+    }
+    return partial;
+}
+
+__device__ __forceinline__ qwen36_float_pair
+qwen36_g32_pair_matvec_partial_same_row(
+    const Qwen36MoeG32Matrix& matrix_a,
+    const Qwen36MoeG32Matrix& matrix_b,
+    const float* __restrict__ x,
+    int row,
+    int cols,
+    int tid,
+    int block_size
+) {
+    const Qwen36MoeG32RowBases bases_a =
+        qwen36_g32_matrix_row_bases(matrix_a, row);
+    const Qwen36MoeG32RowBases bases_b =
+        qwen36_g32_matrix_row_bases(matrix_b, row);
+    float partial_a = 0.0f;
+    float partial_b = 0.0f;
+    for (int col = tid * 8; col < cols; col += block_size * 8) {
+        float values_a[8];
+        float values_b[8];
+        qwen36_g32_dequant_span_8(
+            bases_a.packed_row, bases_a.scale_row, col, values_a);
+        qwen36_g32_dequant_span_8(
+            bases_b.packed_row, bases_b.scale_row, col, values_b);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float value = x[col + i];
+            partial_a += values_a[i] * value;
+            partial_b += values_b[i] * value;
+        }
+    }
+    return {partial_a, partial_b};
+}
+
+__device__ inline void qwen36_int4_dequant_8(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    int row,
+    int col,
+    float out[8]
+) {
+    if (qwen36_g32_descriptor_layout_is_canonical(desc) &&
+        (col & 7) == 0 && (col & 31) <= 24) {
+        const hip_bfloat16* __restrict__ scales =
+            static_cast<const hip_bfloat16*>(desc.scale);
+        const Qwen36MoeG32RowBases bases = qwen36_g32_row_bases(
+            packed, scales, desc, expert, row);
+        qwen36_g32_dequant_span_8(bases.packed_row, bases.scale_row, col, out);
+        return;
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out[i] = qwen36_int4_value(packed, desc, expert, row, col + i);
+    }
+}
+
+__device__ inline void qwen36_int4_pair_dequant_8(
+    const uint8_t* packed_a,
+    const Qwen36MoeInt4WeightDesc& desc_a,
+    int expert_a,
+    int row_a,
+    const uint8_t* packed_b,
+    const Qwen36MoeInt4WeightDesc& desc_b,
+    int expert_b,
+    int row_b,
+    int col,
+    float out_a[8],
+    float out_b[8]
+) {
+    const bool fast_a = qwen36_g32_descriptor_layout_is_canonical(desc_a) &&
+                        (col & 7) == 0 && (col & 31) <= 24;
+    const bool fast_b = qwen36_g32_descriptor_layout_is_canonical(desc_b) &&
+                        (col & 7) == 0 && (col & 31) <= 24;
+    if (fast_a || fast_b) {
+        Qwen36MoeG32RowBases bases_a{};
+        Qwen36MoeG32RowBases bases_b{};
+        if (fast_a) {
+            const hip_bfloat16* __restrict__ scales_a =
+                static_cast<const hip_bfloat16*>(desc_a.scale);
+            bases_a = qwen36_g32_row_bases(
+                packed_a, scales_a, desc_a, expert_a, row_a);
+            qwen36_g32_dequant_span_8(
+                bases_a.packed_row, bases_a.scale_row, col, out_a);
+        } else {
+            qwen36_int4_dequant_8(
+                packed_a, desc_a, expert_a, row_a, col, out_a);
+        }
+        if (fast_b) {
+            const hip_bfloat16* __restrict__ scales_b =
+                static_cast<const hip_bfloat16*>(desc_b.scale);
+            bases_b = qwen36_g32_row_bases(
+                packed_b, scales_b, desc_b, expert_b, row_b);
+            qwen36_g32_dequant_span_8(
+                bases_b.packed_row, bases_b.scale_row, col, out_b);
+        } else {
+            qwen36_int4_dequant_8(
+                packed_b, desc_b, expert_b, row_b, col, out_b);
+        }
+        return;
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out_a[i] = qwen36_int4_value(
+            packed_a, desc_a, expert_a, row_a, col + i);
+        out_b[i] = qwen36_int4_value(
+            packed_b, desc_b, expert_b, row_b, col + i);
+    }
+}
+
+__device__ inline float qwen36_int4_dq8_matvec_partial(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    const float* __restrict__ x,
+    int row,
+    int cols,
+    int tid,
+    int block_size
+) {
+    const bool fast = qwen36_g32_descriptor_is_canonical(desc, cols);
+    if (fast) {
+        const Qwen36MoeG32Matrix matrix =
+            qwen36_g32_matrix_from_desc(packed, desc, expert);
+        return qwen36_g32_matvec_partial(
+            matrix, x, row, cols, tid, block_size);
+    }
+    float partial = 0.0f;
+    for (int col = tid * 8; col < cols; col += block_size * 8) {
+        float values[8];
+        qwen36_int4_dequant_8(packed, desc, expert, row, col, values);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) partial += values[i] * x[col + i];
+    }
+    return partial;
+}
+
+__device__ inline qwen36_float_pair qwen36_int4_dq8_pair_matvec_partial_same_row(
+    const uint8_t* packed_a,
+    const Qwen36MoeInt4WeightDesc& desc_a,
+    int expert_a,
+    const uint8_t* packed_b,
+    const Qwen36MoeInt4WeightDesc& desc_b,
+    int expert_b,
+    const float* __restrict__ x,
+    int row,
+    int cols,
+    int tid,
+    int block_size
+) {
+    const bool fast_a = qwen36_g32_descriptor_is_canonical(desc_a, cols);
+    const bool fast_b = qwen36_g32_descriptor_is_canonical(desc_b, cols);
+    Qwen36MoeG32RowBases bases_a{};
+    Qwen36MoeG32RowBases bases_b{};
+    if (fast_a) {
+        const hip_bfloat16* __restrict__ scales_a =
+            static_cast<const hip_bfloat16*>(desc_a.scale);
+        bases_a = qwen36_g32_row_bases(
+            packed_a, scales_a, desc_a, expert_a, row);
+    }
+    if (fast_b) {
+        const hip_bfloat16* __restrict__ scales_b =
+            static_cast<const hip_bfloat16*>(desc_b.scale);
+        bases_b = qwen36_g32_row_bases(
+            packed_b, scales_b, desc_b, expert_b, row);
+    }
+    float partial_a = 0.0f;
+    float partial_b = 0.0f;
+    for (int col = tid * 8; col < cols; col += block_size * 8) {
+        float values_a[8];
+        float values_b[8];
+        if (fast_a) {
+            qwen36_g32_dequant_span_8(
+                bases_a.packed_row, bases_a.scale_row, col, values_a);
+        } else {
+            qwen36_int4_dequant_8(
+                packed_a, desc_a, expert_a, row, col, values_a);
+        }
+        if (fast_b) {
+            qwen36_g32_dequant_span_8(
+                bases_b.packed_row, bases_b.scale_row, col, values_b);
+        } else {
+            qwen36_int4_dequant_8(
+                packed_b, desc_b, expert_b, row, col, values_b);
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float value = x[col + i];
+            partial_a += values_a[i] * value;
+            partial_b += values_b[i] * value;
+        }
+    }
+    return {partial_a, partial_b};
+}
+
 // ---------------------------------------------------------------------------
 // INT4 group-quant dequant — ported from kernels/full_attention_4b.hip
 // (PR 4b5). Per CLAUDE.md the qwen36_moe and full_attention_4b kernels are
 // isolated compilation units (hipcc on gfx11xx is fragile), so the helpers
 // live here as a copy rather than a shared header.
 //
-// Layout (matches the bake + the full_attention_4b versions):
+// Legacy tile-v1 compatibility (encoding 1) only. Production qwen36 phase
+// paths route both encoding 1 and encoding 2 through the descriptor primitive
+// above; these helpers remain for isolated tile-v1 known-byte coverage.
+//
+// Layout (matches the tile-v1 bake + the full_attention_4b versions):
 //   weights : `[..., out, in/2]` u8   — 2 nibbles/byte, even col → low.
 //   scale   : `[..., out/gs, in/gs]` BF16
 //   zero    : `[..., out/gs, in/gs]` BF16
@@ -131,6 +550,207 @@ struct qwen36_float8_pair {
     qwen36_float8 first;
     qwen36_float8 second;
 };
+
+__device__ inline short qwen36_bf16_operand_bits(float value) {
+    const float rounded = bf16_round_rne_f32(value);
+    uint32_t bits;
+    __builtin_memcpy(&bits, &rounded, sizeof(bits));
+    return static_cast<short>(bits >> 16);
+}
+
+// Construct one 16-value WMMA B operand from two aligned packed words. A
+// canonical G32 WMMA chunk starts at column 0 or 16, so all 16 values share
+// one scale and the BF16 RNE point remains exactly at operand construction.
+__device__ __forceinline__ qwen36_short16 qwen36_g32_wmma_operand(
+    const uint8_t* __restrict__ packed_row,
+    const hip_bfloat16* __restrict__ scale_row,
+    int col
+) {
+    const uint32_t* __restrict__ packed_words =
+        reinterpret_cast<const uint32_t*>(packed_row);
+    const uint32_t packed_word0 = packed_words[col >> 3];
+    const uint32_t packed_word1 = packed_words[(col >> 3) + 1];
+    const float scale = static_cast<float>(scale_row[col >> 5]);
+    qwen36_short16 operand;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const uint32_t packed_word = i < 8 ? packed_word0 : packed_word1;
+        const int code = static_cast<int>(
+            (packed_word >> ((i & 7) * 4)) & 0x0f);
+        operand[i] = qwen36_bf16_operand_bits(
+            (static_cast<float>(code) - 8.0f) * scale);
+    }
+    return operand;
+}
+
+__device__ inline qwen36_short16 qwen36_wmma_activation_operand(
+    const hip_bfloat16* activation,
+    int col,
+    int lane_row
+) {
+    qwen36_short16 operand;
+    if (lane_row == 0) {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            uint16_t bits;
+            __builtin_memcpy(&bits, &activation[col + i], sizeof(bits));
+            operand[i] = static_cast<short>(bits);
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) operand[i] = 0;
+    }
+    return operand;
+}
+
+__device__ inline qwen36_short16 qwen36_wmma_activation_operand(
+    const float* activation,
+    int col,
+    int lane_row
+) {
+    qwen36_short16 operand;
+    if (lane_row == 0) {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            uint32_t bits;
+            __builtin_memcpy(&bits, &activation[col + i], sizeof(bits));
+            operand[i] = static_cast<short>(bits >> 16);
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) operand[i] = 0;
+    }
+    return operand;
+}
+
+__device__ inline qwen36_short16 qwen36_wmma_int4_operand(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    int row,
+    int col,
+    bool row_in_range
+) {
+    qwen36_short16 operand;
+    if (row_in_range) {
+        if (qwen36_g32_descriptor_layout_is_canonical(desc) &&
+            (col & 15) == 0 && (col & 31) <= 16) {
+            const hip_bfloat16* __restrict__ scales =
+                static_cast<const hip_bfloat16*>(desc.scale);
+            const Qwen36MoeG32RowBases bases = qwen36_g32_row_bases(
+                packed, scales, desc, expert, row);
+            return qwen36_g32_wmma_operand(
+                bases.packed_row, bases.scale_row, col);
+        }
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            operand[i] = qwen36_bf16_operand_bits(
+                qwen36_int4_value(packed, desc, expert, row, col + i));
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) operand[i] = 0;
+    }
+    return operand;
+}
+
+template <typename Activation>
+__device__ inline qwen36_float8 qwen36_wmma_int4_matvec_partial_16rows(
+    const uint8_t* packed,
+    const Qwen36MoeInt4WeightDesc& desc,
+    int expert,
+    int rhs_row_idx,
+    bool rhs_in_range,
+    const Activation* activation,
+    int hidden,
+    int lane_row
+) {
+    qwen36_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const bool g32_fast = rhs_in_range &&
+                          qwen36_g32_descriptor_is_canonical(desc, hidden);
+    Qwen36MoeG32RowBases bases{};
+    if (g32_fast) {
+        const hip_bfloat16* __restrict__ scales =
+            static_cast<const hip_bfloat16*>(desc.scale);
+        bases = qwen36_g32_row_bases(
+            packed, scales, desc, expert, rhs_row_idx);
+    }
+    for (int col = 0; col < hidden; col += 16) {
+        const qwen36_short16 a =
+            qwen36_wmma_activation_operand(activation, col, lane_row);
+        qwen36_short16 b;
+        if (g32_fast) {
+            b = qwen36_g32_wmma_operand(
+                bases.packed_row, bases.scale_row, col);
+        } else {
+            b = qwen36_wmma_int4_operand(
+                packed, desc, expert, rhs_row_idx, col, rhs_in_range);
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+    return acc;
+}
+
+template <typename Activation>
+__device__ inline qwen36_float8_pair
+qwen36_wmma_int4_pair_matvec_partial_16rows(
+    const uint8_t* packed_a,
+    const Qwen36MoeInt4WeightDesc& desc_a,
+    int expert_a,
+    int rhs_row_idx_a,
+    const uint8_t* packed_b,
+    const Qwen36MoeInt4WeightDesc& desc_b,
+    int expert_b,
+    int rhs_row_idx_b,
+    bool rhs_in_range,
+    const Activation* activation,
+    int hidden,
+    int lane_row
+) {
+    qwen36_float8 acc_a = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    qwen36_float8 acc_b = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const bool g32_fast_a = rhs_in_range &&
+                            qwen36_g32_descriptor_is_canonical(desc_a, hidden);
+    const bool g32_fast_b = rhs_in_range &&
+                            qwen36_g32_descriptor_is_canonical(desc_b, hidden);
+    Qwen36MoeG32RowBases bases_a{};
+    Qwen36MoeG32RowBases bases_b{};
+    if (g32_fast_a) {
+        const hip_bfloat16* __restrict__ scales_a =
+            static_cast<const hip_bfloat16*>(desc_a.scale);
+        bases_a = qwen36_g32_row_bases(
+            packed_a, scales_a, desc_a, expert_a, rhs_row_idx_a);
+    }
+    if (g32_fast_b) {
+        const hip_bfloat16* __restrict__ scales_b =
+            static_cast<const hip_bfloat16*>(desc_b.scale);
+        bases_b = qwen36_g32_row_bases(
+            packed_b, scales_b, desc_b, expert_b, rhs_row_idx_b);
+    }
+    for (int col = 0; col < hidden; col += 16) {
+        const qwen36_short16 a =
+            qwen36_wmma_activation_operand(activation, col, lane_row);
+        qwen36_short16 b_a;
+        qwen36_short16 b_b;
+        if (g32_fast_a) {
+            b_a = qwen36_g32_wmma_operand(
+                bases_a.packed_row, bases_a.scale_row, col);
+        } else {
+            b_a = qwen36_wmma_int4_operand(
+                packed_a, desc_a, expert_a, rhs_row_idx_a, col, rhs_in_range);
+        }
+        if (g32_fast_b) {
+            b_b = qwen36_g32_wmma_operand(
+                bases_b.packed_row, bases_b.scale_row, col);
+        } else {
+            b_b = qwen36_wmma_int4_operand(
+                packed_b, desc_b, expert_b, rhs_row_idx_b, col, rhs_in_range);
+        }
+        acc_a = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b_a, acc_a);
+        acc_b = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b_b, acc_b);
+    }
+    return {acc_a, acc_b};
+}
 #endif
 
 // Work-stealing matvec inner loop for an INT4 slab `[out_rows, in_cols/2]`.
@@ -179,11 +799,6 @@ __device__ inline float int4_dq8_matvec_partial(
     }
     return partial;
 }
-
-struct qwen36_float_pair {
-    float first;
-    float second;
-};
 
 __device__ inline qwen36_float_pair int4_dq8_pair_matvec_partial_same_row(
     const uint8_t*      __restrict__ packed_a,
@@ -416,7 +1031,8 @@ __device__ inline qwen36_float8_pair wmma_int4_pair_matvec_partial_16rows(
 
 #endif // SUPERSONIC_QWEN36_HAS_WMMA_BF16
 
-// Single-element dequant for non-8-aligned tails. `cols` is the unpacked
+// Legacy tile-v1 (encoding 1) single-element dequant for non-8-aligned
+// tails. `cols` is the unpacked
 // input dim of the 2D slab `(row, col)` indexes into. `scales`/`zeros`
 // are at `[(row/gs) * ((cols + gs - 1)/gs) + col/gs]` — same as the 2D
 // helpers in full_attention_4b.

@@ -16,6 +16,13 @@ static inline cudaError_t supersonic_cuda_malloc(void** ptr, size_t size) { retu
 
 namespace {
 
+int prefill_backend_failure(int project_status, cudaError_t native_status) {
+    return static_cast<int>(
+        0x80000000u
+        | ((static_cast<uint32_t>(project_status) & 0x7fffu) << 16)
+        | (static_cast<uint32_t>(native_status) & 0xffffu));
+}
+
 struct ScopedHipDevice {
     int previous = -1;
     bool changed = false;
@@ -180,7 +187,10 @@ int full_attention_decode_flat_device(
         static_cast<const T*>(key),
         static_cast<const T*>(value),
         static_cast<T*>(out));
-    if (cudaGetLastError() != cudaSuccess) return 21;
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+        return prefill_backend_failure(21, launch_status);
+    }
     return 0;
 }
 
@@ -1046,7 +1056,10 @@ int swiglu_mul_device(
         static_cast<const T*>(gate),
         static_cast<const T*>(up),
         static_cast<T*>(out));
-    if (cudaGetLastError() != cudaSuccess) return 121;
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+        return prefill_backend_failure(121, launch_status);
+    }
     return 0;
 }
 
@@ -1249,8 +1262,14 @@ int cast_device(
         total_elems,
         static_cast<const In*>(xs),
         static_cast<Out*>(out));
-    if (cudaGetLastError() != cudaSuccess) return 135;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 136;
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+        return prefill_backend_failure(135, launch_status);
+    }
+    const cudaError_t sync_status = cudaDeviceSynchronize();
+    if (sync_status != cudaSuccess) {
+        return prefill_backend_failure(136, sync_status);
+    }
     return 0;
 }
 
@@ -1977,8 +1996,14 @@ int rms_norm_device(
         static_cast<const T*>(xs),
         static_cast<const T*>(weight),
         static_cast<T*>(out));
-    if (cudaGetLastError() != cudaSuccess) return 71;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 72;
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+        return prefill_backend_failure(71, launch_status);
+    }
+    const cudaError_t sync_status = cudaDeviceSynchronize();
+    if (sync_status != cudaSuccess) {
+        return prefill_backend_failure(72, sync_status);
+    }
     return 0;
 }
 

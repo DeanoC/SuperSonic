@@ -1,0 +1,137 @@
+{
+  "schema": "qwen36-native-int4-known-bytes/v1",
+  "provenance": "Hand-authored ABI fixture; no producer packer generated these values.",
+  "logical_shape": [
+    256,
+    256
+  ],
+  "group_size": 128,
+  "packed": {
+    "row_pattern_hex": "1032547698badcfe",
+    "pattern_repeats_per_row": 16,
+    "row_repeats": 256
+  },
+  "scale_bf16_le_hex": "803f003f0040803e",
+  "zero_bf16_le_hex": "0000004000417041",
+  "expected_bf16_bits_by_tile": [
+    [
+      "0000",
+      "3f80",
+      "4000",
+      "4040",
+      "4080",
+      "40a0",
+      "40c0",
+      "40e0",
+      "4100",
+      "4110",
+      "4120",
+      "4130",
+      "4140",
+      "4150",
+      "4160",
+      "4170"
+    ],
+    [
+      "bf80",
+      "bf00",
+      "0000",
+      "3f00",
+      "3f80",
+      "3fc0",
+      "4000",
+      "4020",
+      "4040",
+      "4060",
+      "4080",
+      "4090",
+      "40a0",
+      "40b0",
+      "40c0",
+      "40d0"
+    ],
+    [
+      "c180",
+      "c160",
+      "c140",
+      "c120",
+      "c100",
+      "c0c0",
+      "c080",
+      "c000",
+      "0000",
+      "4000",
+      "4080",
+      "40c0",
+      "4100",
+      "4120",
+      "4140",
+      "4160"
+    ],
+    [
+      "c070",
+      "c060",
+      "c050",
+      "c040",
+      "c030",
+      "c020",
+      "c010",
+      "c000",
+      "bfe0",
+      "bfc0",
+      "bfa0",
+      "bf80",
+      "bf40",
+      "bf00",
+      "be80",
+      "0000"
+    ]
+  ],
+  "probes": [
+    {
+      "row": 0,
+      "col": 0,
+      "packed_byte": "10",
+      "nibble": 0,
+      "scale_bf16_bits": "3f80",
+      "zero_bf16_bits": "0000",
+      "output_bf16_bits": "0000"
+    },
+    {
+      "row": 127,
+      "col": 127,
+      "packed_byte": "fe",
+      "nibble": 15,
+      "scale_bf16_bits": "3f80",
+      "zero_bf16_bits": "0000",
+      "output_bf16_bits": "4170"
+    },
+    {
+      "row": 0,
+      "col": 128,
+      "packed_byte": "10",
+      "nibble": 0,
+      "scale_bf16_bits": "3f00",
+      "zero_bf16_bits": "4000",
+      "output_bf16_bits": "bf80"
+    },
+    {
+      "row": 128,
+      "col": 0,
+      "packed_byte": "10",
+      "nibble": 0,
+      "scale_bf16_bits": "4000",
+      "zero_bf16_bits": "4100",
+      "output_bf16_bits": "c180"
+    },
+    {
+      "row": 255,
+      "col": 255,
+      "packed_byte": "fe",
+      "nibble": 15,
+      "scale_bf16_bits": "3e80",
+      "zero_bf16_bits": "4170",
+      "output_bf16_bits": "0000"
+    }
+  ]
+}

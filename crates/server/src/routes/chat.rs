@@ -16,7 +16,9 @@ use crate::compat::validate_model;
 use crate::errors::ApiError;
 use crate::generate::{self, GenParams};
 use crate::ids;
-use crate::output::{parse_assistant_output, AssistantOutput};
+use crate::output::{
+    parse_assistant_output_with_context, AssistantOutput, AssistantOutputParseContext,
+};
 use crate::prefix_cache::{self, CacheRequest, CacheRetention};
 use crate::schemas::{
     ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -61,6 +63,11 @@ pub async fn completions(
             },
         )
         .map_err(|e| ApiError::bad_request(format!("chat template render failed: {e}")))?;
+    let output_context = AssistantOutputParseContext::from_rendered_prompt(&prompt_text);
+    let tool_capable = req
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.as_array().is_some_and(|items| !items.is_empty()));
 
     let params = GenParams {
         temperature: req.temperature.unwrap_or(1.0),
@@ -86,7 +93,15 @@ pub async fn completions(
             req.prompt_cache_retention.as_deref(),
         );
         let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
-        let stream = chat_sse_stream(rx, id, created, model, include_usage);
+        let stream = chat_sse_stream(
+            rx,
+            id,
+            created,
+            model,
+            include_usage,
+            output_context,
+            tool_capable,
+        );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
@@ -100,7 +115,7 @@ pub async fn completions(
         );
         let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
         let result = generate::collect(rx).await.map_err(generation_error)?;
-        let parsed = parse_assistant_output(&result.text);
+        let parsed = parse_assistant_output_with_context(&result.text, output_context);
         let resp = ChatCompletionResponse {
             id,
             object: "chat.completion",
@@ -182,6 +197,8 @@ fn chat_sse_stream(
     created: u64,
     model: String,
     include_usage: bool,
+    output_context: AssistantOutputParseContext,
+    tool_capable: bool,
 ) -> impl Stream<Item = sse::SseEvent> {
     let role_chunk = ChatStreamChunk {
         id: id.clone(),
@@ -201,7 +218,15 @@ fn chat_sse_stream(
         usage: None,
     };
     let role_event = sse::json_event(&role_chunk);
-    let body = parsed_chat_events(rx, id.clone(), model.clone(), created, include_usage);
+    let body = parsed_chat_events(
+        rx,
+        id.clone(),
+        model.clone(),
+        created,
+        include_usage,
+        output_context,
+        tool_capable,
+    );
     stream::once(async move { Ok(role_event) }).chain(body)
 }
 
@@ -211,6 +236,8 @@ fn parsed_chat_events(
     model: String,
     created: u64,
     include_usage: bool,
+    output_context: AssistantOutputParseContext,
+    tool_capable: bool,
 ) -> impl Stream<Item = sse::SseEvent> {
     async_stream::stream! {
         let mut raw = String::new();
@@ -220,51 +247,44 @@ fn parsed_chat_events(
             match ev {
                 generate::GenEvent::Token(text) => {
                     raw.push_str(&text);
-                    if has_incomplete_control_block(&raw) {
+                    if has_incomplete_control_block(&raw, output_context) {
                         continue;
                     }
-                    let parsed = parse_assistant_output(&raw);
-                    if let Some(reasoning) = parsed.reasoning_content.as_ref() {
-                        if let Some(delta) = reasoning.strip_prefix(&emitted_reasoning) {
-                            if !delta.is_empty() {
-                                emitted_reasoning = reasoning.clone();
-                                yield Ok(sse::json_event(&chat_chunk(
-                                    &id,
-                                    &model,
-                                    created,
-                                    ChatStreamDelta {
-                                        role: None,
-                                        content: None,
-                                        reasoning_content: Some(delta.to_string()),
-                                        tool_calls: None,
-                                    },
-                                    None,
-                                    None,
-                                )));
-                            }
-                        }
-                    }
-                    if let Some(delta) = parsed.content.strip_prefix(&emitted_content) {
-                        if !delta.is_empty() {
-                            emitted_content = parsed.content.clone();
-                            yield Ok(sse::json_event(&chat_chunk(
-                                &id,
-                                &model,
-                                created,
-                                ChatStreamDelta {
-                                    role: None,
-                                    content: Some(delta.to_string()),
-                                    reasoning_content: None,
-                                    tool_calls: None,
-                                },
-                                None,
-                                None,
-                            )));
-                        }
+                    let parsed = parse_assistant_output_with_context(&raw, output_context);
+                    for delta in output_deltas(
+                        &parsed,
+                        &mut emitted_reasoning,
+                        &mut emitted_content,
+                        !tool_capable,
+                    ) {
+                        yield Ok(sse::json_event(&chat_chunk(
+                            &id,
+                            &model,
+                            created,
+                            delta,
+                            None,
+                            None,
+                        )));
                     }
                 }
                 generate::GenEvent::Done { reason, stats } => {
-                    let parsed = parse_assistant_output(&raw);
+                    let parsed = parse_assistant_output_with_context(&raw, output_context);
+                    let emit_content = parsed.tool_calls.is_none();
+                    for delta in output_deltas(
+                        &parsed,
+                        &mut emitted_reasoning,
+                        &mut emitted_content,
+                        emit_content,
+                    ) {
+                        yield Ok(sse::json_event(&chat_chunk(
+                            &id,
+                            &model,
+                            created,
+                            delta,
+                            None,
+                            None,
+                        )));
+                    }
                     let done_reason = finish_reason(reason.as_str(), &parsed);
                     yield Ok(sse::json_event(&chat_chunk(
                         &id,
@@ -302,6 +322,42 @@ fn parsed_chat_events(
     }
 }
 
+fn output_deltas(
+    parsed: &AssistantOutput,
+    emitted_reasoning: &mut String,
+    emitted_content: &mut String,
+    emit_content: bool,
+) -> Vec<ChatStreamDelta> {
+    let mut deltas = Vec::new();
+    if let Some(reasoning) = parsed.reasoning_content.as_ref() {
+        if let Some(delta) = reasoning.strip_prefix(emitted_reasoning.as_str()) {
+            if !delta.is_empty() {
+                *emitted_reasoning = reasoning.clone();
+                deltas.push(ChatStreamDelta {
+                    role: None,
+                    content: None,
+                    reasoning_content: Some(delta.to_string()),
+                    tool_calls: None,
+                });
+            }
+        }
+    }
+    if emit_content {
+        if let Some(delta) = parsed.content.strip_prefix(emitted_content.as_str()) {
+            if !delta.is_empty() {
+                *emitted_content = parsed.content.clone();
+                deltas.push(ChatStreamDelta {
+                    role: None,
+                    content: Some(delta.to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                });
+            }
+        }
+    }
+    deltas
+}
+
 fn chat_chunk(
     id: &str,
     model: &str,
@@ -333,7 +389,7 @@ fn finish_reason(default: &'static str, parsed: &AssistantOutput) -> &'static st
 }
 
 fn message_content(parsed: &AssistantOutput) -> Option<String> {
-    if parsed.tool_calls.is_some() && parsed.content.trim().is_empty() {
+    if parsed.tool_calls.is_some() {
         None
     } else {
         Some(parsed.content.clone())
@@ -440,9 +496,15 @@ pub(crate) fn apply_response_format_hint(messages: &mut Vec<ChatMessage>, json_o
     messages.insert(0, ChatMessage::text("system", HINT));
 }
 
-pub(crate) fn has_incomplete_control_block(raw: &str) -> bool {
-    (raw.contains("<think>") && !raw.contains("</think>"))
+pub(crate) fn has_incomplete_control_block(
+    raw: &str,
+    output_context: AssistantOutputParseContext,
+) -> bool {
+    output_context.has_incomplete_think(raw)
         || (raw.contains("<tool_call>") && !raw.contains("</tool_call>"))
+        || ["<tool_call>", "</tool_call>"]
+            .iter()
+            .any(|tag| (1..tag.len()).any(|len| raw.ends_with(&tag[..len])))
 }
 
 pub(crate) fn normalize_messages(
@@ -531,6 +593,8 @@ pub(crate) fn content_to_text(value: &Value) -> Result<String, ApiError> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use crate::output::parse_assistant_output;
 
     use super::*;
 
@@ -632,10 +696,23 @@ mod tests {
 
     #[test]
     fn incomplete_think_and_tool_blocks_are_buffered() {
-        assert!(has_incomplete_control_block("<think>\npartial"));
-        assert!(has_incomplete_control_block("x <tool_call>\npartial"));
-        assert!(!has_incomplete_control_block("<think>x</think>\ny"));
-        assert!(!has_incomplete_control_block("<tool_call>x</tool_call>"));
+        let generated = AssistantOutputParseContext::default();
+        let prefilled = AssistantOutputParseContext::from_rendered_prompt("assistant<think>\n");
+        assert!(has_incomplete_control_block("<think>\npartial", generated));
+        assert!(has_incomplete_control_block("partial", prefilled));
+        assert!(has_incomplete_control_block(
+            "x <tool_call>\npartial",
+            generated
+        ));
+        assert!(!has_incomplete_control_block(
+            "<think>x</think>\ny",
+            generated
+        ));
+        assert!(!has_incomplete_control_block("x</think>\ny", prefilled));
+        assert!(!has_incomplete_control_block(
+            "<tool_call>x</tool_call>",
+            generated
+        ));
     }
 
     #[test]
@@ -668,6 +745,25 @@ mod tests {
                 .as_str()
                 .unwrap(),
             "weather"
+        );
+    }
+
+    #[test]
+    fn valid_tool_calls_suppress_assistant_preamble() {
+        let parsed = parse_assistant_output(
+            "I need to call lookup.\n<tool_call><function=lookup></function></tool_call>",
+        );
+        assert!(parsed.tool_calls.is_some());
+        assert_eq!(message_content(&parsed), None);
+    }
+
+    #[test]
+    fn malformed_tool_call_does_not_suppress_text() {
+        let parsed = parse_assistant_output("I need to call lookup.\n<tool_call>incomplete");
+        assert!(parsed.tool_calls.is_none());
+        assert_eq!(
+            message_content(&parsed).as_deref(),
+            Some(parsed.content.as_str())
         );
     }
 }

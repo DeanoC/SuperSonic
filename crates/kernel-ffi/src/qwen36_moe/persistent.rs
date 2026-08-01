@@ -242,7 +242,7 @@ pub fn persistent_decode_launch_range(
         Qwen36MoePersistentMode::LinearStage(_) => "qwen36.persistent_linear_stage_invalid",
     };
     crate::prefill_ffi::ffi_profile_time_result(op, ordinal, || {
-        let status: c_int = match backend {
+        let status: Qwen36BridgeStatus = match backend {
             Backend::Hip | Backend::Cuda => {
                 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
                 unsafe {
@@ -305,12 +305,7 @@ pub fn persistent_decode_launch_range(
                 ));
             }
         };
-        if status != 0 {
-            return Err(GpuError::backend(
-                backend,
-                format!("qwen36_moe persistent decode launch failed with status {status}"),
-            ));
-        }
+        qwen36_bridge_result(backend, "qwen36_moe persistent decode launch", status)?;
         Ok(())
     })
 }

@@ -2,6 +2,9 @@ use serde_json::{Map, Value};
 
 use crate::schemas::{OpenAiFunctionCall, OpenAiToolCall};
 
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
 #[derive(Debug, Clone, Default)]
 pub struct AssistantOutput {
     pub content: String,
@@ -9,8 +12,56 @@ pub struct AssistantOutput {
     pub tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AssistantOutputParseContext {
+    prefilled_think: bool,
+}
+
+impl AssistantOutputParseContext {
+    pub fn from_rendered_prompt(prompt: &str) -> Self {
+        let Some(open) = prompt.rfind(THINK_OPEN) else {
+            return Self::default();
+        };
+        let close = prompt.rfind(THINK_CLOSE);
+        let unmatched = close.is_none_or(|close| open > close)
+            && prompt[open + THINK_OPEN.len()..].trim().is_empty();
+        Self {
+            prefilled_think: unmatched,
+        }
+    }
+
+    pub fn has_incomplete_think(self, raw: &str) -> bool {
+        let mut in_reasoning = self.prefilled_think;
+        let mut rest = raw;
+        loop {
+            match next_think_tag(rest) {
+                Some((offset, ThinkTag::Open)) => {
+                    in_reasoning = true;
+                    rest = &rest[offset + THINK_OPEN.len()..];
+                }
+                Some((offset, ThinkTag::Close)) => {
+                    in_reasoning = false;
+                    rest = &rest[offset + THINK_CLOSE.len()..];
+                }
+                None => {
+                    return in_reasoning
+                        || ends_with_partial_tag(raw, THINK_OPEN)
+                        || ends_with_partial_tag(raw, THINK_CLOSE)
+                }
+            }
+        }
+    }
+}
+
 pub fn parse_assistant_output(raw: &str) -> AssistantOutput {
-    let (without_reasoning, reasoning) = strip_think(raw);
+    parse_assistant_output_with_context(raw, AssistantOutputParseContext::default())
+}
+
+pub fn parse_assistant_output_with_context(
+    raw: &str,
+    context: AssistantOutputParseContext,
+) -> AssistantOutput {
+    let (without_reasoning, reasoning) = strip_think_with_context(raw, context);
     let (content, tool_calls) = extract_tool_calls(&without_reasoning);
     AssistantOutput {
         content: content.trim_start().to_string(),
@@ -20,18 +71,66 @@ pub fn parse_assistant_output(raw: &str) -> AssistantOutput {
 }
 
 pub fn strip_think(raw: &str) -> (String, Option<String>) {
-    let Some(start) = raw.find("<think>") else {
-        return (raw.to_string(), None);
-    };
-    let body_start = start + "<think>".len();
-    let Some(end_rel) = raw[body_start..].find("</think>") else {
-        return (raw.to_string(), None);
-    };
-    let end = body_start + end_rel;
+    strip_think_with_context(raw, AssistantOutputParseContext::default())
+}
+
+fn strip_think_with_context(
+    raw: &str,
+    context: AssistantOutputParseContext,
+) -> (String, Option<String>) {
     let mut visible = String::new();
-    visible.push_str(&raw[..start]);
-    visible.push_str(&raw[end + "</think>".len()..]);
-    (visible, Some(raw[body_start..end].trim().to_string()))
+    let mut reasoning = String::new();
+    let mut in_reasoning = context.prefilled_think;
+    let mut rest = raw;
+
+    loop {
+        let Some((offset, tag)) = next_think_tag(rest) else {
+            if in_reasoning {
+                reasoning.push_str(rest);
+            } else {
+                visible.push_str(rest);
+            }
+            break;
+        };
+        if in_reasoning {
+            reasoning.push_str(&rest[..offset]);
+        } else {
+            visible.push_str(&rest[..offset]);
+        }
+        match tag {
+            ThinkTag::Open => {
+                in_reasoning = true;
+                rest = &rest[offset + THINK_OPEN.len()..];
+            }
+            ThinkTag::Close => {
+                in_reasoning = false;
+                rest = &rest[offset + THINK_CLOSE.len()..];
+            }
+        }
+    }
+
+    let reasoning = reasoning.trim().to_string();
+    (visible, (!reasoning.is_empty()).then_some(reasoning))
+}
+
+#[derive(Clone, Copy)]
+enum ThinkTag {
+    Open,
+    Close,
+}
+
+fn next_think_tag(raw: &str) -> Option<(usize, ThinkTag)> {
+    match (raw.find(THINK_OPEN), raw.find(THINK_CLOSE)) {
+        (Some(open), Some(close)) if open <= close => Some((open, ThinkTag::Open)),
+        (Some(_), Some(close)) => Some((close, ThinkTag::Close)),
+        (Some(open), None) => Some((open, ThinkTag::Open)),
+        (None, Some(close)) => Some((close, ThinkTag::Close)),
+        (None, None) => None,
+    }
+}
+
+fn ends_with_partial_tag(raw: &str, tag: &str) -> bool {
+    (1..tag.len()).any(|prefix_len| raw.ends_with(&tag[..prefix_len]))
 }
 
 fn extract_tool_calls(raw: &str) -> (String, Vec<OpenAiToolCall>) {
@@ -103,6 +202,73 @@ mod tests {
         let out = parse_assistant_output("<think>\nwork\n</think>\n\nanswer");
         assert_eq!(out.reasoning_content.as_deref(), Some("work"));
         assert_eq!(out.content.trim(), "answer");
+    }
+
+    #[test]
+    fn parses_generated_think_block_without_prompt_context() {
+        let out = parse_assistant_output("<think>plan</think>answer");
+        assert_eq!(out.reasoning_content.as_deref(), Some("plan"));
+        assert_eq!(out.content, "answer");
+    }
+
+    #[test]
+    fn parses_prefilled_open_think_from_rendered_prompt() {
+        let context =
+            AssistantOutputParseContext::from_rendered_prompt("<|im_start|>assistant\n<think>\n");
+        let out = parse_assistant_output_with_context("plan</think>answer", context);
+        assert_eq!(out.reasoning_content.as_deref(), Some("plan"));
+        assert_eq!(out.content, "answer");
+    }
+
+    #[test]
+    fn incomplete_prefilled_think_is_reasoning_without_tag_leakage() {
+        let context = AssistantOutputParseContext::from_rendered_prompt("assistant<think>");
+        let out = parse_assistant_output_with_context("unfinished plan", context);
+        assert_eq!(out.reasoning_content.as_deref(), Some("unfinished plan"));
+        assert!(out.content.is_empty());
+        assert!(!format!("{out:?}").contains("<think>"));
+        assert!(context.has_incomplete_think("unfinished plan"));
+    }
+
+    #[test]
+    fn incomplete_generated_think_is_reasoning_without_tag_leakage() {
+        let out = parse_assistant_output("<think>unfinished plan");
+        assert_eq!(out.reasoning_content.as_deref(), Some("unfinished plan"));
+        assert!(out.content.is_empty());
+        assert!(!format!("{out:?}").contains("<think>"));
+    }
+
+    #[test]
+    fn content_after_prefilled_close_stays_visible() {
+        let context = AssistantOutputParseContext::from_rendered_prompt("assistant<think>\n");
+        let out = parse_assistant_output_with_context(
+            "reasoning tokens</think>\n\nvisible answer",
+            context,
+        );
+        assert_eq!(out.reasoning_content.as_deref(), Some("reasoning tokens"));
+        assert_eq!(out.content, "visible answer");
+        assert!(!out.content.contains("</think>"));
+    }
+
+    #[test]
+    fn duplicate_generated_control_tags_never_leak_in_prefilled_mode() {
+        let context = AssistantOutputParseContext::from_rendered_prompt("assistant<think>\n");
+        let out = parse_assistant_output_with_context(
+            "<think>plan</think>answer <think>more</think> done",
+            context,
+        );
+        let serialized = format!("{out:?}");
+        assert!(!serialized.contains("<think>"));
+        assert!(!serialized.contains("</think>"));
+    }
+
+    #[test]
+    fn ordinary_output_remains_non_reasoning() {
+        let context = AssistantOutputParseContext::from_rendered_prompt("<|im_start|>assistant\n");
+        let out = parse_assistant_output_with_context("ordinary answer", context);
+        assert_eq!(out.reasoning_content, None);
+        assert_eq!(out.content, "ordinary answer");
+        assert!(!context.has_incomplete_think("ordinary answer"));
     }
 
     #[test]

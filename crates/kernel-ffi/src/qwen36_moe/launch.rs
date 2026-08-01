@@ -41,6 +41,25 @@ pub fn metal_mps_expert_f16_probe(
 
 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
 extern "C" {
+    /// Pure dispatch-policy probe used to pin the production encoding-aware
+    /// attention/FFN branch selectors without requiring a device launch.
+    pub fn qwen36_moe_hip_int4_dispatch_policy_probe(
+        phase: c_int,
+        encoding: c_int,
+        shape_valid: c_int,
+        wmma_supported: c_int,
+    ) -> c_int;
+
+    /// Pure prelaunch-policy probe for persistent attention modes. Returns
+    /// status 150 when row-group attention cannot use the qualified WMMA path.
+    pub fn qwen36_moe_hip_persistent_int4_prelaunch_status_probe(
+        mode: c_int,
+        full_attention_encoding: c_int,
+        linear_attention_encoding: c_int,
+        shape_valid: c_int,
+        wmma_supported: c_int,
+    ) -> c_int;
+
     /// Stub launch entry. Walks the descriptor array, validates field
     /// integrity by writing recognizable sentinel values into the workspace
     /// at known offsets, grid-barriers between layers, and returns 0 on
@@ -67,7 +86,7 @@ extern "C" {
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Phase 3e: persistent decode megakernel launcher. One cooperative
     /// HIP launch processes all `num_layers` of {attn or linear-attn, FFN}
@@ -149,7 +168,7 @@ extern "C" {
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// PR 4b2 staged single-layer attention parity launcher. Runs the
     /// full-attention path through `stage` (1..=5) and writes the matching
@@ -195,15 +214,7 @@ extern "C" {
         q_norm_w: *const c_void,
         k_norm_w: *const c_void,
         o_proj_w: *const c_void,
-        int4_group_size: c_int,
-        q_proj_scale: *const c_void,
-        q_proj_zero: *const c_void,
-        k_proj_scale: *const c_void,
-        k_proj_zero: *const c_void,
-        v_proj_scale: *const c_void,
-        v_proj_zero: *const c_void,
-        o_proj_scale: *const c_void,
-        o_proj_zero: *const c_void,
+        int4_desc: *const Qwen36MoeInt4ScaleDesc,
         output: *mut c_void,
         workspace: *mut f32,
         kv_cache_k: *mut c_void,
@@ -212,7 +223,7 @@ extern "C" {
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// PR 4b3 staged single-layer linear-attention parity launcher. Same
     /// staged-build-up discipline as `qwen36_moe_hip_attn_step_launch`,
@@ -263,19 +274,13 @@ extern "C" {
         out_proj_w: *const c_void,
         conv_state: *mut c_void,
         recurrent_state: *mut f32,
-        int4_group_size: c_int,
-        in_proj_qkv_scale: *const c_void,
-        in_proj_qkv_zero: *const c_void,
-        in_proj_z_scale: *const c_void,
-        in_proj_z_zero: *const c_void,
-        out_proj_scale: *const c_void,
-        out_proj_zero: *const c_void,
+        int4_desc: *const Qwen36MoeInt4ScaleDesc,
         output: *mut c_void,
         workspace: *mut f32,
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// PR 4b4 staged single-block MoE FFN parity launcher. Same staged-build-up
     /// discipline as `qwen36_moe_hip_attn_step_launch` and
@@ -332,7 +337,32 @@ extern "C" {
         gsz: c_int,
         dq_8_out: *mut f32,
         dq_scalar_out: *mut f32,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
+
+    /// Task 8 descriptor-driven scalar/8-wide dequant test surface. This is
+    /// deliberately separate from production chained and persistent decode.
+    pub fn qwen36_moe_hip_int4_descriptor_dequant_smoke_launch(
+        device_ordinal: usize,
+        packed: *const u8,
+        desc: *const Qwen36MoeInt4WeightDesc,
+        experts: c_int,
+        out_rows: c_int,
+        in_cols: c_int,
+        dq_8_out: *mut f32,
+        dq_scalar_out: *mut f32,
+    ) -> Qwen36BridgeStatus;
+
+    /// Task 8 gfx11-only descriptor-driven scalar/WMMA parity surface.
+    pub fn qwen36_moe_hip_int4_descriptor_wmma_parity_launch(
+        device_ordinal: usize,
+        packed: *const u8,
+        desc: *const Qwen36MoeInt4WeightDesc,
+        activation: *const c_void,
+        out_rows: c_int,
+        in_cols: c_int,
+        scalar_out: *mut f32,
+        wmma_out: *mut f32,
+    ) -> Qwen36BridgeStatus;
 
     pub fn qwen36_moe_hip_ffn_step_launch(
         dtype: c_int,
@@ -353,24 +383,14 @@ extern "C" {
         shared_up_proj_w: *const c_void,
         shared_down_proj_w: *const c_void,
         shared_expert_gate_w: *const c_void,
-        int4_group_size: c_int,
-        gate_up_proj_scale: *const c_void,
-        gate_up_proj_zero: *const c_void,
-        down_proj_scale: *const c_void,
-        down_proj_zero: *const c_void,
-        shared_gate_proj_scale: *const c_void,
-        shared_gate_proj_zero: *const c_void,
-        shared_up_proj_scale: *const c_void,
-        shared_up_proj_zero: *const c_void,
-        shared_down_proj_scale: *const c_void,
-        shared_down_proj_zero: *const c_void,
+        int4_desc: *const Qwen36MoeInt4ScaleDesc,
         output: *mut c_void,
         output_idx: *mut c_int,
         workspace: *mut f32,
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Final RMSNorm + lm_head GEMV in a single kernel — replaces the
     /// host-side `host_final_norm_lm_head_f32` for qwen3.6-MoE.
@@ -403,7 +423,7 @@ extern "C" {
         // recurrent feed; null = base-decode behavior unchanged.
         x_normed_out: *mut c_void,
         counter: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// FFI bridge for the batched lm_head WMMA kernel (Phase 6.4a). Wraps
     /// `qwen36_moe_lm_head_batched_wmma_kernel`. `m` is the runtime batch
@@ -425,7 +445,7 @@ extern "C" {
         lm_head_w: *const c_void,
         logits: *mut c_void,
         x_normed_out: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// FFI bridge for the MTP pre-fusion kernel (Phase 6.2c.1). Single-block
     /// launch: BF16 RMSNorms over `e_in` and `h_base` followed by a
@@ -446,7 +466,7 @@ extern "C" {
         e_norm_out: *mut c_void,
         h_norm_out: *mut c_void,
         fused_out: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Stage A (M3) batched-Q full-attention prefill kernel. Standalone
     /// attention math: Q/K/V are pre-projected and pre-RoPE'd by the
@@ -484,7 +504,7 @@ extern "C" {
         key: *const c_void,
         value: *const c_void,
         out: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Stage B (M9) router permutation kernel. Groups per-token top-K expert
     /// assignments by target expert (counting-sort, single block).
@@ -520,7 +540,7 @@ extern "C" {
         permuted_token_idx: *mut c_void,
         permuted_kpos: *mut c_void,
         permuted_weight: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Stage B (M10) grouped-expert INT4 GEMM kernel. One launch processes
     /// ALL `num_experts` experts via persistent-block work-stealing on the
@@ -533,8 +553,10 @@ extern "C" {
     ///                            hidden states; gathered by `permuted_token_idx`.
     /// - `expert_offsets`      : `[num_experts + 1]` i32 — M9 prefix sum.
     /// - `permuted_token_idx`  : `[n_tokens * top_k]` i32 — M9 sort output.
-    /// - `experts_gate_up_w/s/z` : `[E, 2*I, hidden/2]` u8 + `[E, 2*I/gs, hidden/gs]` BF16.
-    /// - `experts_down_w/s/z`    : `[E, hidden, I/2]` u8 + `[E, hidden/gs, I/gs]` BF16.
+    /// - `experts_gate_up_w` + descriptor: `[E, 2*I, hidden/2]` packed INT4
+    ///   with descriptor-owned scale/zero geometry.
+    /// - `experts_down_w` + descriptor: `[E, hidden, I/2]` packed INT4 with
+    ///   descriptor-owned scale/zero geometry.
     ///
     /// Caller-owned buffers:
     /// - `expert_out` : `[n_tokens * top_k, hidden]` BF16 — per-permuted-row
@@ -545,8 +567,8 @@ extern "C" {
     /// Status codes (non-zero = failure):
     ///   150 invalid args (zero/negative dims)
     ///   151 num_experts > 256
-    ///   152 hidden / moe_intermediate not divisible by group_size (or 16)
-    ///   153 group_size != 128
+    ///   152 hidden / moe_intermediate not divisible by 16
+    ///   153 missing or invalid INT4 descriptor
     ///   154 top_k * n_tokens > 16384
     ///   155 dtype != bf16
     ///   156 LDS overflow
@@ -559,19 +581,16 @@ extern "C" {
         num_experts: c_int,
         hidden: c_int,
         moe_intermediate: c_int,
-        group_size: c_int,
         x_norm: *const c_void,
         expert_offsets: *const c_void,
         permuted_token_idx: *const c_void,
         experts_gate_up_w: *const c_void,
-        experts_gate_up_scale: *const c_void,
-        experts_gate_up_zero: *const c_void,
+        experts_gate_up_desc: *const Qwen36MoeInt4WeightDesc,
         experts_down_w: *const c_void,
-        experts_down_scale: *const c_void,
-        experts_down_zero: *const c_void,
+        experts_down_desc: *const Qwen36MoeInt4WeightDesc,
         expert_out: *mut c_void,
         counters: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Stage B (M11) unpermute + weighted combine kernel. Inverts the M9
     /// router permutation (host-built `permuted_inverse` table) and computes
@@ -606,7 +625,424 @@ extern "C" {
         permuted_weight: *const c_void,
         expert_out: *const c_void,
         combined: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
+}
+
+fn validate_buffer_for_backend_descriptor_launch(
+    operation: &str,
+    name: &str,
+    backend: Backend,
+    ordinal: usize,
+    buffer: &GpuBuffer,
+    dtype: ScalarType,
+) -> Result<(), GpuError> {
+    if !matches!(backend, Backend::Hip | Backend::Cuda) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: descriptor launch requires HIP or CUDA backend"
+        )));
+    }
+    if buffer.backend() != backend {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: {name} must use the same {backend} backend as the launch"
+        )));
+    }
+    if buffer.device_ordinal() != ordinal {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: {name} device ordinal {} does not match launch ordinal {ordinal}",
+            buffer.device_ordinal()
+        )));
+    }
+    if buffer.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: {name} must be {dtype:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_buffer_for_descriptor_launch(
+    operation: &str,
+    name: &str,
+    ordinal: usize,
+    buffer: &GpuBuffer,
+    dtype: ScalarType,
+) -> Result<(), GpuError> {
+    validate_buffer_for_backend_descriptor_launch(
+        operation,
+        name,
+        Backend::Hip,
+        ordinal,
+        buffer,
+        dtype,
+    )
+}
+
+fn validate_descriptor_int4_common_for_backend(
+    operation: &str,
+    backend: Backend,
+    ordinal: usize,
+    packed: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: Option<&GpuBuffer>,
+    desc: &Qwen36MoeInt4WeightDesc,
+    experts: i32,
+    out_rows: i32,
+    in_cols: i32,
+) -> Result<usize, GpuError> {
+    fn validate_bf16_sidecar(
+        operation: &str,
+        name: &str,
+        backend: Backend,
+        ordinal: usize,
+        sidecar: &GpuBuffer,
+        required_elements: u64,
+    ) -> Result<(), GpuError> {
+        validate_buffer_for_backend_descriptor_launch(
+            operation,
+            name,
+            backend,
+            ordinal,
+            sidecar,
+            ScalarType::BF16,
+        )?;
+        let element_bytes = std::mem::size_of::<u16>();
+        let shape_bytes = sidecar
+            .elem_count()
+            .checked_mul(element_bytes)
+            .ok_or_else(|| {
+                GpuError::InvalidArg(format!(
+                    "qwen36_moe::{operation}: {name} BF16 byte shape overflows"
+                ))
+            })?;
+        if sidecar.len_bytes() != shape_bytes
+            || sidecar.len_bytes() % element_bytes != 0
+            || (sidecar.as_ptr() as usize) % std::mem::align_of::<u16>() != 0
+        {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::{operation}: {name} has invalid BF16 byte shape or alignment"
+            )));
+        }
+        let required_bytes = usize::try_from(required_elements)
+            .ok()
+            .and_then(|elements| elements.checked_mul(element_bytes))
+            .ok_or_else(|| {
+                GpuError::InvalidArg(format!(
+                    "qwen36_moe::{operation}: {name} required byte extent overflows"
+                ))
+            })?;
+        if sidecar.len_bytes() < required_bytes {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::{operation}: {name} sidecar is shorter than descriptor extent"
+            )));
+        }
+        Ok(())
+    }
+
+    validate_buffer_for_backend_descriptor_launch(
+        operation,
+        "packed weights",
+        backend,
+        ordinal,
+        packed,
+        ScalarType::U8,
+    )?;
+    if desc.scale != scale.as_ptr() {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: descriptor scale pointer does not match borrowed scale buffer"
+        )));
+    }
+    if experts <= 0 || out_rows <= 0 || in_cols <= 0 || in_cols % 8 != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: positive dimensions and in_cols divisible by 8 required"
+        )));
+    }
+    if desc.encoding == 3 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: encoding 3 is FP8, not INT4"
+        )));
+    }
+    if !matches!(desc.encoding, 1 | 2) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: unsupported INT4 encoding {}",
+            desc.encoding
+        )));
+    }
+    if desc.scale.is_null()
+        || desc.input_group_size <= 0
+        || desc.output_group_size <= 0
+        || in_cols % desc.input_group_size != 0
+        || out_rows % desc.output_group_size != 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: malformed descriptor group geometry"
+        )));
+    }
+    if desc.encoding == 1
+        && (desc.implicit_zero_code >= 0
+            || desc.input_group_size != 128
+            || desc.output_group_size != 128)
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: tile-v1 encoding 1 requires explicit zero values"
+        )));
+    }
+    let explicit_zero = if desc.encoding == 1 {
+        let zero = zero.ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "qwen36_moe::{operation}: tile-v1 encoding 1 requires a borrowed zero buffer"
+            ))
+        })?;
+        if desc.zero != zero.as_ptr() {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::{operation}: descriptor zero pointer does not match borrowed zero buffer"
+            )));
+        }
+        Some(zero)
+    } else {
+        None
+    };
+    if desc.encoding == 2
+        && (!desc.zero.is_null()
+            || zero.is_some()
+            || desc.input_group_size != 32
+            || desc.output_group_size != 1
+            || desc.implicit_zero_code != 8)
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: row-group encoding 2 requires G32, output group 1, implicit zero 8, and no zero buffer"
+        )));
+    }
+    let logical_row_bytes = (in_cols / 2) as u64;
+    let logical_scale_row = (in_cols / desc.input_group_size) as u64;
+    if desc.packed_row_stride_bytes < logical_row_bytes
+        || desc.scale_row_stride_elements < logical_scale_row
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: descriptor row stride is shorter than its logical row"
+        )));
+    }
+    let packed_per_expert = (out_rows as u64 - 1)
+        .checked_mul(desc.packed_row_stride_bytes)
+        .and_then(|offset| offset.checked_add(logical_row_bytes))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!("qwen36_moe::{operation}: packed extent overflows"))
+        })?;
+    if experts > 1 && desc.packed_expert_stride_bytes < packed_per_expert {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: packed expert stride is too short"
+        )));
+    }
+    let scale_rows = (out_rows / desc.output_group_size) as u64;
+    let scale_per_expert = (scale_rows - 1)
+        .checked_mul(desc.scale_row_stride_elements)
+        .and_then(|offset| offset.checked_add(logical_scale_row))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!("qwen36_moe::{operation}: scale extent overflows"))
+        })?;
+    if experts > 1 && desc.scale_expert_stride_elements < scale_per_expert {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: scale expert stride is too short"
+        )));
+    }
+    let scale_extent = (experts as u64 - 1)
+        .checked_mul(desc.scale_expert_stride_elements)
+        .and_then(|offset| offset.checked_add(scale_per_expert))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!("qwen36_moe::{operation}: scale extent overflows"))
+        })?;
+    validate_bf16_sidecar(operation, "scale", backend, ordinal, scale, scale_extent)?;
+    if let Some(zero) = explicit_zero {
+        validate_bf16_sidecar(operation, "zero", backend, ordinal, zero, scale_extent)?;
+    }
+    let packed_extent = (experts as u64 - 1)
+        .checked_mul(desc.packed_expert_stride_bytes)
+        .and_then(|offset| offset.checked_add(packed_per_expert))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!("qwen36_moe::{operation}: packed extent overflows"))
+        })?;
+    if packed_extent > packed.len_bytes() as u64 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::{operation}: packed buffer is shorter than descriptor extent"
+        )));
+    }
+    (experts as usize)
+        .checked_mul(out_rows as usize)
+        .and_then(|count| count.checked_mul(in_cols as usize))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!("qwen36_moe::{operation}: output extent overflows"))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_descriptor_int4_common(
+    operation: &str,
+    ordinal: usize,
+    packed: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: Option<&GpuBuffer>,
+    desc: &Qwen36MoeInt4WeightDesc,
+    experts: i32,
+    out_rows: i32,
+    in_cols: i32,
+) -> Result<usize, GpuError> {
+    validate_descriptor_int4_common_for_backend(
+        operation,
+        Backend::Hip,
+        ordinal,
+        packed,
+        scale,
+        zero,
+        desc,
+        experts,
+        out_rows,
+        in_cols,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn int4_descriptor_dequant_smoke_launch(
+    ordinal: usize,
+    packed: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: Option<&GpuBuffer>,
+    desc: &Qwen36MoeInt4WeightDesc,
+    experts: i32,
+    out_rows: i32,
+    in_cols: i32,
+    dq_8_out: &mut GpuBuffer,
+    dq_scalar_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let output_count = validate_descriptor_int4_common(
+        "int4_descriptor_dequant_smoke_launch",
+        ordinal,
+        packed,
+        scale,
+        zero,
+        desc,
+        experts,
+        out_rows,
+        in_cols,
+    )?;
+    for output in [&*dq_8_out, &*dq_scalar_out] {
+        validate_buffer_for_descriptor_launch(
+            "int4_descriptor_dequant_smoke_launch",
+            "dequant output",
+            ordinal,
+            output,
+            ScalarType::F32,
+        )?;
+        if output.elem_count() < output_count {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::int4_descriptor_dequant_smoke_launch: F32 HIP outputs are too short"
+                    .into(),
+            ));
+        }
+    }
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    let status = unsafe {
+        qwen36_moe_hip_int4_descriptor_dequant_smoke_launch(
+            ordinal,
+            packed.as_ptr() as *const u8,
+            desc,
+            experts,
+            out_rows,
+            in_cols,
+            dq_8_out.as_mut_ptr() as *mut f32,
+            dq_scalar_out.as_mut_ptr() as *mut f32,
+        )
+    };
+    #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
+    return Err(GpuError::InvalidArg(
+        "qwen36_moe::int4_descriptor_dequant_smoke_launch: HIP backend not compiled".into(),
+    ));
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    qwen36_bridge_result(
+        Backend::Hip,
+        "qwen36_moe int4 descriptor dequant smoke launch",
+        status,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn int4_descriptor_wmma_parity_launch(
+    ordinal: usize,
+    packed: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: Option<&GpuBuffer>,
+    desc: &Qwen36MoeInt4WeightDesc,
+    activation: &GpuBuffer,
+    out_rows: i32,
+    in_cols: i32,
+    scalar_out: &mut GpuBuffer,
+    wmma_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let output_count = validate_descriptor_int4_common(
+        "int4_descriptor_wmma_parity_launch",
+        ordinal,
+        packed,
+        scale,
+        zero,
+        desc,
+        1,
+        out_rows,
+        in_cols,
+    )?;
+    if out_rows != 32 || in_cols != 128 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::int4_descriptor_wmma_parity_launch: fixture must be [32, 128]".into(),
+        ));
+    }
+    validate_buffer_for_descriptor_launch(
+        "int4_descriptor_wmma_parity_launch",
+        "activation",
+        ordinal,
+        activation,
+        ScalarType::BF16,
+    )?;
+    if activation.elem_count() < in_cols as usize {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::int4_descriptor_wmma_parity_launch: BF16 HIP activation is too short"
+                .into(),
+        ));
+    }
+    for output in [&*scalar_out, &*wmma_out] {
+        validate_buffer_for_descriptor_launch(
+            "int4_descriptor_wmma_parity_launch",
+            "matvec output",
+            ordinal,
+            output,
+            ScalarType::F32,
+        )?;
+        if output.elem_count() < output_count / in_cols as usize {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::int4_descriptor_wmma_parity_launch: F32 HIP outputs are too short"
+                    .into(),
+            ));
+        }
+    }
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    let status = unsafe {
+        qwen36_moe_hip_int4_descriptor_wmma_parity_launch(
+            ordinal,
+            packed.as_ptr() as *const u8,
+            desc,
+            activation.as_ptr(),
+            out_rows,
+            in_cols,
+            scalar_out.as_mut_ptr() as *mut f32,
+            wmma_out.as_mut_ptr() as *mut f32,
+        )
+    };
+    #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
+    return Err(GpuError::InvalidArg(
+        "qwen36_moe::int4_descriptor_wmma_parity_launch: HIP backend not compiled".into(),
+    ));
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    qwen36_bridge_result(
+        Backend::Hip,
+        "qwen36_moe int4 descriptor WMMA parity launch",
+        status,
+    )
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -642,7 +1078,7 @@ pub fn stub_launch(
     let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -670,11 +1106,6 @@ pub fn stub_launch(
             ));
         }
     };
-    if status != 0 {
-        return Err(GpuError::backend(
-            backend,
-            format!("qwen36_moe stub launch failed with status {status}"),
-        ));
-    }
+    qwen36_bridge_result(backend, "qwen36_moe stub launch", status)?;
     Ok(())
 }

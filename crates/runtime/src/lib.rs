@@ -11,6 +11,8 @@ pub(crate) mod builders;
 pub mod chat_template;
 pub mod decode_engine;
 pub mod dflash;
+pub mod flm_model_source;
+pub mod flm_tokenizer;
 pub mod gemma4_engine;
 pub mod gemma4_int4_engine;
 pub mod generate;

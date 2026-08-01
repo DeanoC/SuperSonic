@@ -13,7 +13,7 @@
 //! Skipped silently when HIP backend isn't compiled.
 
 use gpu_hal::{Backend, GpuBuffer, ScalarType};
-use kernel_ffi::qwen36_moe::batched_prefill_attn_full_launch;
+use supersonic_runtime::qwen36_moe::prefill::batched_prefill_attn_full_launch;
 
 fn upload_bf16(ordinal: usize, host: &[half::bf16], shape: &[usize]) -> GpuBuffer {
     assert_eq!(host.len(), shape.iter().product::<usize>());

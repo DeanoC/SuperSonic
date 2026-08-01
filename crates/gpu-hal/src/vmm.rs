@@ -7,6 +7,8 @@ use std::ptr::NonNull;
 use crate::backend::{current_backend, Backend};
 #[cfg(supersonic_backend_cuda)]
 use crate::cuda_sys::*;
+#[cfg(supersonic_backend_cuda)]
+use crate::error::backend_driver_error;
 use crate::error::{backend_error, GpuError, Result};
 #[cfg(supersonic_backend_hip)]
 use crate::hip_sys::*;
@@ -277,7 +279,11 @@ impl Drop for VirtualBuffer {
                             cuMemAddressFree(self.ptr.as_ptr() as CuDevicePtr, self.reserved_bytes)
                         };
                         if status != 0 {
-                            return Err(backend_error(Backend::Cuda, "cuMemAddressFree", status));
+                            return Err(backend_driver_error(
+                                Backend::Cuda,
+                                "cuMemAddressFree",
+                                status,
+                            ));
                         }
                         Ok(())
                     });
@@ -1005,7 +1011,7 @@ fn vmm_granularity(backend: Backend, ordinal: usize) -> Result<usize> {
                     )
                 };
                 if status != 0 {
-                    return Err(backend_error(
+                    return Err(backend_driver_error(
                         Backend::Cuda,
                         "cuMemGetAllocationGranularity",
                         status,
@@ -1060,7 +1066,11 @@ fn reserve_address_range(
                 let mut ptr = 0u64;
                 let status = unsafe { cuMemAddressReserve(&mut ptr, len, alignment, 0, 0) };
                 if status != 0 {
-                    return Err(backend_error(Backend::Cuda, "cuMemAddressReserve", status));
+                    return Err(backend_driver_error(
+                        Backend::Cuda,
+                        "cuMemAddressReserve",
+                        status,
+                    ));
                 }
                 NonNull::new(ptr as *mut c_void).ok_or_else(|| {
                     GpuError::backend(Backend::Cuda, "cuMemAddressReserve returned null".into())
@@ -1139,13 +1149,13 @@ fn map_physical(
                 let mut handle = 0u64;
                 let status = unsafe { cuMemCreate(&mut handle, len, &prop, 0) };
                 if status != 0 {
-                    return Err(backend_error(Backend::Cuda, "cuMemCreate", status));
+                    return Err(backend_driver_error(Backend::Cuda, "cuMemCreate", status));
                 }
                 let ptr = base.as_ptr() as CuDevicePtr + offset as u64;
                 let status = unsafe { cuMemMap(ptr, len, 0, handle, 0) };
                 if status != 0 {
                     let _ = unsafe { cuMemRelease(handle) };
-                    return Err(backend_error(Backend::Cuda, "cuMemMap", status));
+                    return Err(backend_driver_error(Backend::Cuda, "cuMemMap", status));
                 }
                 let access = CuMemAccessDesc {
                     location: CuMemLocation {
@@ -1159,12 +1169,16 @@ fn map_physical(
                 if status != 0 {
                     let _ = unsafe { cuMemUnmap(ptr, len) };
                     let _ = unsafe { cuMemRelease(handle) };
-                    return Err(backend_error(Backend::Cuda, "cuMemSetAccess", status));
+                    return Err(backend_driver_error(
+                        Backend::Cuda,
+                        "cuMemSetAccess",
+                        status,
+                    ));
                 }
                 let status = unsafe { cuMemRelease(handle) };
                 if status != 0 {
                     let _ = unsafe { cuMemUnmap(ptr, len) };
-                    return Err(backend_error(Backend::Cuda, "cuMemRelease", status));
+                    return Err(backend_driver_error(Backend::Cuda, "cuMemRelease", status));
                 }
                 Ok(Mapping {
                     offset,
@@ -1210,12 +1224,12 @@ fn unmap_and_release(
             let ptr = base.as_ptr() as CuDevicePtr + mapping.offset as u64;
             let status = unsafe { cuMemUnmap(ptr, mapping.len) };
             if status != 0 {
-                return Err(backend_error(Backend::Cuda, "cuMemUnmap", status));
+                return Err(backend_driver_error(Backend::Cuda, "cuMemUnmap", status));
             }
             if let Some(handle) = handle {
                 let status = unsafe { cuMemRelease(handle) };
                 if status != 0 {
-                    return Err(backend_error(Backend::Cuda, "cuMemRelease", status));
+                    return Err(backend_driver_error(Backend::Cuda, "cuMemRelease", status));
                 }
             }
             ops::sync(ordinal)?;
@@ -1231,12 +1245,12 @@ fn unmap_and_release(
 fn ensure_cuda_driver(ordinal: usize) -> Result<CuDevice> {
     let status = unsafe { cuInit(0) };
     if status != 0 {
-        return Err(backend_error(Backend::Cuda, "cuInit", status));
+        return Err(backend_driver_error(Backend::Cuda, "cuInit", status));
     }
     let mut device = 0;
     let status = unsafe { cuDeviceGet(&mut device, ordinal as c_int) };
     if status != 0 {
-        return Err(backend_error(Backend::Cuda, "cuDeviceGet", status));
+        return Err(backend_driver_error(Backend::Cuda, "cuDeviceGet", status));
     }
     Ok(device)
 }

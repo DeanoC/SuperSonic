@@ -3,20 +3,19 @@
 //! Loads the multi-layer Python oracle's JSON payload (produced by
 //! `oracle/qwen36_moe_multilayer_oracle.py`), uploads each layer's BF16
 //! weights + initial linear-attn state to the GPU, runs the chained decode
-//! via [`runner::qwen36_moe_decode::run_chained_decode`], applies the host-
-//! side final RMSnorm + lm_head, and compares against the oracle's
-//! `intermediates_per_layer` + `final_hidden` + `logits` (cos_sim ≥ 0.999
-//! per the PR 4c acceptance criteria; same ≤0.05 max-abs envelope as the
-//! per-block tests).
+//! via [`supersonic_runtime::qwen36_moe::decode::run_chained_decode`], applies
+//! the host-side final RMSnorm + lm_head, and compares against the oracle's
+//! `intermediates_per_layer` + `final_hidden` + `logits`. Local kernel
+//! stages retain their per-block envelopes. Chained handoffs use frozen
+//! per-layer cumulative budgets, and final logits retain cos_sim ≥ 0.999.
 //!
-//! Skipped silently when `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON` isn't
-//! set so CI / non-HIP machines stay green. To run locally:
+//! The qualification fixture is tracked at
+//! `oracle/fixtures/qwen36_moe_multilayer_row_group_g32_v2.json` and is mandatory.
+//! `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON` may override it for diagnostic
+//! runs, but the normal qualification command needs no environment variable:
 //!
 //! ```bash
-//! ~/venvs/rocm/bin/python oracle/qwen36_moe_multilayer_oracle.py \
-//!     --mode synthetic --num-layers 4 --out /tmp/qwen36_ml.json
-//! SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml.json \
-//!   cargo test --release -p runner --test qwen36_moe_multilayer_parity \
+//! cargo test --release -p runner --test qwen36_moe_multilayer_parity \
 //!     -- --nocapture
 //! ```
 //!
@@ -29,16 +28,156 @@
 //! so this file always builds and skips cleanly when HIP isn't available.
 
 use base64::Engine;
-use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
-use runner::qwen36_moe_decode::run_chained_decode;
-use runner::qwen36_moe_logits::{bf16_bytes_to_f32, host_final_norm_lm_head};
-use runner::qwen36_moe_persistent_decode::PersistentScratch;
-use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
-use runner::qwen36_moe_types::{
-    is_full_attn_layer, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
-    LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
+use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
+use half::bf16;
+use kernel_ffi::qwen36_moe::{
+    ffn_step_launch, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
+    Qwen36MoeInt4WeightDesc,
 };
+use model_store::store::{Int4StorageKind, Int4StorageView};
+use runner::qwen36_moe_logits::{bf16_bytes_to_f32, host_final_norm_lm_head};
+use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
 use serde_json::Value;
+use std::ffi::c_void;
+use std::path::PathBuf;
+use supersonic_runtime::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
+use supersonic_runtime::qwen36_moe::decode::{
+    ffn_output_elems, ffn_workspace_floats, run_chained_decode, Qwen36ExecutionOptions,
+};
+use supersonic_runtime::qwen36_moe::layer_loader::Qwen36WeightMode;
+use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
+use supersonic_runtime::qwen36_moe::persistent_decode::{build_int4_descs, build_int4_weight_desc};
+use supersonic_runtime::qwen36_moe::persistent_decode::{LmHeadFold, CACHE_POS_INHERIT};
+use supersonic_runtime::qwen36_moe::types::{
+    is_full_attn_layer, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
+    LayerBuffers, LinearAttnInt4Sidecars, LoadedInt4Sidecar, MultiLayerGeom, PositionPair,
+    ResidentWeight,
+};
+
+const TRACKED_MULTILAYER_ORACLE: &str =
+    "../../oracle/fixtures/qwen36_moe_multilayer_row_group_g32_v2.json";
+const TILE_V1_MULTILAYER_ORACLE: &str = "../../oracle/fixtures/qwen36_moe_multilayer_int4_v1.json";
+
+#[derive(Clone, Copy, Debug)]
+struct NumericalBudget {
+    max_abs: f32,
+    cosine_floor: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HandoffBoundary {
+    Attention,
+    Ffn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Int4FixtureLayout {
+    TileV1G128,
+    RowGroupG32,
+}
+
+fn fixture_int4_layout(json: &Value) -> Option<Int4FixtureLayout> {
+    let schema = json["schema"].as_str().unwrap_or("");
+    let layout = match schema {
+        "qwen36-moe-oracle-multilayer-v1" => return None,
+        "qwen36-moe-oracle-multilayer-int4-v1" => Int4FixtureLayout::TileV1G128,
+        "qwen36-moe-oracle-multilayer-row-group-int4-v2" => {
+            assert_eq!(json["fixture_id"], "qwen36-moe-multilayer-row-group-g32-v2");
+            Int4FixtureLayout::RowGroupG32
+        }
+        other => panic!("unsupported multi-layer schema: {other}"),
+    };
+    let expected_group = match layout {
+        Int4FixtureLayout::TileV1G128 => 128,
+        Int4FixtureLayout::RowGroupG32 => 32,
+    };
+    assert_eq!(json["config"]["int4_group_size"], expected_group);
+    match layout {
+        Int4FixtureLayout::TileV1G128 => {
+            assert!(json["config"].get("int4_layout").is_none());
+            assert!(json.get("fixture_id").is_none());
+        }
+        Int4FixtureLayout::RowGroupG32 => {
+            assert_eq!(json["config"]["int4_layout"], "row_group");
+        }
+    }
+    for layer in json["int4_weights_per_layer"].as_array().unwrap() {
+        for block in ["attn", "ffn"] {
+            for (projection, sidecar) in layer[block].as_object().unwrap() {
+                let has_zero = sidecar.get("zero").and_then(Value::as_str).is_some();
+                assert_eq!(
+                    has_zero,
+                    layout == Int4FixtureLayout::TileV1G128,
+                    "{schema} {block}.{projection} zero-plane contract"
+                );
+            }
+        }
+    }
+    Some(layout)
+}
+
+// Candidate-independent cumulative budgets frozen from the accepted Round 3
+// qualification run. Maxima were rounded outward to nearby binary fractions
+// and cosine floors downward. They are constants rather than values derived
+// from the candidate under test, so additional accumulation still fails at
+// the first material handoff where it exceeds the observed envelope.
+//
+// Observed attention max_abs:
+//   [0.0234375, 0.15625, 0.2578125, 0.40625]
+// Observed FFN max_abs:
+//   [0.109375, 0.23828125, 0.4375, 0.4765625]
+const ATTENTION_HANDOFF_BUDGETS: [NumericalBudget; 4] = [
+    NumericalBudget {
+        max_abs: 0.03125,
+        cosine_floor: 0.9999,
+    },
+    NumericalBudget {
+        max_abs: 0.1875,
+        cosine_floor: 0.99975,
+    },
+    NumericalBudget {
+        max_abs: 0.3125,
+        cosine_floor: 0.9996,
+    },
+    NumericalBudget {
+        max_abs: 0.4375,
+        cosine_floor: 0.99945,
+    },
+];
+const FFN_HANDOFF_BUDGETS: [NumericalBudget; 4] = [
+    NumericalBudget {
+        max_abs: 0.125,
+        cosine_floor: 0.9998,
+    },
+    NumericalBudget {
+        max_abs: 0.25,
+        cosine_floor: 0.9997,
+    },
+    NumericalBudget {
+        max_abs: 0.5,
+        cosine_floor: 0.9995,
+    },
+    NumericalBudget {
+        max_abs: 0.5,
+        cosine_floor: 0.9994,
+    },
+];
+const EXACT_INPUT_LOGITS_BUDGET: NumericalBudget = NumericalBudget {
+    max_abs: 0.0625,
+    cosine_floor: 0.999,
+};
+const CHAINED_LOGITS_BUDGET: NumericalBudget = NumericalBudget {
+    max_abs: 0.25,
+    cosine_floor: 0.999,
+};
+
+fn tracked_multilayer_oracle_path() -> PathBuf {
+    std::env::var_os("SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TRACKED_MULTILAYER_ORACLE)
+        })
+}
 
 fn b64(input: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
@@ -96,9 +235,9 @@ fn upload_u8(ordinal: usize, shape: &[usize], bytes: &[u8], label: &str) -> GpuB
         .unwrap_or_else(|e| panic!("upload {label}: {e}"))
 }
 
-/// Helper: pull (packed_u8, scale_bf16, zero_bf16) byte streams for one
+/// Helper: pull (packed_u8, scale_bf16, optional zero_bf16) byte streams for one
 /// INT4-quantized tensor out of `int4_weights_per_layer[li].{attn|ffn}.<name>`.
-fn decode_int4_sidecar(block: &Value, name: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+fn decode_int4_sidecar(block: &Value, name: &str) -> (Vec<u8>, Vec<u8>, Option<Vec<u8>>) {
     let blk = &block[name];
     let packed = b64(blk["packed"]
         .as_str()
@@ -106,10 +245,69 @@ fn decode_int4_sidecar(block: &Value, name: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>)
     let scale = b64(blk["scale"]
         .as_str()
         .unwrap_or_else(|| panic!("missing int4 {name}.scale")));
-    let zero = b64(blk["zero"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing int4 {name}.zero")));
+    let zero = blk.get("zero").and_then(Value::as_str).map(b64);
     (packed, scale, zero)
+}
+
+fn fixture_int4_sidecar(
+    ordinal: usize,
+    name: &str,
+    logical_shape: &[usize],
+    group_size: usize,
+    scale: &[u8],
+    zero: Option<&[u8]>,
+    layout: Int4FixtureLayout,
+) -> LoadedInt4Sidecar {
+    let out_rows = logical_shape[logical_shape.len() - 2];
+    let in_cols = logical_shape[logical_shape.len() - 1];
+    let packed_row_stride_bytes = in_cols / 2;
+    let scale_row_stride_elements = in_cols / group_size;
+    let (kind, zero, zero_tensor, output_group_size, implicit_zero_code) = match layout {
+        Int4FixtureLayout::TileV1G128 => {
+            assert_eq!(group_size, 128, "tile-v1 fixture must use G128");
+            let zero = zero.unwrap_or_else(|| panic!("tile-v1 fixture {name} requires zero"));
+            (
+                Int4StorageKind::TileV1,
+                Some(upload_bf16(
+                    ordinal,
+                    &[zero.len() / 2],
+                    zero,
+                    &format!("{name} zero"),
+                )),
+                Some(format!("{name}.zero")),
+                group_size,
+                None,
+            )
+        }
+        Int4FixtureLayout::RowGroupG32 => {
+            assert_eq!(group_size, 32, "row-group fixture must use G32");
+            assert!(zero.is_none(), "row-group fixture {name} must omit zero");
+            (Int4StorageKind::RowGroupSymmetric, None, None, 1, Some(8))
+        }
+    };
+    LoadedInt4Sidecar {
+        scale: upload_bf16(ordinal, &[scale.len() / 2], scale, &format!("{name} scale")),
+        zero,
+        view: Int4StorageView {
+            kind,
+            group_size,
+            packed_tensor: format!("{name}.packed"),
+            scale_tensor: format!("{name}.scale"),
+            zero_tensor,
+            logical_shape: logical_shape.to_vec(),
+            packed_row_stride_bytes,
+            packed_expert_stride_bytes: out_rows * packed_row_stride_bytes,
+            scale_row_stride_elements,
+            scale_expert_stride_elements: (out_rows / output_group_size)
+                * scale_row_stride_elements,
+            output_group_size,
+            implicit_zero_code,
+        },
+    }
+}
+
+fn fixture_weight_desc(sidecar: &LoadedInt4Sidecar) -> Qwen36MoeInt4WeightDesc {
+    build_int4_weight_desc(sidecar).expect("build fixture INT4 descriptor")
 }
 
 fn build_full_attn_layer(
@@ -118,6 +316,7 @@ fn build_full_attn_layer(
     weights: &Value,
     int4_block: Option<&Value>,
     group_size: i32,
+    int4_layout: Option<Int4FixtureLayout>,
 ) -> AttnLayerBuffers {
     let hidden = geom.hidden as usize;
     let h = geom.num_attention_heads as usize;
@@ -136,20 +335,49 @@ fn build_full_attn_layer(
         let k_proj_w = upload_u8(ordinal, &[hkv * d, hidden / 2], &kp, "k_proj packed");
         let v_proj_w = upload_u8(ordinal, &[hkv * d, hidden / 2], &vp, "v_proj packed");
         let o_proj_w = upload_u8(ordinal, &[hidden, h * d / 2], &op, "o_proj packed");
+        let layout = int4_layout.expect("INT4 full-attention fixture layout");
         let int4 = FullAttnInt4Sidecars {
             group_size,
             q_proj_type: 4,
-            q_proj_scale: upload_bf16(ordinal, &[qs.len() / 2], &qs, "q scale"),
-            q_proj_zero: upload_bf16(ordinal, &[qz.len() / 2], &qz, "q zero"),
+            q_proj: fixture_int4_sidecar(
+                ordinal,
+                "q_proj",
+                &[2 * h * d, hidden],
+                group_size as usize,
+                &qs,
+                qz.as_deref(),
+                layout,
+            ),
             k_proj_type: 4,
-            k_proj_scale: upload_bf16(ordinal, &[ks.len() / 2], &ks, "k scale"),
-            k_proj_zero: upload_bf16(ordinal, &[kz.len() / 2], &kz, "k zero"),
+            k_proj: fixture_int4_sidecar(
+                ordinal,
+                "k_proj",
+                &[hkv * d, hidden],
+                group_size as usize,
+                &ks,
+                kz.as_deref(),
+                layout,
+            ),
             v_proj_type: 4,
-            v_proj_scale: upload_bf16(ordinal, &[vs.len() / 2], &vs, "v scale"),
-            v_proj_zero: upload_bf16(ordinal, &[vz.len() / 2], &vz, "v zero"),
+            v_proj: fixture_int4_sidecar(
+                ordinal,
+                "v_proj",
+                &[hkv * d, hidden],
+                group_size as usize,
+                &vs,
+                vz.as_deref(),
+                layout,
+            ),
             o_proj_type: 4,
-            o_proj_scale: upload_bf16(ordinal, &[os.len() / 2], &os, "o scale"),
-            o_proj_zero: upload_bf16(ordinal, &[oz.len() / 2], &oz, "o zero"),
+            o_proj: fixture_int4_sidecar(
+                ordinal,
+                "o_proj",
+                &[hidden, h * d],
+                group_size as usize,
+                &os,
+                oz.as_deref(),
+                layout,
+            ),
         };
         (q_proj_w, k_proj_w, v_proj_w, o_proj_w, Some(int4))
     } else {
@@ -208,6 +436,7 @@ fn build_linear_attn_layer(
     weights: &Value,
     int4_block: Option<&Value>,
     group_size: i32,
+    int4_layout: Option<Int4FixtureLayout>,
 ) -> AttnLayerBuffers {
     let hidden = geom.hidden as usize;
     let k = geom.num_k_heads as usize;
@@ -232,17 +461,39 @@ fn build_linear_attn_layer(
         let in_proj_qkv_w = upload_u8(ordinal, &[qkv_dim, hidden / 2], &qp, "in_proj_qkv packed");
         let in_proj_z_w = upload_u8(ordinal, &[val_dim, hidden / 2], &zp, "in_proj_z packed");
         let out_proj_w = upload_u8(ordinal, &[hidden, val_dim / 2], &op, "out_proj packed");
+        let layout = int4_layout.expect("INT4 linear-attention fixture layout");
         let int4 = LinearAttnInt4Sidecars {
             group_size,
             in_proj_qkv_type: 4,
-            in_proj_qkv_scale: upload_bf16(ordinal, &[qs.len() / 2], &qs, "in_proj_qkv scale"),
-            in_proj_qkv_zero: upload_bf16(ordinal, &[qz.len() / 2], &qz, "in_proj_qkv zero"),
+            in_proj_qkv: fixture_int4_sidecar(
+                ordinal,
+                "in_proj_qkv",
+                &[qkv_dim, hidden],
+                group_size as usize,
+                &qs,
+                qz.as_deref(),
+                layout,
+            ),
             in_proj_z_type: 4,
-            in_proj_z_scale: upload_bf16(ordinal, &[zs.len() / 2], &zs, "in_proj_z scale"),
-            in_proj_z_zero: upload_bf16(ordinal, &[zz.len() / 2], &zz, "in_proj_z zero"),
+            in_proj_z: fixture_int4_sidecar(
+                ordinal,
+                "in_proj_z",
+                &[val_dim, hidden],
+                group_size as usize,
+                &zs,
+                zz.as_deref(),
+                layout,
+            ),
             out_proj_type: 4,
-            out_proj_scale: upload_bf16(ordinal, &[os.len() / 2], &os, "out_proj scale"),
-            out_proj_zero: upload_bf16(ordinal, &[oz.len() / 2], &oz, "out_proj zero"),
+            out_proj: fixture_int4_sidecar(
+                ordinal,
+                "linear_out_proj",
+                &[hidden, val_dim],
+                group_size as usize,
+                &os,
+                oz.as_deref(),
+                layout,
+            ),
         };
         (in_proj_qkv_w, in_proj_z_w, out_proj_w, Some(int4))
     } else {
@@ -327,6 +578,7 @@ fn build_ffn_layer(
     weights: &Value,
     int4_block: Option<&Value>,
     group_size: i32,
+    int4_layout: Option<Int4FixtureLayout>,
 ) -> FfnLayerBuffers {
     let hidden = geom.hidden as usize;
     let e = geom.num_experts as usize;
@@ -353,23 +605,59 @@ fn build_ffn_layer(
         let shared_gate_proj_w = upload_u8(ordinal, &[is_dim, hidden / 2], &sgp, "sgp packed");
         let shared_up_proj_w = upload_u8(ordinal, &[is_dim, hidden / 2], &sup, "sup packed");
         let shared_down_proj_w = upload_u8(ordinal, &[hidden, is_dim / 2], &sdp, "sdp packed");
+        let layout = int4_layout.expect("INT4 FFN fixture layout");
         let int4 = FfnInt4Sidecars {
             group_size,
             gate_up_proj_type: 4,
-            gate_up_proj_scale: upload_bf16(ordinal, &[gs.len() / 2], &gs, "gate_up scale"),
-            gate_up_proj_zero: upload_bf16(ordinal, &[gz.len() / 2], &gz, "gate_up zero"),
+            gate_up_proj: fixture_int4_sidecar(
+                ordinal,
+                "gate_up_proj",
+                &[e, 2 * i_dim, hidden],
+                group_size as usize,
+                &gs,
+                gz.as_deref(),
+                layout,
+            ),
             down_proj_type: 4,
-            down_proj_scale: upload_bf16(ordinal, &[ds.len() / 2], &ds, "down_proj scale"),
-            down_proj_zero: upload_bf16(ordinal, &[dz.len() / 2], &dz, "down_proj zero"),
+            down_proj: fixture_int4_sidecar(
+                ordinal,
+                "down_proj",
+                &[e, hidden, i_dim],
+                group_size as usize,
+                &ds,
+                dz.as_deref(),
+                layout,
+            ),
             shared_gate_proj_type: 4,
-            shared_gate_proj_scale: upload_bf16(ordinal, &[sgs.len() / 2], &sgs, "sgp scale"),
-            shared_gate_proj_zero: upload_bf16(ordinal, &[sgz.len() / 2], &sgz, "sgp zero"),
+            shared_gate_proj: fixture_int4_sidecar(
+                ordinal,
+                "shared_gate_proj",
+                &[is_dim, hidden],
+                group_size as usize,
+                &sgs,
+                sgz.as_deref(),
+                layout,
+            ),
             shared_up_proj_type: 4,
-            shared_up_proj_scale: upload_bf16(ordinal, &[sus.len() / 2], &sus, "sup scale"),
-            shared_up_proj_zero: upload_bf16(ordinal, &[suz.len() / 2], &suz, "sup zero"),
+            shared_up_proj: fixture_int4_sidecar(
+                ordinal,
+                "shared_up_proj",
+                &[is_dim, hidden],
+                group_size as usize,
+                &sus,
+                suz.as_deref(),
+                layout,
+            ),
             shared_down_proj_type: 4,
-            shared_down_proj_scale: upload_bf16(ordinal, &[sds.len() / 2], &sds, "sdp scale"),
-            shared_down_proj_zero: upload_bf16(ordinal, &[sdz.len() / 2], &sdz, "sdp zero"),
+            shared_down_proj: fixture_int4_sidecar(
+                ordinal,
+                "shared_down_proj",
+                &[hidden, is_dim],
+                group_size as usize,
+                &sds,
+                sdz.as_deref(),
+                layout,
+            ),
         };
         (
             gate_up_proj_w,
@@ -443,6 +731,126 @@ fn build_ffn_layer(
     }
 }
 
+fn build_layers(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    weights_per_layer: &[Value],
+    int4_per_layer: Option<&Vec<Value>>,
+    int4_group_size: i32,
+    int4_layout: Option<Int4FixtureLayout>,
+) -> Vec<LayerBuffers> {
+    weights_per_layer
+        .iter()
+        .enumerate()
+        .map(|(li, layer_json)| {
+            let attn_w = &layer_json["attn"];
+            let ffn_w = &layer_json["ffn"];
+            let attn_int4 = int4_per_layer.map(|layers| &layers[li]["attn"]);
+            let ffn_int4 = int4_per_layer.map(|layers| &layers[li]["ffn"]);
+            let attn = if is_full_attn_layer(li as i32) {
+                build_full_attn_layer(
+                    ordinal,
+                    geom,
+                    attn_w,
+                    attn_int4,
+                    int4_group_size,
+                    int4_layout,
+                )
+            } else {
+                build_linear_attn_layer(
+                    ordinal,
+                    geom,
+                    attn_w,
+                    attn_int4,
+                    int4_group_size,
+                    int4_layout,
+                )
+            };
+            let ffn = build_ffn_layer(ordinal, geom, ffn_w, ffn_int4, int4_group_size, int4_layout);
+            LayerBuffers { attn, ffn }
+        })
+        .collect()
+}
+
+fn assert_all_material_descriptors_match_fixture(
+    layers: &[LayerBuffers],
+    layout: Int4FixtureLayout,
+) {
+    let descs = build_int4_descs(layers)
+        .expect("build row-group descriptors")
+        .expect("row-group descriptor array");
+    for (layer_idx, desc) in descs.iter().enumerate() {
+        let mut expected = vec![
+            ("experts_gate_up", &desc.experts_gate_up),
+            ("experts_down", &desc.experts_down),
+            ("shared_gate", &desc.shared_expert_gate_proj),
+            ("shared_up", &desc.shared_expert_up_proj),
+            ("shared_down", &desc.shared_expert_down_proj),
+        ];
+        if is_full_attn_layer(layer_idx as i32) {
+            expected.extend([
+                ("q_proj", &desc.q_proj),
+                ("k_proj", &desc.k_proj),
+                ("v_proj", &desc.v_proj),
+                ("o_proj", &desc.o_proj),
+            ]);
+        } else {
+            expected.extend([
+                ("linear_qkv", &desc.linear_in_proj_qkv),
+                ("linear_z", &desc.linear_in_proj_z),
+                ("linear_out", &desc.linear_out_proj),
+            ]);
+        }
+        for (projection, weight) in expected {
+            let (encoding, input_group, output_group, implicit_zero) = match layout {
+                Int4FixtureLayout::TileV1G128 => (1, 128, 128, -1),
+                Int4FixtureLayout::RowGroupG32 => (2, 32, 1, 8),
+            };
+            assert_eq!(weight.encoding, encoding, "layer {layer_idx} {projection}");
+            assert_eq!(
+                weight.zero.is_null(),
+                layout == Int4FixtureLayout::RowGroupG32,
+                "layer {layer_idx} {projection} zero"
+            );
+            assert_eq!(
+                weight.input_group_size, input_group,
+                "layer {layer_idx} {projection}"
+            );
+            assert_eq!(
+                weight.output_group_size, output_group,
+                "layer {layer_idx} {projection}"
+            );
+            assert_eq!(
+                weight.implicit_zero_code, implicit_zero,
+                "layer {layer_idx} {projection}"
+            );
+        }
+    }
+}
+
+fn run_isolated_attention(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layer: &mut LayerBuffers,
+    input_hidden: &[u8],
+    position: i32,
+) -> Vec<u8> {
+    let mut single_geom = *geom;
+    single_geom.num_layers = 1;
+    run_chained_decode(
+        ordinal,
+        &single_geom,
+        std::slice::from_mut(layer),
+        input_hidden,
+        position,
+    )
+    .expect("isolated attention chain")
+    .per_layer_attn_out
+    .into_iter()
+    .next()
+    .expect("isolated attention output")
+}
+
 /// Identical envelope to the per-block parity tests: cos_sim against the
 /// oracle's BF16 buffer, plus a max |delta| tolerance. Per the plan, the
 /// final logits parity gate is `cos_sim ≥ 0.999`. Per-layer hiddens get a
@@ -486,6 +894,246 @@ fn assert_parity_bf16(label: &str, got: &[u8], want: &[u8], max_abs_tol: f32, co
     );
 }
 
+fn handoff_budget(layer_idx: usize, boundary: HandoffBoundary) -> NumericalBudget {
+    let budgets = match boundary {
+        HandoffBoundary::Attention => &ATTENTION_HANDOFF_BUDGETS,
+        HandoffBoundary::Ffn => &FFN_HANDOFF_BUDGETS,
+    };
+    *budgets
+        .get(layer_idx)
+        .unwrap_or_else(|| panic!("missing {boundary:?} budget for layer {layer_idx}"))
+}
+
+fn assert_chained_handoff_parity(
+    label: &str,
+    layer_idx: usize,
+    boundary: HandoffBoundary,
+    got: &[u8],
+    want: &[u8],
+) {
+    let budget = handoff_budget(layer_idx, boundary);
+    assert_parity_bf16(label, got, want, budget.max_abs, budget.cosine_floor);
+}
+
+fn max_abs_delta_bf16(lhs: &[u8], rhs: &[u8]) -> f32 {
+    assert_eq!(lhs.len(), rhs.len(), "BF16 delta byte length mismatch");
+    bf16_bytes_to_f32(lhs)
+        .into_iter()
+        .zip(bf16_bytes_to_f32(rhs))
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f32::max)
+}
+
+fn max_bf16_ulp(bytes: &[u8]) -> f32 {
+    bf16_bytes_to_f32(bytes)
+        .into_iter()
+        .map(|value| {
+            let magnitude = value.abs();
+            if magnitude == 0.0 {
+                2.0f32.powi(-133)
+            } else {
+                2.0f32.powi(magnitude.log2().floor() as i32 - 7)
+            }
+        })
+        .fold(0.0, f32::max)
+}
+
+fn corrupt_one_lane_from_adjacent(
+    handoff: &mut [u8],
+    reference: &[u8],
+    rejection_threshold: f32,
+) -> (usize, usize, f32, f32) {
+    assert_eq!(handoff.len(), reference.len(), "BF16 byte length mismatch");
+    let actual = bf16_bytes_to_f32(handoff);
+    let oracle = bf16_bytes_to_f32(reference);
+    let candidate = (0..actual.len())
+        .filter_map(|target| {
+            let source = (target + 1) % actual.len();
+            let lane_displacement = (actual[source] - actual[target]).abs();
+            let resulting_error = (actual[source] - oracle[target]).abs();
+            (lane_displacement >= 0.125
+                && lane_displacement <= 0.5
+                && resulting_error > rejection_threshold)
+                .then_some((target, source, lane_displacement, resulting_error))
+        })
+        .min_by(|left, right| left.3.total_cmp(&right.3))
+        .expect("runtime handoff has no bounded adjacent-lane corruption candidate");
+    let source_bits = bf16::from_f32(actual[candidate.1]).to_bits().to_le_bytes();
+    handoff[candidate.0 * 2..candidate.0 * 2 + 2].copy_from_slice(&source_bits);
+    candidate
+}
+
+#[test]
+fn tracked_multilayer_oracle_is_the_mandatory_default() {
+    let path = tracked_multilayer_oracle_path();
+    assert!(
+        path.is_file(),
+        "tracked multi-layer oracle fixture is missing: {}",
+        path.display()
+    );
+    let raw = std::fs::read_to_string(&path).expect("read tracked multi-layer oracle");
+    let json: Value = serde_json::from_str(&raw).expect("parse tracked multi-layer oracle");
+    assert_eq!(
+        json["schema"], "qwen36-moe-oracle-multilayer-row-group-int4-v2",
+        "qualification default must explicitly select the row-group v2 oracle"
+    );
+    assert_eq!(json["fixture_id"], "qwen36-moe-multilayer-row-group-g32-v2");
+    assert_eq!(json["config"]["int4_layout"], "row_group");
+    assert_eq!(json["config"]["int4_group_size"], 32);
+    for layer in json["int4_weights_per_layer"].as_array().unwrap() {
+        for block in ["attn", "ffn"] {
+            for (projection, sidecar) in layer[block].as_object().unwrap() {
+                assert!(
+                    sidecar.get("zero").is_none(),
+                    "{block}.{projection} row-group sidecar must omit zero"
+                );
+            }
+        }
+    }
+    assert_eq!(json["mode"], "synthetic");
+    assert_eq!(json["state"], "fresh");
+    assert_eq!(json["num_layers"], 4);
+}
+
+#[test]
+fn tile_v1_g128_fixture_retains_the_v1_contract() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TILE_V1_MULTILAYER_ORACLE);
+    let raw = std::fs::read_to_string(&path).expect("read tile-v1 G128 fixture");
+    let json: Value = serde_json::from_str(&raw).expect("parse tile-v1 G128 fixture");
+    assert_eq!(json["schema"], "qwen36-moe-oracle-multilayer-int4-v1");
+    assert!(json.get("fixture_id").is_none());
+    assert!(json["config"].get("int4_layout").is_none());
+    assert_eq!(json["config"]["int4_group_size"], 128);
+    for layer in json["int4_weights_per_layer"].as_array().unwrap() {
+        for block in ["attn", "ffn"] {
+            for (projection, sidecar) in layer[block].as_object().unwrap() {
+                assert!(
+                    sidecar.get("zero").and_then(Value::as_str).is_some(),
+                    "{block}.{projection} tile-v1 sidecar requires explicit zero"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn chained_gate_rejects_single_lane_packing_scale_perturbation() {
+    let oracle = std::iter::repeat_n(0x3f80u16, 256)
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let mut corrupted_handoff = oracle.clone();
+    corrupted_handoff[73 * 2..73 * 2 + 2].copy_from_slice(&0x3fa0u16.to_le_bytes());
+
+    let rejected = std::panic::catch_unwind(|| {
+        assert_chained_handoff_parity(
+            "single-lane packing-scale perturbation",
+            0,
+            HandoffBoundary::Ffn,
+            &corrupted_handoff,
+            &oracle,
+        );
+    });
+    assert!(
+        rejected.is_err(),
+        "single-lane packing-scale perturbation passed the chained gate"
+    );
+}
+
+fn i32_bytes_to_vec(bytes: &[u8]) -> Vec<i32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("four-byte i32")))
+        .collect()
+}
+
+fn run_isolated_ffn_stage(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layer_idx: usize,
+    ffn: &FfnLayerBuffers,
+    input_hidden: &[u8],
+    stage: i32,
+) -> (Vec<u8>, Vec<i32>) {
+    let hidden = geom.hidden as usize;
+    let input = upload_bf16(ordinal, &[hidden], input_hidden, "isolated FFN input");
+    let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_output_elems(geom)])
+        .expect("alloc isolated FFN output");
+    let mut output_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[geom.top_k as usize])
+        .expect("alloc isolated FFN route output");
+    let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_workspace_floats(geom)])
+        .expect("alloc isolated FFN workspace");
+    let mut sync_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc isolated FFN sync");
+    let weights = Qwen36MoeFfnStepWeights {
+        input_hidden: input.as_ptr(),
+        post_attn_norm_w: ffn.post_attn_norm_w.as_ptr(),
+        gate_w: ffn.gate_w.as_ptr(),
+        gate_up_proj_w: ffn.gate_up_proj_w.as_ptr(),
+        down_proj_w: ffn.down_proj_w.as_ptr(),
+        shared_gate_proj_w: ffn.shared_gate_proj_w.as_ptr(),
+        shared_up_proj_w: ffn.shared_up_proj_w.as_ptr(),
+        shared_down_proj_w: ffn.shared_down_proj_w.as_ptr(),
+        shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
+    };
+    let int4 = ffn
+        .int4
+        .as_ref()
+        .map_or_else(Qwen36MoeFfnStepInt4::disabled, |sidecars| {
+            Qwen36MoeFfnStepInt4 {
+                group_size: sidecars.group_size,
+                gate_up_proj_type: sidecars.gate_up_proj_type,
+                gate_up_proj: fixture_weight_desc(&sidecars.gate_up_proj),
+                gate_up_proj_scale: sidecars.gate_up_proj.scale.as_ptr(),
+                gate_up_proj_zero: sidecars.gate_up_proj.zero_ptr(),
+                down_proj_type: sidecars.down_proj_type,
+                down_proj: fixture_weight_desc(&sidecars.down_proj),
+                down_proj_scale: sidecars.down_proj.scale.as_ptr(),
+                down_proj_zero: sidecars.down_proj.zero_ptr(),
+                shared_gate_proj_type: sidecars.shared_gate_proj_type,
+                shared_gate_proj: fixture_weight_desc(&sidecars.shared_gate_proj),
+                shared_gate_proj_scale: sidecars.shared_gate_proj.scale.as_ptr(),
+                shared_gate_proj_zero: sidecars.shared_gate_proj.zero_ptr(),
+                shared_up_proj_type: sidecars.shared_up_proj_type,
+                shared_up_proj: fixture_weight_desc(&sidecars.shared_up_proj),
+                shared_up_proj_scale: sidecars.shared_up_proj.scale.as_ptr(),
+                shared_up_proj_zero: sidecars.shared_up_proj.zero_ptr(),
+                shared_down_proj_type: sidecars.shared_down_proj_type,
+                shared_down_proj: fixture_weight_desc(&sidecars.shared_down_proj),
+                shared_down_proj_scale: sidecars.shared_down_proj.scale.as_ptr(),
+                shared_down_proj_zero: sidecars.shared_down_proj.zero_ptr(),
+            }
+        });
+    ffn_step_launch(
+        ordinal,
+        ScalarType::BF16,
+        Qwen36MoeFfnStepParams {
+            stage,
+            layer_idx: layer_idx as i32,
+            hidden: geom.hidden,
+            num_experts: geom.num_experts,
+            moe_intermediate: geom.moe_intermediate,
+            shared_intermediate: geom.shared_intermediate,
+            top_k: geom.top_k,
+            rms_norm_eps: geom.rms_norm_eps,
+        },
+        &weights,
+        &int4,
+        &mut output,
+        &mut output_idx,
+        &mut workspace,
+        &mut sync_buf,
+    )
+    .unwrap_or_else(|error| panic!("isolated FFN layer {layer_idx} stage {stage}: {error}"));
+
+    let output_bytes = output
+        .to_host_bytes()
+        .expect("download isolated FFN output");
+    let idx_bytes = output_idx
+        .to_host_bytes()
+        .expect("download isolated FFN routes");
+    (output_bytes, i32_bytes_to_vec(&idx_bytes))
+}
+
 #[test]
 fn multilayer_chained_decode_matches_oracle() {
     if !is_backend_compiled(Backend::Hip) {
@@ -495,23 +1143,12 @@ fn multilayer_chained_decode_matches_oracle() {
         );
         return;
     }
-    let Ok(json_path) = std::env::var("SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON") else {
-        eprintln!(
-            "skip: SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON not set. Generate with \
-             `~/venvs/rocm/bin/python oracle/qwen36_moe_multilayer_oracle.py \
-             --mode synthetic --num-layers 4 --out /tmp/qwen36_ml.json`."
-        );
-        return;
-    };
+    let json_path = tracked_multilayer_oracle_path();
     let raw = std::fs::read_to_string(&json_path)
-        .unwrap_or_else(|e| panic!("read multi-layer oracle json {json_path}: {e}"));
+        .unwrap_or_else(|e| panic!("read multi-layer oracle json {}: {e}", json_path.display()));
     let json: Value = serde_json::from_str(&raw).expect("parse multi-layer oracle json");
-    let schema = json["schema"].as_str().unwrap_or("");
-    let int4_mode = match schema {
-        "qwen36-moe-oracle-multilayer-v1" => false,
-        "qwen36-moe-oracle-multilayer-int4-v1" => true,
-        other => panic!("unsupported multi-layer schema: {other}"),
-    };
+    let int4_layout = fixture_int4_layout(&json);
+    let int4_mode = int4_layout.is_some();
     assert_eq!(
         json["dtype"].as_str().unwrap_or(""),
         "bf16",
@@ -549,20 +1186,33 @@ fn multilayer_chained_decode_matches_oracle() {
         None
     };
 
-    let mut layers: Vec<LayerBuffers> = Vec::with_capacity(geom.num_layers as usize);
-    for (li, layer_json) in weights_per_layer.iter().enumerate() {
-        let attn_w = &layer_json["attn"];
-        let ffn_w = &layer_json["ffn"];
-        let attn_int4 = int4_per_layer.map(|v| &v[li]["attn"]);
-        let ffn_int4 = int4_per_layer.map(|v| &v[li]["ffn"]);
-        let attn = if is_full_attn_layer(li as i32) {
-            build_full_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
-        } else {
-            build_linear_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
-        };
-        let ffn = build_ffn_layer(ordinal, &geom, ffn_w, ffn_int4, int4_group_size);
-        layers.push(LayerBuffers { attn, ffn });
+    let mut layers = build_layers(
+        ordinal,
+        &geom,
+        weights_per_layer,
+        int4_per_layer,
+        int4_group_size,
+        int4_layout,
+    );
+    if let Some(layout) = int4_layout {
+        assert_all_material_descriptors_match_fixture(&layers, layout);
     }
+    let mut exact_input_attn_layers = build_layers(
+        ordinal,
+        &geom,
+        weights_per_layer,
+        int4_per_layer,
+        int4_group_size,
+        int4_layout,
+    );
+    let mut chained_input_attn_layers = build_layers(
+        ordinal,
+        &geom,
+        weights_per_layer,
+        int4_per_layer,
+        int4_group_size,
+        int4_layout,
+    );
 
     let initial_hidden = b64_field(&json, "input_hidden");
     let final_norm_w = b64_field(&json, "final_norm_w");
@@ -572,26 +1222,9 @@ fn multilayer_chained_decode_matches_oracle() {
     let outputs = run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, position)
         .expect("chained decode");
 
-    // Per-layer parity. Tighter floor (0.9999) — no vocab-wide reduction
-    // to absorb noise.
-    // BF16 rounding noise compounds through residuals — every layer's matvec
-    // adds ~1 ULP per output channel, and N-layer chains see roughly N×
-    // the single-block max_abs and a few-times-N drop in cos_sim. The
-    // PR 4c acceptance criterion (cos_sim ≥ 0.999 on the final logits)
-    // is the real structural-correctness gate; per-layer envelopes are
-    // outlier sanity checks scaled with depth so the 4th residual being
-    // 4× noisier than the 1st doesn't false-positive.
-    let max_abs_envelope = |li: usize| -> f32 {
-        // Single-block stage-5 tests use 0.05; allow that much per layer
-        // of compounding (capped at 0.5 so a real divergence still trips).
-        (0.05 * (li as f32 + 1.0) * 1.5).min(0.5)
-    };
-    // Drop per-layer cos_sim floor by ~5e-5 per layer of depth — matches
-    // the observed drift on the synthetic 4-layer fixture (0.9999937 at
-    // layer 0 down to ~0.99988 at layer 3) with headroom. Still tight
-    // enough that any real bug (e.g. wrong layer kind, swapped weight
-    // pointer) trips it by orders of magnitude.
-    let cos_sim_floor = |li: usize| -> f64 { (0.9999 - 5e-5 * li as f64).max(0.999) };
+    // Each local block is gated against an exact-input oracle. The chained
+    // checks then use triangle-inequality max/L2 bounds from that local
+    // error plus the measured propagation of the preceding residual.
     let inters = json["intermediates_per_layer"]
         .as_array()
         .expect("intermediates_per_layer array");
@@ -600,25 +1233,196 @@ fn multilayer_chained_decode_matches_oracle() {
         geom.num_layers as usize,
         "intermediates length mismatch"
     );
+    let mut last_exact_input_residual = None;
     for (li, item) in inters.iter().enumerate() {
+        let oracle_layer_input = if li == 0 {
+            initial_hidden.clone()
+        } else {
+            b64_field(&inters[li - 1], "output_after_ffn")
+        };
         let want_attn = b64_field(item, "output_after_attn");
         let want_ffn = b64_field(item, "output_after_ffn");
-        let envelope = max_abs_envelope(li);
-        let floor = cos_sim_floor(li);
+        let want_topk_idx = i32_bytes_to_vec(&b64_field(item, "ffn_topk_idx"));
+        let want_topk_weights = b64_field(item, "ffn_topk_weights");
+        let want_shared = b64_field(item, "ffn_shared_out");
+        let want_expert_stack = b64_field(item, "ffn_expert_stack");
+        let want_routed = b64_field(item, "ffn_moe_out");
+        let want_exact_input_residual = b64_field(item, "ffn_output_hidden_exact_input");
+
+        let (route_weights, got_topk_idx) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 1);
+        assert_eq!(
+            got_topk_idx, want_topk_idx,
+            "layer {li} isolated FFN route indices differ"
+        );
         assert_parity_bf16(
+            &format!("layer {li} isolated FFN route weights"),
+            &route_weights[..geom.top_k as usize * 2],
+            &want_topk_weights,
+            0.01,
+            0.9999,
+        );
+        let (chained_route_weights, got_chained_topk_idx) = run_isolated_ffn_stage(
+            ordinal,
+            &geom,
+            li,
+            &layers[li].ffn,
+            &outputs.per_layer_attn_out[li],
+            1,
+        );
+        assert_eq!(
+            got_chained_topk_idx, want_topk_idx,
+            "layer {li} chained-input FFN route indices differ"
+        );
+        let chained_route_weight_delta = max_abs_delta_bf16(
+            &chained_route_weights[..geom.top_k as usize * 2],
+            &route_weights[..geom.top_k as usize * 2],
+        );
+        eprintln!(
+            "[parity layer {li} FFN route propagation] max_abs={chained_route_weight_delta:.5e}"
+        );
+        let (got_shared, _) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 2);
+        assert_parity_bf16(
+            &format!("layer {li} isolated FFN shared"),
+            &got_shared,
+            &want_shared,
+            0.05,
+            0.999,
+        );
+        let isolated_shared_error = max_abs_delta_bf16(&got_shared, &want_shared);
+        let (got_expert0, _) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 3);
+        assert_parity_bf16(
+            &format!("layer {li} isolated FFN expert 0"),
+            &got_expert0,
+            &want_expert_stack[..geom.hidden as usize * 2],
+            0.05,
+            0.999,
+        );
+        let (got_routed, _) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 4);
+        assert_parity_bf16(
+            &format!("layer {li} isolated FFN routed"),
+            &got_routed,
+            &want_routed,
+            0.05,
+            0.999,
+        );
+        let isolated_routed_error = max_abs_delta_bf16(&got_routed, &want_routed);
+        let (got_exact_input_residual, _) =
+            run_isolated_ffn_stage(ordinal, &geom, li, &layers[li].ffn, &want_attn, 5);
+        let isolated_residual_bound = isolated_shared_error
+            + isolated_routed_error
+            + 0.5 * max_bf16_ulp(&got_shared)
+            + 0.5 * max_bf16_ulp(&got_routed)
+            + max_bf16_ulp(&want_exact_input_residual);
+        assert_parity_bf16(
+            &format!("layer {li} isolated FFN residual"),
+            &got_exact_input_residual,
+            &want_exact_input_residual,
+            isolated_residual_bound,
+            0.999,
+        );
+        let (got_chained_input_residual, _) = run_isolated_ffn_stage(
+            ordinal,
+            &geom,
+            li,
+            &layers[li].ffn,
+            &outputs.per_layer_attn_out[li],
+            5,
+        );
+        assert_eq!(
+            got_chained_input_residual, outputs.per_layer_ffn_out[li],
+            "layer {li} chained FFN output is not reproducible from its captured input"
+        );
+        let exact_input_kernel_error =
+            max_abs_delta_bf16(&got_exact_input_residual, &want_exact_input_residual);
+        let propagated_input_delta =
+            max_abs_delta_bf16(&got_chained_input_residual, &got_exact_input_residual);
+        let ffn_budget = handoff_budget(li, HandoffBoundary::Ffn);
+        eprintln!(
+            "[parity layer {li} FFN diagnostics] exact_input_kernel_error={exact_input_kernel_error:.5e} \
+             propagated_input_delta={propagated_input_delta:.5e} \
+             fixed_max_abs={:.5e} fixed_cos_floor={:.7}",
+            ffn_budget.max_abs, ffn_budget.cosine_floor
+        );
+
+        let actual_layer_input = if li == 0 {
+            initial_hidden.clone()
+        } else {
+            outputs.per_layer_ffn_out[li - 1].clone()
+        };
+        let got_exact_input_attn = run_isolated_attention(
+            ordinal,
+            &geom,
+            &mut exact_input_attn_layers[li],
+            &oracle_layer_input,
+            position,
+        );
+        let got_chained_input_attn = run_isolated_attention(
+            ordinal,
+            &geom,
+            &mut chained_input_attn_layers[li],
+            &actual_layer_input,
+            position,
+        );
+        assert_eq!(
+            got_chained_input_attn, outputs.per_layer_attn_out[li],
+            "layer {li} chained attention output is not reproducible from its captured input"
+        );
+        let exact_input_attn_error = max_abs_delta_bf16(&got_exact_input_attn, &want_attn);
+        let propagated_attn_input_delta =
+            max_abs_delta_bf16(&got_chained_input_attn, &got_exact_input_attn);
+        let attention_budget = handoff_budget(li, HandoffBoundary::Attention);
+        eprintln!(
+            "[parity layer {li} attention diagnostics] exact_input_kernel_error={exact_input_attn_error:.5e} \
+             propagated_input_delta={propagated_attn_input_delta:.5e} \
+             fixed_max_abs={:.5e} fixed_cos_floor={:.7}",
+            attention_budget.max_abs, attention_budget.cosine_floor
+        );
+        assert_chained_handoff_parity(
             &format!("layer {li} output_after_attn"),
+            li,
+            HandoffBoundary::Attention,
             &outputs.per_layer_attn_out[li],
             &want_attn,
-            envelope,
-            floor,
         );
-        assert_parity_bf16(
+        assert_chained_handoff_parity(
             &format!("layer {li} output_after_ffn"),
+            li,
+            HandoffBoundary::Ffn,
             &outputs.per_layer_ffn_out[li],
             &want_ffn,
-            envelope,
-            floor,
         );
+        if li == 0 {
+            let mut corrupted_handoff = outputs.per_layer_ffn_out[li].clone();
+            let (target, source, lane_displacement, resulting_error) =
+                corrupt_one_lane_from_adjacent(
+                    &mut corrupted_handoff,
+                    &want_ffn,
+                    ffn_budget.max_abs,
+                );
+            let rejected = std::panic::catch_unwind(|| {
+                assert_chained_handoff_parity(
+                    "layer 0 actual FFN handoff with adjacent-lane indexing fault",
+                    li,
+                    HandoffBoundary::Ffn,
+                    &corrupted_handoff,
+                    &want_ffn,
+                );
+            });
+            assert!(
+                rejected.is_err(),
+                "one-lane runtime handoff corruption passed the frozen layer-0 FFN budget"
+            );
+            eprintln!(
+                "[parity corruption negative] layer={li} boundary=ffn target_lane={target} \
+                 source_lane={source} lane_displacement={lane_displacement:.5e} \
+                 resulting_oracle_error={resulting_error:.5e} rejected=true"
+            );
+        }
+        last_exact_input_residual = Some(got_exact_input_residual);
     }
 
     // The kernel-side residual is covered by the per-layer last-FFN check
@@ -635,26 +1439,52 @@ fn multilayer_chained_decode_matches_oracle() {
         geom.vocab as usize,
         geom.rms_norm_eps,
     );
-    assert_parity_bf16("logits", &logits, &oracle_logits, 0.5, 0.999);
+    let exact_input_logits = host_final_norm_lm_head(
+        &last_exact_input_residual.expect("last exact-input residual"),
+        &final_norm_w,
+        &lm_head_w,
+        geom.hidden as usize,
+        geom.vocab as usize,
+        geom.rms_norm_eps,
+    );
+    assert_parity_bf16(
+        "exact-input logits",
+        &exact_input_logits,
+        &oracle_logits,
+        EXACT_INPUT_LOGITS_BUDGET.max_abs,
+        EXACT_INPUT_LOGITS_BUDGET.cosine_floor,
+    );
+    let exact_input_logit_error = max_abs_delta_bf16(&exact_input_logits, &oracle_logits);
+    let propagated_logit_delta = max_abs_delta_bf16(&logits, &exact_input_logits);
+    eprintln!(
+        "[parity logits diagnostics] exact_input_kernel_error={exact_input_logit_error:.5e} \
+         propagated_input_delta={propagated_logit_delta:.5e} \
+         fixed_max_abs={:.5e} fixed_cos_floor={:.7}",
+        CHAINED_LOGITS_BUDGET.max_abs, CHAINED_LOGITS_BUDGET.cosine_floor
+    );
+    assert_parity_bf16(
+        "chained logits",
+        &logits,
+        &oracle_logits,
+        CHAINED_LOGITS_BUDGET.max_abs,
+        CHAINED_LOGITS_BUDGET.cosine_floor,
+    );
 }
 
 // =============================================================================
 // Phase 3e: persistent decode megakernel parity test.
 //
-// Drives the production
-// `runner::qwen36_moe_persistent_decode::PersistentScratch` with the same
-// fixtures the chained-decode test uses, then asserts the final hidden
-// matches the chained path nearly bit-for-bit. The two paths run the
+// Drives the production runtime layer owner and chain dispatcher with the
+// same fixtures the chained-decode test uses, then asserts the final hidden
+// and folded lm-head logits match the chained path and oracle. The two paths run the
 // IDENTICAL `__device__` phase functions (extracted in Phase 3a-3d) — only
 // the launch orchestration differs (1 cooperative launch vs 80 step
 // launches, with `reset_counters_16` between phases inside the
 // megakernel). So the comparison floor is very tight (cos_sim ≥ 0.99999,
 // max_abs ≤ 1e-3).
 //
-// This test also validates the production module's `PersistentScratch`
-// path that the engine's `--persistent-decode` flag (Phase 3e.2) uses —
-// any regression in `build_layer_descs` / `build_int4_descs` /
-// `PersistentScratch::run` here will trip the engine path too.
+// This test also validates the production `LoadedQwen36Layers` descriptor
+// ownership and `run_chain_step` dispatch used by the engine.
 // =============================================================================
 
 #[test]
@@ -663,22 +1493,11 @@ fn multilayer_persistent_decode_matches_chained() {
         eprintln!("skip: HIP backend not compiled");
         return;
     }
-    let Ok(json_path) = std::env::var("SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON") else {
-        eprintln!(
-            "skip: SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON not set. Generate with \
-             `~/venvs/rocm/bin/python oracle/qwen36_moe_multilayer_oracle.py \
-             --mode synthetic --num-layers 4 --out /tmp/qwen36_ml.json`."
-        );
-        return;
-    };
+    let json_path = tracked_multilayer_oracle_path();
     let raw = std::fs::read_to_string(&json_path).expect("read multi-layer oracle json");
     let json: Value = serde_json::from_str(&raw).expect("parse multi-layer oracle json");
-    let schema = json["schema"].as_str().unwrap_or("");
-    let int4_mode = match schema {
-        "qwen36-moe-oracle-multilayer-v1" => false,
-        "qwen36-moe-oracle-multilayer-int4-v1" => true,
-        other => panic!("unsupported multi-layer schema: {other}"),
-    };
+    let int4_layout = fixture_int4_layout(&json);
+    let int4_mode = int4_layout.is_some();
 
     let geom = parse_geom(&json);
     let position = json["position"].as_i64().unwrap_or(0) as i32;
@@ -711,46 +1530,148 @@ fn multilayer_persistent_decode_matches_chained() {
         let attn_int4 = int4_per_layer.map(|v| &v[li]["attn"]);
         let ffn_int4 = int4_per_layer.map(|v| &v[li]["ffn"]);
         let attn = if is_full_attn_layer(li as i32) {
-            build_full_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
+            build_full_attn_layer(
+                ordinal,
+                &geom,
+                attn_w,
+                attn_int4,
+                int4_group_size,
+                int4_layout,
+            )
         } else {
-            build_linear_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
+            build_linear_attn_layer(
+                ordinal,
+                &geom,
+                attn_w,
+                attn_int4,
+                int4_group_size,
+                int4_layout,
+            )
         };
-        let ffn = build_ffn_layer(ordinal, &geom, ffn_w, ffn_int4, int4_group_size);
+        let ffn = build_ffn_layer(
+            ordinal,
+            &geom,
+            ffn_w,
+            ffn_int4,
+            int4_group_size,
+            int4_layout,
+        );
         layers.push(LayerBuffers { attn, ffn });
+    }
+    if let Some(layout) = int4_layout {
+        assert_all_material_descriptors_match_fixture(&layers, layout);
     }
 
     let initial_hidden = b64_field(&json, "input_hidden");
+    let final_norm_w = b64_field(&json, "final_norm_w");
+    let lm_head_w = b64_field(&json, "lm_head_w");
+    let weight_mode = if int4_mode {
+        Qwen36WeightMode::Int4
+    } else {
+        Qwen36WeightMode::Bf16
+    };
+    let mut loaded = LoadedQwen36Layers::dense(layers, weight_mode);
 
     // Snapshot the linear-attn state so we can reset between the chained
     // and persistent runs (linear-attn mutates conv_state +
     // recurrent_state per token).
-    let snapshot = save_linear_attn_state(ordinal, &layers).expect("save_linear_attn_state");
+    let snapshot =
+        save_linear_attn_state(ordinal, loaded.layers()).expect("save_linear_attn_state");
+    let execution = Qwen36ExecutionOptions::default();
 
-    // ---- Chained-path reference ----
-    let chained = run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, position)
-        .expect("chained decode");
+    // ---- Runtime-owned chained-path reference ----
+    let chained = run_chain_step(Qwen36ChainStep {
+        ordinal,
+        geom: &geom,
+        loaded_layers: &mut loaded,
+        initial_hidden: &initial_hidden,
+        position: PositionPair::dense(position),
+        step: 0,
+        accurate_stage_timings: false,
+        fold: None,
+        download_final_hidden: true,
+        expert_prefetch: None,
+        execution: &execution,
+    })
+    .expect("runtime chained decode")
+    .outputs;
 
     // Restore linear state to the pre-chained values so the persistent
     // run sees the same starting point.
-    restore_linear_attn_state(ordinal, &mut layers, &snapshot).expect("restore_linear_attn_state");
+    restore_linear_attn_state(
+        ordinal,
+        loaded
+            .layers_mut_before_persistent()
+            .expect("mutable layers before persistent descriptors"),
+        &snapshot,
+    )
+    .expect("restore_linear_attn_state");
 
-    // ---- Persistent megakernel run via the production wrapper ----
-    let mut scratch =
-        PersistentScratch::new(ordinal, &geom, &mut layers).expect("alloc PersistentScratch");
-    // Parity test only checks the layer chain — no lm_head fold here
-    // (the host-side `host_final_norm_lm_head` does the lm_head step
-    // for the chained-vs-oracle test).
-    let persistent_outputs = scratch
-        .run(
-            ordinal,
-            &initial_hidden,
-            position,
-            runner::qwen36_moe_persistent_decode::CACHE_POS_INHERIT,
-            None,
-            true,
-        )
-        .expect("PersistentScratch::run");
-    let persistent_final = persistent_outputs.final_hidden_bytes;
+    if !int4_mode {
+        let err = loaded
+            .enable_persistent(ordinal, &geom)
+            .expect_err("BF16 persistent execution must be rejected before mutation");
+        assert!(err.to_string().contains("does not support Bf16"));
+        return;
+    }
+
+    // ---- Persistent megakernel + folded lm-head via runtime dispatch ----
+    loaded
+        .enable_persistent(ordinal, &geom)
+        .expect("enable runtime persistent decode");
+    let final_norm_w_buf = upload_bf16(
+        ordinal,
+        &[geom.hidden as usize],
+        &final_norm_w,
+        "final norm",
+    );
+    let lm_head_w_buf = upload_bf16(
+        ordinal,
+        &[geom.vocab as usize, geom.hidden as usize],
+        &lm_head_w,
+        "lm head",
+    );
+    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.vocab as usize])
+        .expect("alloc folded logits");
+    let persistent = run_chain_step(Qwen36ChainStep {
+        ordinal,
+        geom: &geom,
+        loaded_layers: &mut loaded,
+        initial_hidden: &initial_hidden,
+        position: PositionPair::dense(position),
+        step: 0,
+        accurate_stage_timings: false,
+        fold: Some(LmHeadFold {
+            final_norm_w: &final_norm_w_buf,
+            lm_head_w: &lm_head_w_buf,
+            logits_out: Some(&mut logits_buf),
+            top1_out: None,
+            vocab: geom.vocab,
+        }),
+        download_final_hidden: true,
+        expert_prefetch: None,
+        execution: &execution,
+    })
+    .expect("runtime persistent decode");
+    assert!(persistent.lm_head_folded);
+    assert!(!persistent.lm_head_folded_top1);
+    let persistent_final = persistent.outputs.final_hidden_bytes;
+    let mut persistent_logits = vec![0u8; geom.vocab as usize * 2];
+    copy_d2h(
+        ordinal,
+        persistent_logits.as_mut_ptr() as *mut c_void,
+        logits_buf.as_ptr(),
+        persistent_logits.len(),
+    )
+    .expect("download folded lm-head logits");
+    let chained_logits = host_final_norm_lm_head(
+        &chained.final_hidden_bytes,
+        &final_norm_w,
+        &lm_head_w,
+        geom.hidden as usize,
+        geom.vocab as usize,
+        geom.rms_norm_eps,
+    );
 
     // The persistent kernel runs the IDENTICAL `__device__` phase
     // functions (full_attn_phase / linear_attn_phase / ffn_phase) the
@@ -766,22 +1687,34 @@ fn multilayer_persistent_decode_matches_chained() {
         1e-3,
         0.99999,
     );
+    assert_parity_bf16(
+        "persistent folded lm-head vs chained host lm-head",
+        &persistent_logits,
+        &chained_logits,
+        0.05,
+        0.99999,
+    );
 
     // Segmented persistent is the sparse-VMM orchestration: each layer runs
     // attention + router top-k, returns to the host for remap, then resumes
     // that layer's FFN. With a no-op remap callback it must match the same
     // chained reference.
-    restore_linear_attn_state(ordinal, &mut layers, &snapshot)
-        .expect("restore_linear_attn_state before segmented persistent");
-    let segmented_outputs = scratch
-        .run_sparse_with_expert_prefetch(
-            ordinal,
-            &initial_hidden,
-            position,
-            runner::qwen36_moe_persistent_decode::CACHE_POS_INHERIT,
-            |_phase, _layer, _topk| Ok(()),
-        )
-        .expect("PersistentScratch::run_sparse_with_expert_prefetch");
+    let segmented_outputs = unsafe {
+        loaded.with_experimental_parts(|layers, scratch| {
+            restore_linear_attn_state(ordinal, layers, &snapshot)
+                .expect("restore_linear_attn_state before segmented persistent");
+            scratch
+                .expect("persistent scratch")
+                .run_sparse_with_expert_prefetch(
+                    ordinal,
+                    &initial_hidden,
+                    position,
+                    CACHE_POS_INHERIT,
+                    |_phase, _layer, _topk| Ok(()),
+                )
+        })
+    }
+    .expect("experimental segmented persistent comparison");
     assert_parity_bf16(
         "segmented persistent sparse vs chained final_hidden",
         &segmented_outputs.final_hidden_bytes,

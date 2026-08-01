@@ -25,6 +25,118 @@ pub struct ListModelsResponse {
     pub data: Vec<ModelObject>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FlmSourceOpenPhasesEvidence {
+    pub store_open_seconds: f64,
+    pub config_seconds: f64,
+    pub direct_plan_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlmSourceOpenEvidence {
+    pub total_seconds: f64,
+    pub exclusive_phases: FlmSourceOpenPhasesEvidence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlmStartupComponentsEvidence {
+    pub source_open: FlmSourceOpenEvidence,
+    pub tokenizer_seconds: f64,
+    pub descriptor_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlmStartupEvidence {
+    pub total_seconds: f64,
+    pub exclusive_components: FlmStartupComponentsEvidence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServingFeatures {
+    pub plain_prefill_decode: bool,
+    pub native_dflash_generate: bool,
+    pub prefix_snapshot: bool,
+    pub disk_prefix_snapshot: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlmEvidence {
+    pub source: &'static str,
+    pub file: String,
+    pub architecture_id: u32,
+    pub model_id: u16,
+    pub storage_abi_ids: Vec<u16>,
+    pub required_weights: usize,
+    pub raw_dense_weights: usize,
+    pub native_int4_direct_weights: usize,
+    pub bf16_fallback_weights: usize,
+    pub transfer_backend: &'static str,
+    pub source_bytes: u64,
+    pub device_upload_bytes: u64,
+    pub startup_seconds: f64,
+    pub startup: FlmStartupEvidence,
+    pub load_sequence: u64,
+    pub source_open_count: u64,
+    pub resident_allocation_count: u64,
+    pub features: ServingFeatures,
+}
+
+impl From<&crate::capabilities::FlmLoadEvidence> for FlmEvidence {
+    fn from(evidence: &crate::capabilities::FlmLoadEvidence) -> Self {
+        let transfer_backend = match evidence.transfer_backend {
+            crate::capabilities::FlmTransferBackend::PageableH2d => "pageable_h2d",
+            crate::capabilities::FlmTransferBackend::GpuDirectStorage => "gpu_direct_storage",
+        };
+        Self {
+            source: "flm",
+            file: evidence.source_file.clone(),
+            architecture_id: evidence.architecture_id,
+            model_id: evidence.model_id,
+            storage_abi_ids: evidence.storage_abi_ids.clone(),
+            required_weights: evidence.direct_profile.required_weights,
+            raw_dense_weights: evidence.direct_profile.raw_dense_weights,
+            native_int4_direct_weights: evidence.direct_profile.native_int4_direct_weights,
+            bf16_fallback_weights: evidence.direct_profile.bf16_fallback_weights,
+            transfer_backend,
+            source_bytes: evidence.source_bytes,
+            device_upload_bytes: evidence.device_upload_bytes,
+            startup_seconds: evidence.startup.total.as_secs_f64(),
+            startup: FlmStartupEvidence {
+                total_seconds: evidence.startup.total.as_secs_f64(),
+                exclusive_components: FlmStartupComponentsEvidence {
+                    source_open: FlmSourceOpenEvidence {
+                        total_seconds: evidence.startup.source_open.total.as_secs_f64(),
+                        exclusive_phases: FlmSourceOpenPhasesEvidence {
+                            store_open_seconds: evidence
+                                .startup
+                                .source_open
+                                .store_open
+                                .as_secs_f64(),
+                            config_seconds: evidence.startup.source_open.config.as_secs_f64(),
+                            direct_plan_seconds: evidence
+                                .startup
+                                .source_open
+                                .direct_plan
+                                .as_secs_f64(),
+                        },
+                    },
+                    tokenizer_seconds: evidence.startup.tokenizer.as_secs_f64(),
+                    descriptor_seconds: evidence.startup.descriptor.as_secs_f64(),
+                },
+            },
+            load_sequence: evidence.load_sequence,
+            source_open_count: evidence.source_open_count,
+            resident_allocation_count: evidence.resident_allocation_count,
+            features: ServingFeatures {
+                plain_prefill_decode: evidence.features.plain_prefill_decode,
+                native_dflash_generate: evidence.features.native_dflash_generate,
+                prefix_snapshot: evidence.features.prefix_snapshot,
+                disk_prefix_snapshot: evidence.features.disk_prefix_snapshot,
+            },
+        }
+    }
+}
+
 /* ---------- shared sampling params ---------- */
 
 #[derive(Debug, Clone, Deserialize)]

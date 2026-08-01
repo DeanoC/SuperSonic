@@ -290,6 +290,7 @@ pub fn bake_qwen35(
             | LayoutTag::Fp8Native
             | LayoutTag::Int8Quantized
             | LayoutTag::Int4Quantized
+            | LayoutTag::Int4RowGroup
             | LayoutTag::HiggsGridQuantized
             | LayoutTag::QuipE8Quantized
             | LayoutTag::QtipTrellisQuantized

@@ -265,6 +265,27 @@ unsafe extern "C" {
         combined_ptr: *mut c_void,
         wait_for_completion: c_int,
     ) -> c_int;
+    fn supersonic_metal_qwen36_batched_ffn_grouped_expert_direct_with_options(
+        n_tokens: usize,
+        top_k: usize,
+        hidden: usize,
+        moe_intermediate: usize,
+        group_size: usize,
+        x_norm_ptr: *const c_void,
+        topk_idx_ptr: *const c_void,
+        topk_weight_ptr: *const c_void,
+        gate_up_proj_ptr: *const c_void,
+        gate_up_scale_ptr: *const c_void,
+        gate_up_zero_ptr: *const c_void,
+        down_proj_ptr: *const c_void,
+        down_scale_ptr: *const c_void,
+        down_zero_ptr: *const c_void,
+        expert_mid_ptr: *mut c_void,
+        combined_ptr: *mut c_void,
+        profile_enabled: c_int,
+        phase_profile_enabled: c_int,
+        wait_for_completion: c_int,
+    ) -> c_int;
     fn supersonic_metal_qwen36_router_softmax_topk_bf16(
         n_tokens: usize,
         num_experts: usize,
@@ -2470,6 +2491,84 @@ pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct(
             Backend::Metal,
             format!(
                 "metal native qwen36_batched_prefill_grouped_expert_direct failed with status {status}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct_with_options(
+    n_tokens: usize,
+    top_k: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    group_size: usize,
+    x_norm: *const c_void,
+    topk_idx: *const c_void,
+    topk_weight: *const c_void,
+    gate_up_proj: *const c_void,
+    gate_up_scale: *const c_void,
+    gate_up_zero: *const c_void,
+    down_proj: *const c_void,
+    down_scale: *const c_void,
+    down_zero: *const c_void,
+    expert_mid: *mut c_void,
+    combined: *mut c_void,
+    profile_enabled: bool,
+    phase_profile_enabled: bool,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if n_tokens == 0
+        || top_k == 0
+        || hidden == 0
+        || moe_intermediate == 0
+        || group_size == 0
+        || x_norm.is_null()
+        || topk_idx.is_null()
+        || topk_weight.is_null()
+        || gate_up_proj.is_null()
+        || gate_up_scale.is_null()
+        || gate_up_zero.is_null()
+        || down_proj.is_null()
+        || down_scale.is_null()
+        || down_zero.is_null()
+        || expert_mid.is_null()
+        || combined.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_batched_prefill_grouped_expert_direct_with_options invalid shape: n_tokens={n_tokens} top_k={top_k} hidden={hidden} moe_intermediate={moe_intermediate} group_size={group_size}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_batched_ffn_grouped_expert_direct_with_options(
+            n_tokens,
+            top_k,
+            hidden,
+            moe_intermediate,
+            group_size,
+            x_norm,
+            topk_idx,
+            topk_weight,
+            gate_up_proj,
+            gate_up_scale,
+            gate_up_zero,
+            down_proj,
+            down_scale,
+            down_zero,
+            expert_mid,
+            combined,
+            i32::from(profile_enabled),
+            i32::from(phase_profile_enabled),
+            i32::from(wait_for_completion),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
+                "metal native qwen36_batched_prefill_grouped_expert_direct_with_options failed with status {status}"
             ),
         ));
     }
@@ -5827,6 +5926,36 @@ pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native qwen36_batched_prefill_grouped_expert_direct is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct_with_options(
+    _n_tokens: usize,
+    _top_k: usize,
+    _hidden: usize,
+    _moe_intermediate: usize,
+    _group_size: usize,
+    _x_norm: *const c_void,
+    _topk_idx: *const c_void,
+    _topk_weight: *const c_void,
+    _gate_up_proj: *const c_void,
+    _gate_up_scale: *const c_void,
+    _gate_up_zero: *const c_void,
+    _down_proj: *const c_void,
+    _down_scale: *const c_void,
+    _down_zero: *const c_void,
+    _expert_mid: *mut c_void,
+    _combined: *mut c_void,
+    _profile_enabled: bool,
+    _phase_profile_enabled: bool,
+    _wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_batched_prefill_grouped_expert_direct_with_options is not compiled"
+            .into(),
     ))
 }
 

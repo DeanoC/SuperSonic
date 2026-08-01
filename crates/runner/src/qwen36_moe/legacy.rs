@@ -81,6 +81,7 @@ pub(crate) fn decode_first_token(
             None,
             None,
             VirtualArenaTransferBackend::PageableH2d,
+            &crate::qwen36_moe_cli::options::load_options_from_environment(),
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);

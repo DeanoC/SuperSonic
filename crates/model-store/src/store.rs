@@ -173,6 +173,38 @@ struct CtSymInt4Bf16Fallback {
     group_size: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Int4StorageKind {
+    TileV1,
+    RowGroupSymmetric,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Int4StorageView {
+    pub kind: Int4StorageKind,
+    pub group_size: usize,
+    pub packed_tensor: String,
+    pub scale_tensor: String,
+    pub zero_tensor: Option<String>,
+    pub logical_shape: Vec<usize>,
+    pub packed_row_stride_bytes: usize,
+    pub packed_expert_stride_bytes: usize,
+    pub scale_row_stride_elements: usize,
+    pub scale_expert_stride_elements: usize,
+    pub output_group_size: usize,
+    pub implicit_zero_code: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Int4StorageStrides {
+    packed_row_bytes: usize,
+    packed_expert_bytes: usize,
+    scale_row_elements: usize,
+    scale_expert_elements: usize,
+    packed_elements: usize,
+    scale_elements: usize,
+}
+
 /// A memory-mapped baked weight store for fast GPU loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorStorageSourceKind {
@@ -229,6 +261,7 @@ pub struct BakedStore {
     synthetic: HashMap<String, Vec<u8>>,
     upload_views: HashMap<String, TensorUploadView>,
     ct_int4_bf16_fallbacks: HashMap<String, CtSymInt4Bf16Fallback>,
+    int4_storage_views: HashMap<String, Int4StorageView>,
     runtime: Option<crate::flm::FlmRuntimeDirectory>,
 }
 
@@ -288,6 +321,80 @@ fn gpu_upload_shape(meta: &TensorMeta) -> Result<Vec<usize>, Error> {
         return Ok(vec![byte_len]);
     }
     Ok(meta.shape.clone())
+}
+
+fn int4_storage_strides(
+    logical_shape: &[usize],
+    group_size: usize,
+    output_group_size: usize,
+) -> Result<Int4StorageStrides, Error> {
+    if !matches!(logical_shape.len(), 2 | 3) {
+        return Err(Error::Other(format!(
+            "INT4 storage view requires rank 2 or 3, got rank {}",
+            logical_shape.len()
+        )));
+    }
+    if group_size == 0 || output_group_size == 0 {
+        return Err(Error::Other(
+            "INT4 storage view group sizes must be nonzero".into(),
+        ));
+    }
+    if logical_shape.contains(&0) {
+        return Err(Error::Other(
+            "INT4 storage view logical dimensions must be nonzero".into(),
+        ));
+    }
+    let output_rows = logical_shape[logical_shape.len() - 2];
+    let k = logical_shape[logical_shape.len() - 1];
+    if k % 2 != 0 {
+        return Err(Error::Other(format!(
+            "INT4 storage view has odd final dimension {k}"
+        )));
+    }
+    if k % group_size != 0 {
+        return Err(Error::Other(format!(
+            "INT4 storage view final dimension {k} is not divisible by group size {group_size}"
+        )));
+    }
+    if output_rows % output_group_size != 0 {
+        return Err(Error::Other(format!(
+            "INT4 storage view output rows {output_rows} are not divisible by output group size {output_group_size}"
+        )));
+    }
+
+    let packed_row_bytes = k / 2;
+    let scale_row_elements = k / group_size;
+    let packed_per_expert = output_rows
+        .checked_mul(packed_row_bytes)
+        .ok_or_else(|| Error::Other("INT4 packed expert stride calculation overflows".into()))?;
+    let scale_output_rows = output_rows / output_group_size;
+    let scale_per_expert = scale_output_rows
+        .checked_mul(scale_row_elements)
+        .ok_or_else(|| Error::Other("INT4 scale expert stride calculation overflows".into()))?;
+    let expert_count = if logical_shape.len() == 3 {
+        logical_shape[0]
+    } else {
+        1
+    };
+    let packed_elements = expert_count
+        .checked_mul(packed_per_expert)
+        .ok_or_else(|| Error::Other("INT4 packed element count overflows".into()))?;
+    let scale_elements = expert_count
+        .checked_mul(scale_per_expert)
+        .ok_or_else(|| Error::Other("INT4 scale element count overflows".into()))?;
+
+    Ok(Int4StorageStrides {
+        packed_row_bytes,
+        packed_expert_bytes: (logical_shape.len() == 3)
+            .then_some(packed_per_expert)
+            .unwrap_or(0),
+        scale_row_elements,
+        scale_expert_elements: (logical_shape.len() == 3)
+            .then_some(scale_per_expert)
+            .unwrap_or(0),
+        packed_elements,
+        scale_elements,
+    })
 }
 
 fn read_exact_range<'a>(
@@ -532,9 +639,13 @@ fn flm_read_index_entries(
         let dtype = read_u16(rec, 36, "FLM tensor dtype")?;
         let codec = rec[40];
         let n_dims = rec[41] as usize;
-        let inline_dims = n_dims.min(4);
-        let mut shape = Vec::with_capacity(inline_dims);
-        for dim_idx in 0..inline_dims {
+        if n_dims > 4 {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} has rank {n_dims}; index records support at most 4 dimensions"
+            )));
+        }
+        let mut shape = Vec::with_capacity(n_dims);
+        for dim_idx in 0..n_dims {
             shape.push(read_u32(rec, 42 + dim_idx * 4, "FLM tensor shape")? as usize);
         }
         let shard = shards.get(&shard_id).ok_or_else(|| {
@@ -560,6 +671,11 @@ fn flm_read_index_entries(
             ))
         })?;
 
+        if entries.contains_key(name) {
+            return Err(Error::Other(format!(
+                "duplicate FLM tensor name {name} in tensor index"
+            )));
+        }
         entries.insert(
             name.clone(),
             FlmIndexEntry {
@@ -573,6 +689,82 @@ fn flm_read_index_entries(
         );
     }
     Ok(entries)
+}
+
+fn validate_row_group_storage_plane_overlaps(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index_entries: &HashMap<String, FlmIndexEntry>,
+) -> Result<(), Error> {
+    let mut intervals = Vec::new();
+    for logical in runtime.logical_tensors() {
+        if logical.value_format_id != crate::flm::VALUE_FORMAT_SYM_INT4
+            || runtime.stage3_direct_weight_kind(&logical.name)?
+                != Some(crate::flm::FlmStage3DirectWeightKind::RowGroupInt4)
+        {
+            continue;
+        }
+
+        for storage_role in [
+            crate::flm::STORAGE_ROLE_PACKED,
+            crate::flm::STORAGE_ROLE_SCALE,
+        ] {
+            let binding = runtime
+                .storage_bindings()
+                .iter()
+                .find(|binding| {
+                    binding.logical_tensor_id == logical.tensor_id
+                        && binding.storage_role == storage_role
+                })
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 row-group tensor {} is missing required storage role {}",
+                        logical.name, storage_role
+                    ))
+                })?;
+            let entry = index_entries.get(&binding.tensor_name).ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 row-group tensor {} binding {} is missing from the index",
+                    logical.name, binding.tensor_name
+                ))
+            })?;
+            let end = entry
+                .file_offset
+                .checked_add(entry.stored_len)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 row-group tensor {} binding {} absolute range overflows",
+                        logical.name, binding.tensor_name
+                    ))
+                })?;
+            intervals.push((
+                entry.file_offset,
+                end,
+                logical.name.clone(),
+                binding.tensor_name.clone(),
+                storage_role,
+            ));
+        }
+    }
+
+    intervals
+        .sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    for pair in intervals.windows(2) {
+        let (previous_start, previous_end, previous_logical, previous_tensor, previous_role) =
+            &pair[0];
+        let (current_start, current_end, current_logical, current_tensor, current_role) = &pair[1];
+        if previous_end > current_start {
+            return Err(Error::Other(format!(
+                "overlapping row-group storage planes: {} ({}) role {} [{previous_start:#x}, {previous_end:#x}) and {} ({}) role {} [{current_start:#x}, {current_end:#x})",
+                previous_tensor,
+                previous_logical,
+                previous_role,
+                current_tensor,
+                current_logical,
+                current_role,
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn flm_build_index(
@@ -1102,11 +1294,162 @@ fn stage3_int4_sidecar_alias(logical_name: &str, suffix: &str) -> String {
     }
 }
 
-fn add_stage3_int4_aliases(
+fn validate_stage3_int4_binding_names(
+    logical_name: &str,
+    packed_name: &str,
+    scale_name: &str,
+    zero_name: Option<&str>,
+) -> Result<(), Error> {
+    if logical_name == scale_name || zero_name == Some(logical_name) {
+        return Err(Error::Other(format!(
+            "FLM Stage 3 INT4 tensor {logical_name} logical name must not equal SCALE or ZERO binding names"
+        )));
+    }
+    if packed_name == scale_name || zero_name == Some(packed_name) || zero_name == Some(scale_name)
+    {
+        return Err(Error::Other(format!(
+            "FLM Stage 3 INT4 tensor {logical_name} physical binding names must be pairwise distinct"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum Stage3AliasIdentity<'a> {
+    New,
+    LogicalPackedRebind { physical: &'a TensorMeta },
+    ExactPhysicalReuse { physical: &'a TensorMeta },
+}
+
+fn tensor_meta_matches(left: &TensorMeta, right: &TensorMeta) -> bool {
+    left.name == right.name
+        && left.shape == right.shape
+        && left.dtype == right.dtype
+        && left.layout == right.layout
+        && left.offset == right.offset
+        && left.byte_len == right.byte_len
+}
+
+fn apply_stage3_alias(
+    index: &mut HashMap<String, TensorMeta>,
+    upload_views: &mut HashMap<String, TensorUploadView>,
+    alias: TensorMeta,
+    upload_view: TensorUploadView,
+    identity: Stage3AliasIdentity<'_>,
+) -> Result<(), Error> {
+    let existing_upload = upload_views.get(&alias.name);
+    match identity {
+        Stage3AliasIdentity::New if existing_upload.is_some() => {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 alias {} has an upload-view namespace collision",
+                alias.name
+            )));
+        }
+        Stage3AliasIdentity::LogicalPackedRebind { .. }
+        | Stage3AliasIdentity::ExactPhysicalReuse { .. } => {
+            if existing_upload.is_some_and(|existing| existing != &upload_view) {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 alias {} has an upload-view namespace collision",
+                    alias.name
+                )));
+            }
+        }
+        Stage3AliasIdentity::New => {}
+    }
+
+    match identity {
+        Stage3AliasIdentity::New => {
+            if index.contains_key(&alias.name) {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 alias {} has an indexed tensor namespace collision",
+                    alias.name
+                )));
+            }
+        }
+        Stage3AliasIdentity::LogicalPackedRebind { physical } => {
+            let existing = index.get(&alias.name).ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 logical PACKED rebind {} has no physical source metadata",
+                    alias.name
+                ))
+            })?;
+            if alias.name != physical.name
+                || !tensor_meta_matches(existing, physical)
+                || alias.offset != physical.offset
+                || alias.byte_len != physical.byte_len
+                || alias.dtype != physical.dtype
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 logical PACKED rebind {} does not match its physical source",
+                    alias.name
+                )));
+            }
+        }
+        Stage3AliasIdentity::ExactPhysicalReuse { physical } => {
+            let existing = index.get(&alias.name).ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 physical alias reuse {} has no source metadata",
+                    alias.name
+                ))
+            })?;
+            if alias.name != physical.name
+                || !tensor_meta_matches(existing, physical)
+                || !tensor_meta_matches(&alias, physical)
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 physical alias reuse {} does not exactly match its source metadata",
+                    alias.name
+                )));
+            }
+        }
+    }
+
+    if !matches!(identity, Stage3AliasIdentity::ExactPhysicalReuse { .. }) {
+        index.insert(alias.name.clone(), alias.clone());
+    }
+    upload_views.entry(alias.name).or_insert(upload_view);
+    Ok(())
+}
+
+fn build_stage3_int4_storage(
     runtime: &crate::flm::FlmRuntimeDirectory,
     index: &mut HashMap<String, TensorMeta>,
     upload_views: &mut HashMap<String, TensorUploadView>,
     ct_int4_bf16_fallbacks: &mut HashMap<String, CtSymInt4Bf16Fallback>,
+    int4_storage_views: &mut HashMap<String, Int4StorageView>,
+    index_entries: &HashMap<String, FlmIndexEntry>,
+    insert_logical_aliases: bool,
+) -> Result<(), Error> {
+    let mut staged_index = index.clone();
+    let mut staged_upload_views = upload_views.clone();
+    let mut staged_ct_int4_bf16_fallbacks = ct_int4_bf16_fallbacks.clone();
+    let mut staged_int4_storage_views = int4_storage_views.clone();
+
+    build_stage3_int4_storage_staged(
+        runtime,
+        &mut staged_index,
+        &mut staged_upload_views,
+        &mut staged_ct_int4_bf16_fallbacks,
+        &mut staged_int4_storage_views,
+        index_entries,
+        insert_logical_aliases,
+    )?;
+
+    *index = staged_index;
+    *upload_views = staged_upload_views;
+    *ct_int4_bf16_fallbacks = staged_ct_int4_bf16_fallbacks;
+    *int4_storage_views = staged_int4_storage_views;
+    Ok(())
+}
+
+fn build_stage3_int4_storage_staged(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index: &mut HashMap<String, TensorMeta>,
+    upload_views: &mut HashMap<String, TensorUploadView>,
+    ct_int4_bf16_fallbacks: &mut HashMap<String, CtSymInt4Bf16Fallback>,
+    int4_storage_views: &mut HashMap<String, Int4StorageView>,
+    index_entries: &HashMap<String, FlmIndexEntry>,
+    insert_logical_aliases: bool,
 ) -> Result<(), Error> {
     let direct_plan: HashMap<(u32, u16), &crate::flm::FlmPlanStep> = runtime
         .plan_steps()
@@ -1121,11 +1464,18 @@ fn add_stage3_int4_aliases(
             .or_default()
             .push(binding);
     }
-
     for logical in runtime.logical_tensors() {
         if logical.value_format_id != crate::flm::VALUE_FORMAT_SYM_INT4 {
             continue;
         }
+        let kind = runtime
+            .stage3_direct_weight_kind(&logical.name)?
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} has no supported direct storage contract",
+                    logical.name
+                ))
+            })?;
         let Some(packed_step) =
             direct_plan.get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_PACKED))
         else {
@@ -1169,13 +1519,19 @@ fn add_stage3_int4_aliases(
         let zero = owned
             .iter()
             .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_ZERO);
+        validate_stage3_int4_binding_names(
+            &logical.name,
+            &packed.tensor_name,
+            &scale.tensor_name,
+            zero.map(|binding| binding.tensor_name.as_str()),
+        )?;
         let packed_meta = index.get(&packed.tensor_name).cloned().ok_or_else(|| {
             Error::Other(format!(
                 "FLM Stage 3 packed tensor {} missing from index",
                 packed.tensor_name
             ))
         })?;
-        let scale_meta = index.get(&scale.tensor_name).cloned().ok_or_else(|| {
+        let mut scale_meta = index.get(&scale.tensor_name).cloned().ok_or_else(|| {
             Error::Other(format!(
                 "FLM Stage 3 scale tensor {} missing from index",
                 scale.tensor_name
@@ -1191,7 +1547,7 @@ fn add_stage3_int4_aliases(
                     logical.name, packed.storage_abi_id
                 ))
             })?;
-        if packed.storage_dtype == FLM_DTYPE_INT32 {
+        if kind == crate::flm::FlmStage3DirectWeightKind::CtInt4Bf16Fallback {
             shape_binding.ok_or_else(|| {
                 Error::Other(format!(
                     "FLM Stage 3 INT4 tensor {} missing shape binding",
@@ -1229,30 +1585,175 @@ fn add_stage3_int4_aliases(
                         logical.name
                     ))
                 })?;
+            if insert_logical_aliases {
+                apply_stage3_alias(
+                    index,
+                    upload_views,
+                    TensorMeta {
+                        name: logical.name.clone(),
+                        shape: shape.clone(),
+                        dtype: "bf16".to_string(),
+                        layout: LayoutTag::Raw,
+                        offset: packed_meta.offset,
+                        byte_len: byte_len as u64,
+                    },
+                    TensorUploadView {
+                        dtype: "bf16".to_string(),
+                        shape: shape.clone(),
+                    },
+                    Stage3AliasIdentity::New,
+                )?;
+                ct_int4_bf16_fallbacks
+                    .entry(logical.name.clone())
+                    .or_insert_with(|| CtSymInt4Bf16Fallback {
+                        packed_tensor: packed.tensor_name.clone(),
+                        scale_tensor: scale.tensor_name.clone(),
+                        shape,
+                        group_size,
+                    });
+            }
+            continue;
+        }
+        if kind == crate::flm::FlmStage3DirectWeightKind::RowGroupInt4 {
+            let packed_entry = index_entries
+                .get(packed.tensor_name.as_str())
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 packed tensor {} missing from index entries",
+                        packed.tensor_name
+                    ))
+                })?;
+            if packed_entry.dtype != FLM_DTYPE_UINT8 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 row-group packed index dtype for {} must be UINT8, got {}",
+                    packed.tensor_name, packed_entry.dtype
+                )));
+            }
+            let packed_codec = runtime
+                .codec_by_id(u16::from(packed_entry.codec))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 packed tensor {} references missing codec id {}",
+                        packed.tensor_name, packed_entry.codec
+                    ))
+                })?;
+            let expected_codec_flags = u32::from(
+                crate::flm::QUANT_FLAG_SYMMETRIC | crate::flm::QUANT_FLAG_IMPLICIT_ZERO_8,
+            );
+            if packed_codec.semantic_id as u16 != crate::flm::CODEC_ROW_GROUP_INT4_BF16_SYM
+                || packed_codec.layout_id != crate::flm::LAYOUT_ROW_MAJOR_UINT4_LOW_EVEN
+                || packed_codec.flags != expected_codec_flags
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 packed tensor {} does not use the row-group semantic codec/layout",
+                    packed.tensor_name
+                )));
+            }
+            let scale_entry = index_entries
+                .get(scale.tensor_name.as_str())
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 scale tensor {} missing from index entries",
+                        scale.tensor_name
+                    ))
+                })?;
+            if scale_entry.dtype != FLM_DTYPE_BF16 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 row-group scale index dtype for {} must be BF16, got {}",
+                    scale.tensor_name, scale_entry.dtype
+                )));
+            }
+            let scale_codec = runtime
+                .codec_by_id(u16::from(scale_entry.codec))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 scale tensor {} references missing codec id {}",
+                        scale.tensor_name, scale_entry.codec
+                    ))
+                })?;
+            if scale_codec.semantic_id as u16 != crate::flm::CODEC_RAW_BF16
+                || scale_codec.layout_id != crate::flm::LAYOUT_ID_DEFAULT
+                || scale_codec.decoder_id != 0
+                || scale_codec.flags != 0
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 row-group scale tensor {} must reference a raw BF16 codec descriptor, got local id {} semantic={} layout={} decoder={} flags={}",
+                    scale.tensor_name,
+                    scale_entry.codec,
+                    scale_codec.semantic_id,
+                    scale_codec.layout_id,
+                    scale_codec.decoder_id,
+                    scale_codec.flags
+                )));
+            }
+            scale_meta.dtype = "bf16".to_string();
             index
-                .entry(logical.name.clone())
-                .or_insert_with(|| TensorMeta {
-                    name: logical.name.clone(),
-                    shape: shape.clone(),
-                    dtype: "bf16".to_string(),
-                    layout: LayoutTag::Raw,
-                    offset: packed_meta.offset,
-                    byte_len: byte_len as u64,
-                });
-            upload_views
-                .entry(logical.name.clone())
-                .or_insert_with(|| TensorUploadView {
-                    dtype: "bf16".to_string(),
-                    shape: shape.clone(),
-                });
-            ct_int4_bf16_fallbacks
-                .entry(logical.name.clone())
-                .or_insert_with(|| CtSymInt4Bf16Fallback {
+                .get_mut(&scale.tensor_name)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 scale tensor {} disappeared from the index",
+                        scale.tensor_name
+                    ))
+                })?
+                .dtype = "bf16".to_string();
+
+            let logical_shape = flm_logical_shape(logical)?;
+            let packed_shape = flm_plan_target_shape(packed_step)?;
+            let scale_shape = flm_plan_target_shape(scale_step)?;
+            let strides = validate_int4_storage_planes(
+                &logical.name,
+                &logical_shape,
+                &packed_meta,
+                &packed_shape,
+                &scale_meta,
+                &scale_shape,
+                None,
+                32,
+                1,
+            )?;
+            if insert_logical_aliases {
+                let identity = if logical.name == packed.tensor_name {
+                    Stage3AliasIdentity::LogicalPackedRebind {
+                        physical: &packed_meta,
+                    }
+                } else {
+                    Stage3AliasIdentity::New
+                };
+                apply_stage3_alias(
+                    index,
+                    upload_views,
+                    TensorMeta {
+                        name: logical.name.clone(),
+                        shape: packed_shape.clone(),
+                        dtype: "u8".to_string(),
+                        layout: LayoutTag::Int4RowGroup,
+                        offset: packed_meta.offset,
+                        byte_len: packed_meta.byte_len,
+                    },
+                    TensorUploadView {
+                        dtype: "u8".to_string(),
+                        shape: packed_shape,
+                    },
+                    identity,
+                )?;
+            }
+            int4_storage_views.insert(
+                logical.name.clone(),
+                Int4StorageView {
+                    kind: Int4StorageKind::RowGroupSymmetric,
+                    group_size: 32,
                     packed_tensor: packed.tensor_name.clone(),
                     scale_tensor: scale.tensor_name.clone(),
-                    shape,
-                    group_size,
-                });
+                    zero_tensor: None,
+                    logical_shape,
+                    packed_row_stride_bytes: strides.packed_row_bytes,
+                    packed_expert_stride_bytes: strides.packed_expert_bytes,
+                    scale_row_stride_elements: strides.scale_row_elements,
+                    scale_expert_stride_elements: strides.scale_expert_elements,
+                    output_group_size: 1,
+                    implicit_zero_code: Some(8),
+                },
+            );
             continue;
         }
         if packed.storage_dtype != FLM_DTYPE_UINT8 {
@@ -1297,63 +1798,189 @@ fn add_stage3_int4_aliases(
                 zero.tensor_name
             ))
         })?;
-        let packed_shape = packed_view.shape.clone();
-        index.insert(
-            logical.name.clone(),
-            TensorMeta {
-                name: logical.name.clone(),
-                shape: packed_shape,
-                dtype: "u8".to_string(),
-                layout: LayoutTag::Int4Quantized,
-                offset: packed_meta.offset,
-                byte_len: packed_meta.byte_len,
-            },
-        );
-        upload_views
-            .entry(logical.name.clone())
-            .or_insert(packed_view);
-
         let scale_alias = stage3_int4_sidecar_alias(&logical.name, "scale");
         let scale_dtype = flm_dtype_name(scale_step.target_dtype)?;
         let scale_shape = flm_plan_target_shape(scale_step)?;
-        index
-            .entry(scale_alias.clone())
-            .or_insert_with(|| TensorMeta {
-                name: scale_alias.clone(),
-                shape: scale_shape.clone(),
-                dtype: scale_dtype.to_string(),
-                layout: LayoutTag::Raw,
-                offset: scale_meta.offset,
-                byte_len: scale_meta.byte_len,
-            });
-        upload_views
-            .entry(scale_alias)
-            .or_insert_with(|| TensorUploadView {
-                dtype: scale_dtype.to_string(),
-                shape: scale_shape.clone(),
-            });
-
         let zero_alias = stage3_int4_sidecar_alias(&logical.name, "zero");
         let zero_dtype = flm_dtype_name(zero_step.target_dtype)?;
         let zero_shape = flm_plan_target_shape(zero_step)?;
-        index
-            .entry(zero_alias.clone())
-            .or_insert_with(|| TensorMeta {
-                name: zero_alias.clone(),
-                shape: zero_shape.clone(),
-                dtype: zero_dtype.to_string(),
-                layout: LayoutTag::Raw,
-                offset: zero_meta.offset,
-                byte_len: zero_meta.byte_len,
-            });
-        upload_views
-            .entry(zero_alias)
-            .or_insert_with(|| TensorUploadView {
-                dtype: zero_dtype.to_string(),
-                shape: zero_shape,
-            });
+
+        let logical_shape = flm_logical_shape(logical)?;
+        let packed_shape = flm_plan_target_shape(packed_step)?;
+        let strides = validate_int4_storage_planes(
+            &logical.name,
+            &logical_shape,
+            &packed_meta,
+            &packed_shape,
+            &scale_meta,
+            &scale_shape,
+            Some((&zero_meta, zero_shape.as_slice())),
+            128,
+            128,
+        )?;
+        if insert_logical_aliases {
+            let logical_identity = if logical.name == packed.tensor_name {
+                Stage3AliasIdentity::LogicalPackedRebind {
+                    physical: &packed_meta,
+                }
+            } else {
+                Stage3AliasIdentity::New
+            };
+            apply_stage3_alias(
+                index,
+                upload_views,
+                TensorMeta {
+                    name: logical.name.clone(),
+                    shape: packed_shape,
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Int4Quantized,
+                    offset: packed_meta.offset,
+                    byte_len: packed_meta.byte_len,
+                },
+                packed_view,
+                logical_identity,
+            )?;
+
+            let scale_identity = if scale_alias == scale.tensor_name {
+                Stage3AliasIdentity::ExactPhysicalReuse {
+                    physical: &scale_meta,
+                }
+            } else {
+                Stage3AliasIdentity::New
+            };
+            apply_stage3_alias(
+                index,
+                upload_views,
+                TensorMeta {
+                    name: scale_alias.clone(),
+                    shape: scale_shape.clone(),
+                    dtype: scale_dtype.to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: scale_meta.offset,
+                    byte_len: scale_meta.byte_len,
+                },
+                TensorUploadView {
+                    dtype: scale_dtype.to_string(),
+                    shape: scale_shape.clone(),
+                },
+                scale_identity,
+            )?;
+
+            let zero_identity = if zero_alias == zero.tensor_name {
+                Stage3AliasIdentity::ExactPhysicalReuse {
+                    physical: &zero_meta,
+                }
+            } else {
+                Stage3AliasIdentity::New
+            };
+            apply_stage3_alias(
+                index,
+                upload_views,
+                TensorMeta {
+                    name: zero_alias.clone(),
+                    shape: zero_shape.clone(),
+                    dtype: zero_dtype.to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: zero_meta.offset,
+                    byte_len: zero_meta.byte_len,
+                },
+                TensorUploadView {
+                    dtype: zero_dtype.to_string(),
+                    shape: zero_shape.clone(),
+                },
+                zero_identity,
+            )?;
+        }
+        int4_storage_views.insert(
+            logical.name.clone(),
+            Int4StorageView {
+                kind: Int4StorageKind::TileV1,
+                group_size: 128,
+                packed_tensor: packed.tensor_name.clone(),
+                scale_tensor: scale.tensor_name.clone(),
+                zero_tensor: Some(zero.tensor_name.clone()),
+                logical_shape,
+                packed_row_stride_bytes: strides.packed_row_bytes,
+                packed_expert_stride_bytes: strides.packed_expert_bytes,
+                scale_row_stride_elements: strides.scale_row_elements,
+                scale_expert_stride_elements: strides.scale_expert_elements,
+                output_group_size: 128,
+                implicit_zero_code: None,
+            },
+        );
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_int4_storage_planes(
+    logical_name: &str,
+    logical_shape: &[usize],
+    packed_meta: &TensorMeta,
+    packed_upload_shape: &[usize],
+    scale_meta: &TensorMeta,
+    scale_upload_shape: &[usize],
+    zero: Option<(&TensorMeta, &[usize])>,
+    group_size: usize,
+    output_group_size: usize,
+) -> Result<Int4StorageStrides, Error> {
+    let strides = int4_storage_strides(logical_shape, group_size, output_group_size)?;
+    let rank = logical_shape.len();
+    let mut expected_packed_shape = logical_shape.to_vec();
+    expected_packed_shape[rank - 1] /= 2;
+    let mut expected_scale_shape = logical_shape.to_vec();
+    expected_scale_shape[rank - 2] /= output_group_size;
+    expected_scale_shape[rank - 1] /= group_size;
+
+    let packed_bytes = u64::try_from(strides.packed_elements).map_err(|_| {
+        Error::Other(format!(
+            "FLM Stage 3 INT4 tensor {logical_name} packed byte count does not fit u64"
+        ))
+    })?;
+    let scale_bytes_usize = strides.scale_elements.checked_mul(2).ok_or_else(|| {
+        Error::Other(format!(
+            "FLM Stage 3 INT4 tensor {logical_name} scale byte count overflows"
+        ))
+    })?;
+    let scale_bytes = u64::try_from(scale_bytes_usize).map_err(|_| {
+        Error::Other(format!(
+            "FLM Stage 3 INT4 tensor {logical_name} scale byte count does not fit u64"
+        ))
+    })?;
+
+    if packed_meta.dtype != "u8"
+        || packed_meta.shape != expected_packed_shape
+        || packed_upload_shape != expected_packed_shape
+        || packed_meta.byte_len != packed_bytes
+    {
+        return Err(Error::Other(format!(
+            "FLM Stage 3 INT4 tensor {logical_name} packed plane does not match expected shape {:?} and byte_len {packed_bytes}",
+            expected_packed_shape
+        )));
+    }
+    if scale_meta.dtype != "bf16"
+        || scale_meta.shape != expected_scale_shape
+        || scale_upload_shape != expected_scale_shape
+        || scale_meta.byte_len != scale_bytes
+    {
+        return Err(Error::Other(format!(
+            "FLM Stage 3 INT4 tensor {logical_name} scale plane does not match expected shape {:?} and byte_len {scale_bytes}",
+            expected_scale_shape
+        )));
+    }
+    if let Some((zero_meta, zero_upload_shape)) = zero {
+        if zero_meta.dtype != "bf16"
+            || zero_meta.shape != expected_scale_shape
+            || zero_upload_shape != expected_scale_shape
+            || zero_meta.byte_len != scale_bytes
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 INT4 tensor {logical_name} zero plane does not match expected shape {:?} and byte_len {scale_bytes}",
+                expected_scale_shape
+            )));
+        }
+    }
+    Ok(strides)
 }
 
 fn add_stage3_lowbit_aliases(
@@ -1629,6 +2256,7 @@ impl BakedStore {
             synthetic: HashMap::new(),
             upload_views: HashMap::new(),
             ct_int4_bf16_fallbacks: HashMap::new(),
+            int4_storage_views: HashMap::new(),
             runtime: None,
         })
     }
@@ -1676,20 +2304,25 @@ impl BakedStore {
         let mut synthetic = HashMap::new();
         let mut upload_views = HashMap::new();
         let mut ct_int4_bf16_fallbacks = HashMap::new();
-        if options.flm_int4_logical_aliases {
-            if let Some(runtime) = runtime.as_ref() {
-                if !runtime.logical_tensors().is_empty() {
+        let mut int4_storage_views = HashMap::new();
+        if let Some(runtime) = runtime.as_ref() {
+            if !runtime.logical_tensors().is_empty() {
+                build_stage3_int4_storage(
+                    runtime,
+                    &mut index,
+                    &mut upload_views,
+                    &mut ct_int4_bf16_fallbacks,
+                    &mut int4_storage_views,
+                    &index_entries,
+                    options.flm_int4_logical_aliases,
+                )?;
+                validate_row_group_storage_plane_overlaps(runtime, &index_entries)?;
+                if options.flm_int4_logical_aliases {
                     add_stage3_raw_value_aliases(runtime, &mut index, &mut upload_views)?;
-                    add_stage3_int4_aliases(
-                        runtime,
-                        &mut index,
-                        &mut upload_views,
-                        &mut ct_int4_bf16_fallbacks,
-                    )?;
                     add_stage3_lowbit_aliases(runtime, &mut index, &mut upload_views)?;
-                } else {
-                    add_manifest_int4_aliases(runtime, &mut index, &mut synthetic)?;
                 }
+            } else if options.flm_int4_logical_aliases {
+                add_manifest_int4_aliases(runtime, &mut index, &mut synthetic)?;
             }
         }
         Ok(Self {
@@ -1702,6 +2335,7 @@ impl BakedStore {
             synthetic,
             upload_views,
             ct_int4_bf16_fallbacks,
+            int4_storage_views,
             runtime,
         })
     }
@@ -1726,6 +2360,10 @@ impl BakedStore {
 
     pub fn flm_runtime(&self) -> Option<&crate::flm::FlmRuntimeDirectory> {
         self.runtime.as_ref()
+    }
+
+    pub fn int4_storage_view(&self, logical_name: &str) -> Option<&Int4StorageView> {
+        self.int4_storage_views.get(logical_name)
     }
 
     #[cfg(test)]
@@ -2232,12 +2870,76 @@ mod tests {
     const TEST_FLM_SHARD_DESC_SIZE: usize = 24;
     const TEST_FLM_HASH_RECORD_SIZE: usize = 40;
 
+    #[derive(Clone)]
     struct TestFlmTensor {
         name: &'static str,
         shape: Vec<u32>,
         dtype: u16,
         codec: u8,
         payload: Vec<u8>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestTensorMetaSnapshot {
+        name: String,
+        shape: Vec<usize>,
+        dtype: String,
+        layout: LayoutTag,
+        offset: u64,
+        byte_len: u64,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestStage3PublicationSnapshot {
+        index: Vec<TestTensorMetaSnapshot>,
+        upload_views: Vec<(String, TensorUploadView)>,
+        ct_int4_bf16_fallbacks: Vec<(String, CtSymInt4Bf16Fallback)>,
+        int4_storage_views: Vec<(String, Int4StorageView)>,
+    }
+
+    fn stage3_publication_snapshot(
+        index: &HashMap<String, TensorMeta>,
+        upload_views: &HashMap<String, TensorUploadView>,
+        ct_int4_bf16_fallbacks: &HashMap<String, CtSymInt4Bf16Fallback>,
+        int4_storage_views: &HashMap<String, Int4StorageView>,
+    ) -> TestStage3PublicationSnapshot {
+        let mut index = index
+            .values()
+            .map(|meta| TestTensorMetaSnapshot {
+                name: meta.name.clone(),
+                shape: meta.shape.clone(),
+                dtype: meta.dtype.clone(),
+                layout: meta.layout.clone(),
+                offset: meta.offset,
+                byte_len: meta.byte_len,
+            })
+            .collect::<Vec<_>>();
+        index.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let mut upload_views = upload_views
+            .iter()
+            .map(|(name, view)| (name.clone(), view.clone()))
+            .collect::<Vec<_>>();
+        upload_views.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut ct_int4_bf16_fallbacks = ct_int4_bf16_fallbacks
+            .iter()
+            .map(|(name, fallback)| (name.clone(), fallback.clone()))
+            .collect::<Vec<_>>();
+        ct_int4_bf16_fallbacks.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut int4_storage_views = int4_storage_views
+            .iter()
+            .map(|(name, view)| (name.clone(), view.clone()))
+            .collect::<Vec<_>>();
+        int4_storage_views.sort_by(|left, right| left.0.cmp(&right.0));
+
+        TestStage3PublicationSnapshot {
+            index,
+            upload_views,
+            ct_int4_bf16_fallbacks,
+            int4_storage_views,
+        }
     }
 
     fn put_u16(buf: &mut [u8], off: usize, value: u16) {
@@ -2464,7 +3166,7 @@ mod tests {
 
     fn runtime_codec_section() -> Vec<u8> {
         let mut out = Vec::new();
-        push_u32(&mut out, 10);
+        push_u32(&mut out, 11);
         for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
             (0u8, crate::flm::CODEC_RAW_BF16 as u8, 0u16, 0u16, 0u32),
             (
@@ -2517,6 +3219,15 @@ mod tests {
                 0u16,
                 1u16,
                 0u32,
+            ),
+            (
+                10u8,
+                crate::flm::CODEC_ROW_GROUP_INT4_BF16_SYM as u8,
+                crate::flm::LAYOUT_ROW_MAJOR_UINT4_LOW_EVEN,
+                1u16,
+                u32::from(
+                    crate::flm::QUANT_FLAG_SYMMETRIC | crate::flm::QUANT_FLAG_IMPLICIT_ZERO_8,
+                ),
             ),
         ] {
             out.push(codec_id);
@@ -2867,6 +3578,66 @@ mod tests {
         out
     }
 
+    #[derive(Clone, Copy)]
+    struct TestNativeInt4Stage3 {
+        logical_name: &'static str,
+        packed_name: &'static str,
+        scale_name: &'static str,
+        zero_name: &'static str,
+    }
+
+    impl TestNativeInt4Stage3 {
+        fn canonical() -> Self {
+            Self {
+                logical_name: "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                packed_name: "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                scale_name: "model.language_model.layers.0.mlp.experts.gate_up_proj_int4_scale",
+                zero_name: "model.language_model.layers.0.mlp.experts.gate_up_proj_int4_zero",
+            }
+        }
+    }
+
+    fn test_native_int4_physical_index(
+        fixture: &TestNativeInt4Stage3,
+    ) -> HashMap<String, TensorMeta> {
+        let packed_len = (2 * 256 * 64) as u64;
+        HashMap::from([
+            (
+                fixture.packed_name.to_string(),
+                TensorMeta {
+                    name: fixture.packed_name.to_string(),
+                    shape: vec![2, 256, 64],
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 0,
+                    byte_len: packed_len,
+                },
+            ),
+            (
+                fixture.scale_name.to_string(),
+                TensorMeta {
+                    name: fixture.scale_name.to_string(),
+                    shape: vec![2, 2, 1],
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: packed_len,
+                    byte_len: 8,
+                },
+            ),
+            (
+                fixture.zero_name.to_string(),
+                TensorMeta {
+                    name: fixture.zero_name.to_string(),
+                    shape: vec![2, 2, 1],
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: packed_len + 8,
+                    byte_len: 8,
+                },
+            ),
+        ])
+    }
+
     fn runtime_stage3_native_int4_storage_abi_section() -> Vec<u8> {
         let mut out = Vec::new();
         push_u16(&mut out, 1);
@@ -2885,8 +3656,10 @@ mod tests {
         out
     }
 
-    fn runtime_stage3_native_int4_logical_tensor_section() -> Vec<u8> {
-        let name = b"model.language_model.layers.0.mlp.experts.gate_up_proj";
+    fn runtime_stage3_native_int4_logical_tensor_section(
+        fixture: &TestNativeInt4Stage3,
+    ) -> Vec<u8> {
+        let name = fixture.logical_name.as_bytes();
         let mut out = Vec::new();
         push_u16(&mut out, 1);
         push_u16(&mut out, 44);
@@ -2911,20 +3684,22 @@ mod tests {
         out
     }
 
-    fn runtime_stage3_native_int4_storage_binding_section() -> Vec<u8> {
+    fn runtime_stage3_native_int4_storage_binding_section(
+        fixture: &TestNativeInt4Stage3,
+    ) -> Vec<u8> {
         let rows: [(&[u8], u16, u16); 3] = [
             (
-                b"model.language_model.layers.0.mlp.experts.gate_up_proj",
+                fixture.packed_name.as_bytes(),
                 crate::flm::STORAGE_ROLE_PACKED,
                 FLM_DTYPE_UINT8,
             ),
             (
-                b"model.language_model.layers.0.mlp.experts.gate_up_proj_int4_scale",
+                fixture.scale_name.as_bytes(),
                 crate::flm::STORAGE_ROLE_SCALE,
                 FLM_DTYPE_BF16,
             ),
             (
-                b"model.language_model.layers.0.mlp.experts.gate_up_proj_int4_zero",
+                fixture.zero_name.as_bytes(),
                 crate::flm::STORAGE_ROLE_ZERO,
                 FLM_DTYPE_BF16,
             ),
@@ -2996,6 +3771,564 @@ mod tests {
         out
     }
 
+    const TEST_CT_INT4_LOGICAL_NAME: &str = "model.language_model.layers.0.mlp.gate_proj.weight";
+    const TEST_CT_INT4_PACKED_NAME: &str = "storage/l0_gate_packed";
+    const TEST_CT_INT4_SCALE_NAME: &str = "storage/l0_gate_scale";
+    const TEST_CT_INT4_SHAPE_NAME: &str = "storage/l0_gate_shape";
+
+    fn merge_test_runtime_record_sections(
+        mut first: Vec<u8>,
+        mut second: Vec<u8>,
+        header_len: usize,
+        record_size: usize,
+        first_count: usize,
+        second_count: usize,
+        mut adjust_second: impl FnMut(&mut [u8], usize),
+    ) -> Vec<u8> {
+        assert_eq!(&first[..4], &second[..4]);
+        let first_records_end = header_len + first_count * record_size;
+        let second_records_end = header_len + second_count * record_size;
+        let first_pool_len = first.len() - first_records_end;
+        let second_pool_len = second.len() - second_records_end;
+
+        put_u32(&mut first, 4, (first_count + second_count) as u32);
+        if header_len == 12 {
+            put_u32(&mut first, 8, (first_pool_len + second_pool_len) as u32);
+        }
+        for record in second[header_len..second_records_end].chunks_exact_mut(record_size) {
+            adjust_second(record, first_pool_len);
+        }
+
+        let mut out = first[..header_len].to_vec();
+        out.extend_from_slice(&first[header_len..first_records_end]);
+        out.extend_from_slice(&second[header_len..second_records_end]);
+        out.extend_from_slice(&first[first_records_end..]);
+        out.extend_from_slice(&second[second_records_end..]);
+        out
+    }
+
+    fn add_test_record_name_pool_offset(record: &mut [u8], first_pool_len: usize) {
+        let name_offset = u32::from_le_bytes(record[4..8].try_into().unwrap());
+        put_u32(record, 4, name_offset + first_pool_len as u32);
+    }
+
+    fn runtime_stage3_ct_then_native_storage_abi_section() -> Vec<u8> {
+        merge_test_runtime_record_sections(
+            runtime_stage3_storage_abi_section(),
+            runtime_stage3_native_int4_storage_abi_section(),
+            12,
+            21,
+            1,
+            1,
+            |_, _| {},
+        )
+    }
+
+    fn runtime_stage3_ct_then_native_logical_tensor_section(
+        fixture: &TestNativeInt4Stage3,
+    ) -> Vec<u8> {
+        merge_test_runtime_record_sections(
+            runtime_stage3_logical_tensor_section(),
+            runtime_stage3_native_int4_logical_tensor_section(fixture),
+            12,
+            44,
+            1,
+            1,
+            |record, first_pool_len| {
+                put_u32(record, 0, 2);
+                add_test_record_name_pool_offset(record, first_pool_len);
+                put_u32(record, 34, 3);
+            },
+        )
+    }
+
+    fn runtime_stage3_ct_then_native_storage_binding_section(
+        fixture: &TestNativeInt4Stage3,
+    ) -> Vec<u8> {
+        merge_test_runtime_record_sections(
+            runtime_stage3_storage_binding_section(),
+            runtime_stage3_native_int4_storage_binding_section(fixture),
+            12,
+            20,
+            3,
+            3,
+            |record, first_pool_len| {
+                put_u32(record, 0, 2);
+                add_test_record_name_pool_offset(record, first_pool_len);
+            },
+        )
+    }
+
+    fn runtime_stage3_ct_then_native_plan_step_section() -> Vec<u8> {
+        merge_test_runtime_record_sections(
+            runtime_stage3_plan_step_section(),
+            runtime_stage3_native_int4_plan_step_section(),
+            8,
+            38,
+            2,
+            3,
+            |record, _| put_u32(record, 0, 2),
+        )
+    }
+
+    const TEST_ROW_GROUP_LOGICAL_NAME: &str = "semantic.row_group.weight";
+    const TEST_ROW_GROUP_PACKED_NAME: &str = "opaque/packed-plane";
+    const TEST_ROW_GROUP_SCALE_NAME: &str = "opaque/scale-plane";
+    const TEST_ROW_GROUP_ZERO_NAME: &str = "opaque/zero-plane";
+    const TEST_ROW_GROUP_PARAMS: [u8; 12] = [
+        0x01, 0x00, 0x01, 0x01, 0x02, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00,
+    ];
+
+    #[derive(Clone)]
+    struct TestRowGroupStage3 {
+        logical_name: &'static str,
+        packed_name: &'static str,
+        scale_name: &'static str,
+        zero_name: &'static str,
+        rank: u8,
+        logical_shape: [u32; 4],
+        codec_semantic_id: u16,
+        layout_id: u16,
+        bits: u8,
+        group_size: u16,
+        quant_flags: u16,
+        params: [u8; 12],
+        scale_abi_id: u16,
+        include_scale: bool,
+        include_zero: bool,
+        include_payloads: bool,
+        packed_index_dtype: u16,
+        scale_index_codec: u8,
+        scale_codec_semantic_id: u8,
+        scale_codec_layout_id: u16,
+        scale_codec_decoder_id: u16,
+        scale_codec_flags: u32,
+        scale_payload_shape: Option<Vec<u32>>,
+        payload_len_override: Option<(usize, usize)>,
+        extra_tensors: Vec<TestFlmTensor>,
+    }
+
+    impl TestRowGroupStage3 {
+        fn rank2() -> Self {
+            Self {
+                logical_name: TEST_ROW_GROUP_LOGICAL_NAME,
+                packed_name: TEST_ROW_GROUP_PACKED_NAME,
+                scale_name: TEST_ROW_GROUP_SCALE_NAME,
+                zero_name: TEST_ROW_GROUP_ZERO_NAME,
+                rank: 2,
+                logical_shape: [4, 64, 0, 0],
+                codec_semantic_id: crate::flm::CODEC_ROW_GROUP_INT4_BF16_SYM,
+                layout_id: crate::flm::LAYOUT_ROW_MAJOR_UINT4_LOW_EVEN,
+                bits: 4,
+                group_size: 32,
+                quant_flags: crate::flm::QUANT_FLAG_SYMMETRIC
+                    | crate::flm::QUANT_FLAG_IMPLICIT_ZERO_8,
+                params: TEST_ROW_GROUP_PARAMS,
+                scale_abi_id: crate::flm::STORAGE_ABI_ID_ROW_GROUP_INT4_G32,
+                include_scale: true,
+                include_zero: false,
+                include_payloads: true,
+                packed_index_dtype: FLM_DTYPE_UINT8,
+                scale_index_codec: 0,
+                scale_codec_semantic_id: crate::flm::CODEC_RAW_BF16 as u8,
+                scale_codec_layout_id: crate::flm::LAYOUT_ID_DEFAULT,
+                scale_codec_decoder_id: 0,
+                scale_codec_flags: 0,
+                scale_payload_shape: None,
+                payload_len_override: None,
+                extra_tensors: Vec::new(),
+            }
+        }
+
+        fn rank3() -> Self {
+            Self {
+                rank: 3,
+                logical_shape: [2, 4, 64, 0],
+                ..Self::rank2()
+            }
+        }
+
+        fn physical_shapes(&self) -> (Vec<u32>, Vec<u32>) {
+            match self.rank {
+                2 => (
+                    vec![self.logical_shape[0], self.logical_shape[1] / 2],
+                    vec![self.logical_shape[0], self.logical_shape[1] / 32],
+                ),
+                3 => (
+                    vec![
+                        self.logical_shape[0],
+                        self.logical_shape[1],
+                        self.logical_shape[2] / 2,
+                    ],
+                    vec![
+                        self.logical_shape[0],
+                        self.logical_shape[1],
+                        self.logical_shape[2] / 32,
+                    ],
+                ),
+                _ => (vec![self.logical_shape[0]], vec![self.logical_shape[0]]),
+            }
+        }
+    }
+
+    fn runtime_row_group_codec_section(fixture: &TestRowGroupStage3) -> Vec<u8> {
+        let mut out = runtime_codec_section();
+        let record_offset = 4 + usize::from(fixture.scale_index_codec) * 10;
+        if record_offset + 10 > out.len() {
+            return out;
+        }
+        assert_eq!(out[record_offset], fixture.scale_index_codec);
+        out[record_offset + 1] = fixture.scale_codec_semantic_id;
+        put_u16(&mut out, record_offset + 2, fixture.scale_codec_layout_id);
+        put_u16(&mut out, record_offset + 4, fixture.scale_codec_decoder_id);
+        put_u32(&mut out, record_offset + 6, fixture.scale_codec_flags);
+        out
+    }
+
+    fn runtime_stage3_row_group_storage_abi_section(fixture: &TestRowGroupStage3) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 21);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, fixture.params.len() as u32);
+        push_u16(&mut out, crate::flm::STORAGE_ABI_ID_ROW_GROUP_INT4_G32);
+        push_u16(&mut out, crate::flm::STORAGE_ABI_KIND_GROUP_QUANT);
+        push_u16(&mut out, fixture.codec_semantic_id);
+        push_u16(&mut out, fixture.layout_id);
+        out.push(fixture.bits);
+        push_u16(&mut out, fixture.group_size);
+        push_u16(&mut out, fixture.quant_flags);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, fixture.params.len() as u32);
+        out.extend_from_slice(&fixture.params);
+        out
+    }
+
+    fn runtime_stage3_row_group_logical_tensor_section(fixture: &TestRowGroupStage3) -> Vec<u8> {
+        let name = fixture.logical_name.as_bytes();
+        let binding_count = 1 + u16::from(fixture.include_scale) + u16::from(fixture.include_zero);
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, name.len() as u32);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, name.len() as u16);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+        out.push(fixture.rank);
+        out.push(0);
+        for dim in fixture.logical_shape {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::VALUE_FORMAT_SYM_INT4);
+        push_u16(&mut out, FLM_DTYPE_BF16);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, binding_count);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+        push_u16(&mut out, 0);
+        out.extend_from_slice(name);
+        out
+    }
+
+    fn runtime_stage3_row_group_storage_binding_section(fixture: &TestRowGroupStage3) -> Vec<u8> {
+        let mut rows = vec![(
+            fixture.packed_name.as_bytes(),
+            crate::flm::STORAGE_ROLE_PACKED,
+            FLM_DTYPE_UINT8,
+            crate::flm::STORAGE_ABI_ID_ROW_GROUP_INT4_G32,
+        )];
+        if fixture.include_scale {
+            rows.push((
+                fixture.scale_name.as_bytes(),
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                fixture.scale_abi_id,
+            ));
+        }
+        if fixture.include_zero {
+            rows.push((
+                fixture.zero_name.as_bytes(),
+                crate::flm::STORAGE_ROLE_ZERO,
+                FLM_DTYPE_BF16,
+                crate::flm::STORAGE_ABI_ID_ROW_GROUP_INT4_G32,
+            ));
+        }
+        let pool_len: usize = rows.iter().map(|(name, _, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::new();
+        let mut name_offset = 0u32;
+        for (name, role, dtype, abi_id) in rows {
+            push_u32(&mut out, 1);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, role);
+            push_u16(&mut out, dtype);
+            push_u16(&mut out, abi_id);
+            push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name);
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_row_group_plan_step_section(fixture: &TestRowGroupStage3) -> Vec<u8> {
+        let (packed_shape, scale_shape) = fixture.physical_shapes();
+        let mut rows = vec![(
+            crate::flm::STORAGE_ROLE_PACKED,
+            FLM_DTYPE_UINT8,
+            packed_shape,
+        )];
+        if fixture.include_scale {
+            rows.push((crate::flm::STORAGE_ROLE_SCALE, FLM_DTYPE_BF16, scale_shape));
+        }
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, rows.len() as u32);
+        for (role, dtype, shape) in rows {
+            push_u32(&mut out, 1);
+            push_u16(&mut out, role);
+            push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+            push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+            push_u16(&mut out, dtype);
+            out.push(shape.len() as u8);
+            out.push(0);
+            for dim in shape.iter().copied().chain(std::iter::repeat(0)).take(4) {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+            push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+            push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_row_group_stage3_tables(
+        fixture: &TestRowGroupStage3,
+    ) -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_row_group_codec_section(fixture)),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_row_group_storage_abi_section(fixture)),
+            (
+                10u32,
+                runtime_stage3_row_group_logical_tensor_section(fixture),
+            ),
+            (
+                11u32,
+                runtime_stage3_row_group_storage_binding_section(fixture),
+            ),
+            (12u32, runtime_stage3_row_group_plan_step_section(fixture)),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn runtime_stage3_row_group_logical_tensor_section_for_fixtures(
+        fixtures: &[TestRowGroupStage3],
+    ) -> Vec<u8> {
+        let mut string_pool = Vec::new();
+        let mut names = Vec::with_capacity(fixtures.len());
+        for fixture in fixtures {
+            let offset = string_pool.len() as u32;
+            string_pool.extend_from_slice(fixture.logical_name.as_bytes());
+            names.push((offset, fixture.logical_name.len() as u16));
+        }
+
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, fixtures.len() as u32);
+        push_u32(&mut out, string_pool.len() as u32);
+        for (idx, (fixture, (name_offset, name_len))) in fixtures.iter().zip(names).enumerate() {
+            assert_eq!(fixture.rank, 2);
+            assert!(fixture.include_scale);
+            assert!(!fixture.include_zero);
+            push_u32(&mut out, (idx + 1) as u32);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name_len);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+            out.push(fixture.rank);
+            out.push(0);
+            for dim in fixture.logical_shape {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, crate::flm::VALUE_FORMAT_SYM_INT4);
+            push_u16(&mut out, FLM_DTYPE_BF16);
+            push_u32(&mut out, (idx * 2) as u32);
+            push_u16(&mut out, 2);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+        }
+        out.extend_from_slice(&string_pool);
+        out
+    }
+
+    fn runtime_stage3_row_group_storage_binding_section_for_fixtures(
+        fixtures: &[TestRowGroupStage3],
+    ) -> Vec<u8> {
+        let mut rows = Vec::with_capacity(fixtures.len() * 2);
+        for (idx, fixture) in fixtures.iter().enumerate() {
+            let logical_id = (idx + 1) as u32;
+            rows.push((
+                logical_id,
+                fixture.packed_name.as_bytes(),
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                crate::flm::STORAGE_ABI_ID_ROW_GROUP_INT4_G32,
+            ));
+            rows.push((
+                logical_id,
+                fixture.scale_name.as_bytes(),
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                fixture.scale_abi_id,
+            ));
+        }
+        let pool_len: usize = rows.iter().map(|(_, name, _, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::with_capacity(pool_len);
+        let mut name_offset = 0u32;
+        for (logical_id, name, role, dtype, abi_id) in rows {
+            push_u32(&mut out, logical_id);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, role);
+            push_u16(&mut out, dtype);
+            push_u16(&mut out, abi_id);
+            push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name);
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_row_group_plan_step_section_for_fixtures(
+        fixtures: &[TestRowGroupStage3],
+    ) -> Vec<u8> {
+        let mut rows = Vec::with_capacity(fixtures.len() * 2);
+        for (idx, fixture) in fixtures.iter().enumerate() {
+            let (packed_shape, scale_shape) = fixture.physical_shapes();
+            rows.push((
+                (idx + 1) as u32,
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                packed_shape,
+            ));
+            rows.push((
+                (idx + 1) as u32,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                scale_shape,
+            ));
+        }
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, rows.len() as u32);
+        for (logical_id, role, dtype, shape) in rows {
+            push_u32(&mut out, logical_id);
+            push_u16(&mut out, role);
+            push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+            push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+            push_u16(&mut out, dtype);
+            out.push(shape.len() as u8);
+            out.push(0);
+            for dim in shape.iter().copied().chain(std::iter::repeat(0)).take(4) {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+            push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+            push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_two_row_group_stage3_tables(
+        fixtures: &[TestRowGroupStage3],
+    ) -> Vec<u8> {
+        assert_eq!(fixtures.len(), 2);
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_row_group_codec_section(&fixtures[0])),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (
+                9u32,
+                runtime_stage3_row_group_storage_abi_section(&fixtures[0]),
+            ),
+            (
+                10u32,
+                runtime_stage3_row_group_logical_tensor_section_for_fixtures(fixtures),
+            ),
+            (
+                11u32,
+                runtime_stage3_row_group_storage_binding_section_for_fixtures(fixtures),
+            ),
+            (
+                12u32,
+                runtime_stage3_row_group_plan_step_section_for_fixtures(fixtures),
+            ),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
     fn build_test_runtime_directory_with_stage3_tables() -> Vec<u8> {
         let (asset_table, asset_payloads) = runtime_asset_sections();
         let sections = [
@@ -3031,7 +4364,9 @@ mod tests {
         out
     }
 
-    fn build_test_runtime_directory_with_native_int4_stage3_tables() -> Vec<u8> {
+    fn build_test_runtime_directory_with_native_int4_stage3_fixture(
+        fixture: &TestNativeInt4Stage3,
+    ) -> Vec<u8> {
         let (asset_table, asset_payloads) = runtime_asset_sections();
         let sections = [
             (1u32, runtime_config_section()),
@@ -3043,9 +4378,58 @@ mod tests {
             (7u32, runtime_model_descriptor_section()),
             (8u32, runtime_tensor_manifest_section(&[])),
             (9u32, runtime_stage3_native_int4_storage_abi_section()),
-            (10u32, runtime_stage3_native_int4_logical_tensor_section()),
-            (11u32, runtime_stage3_native_int4_storage_binding_section()),
+            (
+                10u32,
+                runtime_stage3_native_int4_logical_tensor_section(fixture),
+            ),
+            (
+                11u32,
+                runtime_stage3_native_int4_storage_binding_section(fixture),
+            ),
             (12u32, runtime_stage3_native_int4_plan_step_section()),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_ct_then_native_int4_stage3_tables(
+        fixture: &TestNativeInt4Stage3,
+    ) -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_ct_then_native_storage_abi_section()),
+            (
+                10u32,
+                runtime_stage3_ct_then_native_logical_tensor_section(fixture),
+            ),
+            (
+                11u32,
+                runtime_stage3_ct_then_native_storage_binding_section(fixture),
+            ),
+            (12u32, runtime_stage3_ct_then_native_plan_step_section()),
         ];
         let header_len = 16 + sections.len() * 12;
         let mut offset = header_len as u32;
@@ -3842,32 +5226,137 @@ mod tests {
     }
 
     fn build_test_flm_with_stage3_native_int4_bindings() -> Vec<u8> {
-        let mut data = build_test_flm(&[
+        build_test_flm_with_stage3_native_int4_fixture(&TestNativeInt4Stage3::canonical(), &[])
+    }
+
+    fn build_test_flm_with_stage3_native_int4_fixture(
+        fixture: &TestNativeInt4Stage3,
+        extras: &[TestFlmTensor],
+    ) -> Vec<u8> {
+        let mut tensors = vec![
             TestFlmTensor {
-                name: "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                name: fixture.packed_name,
                 shape: vec![2, 256, 64],
                 dtype: FLM_DTYPE_UINT8,
                 codec: 9,
                 payload: vec![0xab; 2 * 256 * 64],
             },
             TestFlmTensor {
-                name: "model.language_model.layers.0.mlp.experts.gate_up_proj_int4_scale",
+                name: fixture.scale_name,
                 shape: vec![2, 2, 1],
                 dtype: FLM_DTYPE_BF16,
                 codec: 0,
                 payload: test_bf16_bytes([1.0, 2.0, 3.0, 4.0]),
             },
             TestFlmTensor {
-                name: "model.language_model.layers.0.mlp.experts.gate_up_proj_int4_zero",
+                name: fixture.zero_name,
                 shape: vec![2, 2, 1],
                 dtype: FLM_DTYPE_BF16,
                 codec: 0,
                 payload: test_bf16_bytes([8.0; 4]),
             },
-        ]);
-        let runtime = build_test_runtime_directory_with_native_int4_stage3_tables();
+        ];
+        tensors.extend(extras.iter().cloned());
+        let mut data = build_test_flm(&tensors);
+        let runtime = build_test_runtime_directory_with_native_int4_stage3_fixture(fixture);
         append_runtime_directory(&mut data, &runtime);
         data
+    }
+
+    fn build_test_flm_with_stage3_row_group_bindings(fixture: &TestRowGroupStage3) -> Vec<u8> {
+        let (packed_shape, scale_shape) = fixture.physical_shapes();
+        let scale_payload_shape = fixture
+            .scale_payload_shape
+            .clone()
+            .unwrap_or_else(|| scale_shape.clone());
+        let (packed_elements, scale_elements) = fixture.payload_len_override.unwrap_or_else(|| {
+            (
+                packed_shape.iter().map(|dim| *dim as usize).product(),
+                scale_payload_shape
+                    .iter()
+                    .map(|dim| *dim as usize)
+                    .product(),
+            )
+        });
+        let mut tensors = Vec::new();
+        if fixture.include_payloads {
+            tensors.push(TestFlmTensor {
+                name: fixture.packed_name,
+                shape: packed_shape,
+                dtype: fixture.packed_index_dtype,
+                codec: 10,
+                payload: vec![0x88; packed_elements],
+            });
+            if fixture.include_scale {
+                tensors.push(TestFlmTensor {
+                    name: fixture.scale_name,
+                    shape: scale_payload_shape,
+                    dtype: FLM_DTYPE_BF16,
+                    codec: fixture.scale_index_codec,
+                    payload: test_bf16_bytes(std::iter::repeat(1.0).take(scale_elements)),
+                });
+            }
+            if fixture.include_zero {
+                tensors.push(TestFlmTensor {
+                    name: fixture.zero_name,
+                    shape: vec![1],
+                    dtype: FLM_DTYPE_BF16,
+                    codec: 0,
+                    payload: test_bf16_bytes([8.0]),
+                });
+            }
+            tensors.extend(fixture.extra_tensors.iter().cloned());
+        }
+        let mut data = build_test_flm(&tensors);
+        let runtime = build_test_runtime_directory_with_row_group_stage3_tables(fixture);
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
+    fn build_test_flm_with_two_row_group_bindings(fixtures: &[TestRowGroupStage3]) -> Vec<u8> {
+        assert_eq!(fixtures.len(), 2);
+        let mut tensors = Vec::with_capacity(4);
+        for fixture in fixtures {
+            let (packed_shape, scale_shape) = fixture.physical_shapes();
+            let packed_elements: usize = packed_shape.iter().map(|dim| *dim as usize).product();
+            let scale_elements: usize = scale_shape.iter().map(|dim| *dim as usize).product();
+            tensors.push(TestFlmTensor {
+                name: fixture.packed_name,
+                shape: packed_shape,
+                dtype: fixture.packed_index_dtype,
+                codec: 10,
+                payload: vec![0x88; packed_elements],
+            });
+            tensors.push(TestFlmTensor {
+                name: fixture.scale_name,
+                shape: scale_shape,
+                dtype: FLM_DTYPE_BF16,
+                codec: fixture.scale_index_codec,
+                payload: test_bf16_bytes(std::iter::repeat(1.0).take(scale_elements)),
+            });
+        }
+        let mut data = build_test_flm(&tensors);
+        let runtime = build_test_runtime_directory_with_two_row_group_stage3_tables(fixtures);
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
+    fn copy_test_flm_index_extent(data: &mut [u8], source_idx: usize, target_idx: usize) {
+        let index_offset =
+            read_u64(data, 24, "test FLM index offset").expect("test FLM index offset") as usize;
+        let source = index_offset + source_idx * TEST_FLM_INDEX_RECORD_SIZE;
+        let target = index_offset + target_idx * TEST_FLM_INDEX_RECORD_SIZE;
+        let extent = data[source + 12..source + 36].to_vec();
+        data[target + 12..target + 36].copy_from_slice(&extent);
+        put_head_crc64(data);
+    }
+
+    fn set_test_flm_index_shard_offset(data: &mut [u8], target_idx: usize, shard_offset: u64) {
+        let index_offset =
+            read_u64(data, 24, "test FLM index offset").expect("test FLM index offset") as usize;
+        let target = index_offset + target_idx * TEST_FLM_INDEX_RECORD_SIZE;
+        put_u64(data, target + 12, shard_offset);
+        put_head_crc64(data);
     }
 
     fn build_test_flm_with_stage3_raw_value_binding() -> Vec<u8> {
@@ -4045,6 +5534,61 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_rejects_duplicate_tensor_index_names() {
+        let data = build_test_flm(&[
+            TestFlmTensor {
+                name: "duplicate.tensor",
+                shape: vec![1],
+                dtype: 4,
+                codec: 0,
+                payload: vec![1],
+            },
+            TestFlmTensor {
+                name: "duplicate.tensor",
+                shape: vec![1],
+                dtype: 4,
+                codec: 0,
+                payload: vec![2],
+            },
+        ]);
+        let file = write_temp_flm(&data);
+
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("duplicate FLM tensor names must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("duplicate FLM tensor name"),
+            "unexpected duplicate-name error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_tensor_index_rank_above_four() {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "rank.five.tensor",
+            shape: vec![1, 2, 3, 4],
+            dtype: FLM_DTYPE_UINT8,
+            codec: 0,
+            payload: vec![0; 24],
+        }]);
+        let index_offset =
+            read_u64(&data, 24, "test FLM index offset").expect("test FLM index offset") as usize;
+        data[index_offset + 41] = 5;
+        put_head_crc64(&mut data);
+        let file = write_temp_flm(&data);
+
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("tensor index rank above four must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("rank 5") && err.to_string().contains("4 dimensions"),
+            "unexpected rank error: {err}"
+        );
+    }
+
+    #[test]
     fn open_flm_exposes_file_storage_extent_for_direct_tensor() {
         let data = build_test_flm(&[
             TestFlmTensor {
@@ -4072,7 +5616,7 @@ mod tests {
             .expect("direct FLM tensor should expose a file extent");
 
         assert_eq!(extent.source_kind, TensorStorageSourceKind::FlmContainer);
-        assert_eq!(extent.source_path, file.path());
+        assert_eq!(extent.source_path, file.path().canonicalize().unwrap());
         assert_eq!(extent.name, "model.norm.weight");
         assert_eq!(extent.file_offset, meta.offset);
         assert_eq!(extent.byte_len, meta.byte_len);
@@ -4105,7 +5649,10 @@ mod tests {
             range.extent.source_kind,
             TensorStorageSourceKind::FlmContainer
         );
-        assert_eq!(range.extent.source_path, file.path());
+        assert_eq!(
+            range.extent.source_path,
+            file.path().canonicalize().unwrap()
+        );
         assert_eq!(range.extent.name, "model.norm.weight");
         assert_eq!(range.extent.file_offset, meta.offset);
         assert_eq!(range.extent.byte_len, meta.byte_len);
@@ -4393,6 +5940,1024 @@ mod tests {
             store.raw_bytes(&zero_name).expect("native INT4 zero bytes"),
             test_bf16_bytes([8.0; 4]).as_slice()
         );
+
+        let view = store.int4_storage_view(name).expect("tile-v1 storage view");
+        assert_eq!(view.kind, Int4StorageKind::TileV1);
+        assert_eq!(view.group_size, 128);
+        assert_eq!(view.packed_tensor, name);
+        assert_eq!(view.scale_tensor, scale_name);
+        assert_eq!(view.zero_tensor.as_deref(), Some(zero_name.as_str()));
+        assert_eq!(view.logical_shape, vec![2, 256, 128]);
+        assert_eq!(view.packed_row_stride_bytes, 64);
+        assert_eq!(view.packed_expert_stride_bytes, 16_384);
+        assert_eq!(view.scale_row_stride_elements, 1);
+        assert_eq!(view.scale_expert_stride_elements, 2);
+        assert_eq!(view.output_group_size, 128);
+        assert_eq!(view.implicit_zero_code, None);
+    }
+
+    #[test]
+    fn open_flm_keeps_tile_v1_storage_view_when_logical_aliases_are_disabled() {
+        let fixture = TestNativeInt4Stage3::canonical();
+        let data = build_test_flm_with_stage3_native_int4_fixture(&fixture, &[]);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: false,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open tile-v1 FLM without convenience aliases");
+
+        let view = store
+            .int4_storage_view(fixture.logical_name)
+            .expect("tile-v1 typed storage view");
+        assert_eq!(view.kind, Int4StorageKind::TileV1);
+        assert_eq!(view.packed_tensor, fixture.packed_name);
+        assert_eq!(view.scale_tensor, fixture.scale_name);
+        assert_eq!(view.zero_tensor.as_deref(), Some(fixture.zero_name));
+        assert_eq!(store.layout(fixture.packed_name), Some(&LayoutTag::Raw));
+        assert!(store.upload_view(fixture.logical_name).is_none());
+    }
+
+    #[test]
+    fn open_flm_reuses_exact_tile_sidecar_names_without_replacing_metadata() {
+        let fixture = TestNativeInt4Stage3::canonical();
+        let data = build_test_flm_with_stage3_native_int4_fixture(&fixture, &[]);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("exact physical sidecar reuse is legal");
+
+        for name in [fixture.scale_name, fixture.zero_name] {
+            let meta = store.meta(name).expect("physical sidecar metadata");
+            assert_eq!(meta.name, name);
+            assert_eq!(meta.shape, vec![2, 2, 1]);
+            assert_eq!(meta.dtype, "bf16");
+            assert_eq!(meta.layout, LayoutTag::Raw);
+            assert_eq!(meta.byte_len, 8);
+            let upload = store
+                .upload_view(name)
+                .expect("physical sidecar upload view");
+            assert_eq!(upload.dtype, "bf16");
+            assert_eq!(upload.shape, vec![2, 2, 1]);
+        }
+    }
+
+    #[test]
+    fn open_flm_rejects_equal_extent_unrelated_logical_alias_collision() {
+        let mut fixture = TestRowGroupStage3::rank2();
+        fixture.logical_name = "collision/equal-extent-logical";
+        fixture.extra_tensors.push(TestFlmTensor {
+            name: fixture.logical_name,
+            shape: vec![4, 32],
+            dtype: FLM_DTYPE_UINT8,
+            codec: 10,
+            payload: vec![0x44; 128],
+        });
+        let mut data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        copy_test_flm_index_extent(&mut data, 0, 2);
+        let file = write_temp_flm(&data);
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("unrelated equal-extent logical alias must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("namespace collision"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_equal_extent_unrelated_tile_sidecar_alias_collisions() {
+        let canonical = TestNativeInt4Stage3::canonical();
+        for (role, source_idx, generated_name) in [
+            ("SCALE", 1usize, canonical.scale_name),
+            ("ZERO", 2usize, canonical.zero_name),
+        ] {
+            let fixture = TestNativeInt4Stage3 {
+                scale_name: "opaque/tile-scale",
+                zero_name: "opaque/tile-zero",
+                ..canonical
+            };
+            let extra = TestFlmTensor {
+                name: generated_name,
+                shape: vec![2, 2, 1],
+                dtype: FLM_DTYPE_BF16,
+                codec: 0,
+                payload: test_bf16_bytes([4.0; 4]),
+            };
+            let mut data = build_test_flm_with_stage3_native_int4_fixture(&fixture, &[extra]);
+            copy_test_flm_index_extent(&mut data, source_idx, 3);
+            let file = write_temp_flm(&data);
+            let err = match BakedStore::open_flm_with_options(
+                file.path(),
+                FlmLoadOptions {
+                    flm_int4_logical_aliases: true,
+                    verify_block_hashes: false,
+                },
+            ) {
+                Ok(_) => panic!("unrelated equal-extent {role} alias must fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("namespace collision"),
+                "unexpected {role} error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage3_alias_collision_does_not_leave_index_and_upload_view_disagreeing() {
+        let fixture = TestNativeInt4Stage3::canonical();
+        let runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_native_int4_stage3_fixture(&fixture),
+        )
+        .expect("parse native INT4 runtime");
+        let packed_len = (2 * 256 * 64) as u64;
+        let mut index = HashMap::from([
+            (
+                fixture.packed_name.to_string(),
+                TensorMeta {
+                    name: fixture.packed_name.to_string(),
+                    shape: vec![2, 256, 64],
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 0,
+                    byte_len: packed_len,
+                },
+            ),
+            (
+                fixture.scale_name.to_string(),
+                TensorMeta {
+                    name: fixture.scale_name.to_string(),
+                    shape: vec![2, 2, 1],
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: packed_len,
+                    byte_len: 8,
+                },
+            ),
+            (
+                fixture.zero_name.to_string(),
+                TensorMeta {
+                    name: fixture.zero_name.to_string(),
+                    shape: vec![2, 2, 1],
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: packed_len + 8,
+                    byte_len: 8,
+                },
+            ),
+        ]);
+        let stale_upload = TensorUploadView {
+            dtype: "bf16".to_string(),
+            shape: vec![1],
+        };
+        let mut upload_views =
+            HashMap::from([(fixture.logical_name.to_string(), stale_upload.clone())]);
+        let mut fallbacks = HashMap::new();
+        let mut views = HashMap::new();
+        let err = build_stage3_int4_storage(
+            &runtime,
+            &mut index,
+            &mut upload_views,
+            &mut fallbacks,
+            &mut views,
+            &HashMap::new(),
+            true,
+        )
+        .expect_err("stale upload-view collision must fail atomically");
+
+        assert!(
+            err.to_string().contains("upload-view namespace collision"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            index.get(fixture.packed_name).unwrap().layout,
+            LayoutTag::Raw,
+            "logical PACKED rebind must not commit before upload preflight"
+        );
+        assert_eq!(upload_views.get(fixture.logical_name), Some(&stale_upload));
+    }
+
+    #[test]
+    fn tile_v1_scale_alias_failure_rolls_back_all_publication_maps() {
+        let canonical = TestNativeInt4Stage3::canonical();
+        let fixture = TestNativeInt4Stage3 {
+            scale_name: "opaque/transaction-scale",
+            ..canonical
+        };
+        let runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_native_int4_stage3_fixture(&fixture),
+        )
+        .expect("parse tile-v1 runtime");
+        let mut index = test_native_int4_physical_index(&fixture);
+        let physical_scale = index.get(fixture.scale_name).unwrap().clone();
+        index.insert(
+            canonical.scale_name.to_string(),
+            TensorMeta {
+                name: canonical.scale_name.to_string(),
+                ..physical_scale
+            },
+        );
+        let mut upload_views = HashMap::new();
+        let mut fallbacks = HashMap::new();
+        let mut views = HashMap::new();
+        let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
+
+        let err = build_stage3_int4_storage(
+            &runtime,
+            &mut index,
+            &mut upload_views,
+            &mut fallbacks,
+            &mut views,
+            &HashMap::new(),
+            true,
+        )
+        .expect_err("occupied generated SCALE alias must fail");
+
+        assert!(
+            err.to_string().contains("namespace collision"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
+            before
+        );
+        assert!(
+            views.is_empty(),
+            "failed transaction must not publish a view"
+        );
+    }
+
+    #[test]
+    fn mixed_ct_fallback_then_tile_scale_failure_rolls_back_every_publication_map() {
+        let canonical = TestNativeInt4Stage3::canonical();
+        let fixture = TestNativeInt4Stage3 {
+            scale_name: "opaque/mixed-transaction-scale",
+            ..canonical
+        };
+        let runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_ct_then_native_int4_stage3_tables(&fixture),
+        )
+        .expect("parse mixed CT and tile-v1 runtime");
+        let ct_runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_stage3_tables(),
+        )
+        .expect("parse CT-only runtime");
+        let tile_runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_native_int4_stage3_fixture(&fixture),
+        )
+        .expect("parse tile-v1-only runtime");
+
+        let logical_order = runtime
+            .logical_tensors()
+            .iter()
+            .map(|logical| logical.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logical_order,
+            vec![TEST_CT_INT4_LOGICAL_NAME, fixture.logical_name],
+            "the CT fallback must be processed before the failing tile-v1 tensor"
+        );
+        assert_eq!(
+            runtime
+                .stage3_direct_weight_kind(TEST_CT_INT4_LOGICAL_NAME)
+                .expect("classify CT fallback"),
+            Some(crate::flm::FlmStage3DirectWeightKind::CtInt4Bf16Fallback)
+        );
+        assert_eq!(
+            runtime
+                .stage3_direct_weight_kind(fixture.logical_name)
+                .expect("classify tile-v1 tensor"),
+            Some(crate::flm::FlmStage3DirectWeightKind::NativeInt4)
+        );
+
+        let mut index = HashMap::from([
+            (
+                TEST_CT_INT4_PACKED_NAME.to_string(),
+                TensorMeta {
+                    name: TEST_CT_INT4_PACKED_NAME.to_string(),
+                    shape: vec![128, 8],
+                    dtype: "i32".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 0,
+                    byte_len: 128 * 8 * 4,
+                },
+            ),
+            (
+                TEST_CT_INT4_SCALE_NAME.to_string(),
+                TensorMeta {
+                    name: TEST_CT_INT4_SCALE_NAME.to_string(),
+                    shape: vec![128, 1],
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 4096,
+                    byte_len: 128 * 2,
+                },
+            ),
+            (
+                TEST_CT_INT4_SHAPE_NAME.to_string(),
+                TensorMeta {
+                    name: TEST_CT_INT4_SHAPE_NAME.to_string(),
+                    shape: vec![2],
+                    dtype: "i64".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 4352,
+                    byte_len: 16,
+                },
+            ),
+        ]);
+        let mut tile_index = test_native_int4_physical_index(&fixture);
+        for meta in tile_index.values_mut() {
+            meta.offset += 8192;
+        }
+        index.extend(tile_index);
+        let physical_scale = index.get(fixture.scale_name).unwrap().clone();
+        index.insert(
+            canonical.scale_name.to_string(),
+            TensorMeta {
+                name: canonical.scale_name.to_string(),
+                ..physical_scale
+            },
+        );
+
+        let existing_fallback = CtSymInt4Bf16Fallback {
+            packed_tensor: "preexisting/packed".to_string(),
+            scale_tensor: "preexisting/scale".to_string(),
+            shape: vec![1, 32],
+            group_size: 32,
+        };
+        let mut upload_views = HashMap::new();
+        let mut fallbacks = HashMap::from([(
+            "preexisting/fallback".to_string(),
+            existing_fallback.clone(),
+        )]);
+        let mut views = HashMap::new();
+        let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
+        let assert_ct_publication =
+            |candidate_index: &HashMap<String, TensorMeta>,
+             candidate_upload_views: &HashMap<String, TensorUploadView>,
+             candidate_fallbacks: &HashMap<String, CtSymInt4Bf16Fallback>| {
+                let alias = candidate_index
+                    .get(TEST_CT_INT4_LOGICAL_NAME)
+                    .expect("staged CT logical alias");
+                assert_eq!(alias.name, TEST_CT_INT4_LOGICAL_NAME);
+                assert_eq!(alias.shape, vec![128, 64]);
+                assert_eq!(alias.dtype, "bf16");
+                assert_eq!(alias.layout, LayoutTag::Raw);
+                assert_eq!(alias.offset, 0);
+                assert_eq!(alias.byte_len, 16_384);
+                assert_eq!(
+                    candidate_upload_views.get(TEST_CT_INT4_LOGICAL_NAME),
+                    Some(&TensorUploadView {
+                        dtype: "bf16".to_string(),
+                        shape: vec![128, 64],
+                    })
+                );
+                assert_eq!(
+                    candidate_fallbacks.get(TEST_CT_INT4_LOGICAL_NAME),
+                    Some(&CtSymInt4Bf16Fallback {
+                        packed_tensor: TEST_CT_INT4_PACKED_NAME.to_string(),
+                        scale_tensor: TEST_CT_INT4_SCALE_NAME.to_string(),
+                        shape: vec![128, 64],
+                        group_size: 128,
+                    })
+                );
+            };
+
+        let mut staged_index = index.clone();
+        let mut staged_upload_views = upload_views.clone();
+        let mut staged_fallbacks = fallbacks.clone();
+        let mut staged_views = views.clone();
+        let index_entries = HashMap::new();
+        build_stage3_int4_storage_staged(
+            &ct_runtime,
+            &mut staged_index,
+            &mut staged_upload_views,
+            &mut staged_fallbacks,
+            &mut staged_views,
+            &index_entries,
+            true,
+        )
+        .expect("publish CT fallback into staged maps");
+
+        assert_ct_publication(&staged_index, &staged_upload_views, &staged_fallbacks);
+        assert_eq!(
+            staged_fallbacks.get("preexisting/fallback"),
+            Some(&existing_fallback)
+        );
+        assert!(staged_views.is_empty());
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
+            before,
+            "staged CT publication must not mutate the original maps"
+        );
+
+        let staged_err = build_stage3_int4_storage_staged(
+            &tile_runtime,
+            &mut staged_index,
+            &mut staged_upload_views,
+            &mut staged_fallbacks,
+            &mut staged_views,
+            &index_entries,
+            true,
+        )
+        .expect_err("later tile-v1 SCALE collision must fail staged publication");
+
+        let staged_message = staged_err.to_string();
+        assert!(
+            staged_message.contains("namespace collision")
+                && staged_message.contains(canonical.scale_name),
+            "unexpected staged error: {staged_err}"
+        );
+        assert_ct_publication(&staged_index, &staged_upload_views, &staged_fallbacks);
+
+        let err = build_stage3_int4_storage(
+            &runtime,
+            &mut index,
+            &mut upload_views,
+            &mut fallbacks,
+            &mut views,
+            &index_entries,
+            true,
+        )
+        .expect_err("later tile-v1 SCALE collision must roll back the earlier CT fallback");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("namespace collision") && message.contains(canonical.scale_name),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
+            before
+        );
+        assert_eq!(fallbacks.len(), 1);
+        assert_eq!(
+            fallbacks.get("preexisting/fallback"),
+            Some(&existing_fallback)
+        );
+        assert!(!fallbacks.contains_key(TEST_CT_INT4_LOGICAL_NAME));
+    }
+
+    #[test]
+    fn tile_v1_zero_alias_failure_rolls_back_logical_and_scale_publication() {
+        let canonical = TestNativeInt4Stage3::canonical();
+        let fixture = TestNativeInt4Stage3 {
+            zero_name: "opaque/transaction-zero",
+            ..canonical
+        };
+        let runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_native_int4_stage3_fixture(&fixture),
+        )
+        .expect("parse tile-v1 runtime");
+        let mut index = test_native_int4_physical_index(&fixture);
+        let physical_zero = index.get(fixture.zero_name).unwrap().clone();
+        index.insert(
+            canonical.zero_name.to_string(),
+            TensorMeta {
+                name: canonical.zero_name.to_string(),
+                ..physical_zero
+            },
+        );
+        let mut upload_views = HashMap::new();
+        let mut fallbacks = HashMap::new();
+        let mut views = HashMap::new();
+        let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
+
+        let err = build_stage3_int4_storage(
+            &runtime,
+            &mut index,
+            &mut upload_views,
+            &mut fallbacks,
+            &mut views,
+            &HashMap::new(),
+            true,
+        )
+        .expect_err("occupied generated ZERO alias must fail");
+
+        assert!(
+            err.to_string().contains("namespace collision"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
+            before
+        );
+        assert!(
+            views.is_empty(),
+            "failed transaction must not publish a view"
+        );
+    }
+
+    #[test]
+    fn row_group_scale_failure_rolls_back_candidate_logical_publication() {
+        let mut fixture = TestRowGroupStage3::rank2();
+        fixture.scale_index_codec = 7;
+        let runtime = crate::flm::FlmRuntimeDirectory::parse(
+            &build_test_runtime_directory_with_row_group_stage3_tables(&fixture),
+        )
+        .expect("parse row-group runtime");
+        let mut index = HashMap::from([
+            (
+                fixture.packed_name.to_string(),
+                TensorMeta {
+                    name: fixture.packed_name.to_string(),
+                    shape: vec![4, 32],
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 0,
+                    byte_len: 128,
+                },
+            ),
+            (
+                fixture.scale_name.to_string(),
+                TensorMeta {
+                    name: fixture.scale_name.to_string(),
+                    shape: vec![4, 1],
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: 128,
+                    byte_len: 8,
+                },
+            ),
+        ]);
+        let index_entries = HashMap::from([
+            (
+                fixture.packed_name.to_string(),
+                FlmIndexEntry {
+                    name: fixture.packed_name.to_string(),
+                    shape: vec![4, 32],
+                    dtype: FLM_DTYPE_UINT8,
+                    codec: 10,
+                    file_offset: 0,
+                    stored_len: 128,
+                },
+            ),
+            (
+                fixture.scale_name.to_string(),
+                FlmIndexEntry {
+                    name: fixture.scale_name.to_string(),
+                    shape: vec![4, 1],
+                    dtype: FLM_DTYPE_BF16,
+                    codec: 7,
+                    file_offset: 128,
+                    stored_len: 8,
+                },
+            ),
+        ]);
+        let mut upload_views = HashMap::new();
+        let mut fallbacks = HashMap::new();
+        let mut views = HashMap::new();
+        let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
+
+        let err = build_stage3_int4_storage(
+            &runtime,
+            &mut index,
+            &mut upload_views,
+            &mut fallbacks,
+            &mut views,
+            &index_entries,
+            true,
+        )
+        .expect_err("malformed row-group SCALE must fail transactionally");
+
+        assert!(
+            err.to_string().contains("scale plane"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
+            before
+        );
+        assert!(
+            views.is_empty(),
+            "failed transaction must not publish a view"
+        );
+    }
+
+    fn assert_row_group_storage_overlap_is_rejected(
+        target_index: usize,
+        target_shard_offset: u64,
+        overlap_kind: &str,
+    ) {
+        let mut first = TestRowGroupStage3::rank2();
+        first.logical_name = "semantic.row_group.first";
+        first.packed_name = "storage/row_group_first_packed";
+        first.scale_name = "storage/row_group_first_scale";
+        let mut second = TestRowGroupStage3::rank2();
+        second.logical_name = "semantic.row_group.second";
+        second.packed_name = "storage/row_group_second_packed";
+        second.scale_name = "storage/row_group_second_scale";
+
+        let mut data = build_test_flm_with_two_row_group_bindings(&[first, second]);
+        set_test_flm_index_shard_offset(&mut data, target_index, target_shard_offset);
+        let file = write_temp_flm(&data);
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("{overlap_kind} row-group storage overlap must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("overlapping row-group storage planes"),
+            "unexpected {overlap_kind} overlap error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_exact_row_group_storage_plane_overlap() {
+        assert_row_group_storage_overlap_is_rejected(2, 0, "exact");
+    }
+
+    #[test]
+    fn open_flm_rejects_partial_row_group_storage_plane_overlap() {
+        assert_row_group_storage_overlap_is_rejected(2, 64, "partial");
+    }
+
+    #[test]
+    fn open_flm_rejects_contained_row_group_storage_plane_overlap() {
+        assert_row_group_storage_overlap_is_rejected(3, 8, "contained");
+    }
+
+    #[test]
+    fn open_flm_builds_rank2_row_group_int4_view_from_opaque_bindings() {
+        let fixture = TestRowGroupStage3::rank2();
+        let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open rank-2 row-group FLM");
+
+        assert_eq!(
+            store
+                .flm_runtime()
+                .expect("runtime")
+                .stage3_direct_weight_kind(TEST_ROW_GROUP_LOGICAL_NAME)
+                .expect("classify row-group weight"),
+            Some(crate::flm::FlmStage3DirectWeightKind::RowGroupInt4)
+        );
+        let meta = store
+            .meta(TEST_ROW_GROUP_LOGICAL_NAME)
+            .expect("logical row-group alias");
+        assert_eq!(meta.layout, LayoutTag::Int4RowGroup);
+        assert_eq!(meta.shape, vec![4, 32]);
+
+        let view = store
+            .int4_storage_view(TEST_ROW_GROUP_LOGICAL_NAME)
+            .expect("rank-2 row-group storage view");
+        assert_eq!(view.kind, Int4StorageKind::RowGroupSymmetric);
+        assert_eq!(view.group_size, 32);
+        assert_eq!(view.packed_tensor, TEST_ROW_GROUP_PACKED_NAME);
+        assert_eq!(view.scale_tensor, TEST_ROW_GROUP_SCALE_NAME);
+        assert_eq!(view.zero_tensor, None);
+        assert_eq!(view.logical_shape, vec![4, 64]);
+        assert_eq!(view.packed_row_stride_bytes, 32);
+        assert_eq!(view.packed_expert_stride_bytes, 0);
+        assert_eq!(view.scale_row_stride_elements, 2);
+        assert_eq!(view.scale_expert_stride_elements, 0);
+        assert_eq!(view.output_group_size, 1);
+        assert_eq!(view.implicit_zero_code, Some(8));
+        assert!(store.contains(TEST_ROW_GROUP_SCALE_NAME));
+        assert!(!store.contains("semantic.row_group.weight_int4_scale"));
+        assert_eq!(
+            store.raw_bytes(TEST_ROW_GROUP_LOGICAL_NAME).unwrap().len(),
+            128
+        );
+    }
+
+    #[test]
+    fn open_flm_builds_rank3_row_group_int4_expert_strides() {
+        let fixture = TestRowGroupStage3::rank3();
+        let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open rank-3 row-group FLM");
+
+        let view = store
+            .int4_storage_view(TEST_ROW_GROUP_LOGICAL_NAME)
+            .expect("rank-3 row-group storage view");
+        assert_eq!(view.logical_shape, vec![2, 4, 64]);
+        assert_eq!(view.packed_row_stride_bytes, 32);
+        assert_eq!(view.packed_expert_stride_bytes, 128);
+        assert_eq!(view.scale_row_stride_elements, 2);
+        assert_eq!(view.scale_expert_stride_elements, 8);
+    }
+
+    #[test]
+    fn open_flm_keeps_row_group_storage_view_when_logical_aliases_are_disabled() {
+        let fixture = TestRowGroupStage3::rank2();
+        let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: false,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open row-group FLM without logical aliases");
+
+        assert!(!store.contains(fixture.logical_name));
+        let view = store
+            .int4_storage_view(fixture.logical_name)
+            .expect("semantic row-group storage view remains available");
+        assert_eq!(view.kind, Int4StorageKind::RowGroupSymmetric);
+        assert_eq!(view.packed_tensor, fixture.packed_name);
+        assert_eq!(view.scale_tensor, fixture.scale_name);
+    }
+
+    #[test]
+    fn open_flm_rejects_malformed_row_group_storage_when_aliases_are_disabled() {
+        let mut fixture = TestRowGroupStage3::rank2();
+        fixture.scale_payload_shape = Some(vec![4, 1]);
+        let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        let file = write_temp_flm(&data);
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: false,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("malformed physical scale plane must fail without aliases"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("scale plane"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_resolves_row_group_scale_codec_by_file_local_descriptor() {
+        let mut fixture = TestRowGroupStage3::rank2();
+        fixture.scale_index_codec = 7;
+        let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: false,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("raw BF16 SCALE codec may use any file-local id");
+
+        assert!(store.int4_storage_view(fixture.logical_name).is_some());
+    }
+
+    #[test]
+    fn open_flm_rejects_row_group_local_codec_zero_remapped_away_from_raw_bf16() {
+        let mut fixture = TestRowGroupStage3::rank2();
+        fixture.scale_codec_semantic_id = crate::flm::CODEC_FP8_E4M3_F32 as u8;
+        let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        let file = write_temp_flm(&data);
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: false,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("local codec id zero is not intrinsically raw"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("raw BF16 codec descriptor"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_missing_row_group_scale_local_codec_descriptor() {
+        let mut fixture = TestRowGroupStage3::rank2();
+        fixture.scale_index_codec = 12;
+        let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        let file = write_temp_flm(&data);
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: false,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("missing SCALE local codec descriptor must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("references missing codec id 12"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_row_group_binding_name_namespace_collisions() {
+        let mut duplicate_physical = TestRowGroupStage3::rank2();
+        duplicate_physical.scale_name = duplicate_physical.packed_name;
+        duplicate_physical.include_payloads = false;
+
+        let mut logical_redirects_scale = TestRowGroupStage3::rank2();
+        logical_redirects_scale.logical_name = logical_redirects_scale.scale_name;
+
+        for (fixture, expected) in [
+            (duplicate_physical, "physical binding names"),
+            (
+                logical_redirects_scale,
+                "logical name must not equal SCALE or ZERO",
+            ),
+        ] {
+            let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+            let file = write_temp_flm(&data);
+            let err = match BakedStore::open_flm_with_options(
+                file.path(),
+                FlmLoadOptions {
+                    flm_int4_logical_aliases: true,
+                    verify_block_hashes: false,
+                },
+            ) {
+                Ok(_) => panic!("binding namespace collision must fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_flm_allows_row_group_logical_name_to_equal_packed_name() {
+        let mut fixture = TestRowGroupStage3::rank2();
+        fixture.logical_name = fixture.packed_name;
+        let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("producer may use the packed physical name as the logical name");
+
+        assert_eq!(
+            store.layout(fixture.logical_name),
+            Some(&LayoutTag::Int4RowGroup)
+        );
+        let view = store
+            .int4_storage_view(fixture.logical_name)
+            .expect("logical PACKED rebind keeps typed view");
+        assert_eq!(view.kind, Int4StorageKind::RowGroupSymmetric);
+        assert_eq!(view.packed_tensor, fixture.packed_name);
+        assert_eq!(view.logical_shape, vec![4, 64]);
+    }
+
+    #[test]
+    fn open_flm_rejects_row_group_stride_overflow_before_payload_use() {
+        let mut fixture = TestRowGroupStage3::rank3();
+        fixture.logical_shape = [u32::MAX, u32::MAX, 64, 0];
+        fixture.payload_len_override = Some((0, 0));
+        let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+        let file = write_temp_flm(&data);
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: false,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("full FLM open must reject row-group stride overflow"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("overflow"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_malformed_row_group_int4_contracts_before_payload_use() {
+        let mut cases = Vec::new();
+
+        let mut old_codec = TestRowGroupStage3::rank2();
+        old_codec.codec_semantic_id = crate::flm::CODEC_SUPERSONIC_NATIVE_INT4_G128_BF16;
+        cases.push((old_codec, "codec=10"));
+
+        let mut default_layout = TestRowGroupStage3::rank2();
+        default_layout.layout_id = crate::flm::LAYOUT_ID_DEFAULT;
+        cases.push((default_layout, "layout=0"));
+
+        let mut g64 = TestRowGroupStage3::rank2();
+        g64.group_size = 64;
+        cases.push((g64, "group_size=64"));
+
+        let mut wrong_flags = TestRowGroupStage3::rank2();
+        wrong_flags.quant_flags = crate::flm::QUANT_FLAG_SYMMETRIC;
+        cases.push((wrong_flags, "quant_flags"));
+
+        let mut contradictory_index_dtype = TestRowGroupStage3::rank2();
+        contradictory_index_dtype.packed_index_dtype = FLM_DTYPE_BF16;
+        cases.push((contradictory_index_dtype, "packed index dtype"));
+
+        let mut wrong_params = TestRowGroupStage3::rank2();
+        wrong_params.params[2] = 0;
+        wrong_params.include_payloads = false;
+        cases.push((wrong_params, "group_axis_from_end"));
+
+        let mut zero = TestRowGroupStage3::rank2();
+        zero.include_zero = true;
+        cases.push((zero, "PACKED and SCALE only"));
+
+        let mut missing_scale = TestRowGroupStage3::rank2();
+        missing_scale.include_scale = false;
+        cases.push((missing_scale, "missing storage binding role 2"));
+
+        let mut contradictory_abi = TestRowGroupStage3::rank2();
+        contradictory_abi.scale_abi_id = 8;
+        cases.push((contradictory_abi, "same storage ABI id 9"));
+
+        let mut rank1 = TestRowGroupStage3::rank2();
+        rank1.rank = 1;
+        rank1.logical_shape = [64, 0, 0, 0];
+        cases.push((rank1, "rank 1"));
+
+        let mut rank4 = TestRowGroupStage3::rank2();
+        rank4.rank = 4;
+        rank4.logical_shape = [1, 2, 4, 64];
+        cases.push((rank4, "rank 4"));
+
+        let mut odd_k = TestRowGroupStage3::rank2();
+        odd_k.logical_shape = [4, 33, 0, 0];
+        cases.push((odd_k, "odd final dimension"));
+
+        let mut partial_g32 = TestRowGroupStage3::rank2();
+        partial_g32.logical_shape = [4, 34, 0, 0];
+        cases.push((partial_g32, "not divisible by group size 32"));
+
+        for (fixture, expected) in cases {
+            let data = build_test_flm_with_stage3_row_group_bindings(&fixture);
+            let file = write_temp_flm(&data);
+            let err = match BakedStore::open_flm_with_options(
+                file.path(),
+                FlmLoadOptions {
+                    flm_int4_logical_aliases: true,
+                    verify_block_hashes: false,
+                },
+            ) {
+                Ok(_) => panic!("malformed row-group contract must fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_group_int4_stride_arithmetic_rejects_overflow() {
+        let err = int4_storage_strides(&[2, usize::MAX, 64], 32, 1)
+            .expect_err("expert stride overflow must fail");
+        assert!(
+            err.to_string().contains("overflow"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -4457,7 +7022,7 @@ mod tests {
             .expect("native INT4 extent")
             .expect("native INT4 direct tensor should expose file extent");
         assert_eq!(extent.source_kind, TensorStorageSourceKind::FlmContainer);
-        assert_eq!(extent.source_path, file.path());
+        assert_eq!(extent.source_path, file.path().canonicalize().unwrap());
         assert_eq!(extent.storage_dtype, "u8");
         assert_eq!(extent.storage_shape, vec![2, 256, 64]);
         assert_eq!(extent.layout, LayoutTag::Int4Quantized);

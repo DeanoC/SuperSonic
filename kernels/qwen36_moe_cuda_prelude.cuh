@@ -21,6 +21,8 @@ using hip_bfloat16 = __nv_bfloat16;
 #define hipGetDevice cudaGetDevice
 #define hipSetDevice cudaSetDevice
 #define hipGetDeviceProperties cudaGetDeviceProperties
+#define hipMemcpy cudaMemcpy
+#define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost
 #define hipMemset cudaMemset
 #define hipMemsetAsync cudaMemsetAsync
 #define hipGetLastError cudaGetLastError

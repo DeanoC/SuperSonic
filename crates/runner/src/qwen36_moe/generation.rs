@@ -15,6 +15,7 @@ use crate::qwen36_moe_cli::output::{
     emit_logits_tap_if_requested, print_decoded_token,
 };
 use crate::qwen36_moe_cli::timing::{Qwen36StageTimingTotals, SamplingParams};
+use crate::qwen36_moe_decode::Qwen36ExecutionOptions;
 use crate::qwen36_moe_logits::{sample_bf16_logits, XorshiftRng};
 use crate::qwen36_moe_types::{DecodeOutputs, MultiLayerGeom};
 
@@ -31,6 +32,7 @@ pub(crate) struct Qwen36GenerationStep<'a> {
     pub(crate) embed_lookup_timing: Option<EmbedLookupTiming>,
     pub(crate) t_chain_step: Duration,
     pub(crate) outputs: &'a DecodeOutputs,
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
     pub(crate) final_norm_w_buf: &'a GpuBuffer,
     pub(crate) lm_head_w_buf: &'a GpuBuffer,
     pub(crate) final_hidden_buf: &'a mut GpuBuffer,
@@ -67,6 +69,7 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
         embed_lookup_timing,
         t_chain_step,
         outputs,
+        execution,
         final_norm_w_buf,
         lm_head_w_buf,
         final_hidden_buf,
@@ -106,6 +109,7 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
             ordinal,
             geom,
             &outputs.final_hidden_bytes,
+            &execution.prefill_kernel,
             LmHeadBuffers {
                 final_norm_w: final_norm_w_buf,
                 lm_head_w: lm_head_w_buf,
@@ -126,6 +130,7 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
             ordinal,
             geom,
             &outputs.final_hidden_bytes,
+            &execution.prefill_kernel,
             LmHeadBuffers {
                 final_norm_w: final_norm_w_buf,
                 lm_head_w: lm_head_w_buf,

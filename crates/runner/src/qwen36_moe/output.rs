@@ -1,9 +1,37 @@
 use std::io::Write as _;
 
 use anyhow::{Context, Result};
+use supersonic_runtime::qwen36_moe::engine::Qwen36MoeLoadEvidence;
 
 use crate::qwen36_moe_cli::timing::SamplingParams;
 use crate::qwen36_moe_logits::bf16_bytes_to_f32;
+
+pub(crate) fn print_runtime_engine_load_evidence(evidence: &Qwen36MoeLoadEvidence) {
+    eprintln!("[qwen36-moe] FLM weight mode: INT4 native FLM");
+    eprintln!("[qwen36-moe] FLM direct plans: {}", evidence.direct_profile);
+    println!(
+        "[qwen36-moe] loading weights from already-open FLM source at {} (INT4 native FLM)",
+        evidence.flm_path.display()
+    );
+    println!(
+        "[FLM runtime weights] ready-for-decode: YES (source={} direct_plans={})",
+        evidence.flm_path.display(),
+        evidence.direct_profile
+    );
+    println!("[runtime residency]");
+    println!(
+        "  resident allocations: {}",
+        evidence.resident_allocation_count
+    );
+    println!(
+        "  mapped virtual ranges: {}",
+        evidence.mapped_virtual_ranges.len()
+    );
+    eprintln!(
+        "[qwen36-moe] runtime engine ready: load_sequence={} source_open_count={}",
+        evidence.load_sequence, evidence.source_open_count
+    );
+}
 
 pub(crate) fn print_decode_stream_start(
     tokenizer: Option<&tokenizers::Tokenizer>,

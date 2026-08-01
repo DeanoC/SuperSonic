@@ -6,7 +6,9 @@ use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_cli::host::lookup_embed_row;
 use crate::qwen36_moe_cli::lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
 use crate::qwen36_moe_cli::timing::Qwen36StageTimingTotals;
-use crate::qwen36_moe_decode::{run_chained_decode_fast, run_chained_decode_fast_with_cache_pos};
+use crate::qwen36_moe_decode::{
+    run_chained_decode_fast, run_chained_decode_fast_with_cache_pos, Qwen36ExecutionOptions,
+};
 use crate::qwen36_moe_logits::argmax_bf16_logits;
 use crate::qwen36_moe_mtp::{MtpChainScratch, MtpForwardScratch};
 use crate::qwen36_moe_persistent_decode::PersistentScratch;
@@ -26,6 +28,7 @@ pub(crate) struct Qwen36SpecChainStep<'a> {
     pub(crate) store: &'a BakedStore,
     pub(crate) weight_prefix: &'a str,
     pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
     pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
     /// `(rope, cache)` for this verify-replay step. In dense MTP
@@ -71,6 +74,7 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
             rope,
             cache,
             args.emit_stage_timings,
+            args.execution,
         )?
     } else {
         run_chained_decode_fast(
@@ -80,6 +84,7 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
             &initial_hidden,
             rope,
             args.emit_stage_timings,
+            args.execution,
         )?
     };
     args.stage_timings
@@ -95,6 +100,7 @@ pub(crate) struct Qwen36SpecReplayAccepted<'a> {
     pub(crate) weight_prefix: &'a str,
     pub(crate) layers: &'a mut [LayerBuffers],
     pub(crate) snapshot: &'a LinearAttnSnapshot,
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
     pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
     pub(crate) replay_inputs: &'a [(PositionPair, u32)],
@@ -113,6 +119,7 @@ pub(crate) fn restore_and_replay_accepted_prefix(
             store: args.store,
             weight_prefix: args.weight_prefix,
             layers: args.layers,
+            execution: args.execution,
             persistent_scratch: args.persistent_scratch.as_deref_mut(),
             stage_timings: args.stage_timings,
             position,
@@ -129,6 +136,7 @@ pub(crate) struct Qwen36BatchedSpecVerifyInputs<'a> {
     pub(crate) store: &'a BakedStore,
     pub(crate) weight_prefix: &'a str,
     pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
     pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
     pub(crate) final_norm_w: &'a GpuBuffer,
     pub(crate) lm_head_w: &'a GpuBuffer,
@@ -152,6 +160,7 @@ pub(crate) fn run_batched_spec_verify_inputs(
             store: args.store,
             weight_prefix: args.weight_prefix,
             layers: args.layers,
+            execution: args.execution,
             persistent_scratch: args.persistent_scratch.as_deref_mut(),
             stage_timings: args.stage_timings,
             position,
@@ -166,6 +175,7 @@ pub(crate) fn run_batched_spec_verify_inputs(
         geom: args.geom,
         final_norm_w: args.final_norm_w,
         lm_head_w: args.lm_head_w,
+        execution: args.execution,
         stage_timings: args.stage_timings,
         final_hiddens,
     })
@@ -176,6 +186,7 @@ pub(crate) struct Qwen36SingleLmHeadTop1<'a> {
     pub(crate) geom: &'a MultiLayerGeom,
     pub(crate) final_norm_w: &'a GpuBuffer,
     pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
     pub(crate) final_hidden: &'a mut GpuBuffer,
     pub(crate) logits: &'a mut GpuBuffer,
     pub(crate) counter: &'a mut GpuBuffer,
@@ -189,6 +200,7 @@ pub(crate) fn run_single_lm_head_top1(args: Qwen36SingleLmHeadTop1<'_>) -> Resul
         args.ordinal,
         args.geom,
         args.final_hidden_bytes,
+        &args.execution.prefill_kernel,
         LmHeadBuffers {
             final_norm_w: args.final_norm_w,
             lm_head_w: args.lm_head_w,
@@ -208,6 +220,7 @@ pub(crate) struct Qwen36SequentialSpecVerifyInput<'a> {
     pub(crate) store: &'a BakedStore,
     pub(crate) weight_prefix: &'a str,
     pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
     pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
     pub(crate) final_norm_w: &'a GpuBuffer,
     pub(crate) lm_head_w: &'a GpuBuffer,
@@ -229,6 +242,7 @@ pub(crate) fn run_sequential_spec_verify_input(
         store: args.store,
         weight_prefix: args.weight_prefix,
         layers: args.layers,
+        execution: args.execution,
         persistent_scratch: args.persistent_scratch,
         stage_timings: args.stage_timings,
         position: args.position,
@@ -241,6 +255,7 @@ pub(crate) fn run_sequential_spec_verify_input(
         geom: args.geom,
         final_norm_w: args.final_norm_w,
         lm_head_w: args.lm_head_w,
+        execution: args.execution,
         final_hidden: args.final_hidden,
         logits: args.logits,
         counter: args.counter,
@@ -256,6 +271,7 @@ pub(crate) struct Qwen36SpeculativeExtension<'a> {
     pub(crate) store: &'a BakedStore,
     pub(crate) weight_prefix: &'a str,
     pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
     pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
     pub(crate) mtp: &'a mut MtpLayerBuffers,
     pub(crate) forward_scratch: &'a mut MtpForwardScratch,
@@ -311,6 +327,7 @@ pub(crate) fn run_speculative_extension(
                     store: args.store,
                     weight_prefix: args.weight_prefix,
                     layers: args.layers,
+                    execution: args.execution,
                     persistent_scratch: args.persistent_scratch.as_deref_mut(),
                     final_norm_w: args.final_norm_w,
                     lm_head_w: args.lm_head_w,
@@ -335,6 +352,7 @@ pub(crate) fn run_speculative_extension(
                 store: args.store,
                 weight_prefix: args.weight_prefix,
                 layers: args.layers,
+                execution: args.execution,
                 snapshot,
                 persistent_scratch: args.persistent_scratch.as_deref_mut(),
                 stage_timings: args.stage_timings,
@@ -364,6 +382,7 @@ pub(crate) fn run_speculative_extension(
                     store: args.store,
                     weight_prefix: args.weight_prefix,
                     layers: args.layers,
+                    execution: args.execution,
                     persistent_scratch: args.persistent_scratch.as_deref_mut(),
                     final_norm_w: args.final_norm_w,
                     lm_head_w: args.lm_head_w,
@@ -386,6 +405,7 @@ pub(crate) struct Qwen36BatchedLmHeadTop1<'a> {
     pub(crate) geom: &'a MultiLayerGeom,
     pub(crate) final_norm_w: &'a GpuBuffer,
     pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
     pub(crate) final_hiddens: Vec<Vec<u8>>,
 }
@@ -410,7 +430,7 @@ pub(crate) fn run_batched_lm_head_top1(
         ScalarType::BF16,
         &[n, args.geom.vocab as usize],
     )?;
-    kernel_ffi::qwen36_moe::lm_head_batched_launch(
+    kernel_ffi::qwen36_moe::lm_head_batched_launch_with_options(
         args.ordinal,
         n as i32,
         args.geom.hidden,
@@ -421,6 +441,7 @@ pub(crate) fn run_batched_lm_head_top1(
         args.lm_head_w,
         &mut logits_buf,
         None,
+        &args.execution.prefill_kernel,
     )?;
     let logits_bytes = logits_buf.to_host_bytes().context("d2h batched logits")?;
     args.stage_timings.record_lm_head(t_lm_head_start.elapsed());

@@ -118,9 +118,9 @@ enum PersistentDecodeMode {
     PERSISTENT_MODE_LINEAR_STAGE5 = 13,
 };
 
-// Persistent decode kernel template. Instantiated by the bridge for
-// (T=hip_bfloat16, USE_WMMA={true,false}) at launch time based on
-// `device_supports_wmma_bf16(ordinal)` + dim divisibility.
+// Persistent decode kernel template. Attention/linear, FFN, and lm-head
+// WMMA controls remain independent so each phase can be enabled only after
+// its staged kernel has passed the same numerical gate.
 //
 // Each layer runs:
 //   1. attn or linear-attn (selected by descriptor's `is_full_attention`)
@@ -129,7 +129,11 @@ enum PersistentDecodeMode {
 //   3. ffn writes post-ffn residual into the swapped-back `out_buf` (= the
 //      original `in_buf`, since we swap once between phases).
 //   4. reset_counters_16, swap so `out_buf` becomes next-layer input.
-template <typename T, bool USE_WMMA>
+template <
+    typename T,
+    bool USE_ATTN_WMMA,
+    bool USE_FFN_WMMA,
+    bool USE_LM_HEAD_WMMA>
 __global__ void qwen36_moe_persistent_decode_kernel(
     int                                  num_layers,
     int                                  start_layer,
@@ -213,12 +217,11 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         const DecodeLayerDesc& d = layers[start_layer];
         const Int4ScaleDesc* i4 =
             (int4_scales != nullptr) ? &int4_scales[start_layer] : nullptr;
-        const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
         const int ffn_stage = (mode == PERSISTENT_MODE_FFN_ONLY)
             ? 5
             : (mode - PERSISTENT_MODE_FFN_STAGE1 + 1);
 
-        qwen36_moe_ffn_step_device<T, USE_WMMA>(
+        qwen36_moe_ffn_step_device<T, USE_FFN_WMMA>(
             ffn_stage,
             hidden, num_experts,
             moe_intermediate, shared_intermediate, top_k,
@@ -232,17 +235,11 @@ __global__ void qwen36_moe_persistent_decode_kernel(
             static_cast<const T*>(d.shared_expert_up_proj_w),
             static_cast<const T*>(d.shared_expert_down_proj_w),
             static_cast<const T*>(d.shared_expert_gate_w),
-            i4_gs,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_scale)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_zero)     : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_scale)   : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_zero)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_zero)  : nullptr,
+            i4 ? i4->experts_gate_up : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->experts_down : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->shared_expert_gate_proj : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->shared_expert_up_proj : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->shared_expert_down_proj : Qwen36MoeInt4WeightDesc{},
             hidden_ping,
             ffn_topk_idx_scratch,
             workspace,
@@ -255,10 +252,9 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         const DecodeLayerDesc& d = layers[start_layer];
         const Int4ScaleDesc* i4 =
             (int4_scales != nullptr) ? &int4_scales[start_layer] : nullptr;
-        const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
         const int linear_stage = mode - PERSISTENT_MODE_LINEAR_STAGE1 + 1;
 
-        qwen36_moe_linear_step_device<T, USE_WMMA>(
+        qwen36_moe_linear_step_device<T, USE_ATTN_WMMA>(
             linear_stage,
             hidden, num_k_heads, num_v_heads,
             head_k_dim, head_v_dim, conv_kernel_dim, rms_norm_eps,
@@ -276,13 +272,9 @@ __global__ void qwen36_moe_persistent_decode_kernel(
             static_cast<const T*>(d.linear_out_proj_w),
             static_cast<T*>(d.linear_conv_state),
             static_cast<float*>(d.linear_recurrent_state),
-            i4_gs,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_scale)   : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_zero)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_scale)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_zero)     : nullptr,
+            i4 ? i4->linear_in_proj_qkv : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->linear_in_proj_z : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->linear_out_proj : Qwen36MoeInt4WeightDesc{},
             hidden_pong,
             workspace,
             counters, barrier_counter, barrier_flag,
@@ -295,13 +287,12 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         const DecodeLayerDesc& d = layers[li];
         const Int4ScaleDesc* i4 =
             (int4_scales != nullptr) ? &int4_scales[li] : nullptr;
-        const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
         const KVCacheFp8Desc* kv_fp8 =
             (kv_fp8_descs != nullptr) ? &kv_fp8_descs[li] : nullptr;
 
         // ---- attn or linear-attn ----
         if (d.is_full_attention != 0) {
-            qwen36_moe_attn_step_device<T, USE_WMMA>(
+            qwen36_moe_attn_step_device<T, USE_ATTN_WMMA>(
                 /*stage*/ 5,
                 hidden, num_heads, num_kv_heads, head_dim,
                 rotary_dim, rope_theta, rms_norm_eps,
@@ -314,15 +305,10 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 static_cast<const T*>(d.q_norm_w),
                 static_cast<const T*>(d.k_norm_w),
                 static_cast<const T*>(d.o_proj_w),
-                i4_gs,
-                i4 ? static_cast<const hip_bfloat16*>(i4->q_proj_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->q_proj_zero)  : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->k_proj_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->k_proj_zero)  : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->v_proj_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->v_proj_zero)  : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->o_proj_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->o_proj_zero)  : nullptr,
+                i4 ? i4->q_proj : Qwen36MoeInt4WeightDesc{},
+                i4 ? i4->k_proj : Qwen36MoeInt4WeightDesc{},
+                i4 ? i4->v_proj : Qwen36MoeInt4WeightDesc{},
+                i4 ? i4->o_proj : Qwen36MoeInt4WeightDesc{},
                 out_buf,
                 workspace,
                 static_cast<T*>(d.kv_cache_k),
@@ -338,7 +324,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 d.kv_max_t,
                 counters, barrier_counter, barrier_flag);
         } else {
-            qwen36_moe_linear_step_device<T, USE_WMMA>(
+            qwen36_moe_linear_step_device<T, USE_ATTN_WMMA>(
                 /*stage*/ 5,
                 hidden, num_k_heads, num_v_heads,
                 head_k_dim, head_v_dim, conv_kernel_dim, rms_norm_eps,
@@ -356,13 +342,9 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 static_cast<const T*>(d.linear_out_proj_w),
                 static_cast<T*>(d.linear_conv_state),
                 static_cast<float*>(d.linear_recurrent_state),
-                i4_gs,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_scale) : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_zero)  : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_scale)   : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_zero)    : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_scale)    : nullptr,
-                i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_zero)     : nullptr,
+                i4 ? i4->linear_in_proj_qkv : Qwen36MoeInt4WeightDesc{},
+                i4 ? i4->linear_in_proj_z : Qwen36MoeInt4WeightDesc{},
+                i4 ? i4->linear_out_proj : Qwen36MoeInt4WeightDesc{},
                 out_buf,
                 workspace,
                 counters, barrier_counter, barrier_flag);
@@ -388,7 +370,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
 
         // ---- FFN ----
         const int ffn_stage = (mode == PERSISTENT_MODE_ROUTER_ONLY) ? 1 : 5;
-        qwen36_moe_ffn_step_device<T, USE_WMMA>(
+        qwen36_moe_ffn_step_device<T, USE_FFN_WMMA>(
             ffn_stage,
             hidden, num_experts,
             moe_intermediate, shared_intermediate, top_k,
@@ -402,17 +384,11 @@ __global__ void qwen36_moe_persistent_decode_kernel(
             static_cast<const T*>(d.shared_expert_up_proj_w),
             static_cast<const T*>(d.shared_expert_down_proj_w),
             static_cast<const T*>(d.shared_expert_gate_w),
-            i4_gs,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_scale)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_zero)     : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_zero)  : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_scale)   : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_zero)    : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_scale) : nullptr,
-            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_zero)  : nullptr,
+            i4 ? i4->experts_gate_up : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->experts_down : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->shared_expert_gate_proj : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->shared_expert_up_proj : Qwen36MoeInt4WeightDesc{},
+            i4 ? i4->shared_expert_down_proj : Qwen36MoeInt4WeightDesc{},
             out_buf,
             ffn_topk_idx_scratch,
             workspace,
@@ -453,7 +429,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         // double-swap) before the lm_head reads from it as activation.
         reset_counters_16(counters, barrier_counter, barrier_flag, num_blocks);
 
-        qwen36_moe_lm_head_device<T, USE_WMMA>(
+        qwen36_moe_lm_head_device<T, USE_LM_HEAD_WMMA>(
             hidden, vocab, rms_norm_eps,
             in_buf, final_norm_w, lm_head_w, logits_out,
             top1_out, workspace,

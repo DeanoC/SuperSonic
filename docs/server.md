@@ -17,6 +17,20 @@ target/release/supersonic-serve \
   --port 8080
 ```
 
+For the canonical Qwen3.6-35B-A3B native INT4 FLM, start the persistent server
+from the FLM alone:
+
+```bash
+target/release/supersonic-serve \
+  --flm-file /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --backend hip --device 0 --max-context 4096 \
+  --host 127.0.0.1 --port 8080 --api-key local --no-download
+```
+
+This first-class path resolves the model, tokenizer, native chat template, and
+native INT4 execution plan from the FLM. Do not add `--model`, `--model-dir`,
+or an INT4 layout flag to this invocation.
+
 Optional deployment flags:
 
 - `--api-key KEY` or `SUPERSONIC_API_KEY=KEY` requires
@@ -255,20 +269,37 @@ temporary directory and point it at `supersonic-serve`:
 tmpdir=$(mktemp -d /tmp/supersonic-openai-smoke.XXXXXX)
 cd "$tmpdir"
 npm init -y >/dev/null
-npm install openai@6 >/dev/null
+npm install openai@6.49.0 >/dev/null
 
 SUPERSONIC_BASE_URL=http://127.0.0.1:8080 \
 SUPERSONIC_API_KEY=secret \
 node /path/to/SuperSonic/scripts/openai_compat_smoke.mjs
+
+SUPERSONIC_BASE_URL=http://127.0.0.1:8080 \
+SUPERSONIC_API_KEY=secret \
+node /path/to/SuperSonic/scripts/openai_agent_tool_smoke.mjs
 ```
 
-The smoke covers model list/retrieve, Chat Completions, streaming Chat
-Completions with usage, legacy Completions, Responses create/get/delete,
-tokenization, and metrics.
+The compatibility smoke covers missing and wrong-key auth, protected
+operational routes, model list/retrieve, tokenize/detokenize, exact `hello`
+canaries for Chat Completions, legacy Completions, Responses, and both
+reconstructed streams, terminal ordering and usage, Responses
+create/get/delete, and repeated warm requests. Transport compatibility and
+semantic quality are reported independently. Reasoning acceptance is also
+reported separately from observed reasoning and is not a green capability
+unless reasoning content is actually observed.
+
+The agent smoke requires exactly one model-generated `read_source_file` call
+with a nonempty call ID and exactly `{"path":"src/lib.rs"}`, no suffix text,
+and terminal tool state. It performs a terminal text-only continuation through
+both Chat Completions and Responses. Its cancellation gate observes a
+nonterminal stream delta, queues a second real request, awaits abort closure,
+completes the queued request, and requires authenticated health and metrics to
+report released active and queued work without a model reload.
 
 The 2026-06-28 production refactor validation ran this harness against
-`qwen3.6-27b` Q4KM-GPTQ DFlash on HIP at `127.0.0.1:8013`, using `openai@6`
-from a temporary npm directory. It passed model list/retrieve, Chat
+`qwen3.6-27b` Q4KM-GPTQ DFlash on HIP at `127.0.0.1:8013`, using the then-current
+`openai@6` from a temporary npm directory. It passed model list/retrieve, Chat
 Completions, streaming Chat Completions with usage, legacy Completions,
 Responses create/get/delete, `/tokenize`, and `/metrics`.
 

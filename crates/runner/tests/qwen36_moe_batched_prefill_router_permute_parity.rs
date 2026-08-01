@@ -16,7 +16,7 @@
 //! Skipped silently when HIP backend isn't compiled.
 
 use gpu_hal::{Backend, GpuBuffer, ScalarType};
-use kernel_ffi::qwen36_moe::batched_prefill_router_permute_launch;
+use supersonic_runtime::qwen36_moe::prefill::batched_prefill_router_permute_launch;
 
 // gpu-hal's ScalarType has no I32 variant — we use U32 as the 4-byte
 // storage tag for buffers that semantically hold i32 values. The kernel

@@ -509,6 +509,15 @@ fn compile_metal_stubs(manifest_dir: &Path) {
     println!("cargo:rustc-cfg=supersonic_backend_metal");
 }
 
+fn compile_metal_ffi_contract(manifest_dir: &Path) {
+    cc::Build::new()
+        .cpp(true)
+        .include(manifest_dir.join("src"))
+        .file(manifest_dir.join("src/metal_native_ffi_contract.cc"))
+        .flag_if_supported("-std=c++17")
+        .compile("kernel_ffi_metal_ffi_contract");
+}
+
 fn have_mtl4_mpp_sdk() -> bool {
     let Ok(output) = Command::new("xcrun")
         .args(["--sdk", "macosx", "--show-sdk-path"])
@@ -561,6 +570,16 @@ fn main() {
         "cargo:rerun-if-changed={}",
         manifest_dir.join("src/metal_native.mm").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/metal_native_ffi.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir
+            .join("src/metal_native_ffi_contract.cc")
+            .display()
+    );
 
     let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "auto".to_string());
     let normalized = requested.trim().to_ascii_lowercase();
@@ -589,6 +608,8 @@ fn main() {
              Choose one backend, or build on a machine with only one toolchain available."
         );
     }
+
+    compile_metal_ffi_contract(&manifest_dir);
 
     if normalized == "hip" {
         compile_hip(&kernel_dir, &out_dir);

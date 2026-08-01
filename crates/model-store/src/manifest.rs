@@ -32,6 +32,9 @@ pub enum LayoutTag {
     /// INT4 quantized weight. Packed as 2 nibbles per byte.
     /// Companion _int4_scale and _int4_zero tensors stored separately.
     Int4Quantized,
+    /// Row-major symmetric INT4 grouped along the final K axis, with BF16
+    /// scales and an implicit code-8 zero point.
+    Int4RowGroup,
     /// HIGGS 4-bit grid-coded weights. Runtime-backed profile, not compatible
     /// with native INT4 scale/zero sidecars.
     HiggsGridQuantized,
@@ -206,6 +209,17 @@ mod tests {
         assert!(QuantProfile::Int4Hqq.is_native_int4_runtime());
         assert!(QuantProfile::Higgs4.is_runtime_backed_lowbit());
         assert!(!QuantProfile::Bf16.is_native_int4_runtime());
+    }
+
+    #[test]
+    fn row_group_int4_layout_round_trips_without_tile_aliasing() {
+        let json = serde_json::to_string(&LayoutTag::Int4RowGroup).expect("serialize layout");
+        assert_eq!(json, "\"Int4RowGroup\"");
+        assert_eq!(
+            serde_json::from_str::<LayoutTag>(&json).expect("deserialize layout"),
+            LayoutTag::Int4RowGroup
+        );
+        assert_ne!(LayoutTag::Int4RowGroup, LayoutTag::Int4Quantized);
     }
 
     #[test]

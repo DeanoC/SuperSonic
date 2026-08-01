@@ -1,11 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
 use server::generate::MockGeneration;
 use server::prefix_cache::{PrefixCache, PrefixCacheConfig};
-use server::state::{GenerationScheduler, ServerState};
+use server::state::{GenerationScheduler, ServerState, ARCH_QWEN3_6_MOE, MODEL_QWEN3_6_MOE_V1};
 use server::{capabilities, chat_template, registry};
 
 fn test_tokenizer() -> tokenizers::Tokenizer {
@@ -30,6 +31,21 @@ fn test_template() -> Arc<chat_template::ChatTemplate> {
     .expect("test chat template")
 }
 
+fn user_history_template() -> Arc<chat_template::ChatTemplate> {
+    chat_template::ChatTemplate::from_template_source(
+        r#"{%- if messages[0].role != "user" -%}
+{{- raise_exception('No user query found in messages.') -}}
+{%- endif -%}
+{%- for message in messages -%}
+<|im_start|>{{ message.role }}
+{{ message.content }}<|im_end|>
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|im_start|>assistant
+{%- endif -%}"#,
+    )
+    .expect("user-history chat template")
+}
+
 fn test_state_with_mock(mock_generation: MockGeneration) -> Arc<ServerState> {
     test_state_with_scheduler(mock_generation, GenerationScheduler::new(32, 30_000))
 }
@@ -45,6 +61,7 @@ fn test_state_with_scheduler(
         tokenizer: Arc::new(test_tokenizer()),
         chat_template: Some(test_template()),
         session: None,
+        qwen36_moe_engine: None,
         mock_generation: Some(mock_generation),
         eos_ids: Vec::new(),
         max_context: 256,
@@ -70,6 +87,72 @@ fn test_state_with_scheduler(
             disk_ttl_secs: 86_400,
         })),
     })
+}
+
+fn test_flm_state_with_scheduler(
+    mock_generation: MockGeneration,
+    scheduler: GenerationScheduler,
+) -> Arc<ServerState> {
+    let mut state = test_state_with_scheduler(mock_generation, scheduler);
+    let state_mut = Arc::get_mut(&mut state).expect("unique test state");
+    state_mut.model_id = "qwen3.6-35b-a3b".to_string();
+    state_mut.model_family = registry::ModelFamily::Qwen36Moe;
+    state_mut.capabilities = capabilities::capabilities_for_variant(
+        &registry::ModelVariant::Qwen3_6_35B_A3B,
+        registry::Backend::Hip,
+        false,
+        false,
+        false,
+    );
+    state_mut.capabilities.flm = Some(capabilities::FlmLoadEvidence {
+        source_file: "qwen36-native.flm".to_string(),
+        architecture_id: ARCH_QWEN3_6_MOE,
+        model_id: MODEL_QWEN3_6_MOE_V1,
+        storage_abi_ids: vec![8],
+        direct_profile: capabilities::FlmDirectProfile {
+            required_weights: 693,
+            raw_dense_weights: 363,
+            native_int4_direct_weights: 330,
+            bf16_fallback_weights: 0,
+        },
+        transfer_backend: capabilities::FlmTransferBackend::PageableH2d,
+        source_bytes: 8_000_000_000,
+        device_upload_bytes: 7_000_000_000,
+        startup: capabilities::FlmStartupDurations {
+            total: Duration::from_millis(1250),
+            source_open: capabilities::FlmSourceOpenDurations {
+                total: Duration::from_millis(120),
+                store_open: Duration::from_millis(80),
+                config: Duration::from_millis(10),
+                direct_plan: Duration::from_millis(20),
+            },
+            descriptor: Duration::from_millis(40),
+            tokenizer: Duration::from_millis(50),
+        },
+        load_window_profile: capabilities::FlmLoadWindowProfileDurations {
+            allocation_api: Duration::from_millis(70),
+            upload_api: Duration::from_millis(80),
+        },
+        load_sequence: 1,
+        source_open_count: 1,
+        resident_allocation_count: 42,
+        features: capabilities::ServingFeatures {
+            plain_prefill_decode: true,
+            native_dflash_generate: false,
+            prefix_snapshot: false,
+            disk_prefix_snapshot: false,
+        },
+    });
+    state_mut.prefix_cache = Arc::new(PrefixCache::new(PrefixCacheConfig {
+        enabled: false,
+        dir: std::path::PathBuf::new(),
+        min_tokens: 1,
+        max_entries: 1,
+        max_bytes: 64 * 1024 * 1024,
+        memory_ttl_secs: 600,
+        disk_ttl_secs: 86_400,
+    }));
+    state
 }
 
 fn next_test_server_instance_id() -> u64 {
@@ -145,6 +228,15 @@ async fn collect_sse(resp: reqwest::Response) -> Vec<Value> {
     events
 }
 
+fn assert_metric(metrics: &str, name: &str, expected: &str) {
+    assert!(
+        metrics
+            .lines()
+            .any(|line| line == format!("{name} {expected}")),
+        "missing metric {name} {expected} in:\n{metrics}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_chat_non_stream_parses_reasoning_and_tools() {
     let h = spawn(
@@ -200,6 +292,58 @@ async fn mock_chat_non_stream_parses_reasoning_and_tools() {
         .await
         .expect("send unsupported");
     assert_eq!(unsupported.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_chat_non_stream_parses_prefilled_reasoning() {
+    let h = spawn("plan from prefill</think>\nvisible answer").await;
+    let response = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "medium",
+            "max_completion_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let status = response.status();
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_content"],
+        "plan from prefill"
+    );
+    assert_eq!(body["choices"][0]["message"]["content"], "visible answer");
+    assert!(!body.to_string().contains("<think>"));
+    assert!(!body.to_string().contains("</think>"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_non_stream_parses_prefilled_reasoning() {
+    let h = spawn("plan from prefill</think>\nvisible answer").await;
+    let response = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "hi",
+            "reasoning": {"effort": "medium"},
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let status = response.status();
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
+    assert_eq!(body["output"][0]["type"], "reasoning");
+    assert_eq!(body["output"][0]["summary"][0], "plan from prefill");
+    assert_eq!(body["output"][1]["content"][0]["text"], "visible answer");
+    assert!(!body.to_string().contains("<think>"));
+    assert!(!body.to_string().contains("</think>"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -339,6 +483,101 @@ async fn mock_responses_previous_response_tool_loop_shape() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_accepts_flat_function_tool_schema() {
+    let h = spawn(
+        "<tool_call>\n<function=lookup>\n<parameter=query>\nweather\n</parameter>\n</function>\n</tool_call>",
+    )
+    .await;
+    let http = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "need weather",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up a value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }],
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("Responses request");
+    let status = http.status();
+    let body: Value = http.json().await.expect("Responses JSON");
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
+    assert_eq!(body["output"][0]["type"], "function_call");
+    assert_eq!(body["output"][0]["name"], "lookup");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_previous_id_preserves_original_user_history() {
+    let mut state = test_state_with_mock(MockGeneration::text(
+        "<tool_call>\n<function=lookup>\n<parameter=query>\nweather\n</parameter>\n</function>\n</tool_call>",
+    ));
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .chat_template = Some(user_history_template());
+    let h = spawn_with_state(state).await;
+    let tools = json!([{
+        "type": "function",
+        "name": "lookup",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        }
+    }]);
+    let first: Value = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "need weather",
+            "tools": tools,
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("first response")
+        .json()
+        .await
+        .expect("first JSON");
+    let call_id = first["output"][0]["call_id"].as_str().expect("call id");
+
+    let second_http = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "previous_response_id": first["id"],
+            "input": [{
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "{\"forecast\":\"sunny\"}"
+            }],
+            "tools": tools,
+            "max_output_tokens": 4
+        }))
+        .send()
+        .await
+        .expect("second response");
+    let status = second_http.status();
+    let body: Value = second_http.json().await.expect("second JSON");
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_responses_store_is_scoped_per_server_instance() {
     let first = spawn("hello from first").await;
     let second = spawn("hello from second").await;
@@ -391,14 +630,13 @@ async fn mock_responses_store_is_scoped_per_server_instance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_chat_stream_buffers_reasoning_and_includes_usage() {
-    let h = spawn_chunks(&["<think>plan", "</think>\nhello", " world"]).await;
+    let h = spawn_chunks(&["<thi", "nk>plan</thi", "nk>\nhello", " world"]).await;
     let resp = h
         .client
         .post(format!("{}/v1/chat/completions", h.base))
         .bearer_auth("secret")
         .json(&json!({
             "messages": [{"role": "user", "content": "hi"}],
-            "reasoning_effort": "medium",
             "stream": true,
             "stream_options": {"include_usage": true},
             "prompt_cache_key": "protocol-mock",
@@ -444,6 +682,115 @@ async fn mock_chat_stream_buffers_reasoning_and_includes_usage() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_chat_stream_drops_tool_call_preamble() {
+    let h = spawn_chunks(&[
+        "I need to call lookup.\n",
+        "<tool_call><function=lookup></function></tool_call>",
+    ])
+    .await;
+    let response = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "stream": true,
+            "max_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let events = collect_sse(response).await;
+    let content = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+        .collect::<String>();
+    assert_eq!(content, "");
+    assert!(events.iter().any(|event| {
+        event["choices"][0]["finish_reason"] == "tool_calls"
+            && event["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "lookup"
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_chat_stream_parses_prefilled_reasoning() {
+    let h = spawn_chunks(&["plan from ", "prefill</think>\nvisible", " answer"]).await;
+    let response = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "medium",
+            "stream": true,
+            "max_completion_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let events = collect_sse(response).await;
+
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    for event in &events {
+        if let Some(delta) = event["choices"][0]["delta"]["reasoning_content"].as_str() {
+            reasoning.push_str(delta);
+        }
+        if let Some(delta) = event["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(delta);
+        }
+        assert!(!event.to_string().contains("<think>"));
+        assert!(!event.to_string().contains("</think>"));
+    }
+    assert_eq!(reasoning, "plan from prefill");
+    assert_eq!(content, "visible answer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_stream_parses_prefilled_reasoning() {
+    let h = spawn_chunks(&["plan from ", "prefill</think>\nvisible", " answer"]).await;
+    let response = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "hi",
+            "reasoning": {"effort": "medium"},
+            "stream": true,
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let events = collect_sse(response).await;
+
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    for event in &events {
+        if event["type"] == "response.reasoning_summary_text.delta" {
+            reasoning.push_str(event["delta"].as_str().expect("reasoning delta"));
+        }
+        if event["type"] == "response.output_text.delta" {
+            content.push_str(event["delta"].as_str().expect("content delta"));
+        }
+        assert!(!event.to_string().contains("<think>"));
+        assert!(!event.to_string().contains("</think>"));
+    }
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .expect("response.completed");
+    assert_eq!(reasoning, "plan from prefill");
+    assert_eq!(content, "visible answer");
+    assert_eq!(completed["response"]["output"][0]["summary"][0], reasoning);
+    assert_eq!(
+        completed["response"]["output"][1]["content"][0]["text"],
+        content
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_responses_stream_emits_expected_events() {
     let h = spawn_chunks(&["hello", " world"]).await;
     let resp = h
@@ -466,6 +813,40 @@ async fn mock_responses_stream_emits_expected_events() {
     assert!(body.contains("event: response.output_item.done"));
     assert!(body.contains("event: response.completed"));
     assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_stream_drops_tool_call_preamble() {
+    let h = spawn_chunks(&[
+        "I need to call lookup.\n",
+        "<tool_call><function=lookup></function></tool_call>",
+    ])
+    .await;
+    let response = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "hi",
+            "tools": [{"type": "function", "name": "lookup"}],
+            "stream": true,
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("send");
+    let events = collect_sse(response).await;
+    let content = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_text.delta")
+        .filter_map(|event| event["delta"].as_str())
+        .collect::<String>();
+    assert_eq!(content, "");
+    assert!(events.iter().any(|event| {
+        event["type"] == "response.output_item.done"
+            && event["item"]["type"] == "function_call"
+            && event["item"]["name"] == "lookup"
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -606,6 +987,195 @@ async fn mock_auth_cors_and_model_mismatch() {
     assert_eq!(unsupported.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
+#[test]
+fn capabilities_readiness_starts_false_and_integrity_loss_is_one_way() {
+    let state = test_state_with_scheduler(
+        MockGeneration::text("hello"),
+        GenerationScheduler::loading(32, 30_000),
+    );
+
+    assert!(!state.is_ready());
+    assert!(state.mark_loaded());
+    assert!(state.is_ready());
+
+    state.mark_integrity_lost();
+    assert!(!state.is_ready());
+    assert!(!state.mark_loaded());
+    assert!(!state.is_ready());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capabilities_report_truthful_flm_evidence_without_path_leaks() {
+    let state = test_flm_state_with_scheduler(
+        MockGeneration::text("hello"),
+        GenerationScheduler::new(32, 30_000),
+    );
+    let h = spawn_with_state(state.clone()).await;
+
+    let capabilities: Value = h
+        .client
+        .get(format!("{}/v1/capabilities", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("capabilities")
+        .json()
+        .await
+        .expect("capabilities json");
+    assert_eq!(capabilities["model"], "qwen3.6-35b-a3b");
+    assert_eq!(capabilities["ready"], true);
+    assert_eq!(capabilities["flm"]["source"], "flm");
+    assert_eq!(capabilities["flm"]["file"], "qwen36-native.flm");
+    assert_eq!(capabilities["flm"]["architecture_id"], 2);
+    assert_eq!(capabilities["flm"]["model_id"], 2);
+    assert_eq!(capabilities["flm"]["storage_abi_ids"], json!([8]));
+    assert_eq!(capabilities["flm"]["required_weights"], 693);
+    assert_eq!(capabilities["flm"]["raw_dense_weights"], 363);
+    assert_eq!(capabilities["flm"]["native_int4_direct_weights"], 330);
+    assert_eq!(capabilities["flm"]["bf16_fallback_weights"], 0);
+    assert_eq!(capabilities["flm"]["load_sequence"], 1);
+    assert_eq!(capabilities["flm"]["startup"]["total_seconds"], 1.25);
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["source_open"]["total_seconds"],
+        0.12
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["source_open"]["exclusive_phases"]
+            ["store_open_seconds"],
+        0.08
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["source_open"]["exclusive_phases"]
+            ["config_seconds"],
+        0.01
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["source_open"]["exclusive_phases"]
+            ["direct_plan_seconds"],
+        0.02
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["tokenizer_seconds"],
+        0.05
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["descriptor_seconds"],
+        0.04
+    );
+    assert!(capabilities["flm"]["startup"]
+        .get("source_open_seconds")
+        .is_none());
+    assert!(capabilities["flm"]["startup"]
+        .get("upload_seconds")
+        .is_none());
+    assert_eq!(
+        capabilities["flm"]["features"]["plain_prefill_decode"],
+        true
+    );
+    assert_eq!(
+        capabilities["flm"]["features"]["native_dflash_generate"],
+        false
+    );
+    assert_eq!(capabilities["flm"]["features"]["prefix_snapshot"], false);
+    assert_eq!(
+        capabilities["flm"]["features"]["disk_prefix_snapshot"],
+        false
+    );
+    assert_eq!(capabilities["prefix_cache"]["enabled"], false);
+    let rendered = serde_json::to_string(&capabilities).expect("capabilities serialization");
+    assert!(!rendered.contains("/models/private"));
+    assert!(!rendered.contains("resident_allocation_pointers"));
+    assert!(!rendered.contains("mapped_virtual_ranges"));
+
+    let health: Value = h
+        .client
+        .get(format!("{}/health", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("health")
+        .json()
+        .await
+        .expect("health json");
+    assert_eq!(health["ready"], true);
+    assert_eq!(health["flm"], capabilities["flm"]);
+
+    state.mark_integrity_lost();
+
+    let health = h
+        .client
+        .get(format!("{}/health", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("poisoned health");
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+    let health: Value = health.json().await.expect("poisoned health json");
+    assert_eq!(health["status"], "degraded");
+    assert_eq!(health["ready"], false);
+
+    let ready = h
+        .client
+        .get(format!("{}/ready", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("poisoned ready");
+    assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let ready: Value = ready.json().await.expect("poisoned ready json");
+    assert_eq!(ready["ready"], false);
+    assert_eq!(ready["flm"]["load_sequence"], 1);
+
+    let metrics = h
+        .client
+        .get(format!("{}/metrics", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("poisoned metrics")
+        .text()
+        .await
+        .expect("poisoned metrics text");
+    assert_metric(&metrics, "supersonic_ready", "0");
+    assert_metric(&metrics, "supersonic_model_loads_total", "1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capabilities_metrics_report_flm_load_and_serving_truth() {
+    let h = spawn_with_state(test_flm_state_with_scheduler(
+        MockGeneration::text("hello"),
+        GenerationScheduler::new(32, 30_000),
+    ))
+    .await;
+
+    let metrics = h
+        .client
+        .get(format!("{}/metrics", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("metrics")
+        .text()
+        .await
+        .expect("metrics text");
+
+    assert_metric(&metrics, "supersonic_ready", "1");
+    assert_metric(&metrics, "supersonic_active_requests", "0");
+    assert_metric(&metrics, "supersonic_queued_requests", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_enabled", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_entries", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_cached_tokens", "0");
+    assert_metric(&metrics, "supersonic_model_loads_total", "1");
+    assert_metric(&metrics, "supersonic_flm_native_int4_direct_weights", "330");
+    assert_metric(&metrics, "supersonic_flm_bf16_fallback_weights", "0");
+    assert_metric(&metrics, "supersonic_flm_source_bytes", "8000000000");
+    assert_metric(&metrics, "supersonic_flm_device_upload_bytes", "7000000000");
+    assert_metric(&metrics, "supersonic_flm_startup_seconds", "1.25");
+    assert!(!metrics.contains("qwen36-native.flm"));
+    assert!(!metrics.contains("/models/private"));
+    assert!(!metrics.contains('{'));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_generation_queue_full_returns_429() {
     let state = test_state_with_scheduler(
@@ -703,7 +1273,7 @@ async fn mock_generation_queue_timeout_returns_503() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_queued_stream_disconnect_releases_queue_slot() {
-    let state = test_state_with_scheduler(
+    let state = test_flm_state_with_scheduler(
         MockGeneration {
             chunks: vec!["hello".to_string(), " world".to_string()],
             finish: server::generate::FinishReason::Stop,
@@ -770,6 +1340,22 @@ async fn mock_queued_stream_disconnect_releases_queue_slot() {
 
     let first = first.await.expect("first join");
     assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+    let metrics = h
+        .client
+        .get(format!("{}/metrics", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("metrics after disconnect")
+        .text()
+        .await
+        .expect("metrics text");
+    assert_metric(&metrics, "supersonic_active_requests", "0");
+    assert_metric(&metrics, "supersonic_queued_requests", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_enabled", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_entries", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_cached_tokens", "0");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

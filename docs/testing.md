@@ -96,8 +96,8 @@ entered.
 
 The Qwen3.6 35B-A3B MoE FLM path uses the same single-source contract for the
 HIP decode path. The canonical producer-to-consumer gate prepares or reuses
-the native artifact, validates it, runs the benchmark, and checks first-class
-FLM evidence in the resulting JSON:
+the G32 row-group direct artifact, validates it, runs the benchmark, and checks
+first-class FLM evidence in the resulting JSON:
 
 ```bash
 cd /home/deano/projects/SuperSonicBase
@@ -111,7 +111,7 @@ python3 tests/gfx1100/run_qwen36_flm_first_class_e2e.py \
 ```
 
 By default, the verifier strictly reuses the artifact only after the
-`supersonic-qwen36-moe-native-int4` structural validation passes, then runs
+`supersonic-qwen36-moe-row-group-int4` structural validation passes, then runs
 full payload verification with `--verify-payload-hashes`. Pass `--regenerate`
 to force a fresh geo-quant export. Exports are written to a PID-specific
 `.partial-*` file and are renamed into the canonical path only after full
@@ -119,15 +119,61 @@ payload validation succeeds; a failed export or validation retains that
 partial file for diagnosis. The verifier invokes the SuperSonic subprocess
 with the FLM as `--model-dir` and does not pass an HF path to it.
 
-For low-level diagnosis, validate the native SuperSonic-layout artifact with
-geo-quant's no-HF profile:
+The persistent real-server gate starts `supersonic-serve` with `--flm-file` on
+an unused loopback port, installs exactly `openai@6.49.0` under `target/` when
+needed, records that version in provenance, and runs the compatibility and
+coding-tool SDK smokes against the same resident process:
+
+```bash
+python3 tests/gfx1100/run_qwen36_flm_server_e2e.py \
+  --flm /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --binary /home/deano/projects/SuperSonicBase/target/release/supersonic-serve \
+  --device 0 \
+  --max-context 4096 \
+  --out-json target/qwen36_35b_a3b_flm_server_e2e.json
+```
+
+The compatibility gate reports transport separately from semantic quality. Its
+Chat, Completions, Responses, and reconstructed-stream canaries must normalize
+to exactly `hello`, stop normally, contain one final terminal event in protocol
+order, and report terminal usage. Reasoning acceptance and observation are
+separate; reasoning is not green unless content is observed without visible
+thinking tags. Missing and wrong keys are checked through the SDK and on every
+protected operational route.
+
+The agent gate performs exact one-call Chat and Responses tool loops, including
+call IDs, name, arguments, no suffix text, terminal state, and text-only
+continuations. Cancellation must first observe a nonterminal delta, place a
+second request in the queue, await abort closure, complete the queued request,
+and prove both health and metrics return to idle without reloading the model.
+The structured report uses an exact nested schema for raw usage, stored
+Responses round-trips, tool evidence, scheduler snapshots, timings, and
+artifact/SDK provenance.
+
+The harness removes any prior output before startup. On failure it atomically
+writes a phase-labelled failure report after collecting final health, metrics,
+and load evidence in the server cleanup path; the adjacent `.server.log`
+retains startup and request output. Process cleanup owns the complete process
+group and escalates surviving descendants to `SIGKILL`.
+
+Run its deterministic lifecycle and report contracts plus the real route
+protocol suite with:
+
+```bash
+python3 -m unittest tests.test_qwen36_flm_server_e2e -v
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+  cargo test -q -p server
+```
+
+For low-level diagnosis, validate the row-group SuperSonic-layout artifact
+with geo-quant's no-HF profile:
 
 ```bash
 cd /home/deano/projects/geo-quant
 /home/deano/projects/geo-quant/.venv-rocm/bin/python \
   -m geoquant.formats.flm_validate \
   /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
-  --profile supersonic-qwen36-moe-native-int4 \
+  --profile supersonic-qwen36-moe-row-group-int4 \
   --verify-payload-hashes
 ```
 
@@ -145,6 +191,44 @@ the SuperSonic runtime bake: `conv1d.weight` must already be
 `DepthwiseConvSqueezed`, `dt_bias` must be `[1, 1, H]`, and `A_log` must already
 be exponentiated BF16 `[1, 1, H]`. The loader labels and binds those bytes; it
 does not perform HF-layout reshapes in the normal FLM path.
+
+The native-INT4 ABI is also pinned by the hand-authored fixture
+`oracle/fixtures/qwen36_native_int4_v1_known_bytes.json`. The fixture does not
+call either producer packer. It fixes low/even and high/odd nibble order,
+128-by-128 tile scale/zero indexing, affine dequantization, and the packed
+row-major layout. The production decoder must reproduce its expected BF16
+values:
+
+```bash
+cargo test -q -p supersonic-runtime \
+  --test qwen36_native_int4_known_bytes -- --nocapture
+```
+
+The mandatory four-layer HIP oracle uses the tracked
+`oracle/fixtures/qwen36_moe_multilayer_int4_v1.json`. Its cumulative
+attention max-absolute budgets are `0.03125, 0.1875, 0.3125, 0.4375`; FFN
+budgets are `0.125, 0.25, 0.5, 0.5`. Corresponding cosine floors tighten each
+handoff, and final chained logits require max-absolute error at most `0.25`
+and cosine at least `0.999`. These constants were rounded outward from the
+accepted accumulation trace and are never derived from the candidate run.
+The suite corrupts an actual FFN handoff by one adjacent lane and separately
+applies a one-lane packing-scale perturbation; both must be rejected.
+
+```bash
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+RUST_TEST_THREADS=1 cargo test -q -p runner \
+  --test qwen36_moe_multilayer_parity -- --nocapture
+```
+
+For layer-0 recurrence diagnosis,
+`qwen36_layer0_diagnostic` starts production state at zero and executes all
+322 aligned positions before collecting stages 1 through 5 at the final
+position. Its report carries the actual input sequence, initial/pre-final/
+post-final conv and recurrent states, strict artifact hashes, and every
+material linear-attention boundary. Compare that report with geo-quant's
+`compare_qwen36_layer0_abcd.py`; the comparison uses fixed per-boundary and
+state budgets and rejects mutation of every reported boundary, state, or
+input.
 
 Then run the env-gated MoE runner smoke:
 
@@ -262,7 +346,7 @@ SUPERSONIC_QWEN36_35B_CT_INT4_FLM_DRY_RUN=/mnt/data/runs/geo-quant/qwen36-35b-a3
 ### Configuration
 
 ```bash
-# Max acceptable logit divergence from oracle (default: 1.0)
+# Legacy gfx1150 script threshold; tracked Qwen oracles use fixed local budgets
 MAX_DELTA_THRESHOLD=0.5 ./tests/gfx1150/run.sh /path/to/model
 
 # Per-test timeout in seconds (default: 120)

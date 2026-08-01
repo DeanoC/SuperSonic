@@ -5,6 +5,8 @@
 #import <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #endif
 
+#include "metal_native_ffi.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -23,15 +25,16 @@ extern "C" int supersonic_metal_lookup_buffer(
     void** buffer_out,
     size_t* offset_out
 );
-extern "C" void supersonic_metal_profile_record(
-    const char* op,
-    const char* path,
-    double elapsed_ms
-);
 
 namespace {
 
 using MetalClock = std::chrono::steady_clock;
+enum class MetalProfilePolicy : uint8_t {
+    Ambient,
+    ExplicitDisabled,
+    ExplicitEnabled,
+};
+
 static constexpr uint32_t QWEN36_FFN_NO_EXPERT_GU_TAP = 0xffffffffu;
 static constexpr uint32_t QWEN36_LOWBIT_NATIVE_INT4 = 4u;
 static constexpr uint32_t QWEN36_LOWBIT_GGML_Q4_K = 12u;
@@ -45,18 +48,54 @@ inline bool lowbit_qtype_supported(int qtype) {
            qtype == static_cast<int>(QWEN36_LOWBIT_GGML_Q6_K);
 }
 
-inline void record_runtime_profile(const char* op, MetalClock::time_point start) {
-    supersonic_metal_profile_record(
+inline void record_profile_sample(
+    MetalProfilePolicy policy,
+    const char* op,
+    const char* path,
+    double elapsed_ms
+) {
+    switch (policy) {
+        case MetalProfilePolicy::Ambient:
+            supersonic_metal_profile_record(op, path, elapsed_ms);
+            break;
+        case MetalProfilePolicy::ExplicitEnabled:
+            supersonic_metal_profile_record_explicit(1, op, path, elapsed_ms);
+            break;
+        case MetalProfilePolicy::ExplicitDisabled:
+            break;
+    }
+}
+
+inline void record_runtime_profile(
+    MetalProfilePolicy policy,
+    const char* op,
+    MetalClock::time_point start
+) {
+    record_profile_sample(
+        policy,
         op,
         "runtime",
         std::chrono::duration<double, std::milli>(MetalClock::now() - start).count()
     );
 }
 
-inline void record_profile_elapsed(const char* op, const char* path, double elapsed_ms) {
+inline void record_runtime_profile(const char* op, MetalClock::time_point start) {
+    record_runtime_profile(MetalProfilePolicy::Ambient, op, start);
+}
+
+inline void record_profile_elapsed(
+    MetalProfilePolicy policy,
+    const char* op,
+    const char* path,
+    double elapsed_ms
+) {
     if (std::isfinite(elapsed_ms) && elapsed_ms >= 0.0) {
-        supersonic_metal_profile_record(op, path, elapsed_ms);
+        record_profile_sample(policy, op, path, elapsed_ms);
     }
+}
+
+inline void record_profile_elapsed(const char* op, const char* path, double elapsed_ms) {
+    record_profile_elapsed(MetalProfilePolicy::Ambient, op, path, elapsed_ms);
 }
 
 struct Qwen36FfnPhaseStats {
@@ -374,17 +413,30 @@ inline uint32_t qwen36_full_attn_exact_flags() {
     return flags;
 }
 
-inline void record_command_buffer_gpu_profile(id<MTLCommandBuffer> command_buffer, const std::string& label) {
+inline void record_command_buffer_gpu_profile(
+    MetalProfilePolicy policy,
+    id<MTLCommandBuffer> command_buffer,
+    const std::string& label
+) {
     if (command_buffer == nil) {
         return;
     }
     double gpu_elapsed_ms = (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0;
-    record_profile_elapsed("command_buffer_gpu", "runtime", gpu_elapsed_ms);
+    record_profile_elapsed(policy, "command_buffer_gpu", "runtime", gpu_elapsed_ms);
     if (!label.empty()) {
         std::string labeled_op = "command_buffer_gpu:" + label;
-        record_profile_elapsed(labeled_op.c_str(), "runtime", gpu_elapsed_ms);
-        qwen36_ffn_phase_summary_record(label, gpu_elapsed_ms);
+        record_profile_elapsed(policy, labeled_op.c_str(), "runtime", gpu_elapsed_ms);
+        if (policy == MetalProfilePolicy::Ambient) {
+            qwen36_ffn_phase_summary_record(label, gpu_elapsed_ms);
+        }
     }
+}
+
+inline void record_command_buffer_gpu_profile(
+    id<MTLCommandBuffer> command_buffer,
+    const std::string& label
+) {
+    record_command_buffer_gpu_profile(MetalProfilePolicy::Ambient, command_buffer, label);
 }
 
 double wait_command_buffer_ms(id<MTLCommandBuffer> command_buffer, MetalClock::time_point start) {
@@ -761,6 +813,7 @@ struct MetalBatchState {
     __strong NSMutableArray* pending_buffers = nil;
     bool has_work = false;
     std::string label;
+    MetalProfilePolicy profile_policy = MetalProfilePolicy::Ambient;
 
     MetalBatchState() : pending_buffers([[NSMutableArray alloc] init]) {}
 };
@@ -781,7 +834,11 @@ int metal_batch_ensure_command_buffer() {
     }
     auto command_buffer_start = MetalClock::now();
     metal_batch_state->command_buffer = [queue commandBuffer];
-    record_runtime_profile("command_buffer_create", command_buffer_start);
+    record_runtime_profile(
+        metal_batch_state->profile_policy,
+        "command_buffer_create",
+        command_buffer_start
+    );
     if (metal_batch_state->command_buffer == nil) {
         return 902;
     }
@@ -800,11 +857,19 @@ int metal_batch_wait_pending() {
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             [metal_batch_state->pending_buffers removeAllObjects];
-            record_runtime_profile("command_buffer_wait", wait_start);
+            record_runtime_profile(
+                metal_batch_state->profile_policy,
+                "command_buffer_wait",
+                wait_start
+            );
             return 906;
         }
     }
-    record_runtime_profile("command_buffer_wait", wait_start);
+    record_runtime_profile(
+        metal_batch_state->profile_policy,
+        "command_buffer_wait",
+        wait_start
+    );
     [metal_batch_state->pending_buffers removeAllObjects];
     return 0;
 }
@@ -819,7 +884,11 @@ int metal_batch_ensure_compute_encoder() {
     }
     auto encoder_start = MetalClock::now();
     metal_batch_state->encoder = [metal_batch_state->command_buffer computeCommandEncoder];
-    record_runtime_profile("compute_encoder_create", encoder_start);
+    record_runtime_profile(
+        metal_batch_state->profile_policy,
+        "compute_encoder_create",
+        encoder_start
+    );
     if (metal_batch_state->encoder == nil) {
         metal_batch_state->command_buffer = nil;
         return 903;
@@ -836,6 +905,7 @@ int metal_batch_close_encoder(bool restart) {
     id<MTLComputeCommandEncoder> encoder = metal_batch_state->encoder;
     bool has_work = metal_batch_state->has_work;
     std::string label = metal_batch_state->label;
+    MetalProfilePolicy profile_policy = metal_batch_state->profile_policy;
     metal_batch_state->encoder = nil;
     metal_batch_state->command_buffer = nil;
     metal_batch_state->has_work = false;
@@ -844,19 +914,19 @@ int metal_batch_close_encoder(bool restart) {
     if (encoder != nil) {
         auto end_encoding_start = MetalClock::now();
         [encoder endEncoding];
-        record_runtime_profile("encoder_end", end_encoding_start);
+        record_runtime_profile(profile_policy, "encoder_end", end_encoding_start);
     }
     if (has_work) {
         auto commit_start = MetalClock::now();
         [command_buffer commit];
-        record_runtime_profile("command_buffer_commit", commit_start);
+        record_runtime_profile(profile_policy, "command_buffer_commit", commit_start);
         auto wait_start = MetalClock::now();
         [command_buffer waitUntilCompleted];
-        record_runtime_profile("command_buffer_wait", wait_start);
+        record_runtime_profile(profile_policy, "command_buffer_wait", wait_start);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             return 904;
         }
-        record_command_buffer_gpu_profile(command_buffer, label);
+        record_command_buffer_gpu_profile(profile_policy, command_buffer, label);
     }
     int pending_status = metal_batch_wait_pending();
     if (pending_status != 0) {
@@ -882,6 +952,7 @@ int metal_batch_commit_current_async(const char* label_override) {
     id<MTLComputeCommandEncoder> encoder = metal_batch_state->encoder;
     bool has_work = metal_batch_state->has_work;
     std::string label = label_override == nullptr ? metal_batch_state->label : label_override;
+    MetalProfilePolicy profile_policy = metal_batch_state->profile_policy;
     metal_batch_state->encoder = nil;
     metal_batch_state->command_buffer = nil;
     metal_batch_state->has_work = false;
@@ -890,7 +961,7 @@ int metal_batch_commit_current_async(const char* label_override) {
     if (encoder != nil) {
         auto end_encoding_start = MetalClock::now();
         [encoder endEncoding];
-        record_runtime_profile("encoder_end", end_encoding_start);
+        record_runtime_profile(profile_policy, "encoder_end", end_encoding_start);
     }
     if (!has_work) {
         return 0;
@@ -899,12 +970,12 @@ int metal_batch_commit_current_async(const char* label_override) {
     std::string label_copy = label;
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         if (completed.status == MTLCommandBufferStatusCompleted) {
-            record_command_buffer_gpu_profile(completed, label_copy);
+            record_command_buffer_gpu_profile(profile_policy, completed, label_copy);
         }
     }];
     auto commit_start = MetalClock::now();
     [command_buffer commit];
-    record_runtime_profile("command_buffer_commit", commit_start);
+    record_runtime_profile(profile_policy, "command_buffer_commit", commit_start);
     [metal_batch_state->pending_buffers addObject:command_buffer];
     return 0;
 }
@@ -951,16 +1022,20 @@ int metal_batch_end() {
 }
 
 template <typename EncodeFn>
-int encode_or_submit_labeled_maybe_wait(
+int encode_or_submit_labeled_maybe_wait_with_profile_policy(
     EncodeFn encode,
     const std::string& label,
     int queue_error,
     int command_buffer_error,
     int encoder_error,
     int completion_error,
-    bool wait_for_completion
+    bool wait_for_completion,
+    MetalProfilePolicy profile_policy
 ) {
     if (metal_batch_depth > 0 && metal_batch_state != nullptr) {
+        if (profile_policy != MetalProfilePolicy::Ambient) {
+            metal_batch_state->profile_policy = profile_policy;
+        }
         int status = metal_batch_ensure_compute_encoder();
         if (status != 0) {
             return status;
@@ -980,13 +1055,13 @@ int encode_or_submit_labeled_maybe_wait(
     }
     auto command_buffer_start = MetalClock::now();
     id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-    record_runtime_profile("command_buffer_create", command_buffer_start);
+    record_runtime_profile(profile_policy, "command_buffer_create", command_buffer_start);
     if (command_buffer == nil) {
         return command_buffer_error;
     }
     auto encoder_start = MetalClock::now();
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-    record_runtime_profile("compute_encoder_create", encoder_start);
+    record_runtime_profile(profile_policy, "compute_encoder_create", encoder_start);
     if (encoder == nil) {
         return encoder_error;
     }
@@ -994,30 +1069,74 @@ int encode_or_submit_labeled_maybe_wait(
     encode(encoder);
     auto end_encoding_start = MetalClock::now();
     [encoder endEncoding];
-    record_runtime_profile("encoder_end", end_encoding_start);
+    record_runtime_profile(profile_policy, "encoder_end", end_encoding_start);
     if (!wait_for_completion) {
         std::string label_copy = label;
         [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
             if (completed.status == MTLCommandBufferStatusCompleted) {
-                record_command_buffer_gpu_profile(completed, label_copy);
+                record_command_buffer_gpu_profile(profile_policy, completed, label_copy);
             }
         }];
     }
     auto commit_start = MetalClock::now();
     [command_buffer commit];
-    record_runtime_profile("command_buffer_commit", commit_start);
+    record_runtime_profile(profile_policy, "command_buffer_commit", commit_start);
     if (!wait_for_completion) {
         return 0;
     }
     auto wait_start = MetalClock::now();
     [command_buffer waitUntilCompleted];
-    record_runtime_profile("command_buffer_wait", wait_start);
+    record_runtime_profile(profile_policy, "command_buffer_wait", wait_start);
 
     if (command_buffer.status != MTLCommandBufferStatusCompleted) {
         return completion_error;
     }
-    record_command_buffer_gpu_profile(command_buffer, label);
+    record_command_buffer_gpu_profile(profile_policy, command_buffer, label);
     return 0;
+}
+
+template <typename EncodeFn>
+int encode_or_submit_labeled_maybe_wait(
+    EncodeFn encode,
+    const std::string& label,
+    int queue_error,
+    int command_buffer_error,
+    int encoder_error,
+    int completion_error,
+    bool wait_for_completion
+) {
+    return encode_or_submit_labeled_maybe_wait_with_profile_policy(
+        encode,
+        label,
+        queue_error,
+        command_buffer_error,
+        encoder_error,
+        completion_error,
+        wait_for_completion,
+        MetalProfilePolicy::Ambient
+    );
+}
+
+template <typename EncodeFn>
+int encode_or_submit_labeled_with_profile_policy(
+    EncodeFn encode,
+    const std::string& label,
+    int queue_error,
+    int command_buffer_error,
+    int encoder_error,
+    int completion_error,
+    MetalProfilePolicy profile_policy
+) {
+    return encode_or_submit_labeled_maybe_wait_with_profile_policy(
+        encode,
+        label,
+        queue_error,
+        command_buffer_error,
+        encoder_error,
+        completion_error,
+        true,
+        profile_policy
+    );
 }
 
 template <typename EncodeFn>
@@ -1075,6 +1194,28 @@ int encode_or_submit_labeled_async(
         encoder_error,
         completion_error,
         false
+    );
+}
+
+template <typename EncodeFn>
+int encode_or_submit_labeled_async_with_profile_policy(
+    EncodeFn encode,
+    const std::string& label,
+    int queue_error,
+    int command_buffer_error,
+    int encoder_error,
+    int completion_error,
+    MetalProfilePolicy profile_policy
+) {
+    return encode_or_submit_labeled_maybe_wait_with_profile_policy(
+        encode,
+        label,
+        queue_error,
+        command_buffer_error,
+        encoder_error,
+        completion_error,
+        false,
+        profile_policy
     );
 }
 
@@ -16052,7 +16193,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_direct_gather_stage5(
     }
 }
 
-extern "C" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct(
+int qwen36_batched_ffn_grouped_expert_direct_impl(
     size_t n_tokens,
     size_t top_k,
     size_t hidden,
@@ -16069,7 +16210,9 @@ extern "C" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct(
     const void* down_zero_ptr,
     void* expert_mid_ptr,
     void* combined_ptr,
-    int wait_for_completion
+    int wait_for_completion,
+    MetalProfilePolicy profile_policy,
+    bool split_profile
 ) {
     @autoreleasepool {
         if (n_tokens == 0 || top_k == 0 || hidden == 0 || moe_intermediate == 0 ||
@@ -16169,24 +16312,25 @@ extern "C" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         };
 
-        bool split_profile = qwen36_ffn_phase_profile_enabled();
         if (split_profile) {
-            if ((status = encode_or_submit_labeled(
+            if ((status = encode_or_submit_labeled_with_profile_policy(
                     encode_gate_up,
                     "qwen36_batched_prefill_grouped_expert_gate_up",
                     1275,
                     1276,
                     1277,
-                    1278)) != 0) {
+                    1278,
+                    profile_policy)) != 0) {
                 return status;
             }
-            return encode_or_submit_labeled(
+            return encode_or_submit_labeled_with_profile_policy(
                 encode_down_combine,
                 "qwen36_batched_prefill_grouped_expert_down_combine",
                 1279,
                 1280,
                 1281,
-                1282);
+                1282,
+                profile_policy);
         }
 
         auto encode_stage = [&](id<MTLComputeCommandEncoder> encoder) {
@@ -16195,22 +16339,113 @@ extern "C" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct(
             encode_down_combine(encoder);
         };
         if (wait_for_completion != 0) {
-            return encode_or_submit_labeled(
+            return encode_or_submit_labeled_with_profile_policy(
                 encode_stage,
                 "qwen36_batched_prefill_grouped_expert_direct",
                 1283,
                 1284,
                 1285,
-                1286);
+                1286,
+                profile_policy);
         }
-        return encode_or_submit_labeled_async(
+        return encode_or_submit_labeled_async_with_profile_policy(
             encode_stage,
             "qwen36_batched_prefill_grouped_expert_direct",
             1283,
             1284,
             1285,
-            1286);
+            1286,
+            profile_policy);
     }
+}
+
+extern "C" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct(
+    size_t n_tokens,
+    size_t top_k,
+    size_t hidden,
+    size_t moe_intermediate,
+    size_t group_size,
+    const void* x_norm_ptr,
+    const void* topk_idx_ptr,
+    const void* topk_weight_ptr,
+    const void* gate_up_proj_ptr,
+    const void* gate_up_scale_ptr,
+    const void* gate_up_zero_ptr,
+    const void* down_proj_ptr,
+    const void* down_scale_ptr,
+    const void* down_zero_ptr,
+    void* expert_mid_ptr,
+    void* combined_ptr,
+    int wait_for_completion
+) {
+    return qwen36_batched_ffn_grouped_expert_direct_impl(
+        n_tokens,
+        top_k,
+        hidden,
+        moe_intermediate,
+        group_size,
+        x_norm_ptr,
+        topk_idx_ptr,
+        topk_weight_ptr,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+        expert_mid_ptr,
+        combined_ptr,
+        wait_for_completion,
+        MetalProfilePolicy::Ambient,
+        qwen36_ffn_phase_profile_enabled()
+    );
+}
+
+extern "C" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct_with_options(
+    size_t n_tokens,
+    size_t top_k,
+    size_t hidden,
+    size_t moe_intermediate,
+    size_t group_size,
+    const void* x_norm_ptr,
+    const void* topk_idx_ptr,
+    const void* topk_weight_ptr,
+    const void* gate_up_proj_ptr,
+    const void* gate_up_scale_ptr,
+    const void* gate_up_zero_ptr,
+    const void* down_proj_ptr,
+    const void* down_scale_ptr,
+    const void* down_zero_ptr,
+    void* expert_mid_ptr,
+    void* combined_ptr,
+    int profile_enabled,
+    int phase_profile_enabled,
+    int wait_for_completion
+) {
+    MetalProfilePolicy profile_policy = profile_enabled != 0
+        ? MetalProfilePolicy::ExplicitEnabled
+        : MetalProfilePolicy::ExplicitDisabled;
+    return qwen36_batched_ffn_grouped_expert_direct_impl(
+        n_tokens,
+        top_k,
+        hidden,
+        moe_intermediate,
+        group_size,
+        x_norm_ptr,
+        topk_idx_ptr,
+        topk_weight_ptr,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+        expert_mid_ptr,
+        combined_ptr,
+        wait_for_completion,
+        profile_policy,
+        phase_profile_enabled != 0
+    );
 }
 
 extern "C" int supersonic_metal_qwen36_router_softmax_topk_bf16(

@@ -900,7 +900,7 @@ impl DecodeEngineSnapshot {
             state: self
                 .state
                 .clone_gpu()
-                .map_err(|e| anyhow::anyhow!("clone Qwen prefix snapshot: {e}"))?,
+                .context("clone Qwen prefix snapshot")?,
             logits: self.logits.clone(),
         })
     }
@@ -910,7 +910,7 @@ impl DecodeEngineSnapshot {
             state: self
                 .state
                 .to_disk_snapshot()
-                .map_err(|e| anyhow::anyhow!("snapshot Qwen state to disk: {e}"))?,
+                .context("snapshot Qwen state to disk")?,
             logits: self.logits.clone(),
         };
         serde_json::to_vec(&disk).map_err(Into::into)
@@ -10454,7 +10454,7 @@ impl DecodeEngine {
             state: self
                 .state
                 .clone_gpu()
-                .map_err(|e| anyhow::anyhow!("snapshot Qwen prefix state: {e}"))?,
+                .context("snapshot Qwen prefix state")?,
             logits,
         })
     }
@@ -10469,10 +10469,10 @@ impl DecodeEngine {
         self.state = snapshot
             .state
             .clone_gpu()
-            .map_err(|e| anyhow::anyhow!("restore Qwen prefix state: {e}"))?;
+            .context("restore Qwen prefix state")?;
         self.scratch
             .reset_sync()
-            .map_err(|e| anyhow::anyhow!("reset sync after prefix restore: {e}"))?;
+            .context("reset sync after prefix restore")?;
         Ok(snapshot.logits.clone())
     }
 
@@ -10480,7 +10480,7 @@ impl DecodeEngine {
         self.state = snapshot.state;
         self.scratch
             .reset_sync()
-            .map_err(|e| anyhow::anyhow!("reset sync after prefix restore: {e}"))?;
+            .context("reset sync after prefix restore")?;
         Ok(snapshot.logits)
     }
 
@@ -10488,7 +10488,7 @@ impl DecodeEngine {
         let disk: DecodeEngineDiskSnapshot = serde_json::from_slice(bytes)?;
         Ok(DecodeEngineSnapshot {
             state: ModelState::from_disk_snapshot(disk.state, &self.weights.config, self.ordinal)
-                .map_err(|e| anyhow::anyhow!("load Qwen prefix snapshot from disk: {e}"))?,
+                .context("load Qwen prefix snapshot from disk")?,
             logits: disk.logits,
         })
     }

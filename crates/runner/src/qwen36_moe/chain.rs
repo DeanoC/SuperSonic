@@ -3,25 +3,19 @@ use model_store::BakedStore;
 
 use crate::qwen36_moe_cli::prefetch::handle_moe_expert_prefetch;
 use crate::qwen36_moe_cli::vmm_config::MoeRuntimeConfig;
-use crate::qwen36_moe_decode::{
-    run_chained_decode_fast, run_chained_decode_fast_with_cache_pos,
-    run_chained_decode_fast_with_expert_prefetch,
-    run_chained_decode_fast_with_expert_prefetch_and_cache_pos,
-};
-use crate::qwen36_moe_persistent_decode::{LmHeadFold, PersistentScratch};
-use crate::qwen36_moe_residency::MoeExpertResidencyManager;
+use crate::qwen36_moe_persistent_decode::LmHeadFold;
 use crate::qwen36_moe_telemetry::{MoeRouteRuntime, MoeSparseTelemetrySnapshot};
 use crate::qwen36_moe_types::{
-    DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom, PositionPair,
+    DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, MultiLayerGeom, PositionPair,
 };
+use supersonic_runtime::qwen36_moe::decode::Qwen36ExecutionOptions;
+use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
 
 pub(crate) struct Qwen36ChainStep<'a> {
     pub(crate) ordinal: usize,
     pub(crate) geom: &'a MultiLayerGeom,
     pub(crate) store: &'a BakedStore,
-    pub(crate) layers: &'a mut [LayerBuffers],
-    pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
-    pub(crate) moe_expert_residency: Option<&'a mut MoeExpertResidencyManager>,
+    pub(crate) loaded_layers: &'a mut LoadedQwen36Layers,
     pub(crate) moe_runtime: &'a mut MoeRuntimeConfig,
     pub(crate) moe_routes: &'a mut MoeRouteRuntime,
     pub(crate) initial_hidden: &'a [u8],
@@ -36,6 +30,7 @@ pub(crate) struct Qwen36ChainStep<'a> {
     pub(crate) emit_stage_timings: bool,
     pub(crate) fold: Option<LmHeadFold<'a>>,
     pub(crate) download_final_hidden: bool,
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
 }
 
 pub(crate) struct Qwen36ChainStepOutput {
@@ -44,10 +39,10 @@ pub(crate) struct Qwen36ChainStepOutput {
     pub(crate) lm_head_folded_top1: bool,
 }
 
-pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36ChainStepOutput> {
+pub(crate) fn run_chain_step(args: Qwen36ChainStep<'_>) -> Result<Qwen36ChainStepOutput> {
     let moe_telemetry_before = args
-        .moe_expert_residency
-        .as_deref()
+        .loaded_layers
+        .sparse_expert_residency()
         .map(MoeSparseTelemetrySnapshot::capture);
     let track_moe_routes = args
         .moe_routes
@@ -56,154 +51,37 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
 
     let rope = args.position.rope;
     let cache = args.position.cache;
-
-    let mut lm_head_folded = false;
-    let mut lm_head_folded_top1 = false;
-    let outputs = if let Some(scratch) = args.persistent_scratch.as_deref_mut() {
-        // Persistent kernel takes (rope, cache) directly. The
-        // megakernel's full-attn phase consumes cache_pos via
-        // `eff_cache_pos = (cache_pos >= 0) ? cache_pos : position`,
-        // so passing `cache` works for both dense and SpecPrefill
-        // cases (when rope == cache the kernel produces bit-identical
-        // output to the pre-PR-#211 hard-coded -1 path).
-        if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
-            drop(args.fold);
-            let mut prefetch = |phase: ExpertPrefetchPhase,
-                                layer_idx: usize,
-                                routes: &[ExpertRoute]|
-             -> Result<()> {
-                handle_moe_expert_prefetch(
-                    manager,
-                    args.store,
-                    args.moe_runtime.prefetch_mode,
-                    args.moe_runtime.prefetch_ranks,
-                    args.moe_runtime.prefetch_evict_min_probability,
-                    args.moe_runtime.protect_demand_routes,
-                    args.moe_runtime.hot_protect_min_hits,
-                    args.moe_runtime.fixed_hot_min_hits,
-                    &args.moe_routes.previous_topk_by_layer,
-                    &mut next_moe_topk_by_layer,
-                    track_moe_routes,
-                    args.moe_routes.route_telemetry.as_mut(),
-                    args.moe_routes.transition_predictors.as_deref_mut(),
-                    args.moe_routes.hot_expert_counts.as_deref_mut(),
-                    phase,
-                    layer_idx,
-                    routes,
-                )
-            };
-            scratch
-                .run_sparse_with_expert_prefetch(
-                    args.ordinal,
-                    args.initial_hidden,
-                    rope,
-                    cache,
-                    &mut prefetch,
-                )
-                .with_context(|| {
-                    format!(
-                        "segmented persistent sparse decode (step {}, rope {}, cache {})",
-                        args.step, rope, cache
-                    )
-                })?
-        } else {
-            if std::env::var_os("SUPERSONIC_QWEN36_SEGMENTED_PROFILE").is_some() {
-                drop(args.fold);
-                scratch
-                    .run_segmented_profile(args.ordinal, args.initial_hidden, rope, cache)
-                    .with_context(|| {
-                        format!(
-                            "persistent segmented profile decode (step {}, rope {}, cache {})",
-                            args.step, rope, cache
-                        )
-                    })?
-            } else {
-                lm_head_folded = args.fold.is_some();
-                lm_head_folded_top1 = args
-                    .fold
-                    .as_ref()
-                    .is_some_and(|fold| fold.top1_out.is_some());
-                scratch
-                    .run(
-                        args.ordinal,
-                        args.initial_hidden,
-                        rope,
-                        cache,
-                        args.fold,
-                        args.download_final_hidden,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "persistent decode (step {}, rope {}, cache {})",
-                            args.step, rope, cache
-                        )
-                    })?
-            }
-        }
-    } else {
-        // Chained fallback for when the persistent megakernel isn't
-        // available (engine started without --persistent-decode, or
-        // a dispatch path that the persistent kernel doesn't yet
-        // support). Chained has parallel cache_pos siblings; we
-        // pick them only when the pair actually diverges.
+    let runtime_output = if std::env::var_os("SUPERSONIC_QWEN36_SEGMENTED_PROFILE").is_some()
+        && args.loaded_layers.persistent_enabled()
+        && !args.loaded_layers.has_sparse_expert_residency()
+    {
         drop(args.fold);
-        if !args.position.is_dense() {
-            if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
-                let mut prefetch = |phase: ExpertPrefetchPhase,
-                                    layer_idx: usize,
-                                    routes: &[ExpertRoute]|
-                 -> Result<()> {
-                    handle_moe_expert_prefetch(
-                        manager,
-                        args.store,
-                        args.moe_runtime.prefetch_mode,
-                        args.moe_runtime.prefetch_ranks,
-                        args.moe_runtime.prefetch_evict_min_probability,
-                        args.moe_runtime.protect_demand_routes,
-                        args.moe_runtime.hot_protect_min_hits,
-                        args.moe_runtime.fixed_hot_min_hits,
-                        &args.moe_routes.previous_topk_by_layer,
-                        &mut next_moe_topk_by_layer,
-                        track_moe_routes,
-                        args.moe_routes.route_telemetry.as_mut(),
-                        args.moe_routes.transition_predictors.as_deref_mut(),
-                        args.moe_routes.hot_expert_counts.as_deref_mut(),
-                        phase,
-                        layer_idx,
-                        routes,
-                    )
-                };
-                run_chained_decode_fast_with_expert_prefetch_and_cache_pos(
-                    args.ordinal,
-                    args.geom,
-                    args.layers,
-                    args.initial_hidden,
-                    rope,
-                    cache,
-                    args.emit_stage_timings,
-                    &mut prefetch,
-                )
-            } else {
-                run_chained_decode_fast_with_cache_pos(
-                    args.ordinal,
-                    args.geom,
-                    args.layers,
-                    args.initial_hidden,
-                    rope,
-                    cache,
-                    args.emit_stage_timings,
-                )
-            }
+        let outputs = args
+            .loaded_layers
+            .run_segmented_profile(
+                args.ordinal,
+                args.initial_hidden,
+                rope,
+                cache,
+                args.execution,
+            )
             .with_context(|| {
                 format!(
-                    "chained sparse-prefill decode (step {}, rope {}, cache {})",
+                    "persistent segmented profile decode (step {}, rope {}, cache {})",
                     args.step, rope, cache
                 )
-            })?
-        } else if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
-            let mut prefetch = |phase: ExpertPrefetchPhase,
-                                layer_idx: usize,
-                                routes: &[ExpertRoute]|
+            })?;
+        supersonic_runtime::qwen36_moe::chain::Qwen36ChainStepOutput {
+            outputs,
+            lm_head_folded: false,
+            lm_head_folded_top1: false,
+        }
+    } else {
+        let mut prefetch =
+            |manager: &mut crate::qwen36_moe_residency::MoeExpertResidencyManager,
+             phase: ExpertPrefetchPhase,
+             layer_idx: usize,
+             routes: &[ExpertRoute]|
              -> Result<()> {
                 handle_moe_expert_prefetch(
                     manager,
@@ -225,27 +103,25 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
                     routes,
                 )
             };
-            run_chained_decode_fast_with_expert_prefetch(
-                args.ordinal,
-                args.geom,
-                args.layers,
-                args.initial_hidden,
-                rope,
-                args.emit_stage_timings,
-                &mut prefetch,
-            )
-            .with_context(|| format!("chained decode (step {}, rope {})", args.step, rope))?
-        } else {
-            run_chained_decode_fast(
-                args.ordinal,
-                args.geom,
-                args.layers,
-                args.initial_hidden,
-                rope,
-                args.emit_stage_timings,
-            )
-            .with_context(|| format!("chained decode (step {}, rope {})", args.step, rope))?
-        }
+        let expert_prefetch = args.loaded_layers.has_sparse_expert_residency().then_some(
+            &mut prefetch
+                as &mut supersonic_runtime::qwen36_moe::chain::ChainExpertPrefetchCallback<'_>,
+        );
+        supersonic_runtime::qwen36_moe::chain::run_chain_step(
+            supersonic_runtime::qwen36_moe::chain::Qwen36ChainStep {
+                ordinal: args.ordinal,
+                geom: args.geom,
+                loaded_layers: args.loaded_layers,
+                initial_hidden: args.initial_hidden,
+                position: args.position,
+                step: args.step,
+                accurate_stage_timings: args.emit_stage_timings,
+                fold: args.fold,
+                download_final_hidden: args.download_final_hidden,
+                expert_prefetch,
+                execution: args.execution,
+            },
+        )?
     };
 
     args.moe_routes
@@ -253,15 +129,15 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
     if let (Some(telemetry), Some(before), Some(manager)) = (
         args.moe_runtime.sparse_telemetry.as_mut(),
         moe_telemetry_before,
-        args.moe_expert_residency.as_deref(),
+        args.loaded_layers.sparse_expert_residency(),
     ) {
         let after = MoeSparseTelemetrySnapshot::capture(manager);
         telemetry.record_step(args.step, rope, args.is_gen_step, before, after);
     }
 
     Ok(Qwen36ChainStepOutput {
-        outputs,
-        lm_head_folded,
-        lm_head_folded_top1,
+        outputs: runtime_output.outputs,
+        lm_head_folded: runtime_output.lm_head_folded,
+        lm_head_folded_top1: runtime_output.lm_head_folded_top1,
     })
 }

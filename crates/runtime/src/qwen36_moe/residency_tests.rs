@@ -1,10 +1,37 @@
 use super::*;
+use crate::qwen36_moe::types::ExpertPrefetchPhase;
 use gpu_hal::{Backend, VirtualAllocationRole};
 use model_store::manifest::{LayoutTag, Manifest, TensorMeta, FORMAT_VERSION};
 use model_store::VirtualArenaTransferBackend;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-static VMM_BACKEND_TEST_LOCK: Mutex<()> = Mutex::new(());
+static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> Self {
+        let suffix = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "supersonic-runtime-qwen36-residency-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create test directory");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 struct BackendRestore(Backend);
 
@@ -14,8 +41,19 @@ impl Drop for BackendRestore {
     }
 }
 
-fn synthetic_store(expert_count: usize, expert_bytes: usize) -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().expect("tempdir");
+struct DropProbe {
+    name: &'static str,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.events.lock().expect("drop event lock").push(self.name);
+    }
+}
+
+fn synthetic_store(expert_count: usize, expert_bytes: usize) -> TestDir {
+    let tmp = TestDir::new();
     let bake_dir = tmp.path();
     let total_bytes = expert_count * expert_bytes;
     let mut weights = vec![0u8; total_bytes];
@@ -49,12 +87,172 @@ fn synthetic_store(expert_count: usize, expert_bytes: usize) -> tempfile::TempDi
     tmp
 }
 
+fn reset_mutable_state(state: &mut [u8]) {
+    state.fill(0);
+}
+
+#[test]
+fn residency_config_rejects_zero_page_budget() {
+    assert!(MoeExpertResidencyConfig::new(0).is_err());
+    assert_eq!(
+        MoeExpertResidencyConfig::new(8)
+            .unwrap()
+            .with_prefetch_evict(true),
+        MoeExpertResidencyConfig {
+            max_resident_pages: 8,
+            prefetch_evict: true,
+        }
+    );
+}
+
+#[test]
+fn expert_keys_are_hashable_runtime_contracts() {
+    let key = MoeExpertKey {
+        layer_idx: 3,
+        expert_idx: 17,
+        projection: MoeExpertProjection::GateUp,
+    };
+    let mut set = std::collections::HashSet::new();
+
+    set.insert(key);
+
+    assert!(set.contains(&key));
+    assert_ne!(MoeExpertProjection::GateUp, MoeExpertProjection::Down);
+}
+
+#[test]
+fn residency_stats_default_to_empty() {
+    let stats = MoeExpertResidencyStats::default();
+
+    assert_eq!(stats.registered_tensors, 0);
+    assert_eq!(stats.resident_pages, 0);
+    assert_eq!(stats.async_pending_pages_peak, 0);
+}
+
+#[test]
+fn async_teardown_drops_async_resources_before_the_arena() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let async_owner = DropProbe {
+        name: "async",
+        events: events.clone(),
+    };
+    let arena_owner = DropProbe {
+        name: "arena",
+        events: events.clone(),
+    };
+
+    let result = teardown_residency_resources(Some(async_owner), arena_owner, |_| {
+        events.lock().expect("sync event lock").push("sync");
+        Ok(())
+    });
+
+    assert!(result.is_ok());
+    assert_eq!(
+        events.lock().expect("teardown event lock").as_slice(),
+        ["sync", "async", "arena"]
+    );
+}
+
+#[test]
+fn async_teardown_error_retains_both_resource_owners() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let async_owner = DropProbe {
+        name: "async",
+        events: events.clone(),
+    };
+    let arena_owner = DropProbe {
+        name: "arena",
+        events: events.clone(),
+    };
+
+    let failure = teardown_residency_resources(Some(async_owner), arena_owner, |_| {
+        events.lock().expect("sync event lock").push("sync");
+        Err(anyhow!("injected stream synchronization failure"))
+    })
+    .expect_err("synchronization failure must retain ownership");
+
+    assert!(failure
+        .error()
+        .to_string()
+        .contains("injected stream synchronization failure"));
+    assert_eq!(
+        events
+            .lock()
+            .expect("failed teardown event lock")
+            .as_slice(),
+        ["sync"]
+    );
+
+    let (async_owner, arena_owner) = failure.into_resources();
+    drop(async_owner);
+    drop(arena_owner);
+    assert_eq!(
+        events.lock().expect("cleanup event lock").as_slice(),
+        ["sync", "async", "arena"]
+    );
+}
+
+#[test]
+fn async_teardown_error_fallback_leaks_live_resources() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let async_owner = DropProbe {
+        name: "async",
+        events: events.clone(),
+    };
+    let arena_owner = DropProbe {
+        name: "arena",
+        events: events.clone(),
+    };
+
+    let failure = teardown_residency_resources(Some(async_owner), arena_owner, |_| {
+        events.lock().expect("sync event lock").push("sync");
+        Err(anyhow!("injected stream synchronization failure"))
+    })
+    .expect_err("synchronization failure must retain ownership");
+
+    let error = failure.into_error_leaking_resources();
+
+    assert!(error
+        .to_string()
+        .contains("injected stream synchronization failure"));
+    assert_eq!(
+        events.lock().expect("leak fallback event lock").as_slice(),
+        ["sync"]
+    );
+}
+
+#[test]
+fn async_teardown_panic_does_not_release_live_resources() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let async_owner = DropProbe {
+        name: "async",
+        events: events.clone(),
+    };
+    let arena_owner = DropProbe {
+        name: "arena",
+        events: events.clone(),
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = teardown_residency_resources(Some(async_owner), arena_owner, |_| {
+            events.lock().expect("sync event lock").push("sync");
+            panic!("injected synchronization panic");
+        });
+    }));
+
+    assert!(result.is_err());
+    assert_eq!(
+        events.lock().expect("panic event lock").as_slice(),
+        ["sync"]
+    );
+}
+
 fn vmm_backends() -> [Backend; 2] {
     [Backend::Hip, Backend::Cuda]
 }
 
 fn with_supported_vmm_backend(test_name: &str, mut f: impl FnMut(Backend)) {
-    let _lock = VMM_BACKEND_TEST_LOCK
+    let _lock = crate::qwen36_moe::layer_loader::GPU_BACKEND_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _restore_backend = BackendRestore(gpu_hal::current_backend());
@@ -94,6 +292,57 @@ fn reserves_expert_slab_without_resident_pages() {
         assert_eq!(arena_stats.logical_resident_bytes, 0);
         assert_eq!(arena_stats.mapping_count, 0);
     });
+}
+
+#[test]
+fn mutable_state_reset_preserves_mapped_expert_residency() {
+    with_supported_vmm_backend(
+        "mutable_state_reset_preserves_mapped_expert_residency",
+        |_backend| {
+            let tmp = synthetic_store(2, 4096);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            let reservation = manager
+                .register_tensor(
+                    &store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    2,
+                )
+                .expect("register tensor");
+            let key = MoeExpertKey {
+                layer_idx: 0,
+                expert_idx: 0,
+                projection: MoeExpertProjection::GateUp,
+            };
+            manager.ensure_resident(&store, key).expect("map expert");
+
+            let resident_ptr = manager
+                .resident_weight(0, MoeExpertProjection::GateUp)
+                .expect("resident weight")
+                .as_ptr();
+            let stats_before_reset = manager.stats();
+            let arena_before_reset = manager.arena().stats();
+            let mut mutable_state = [0x5au8; 32];
+
+            reset_mutable_state(&mut mutable_state);
+
+            assert_eq!(mutable_state, [0; 32]);
+            assert!(manager.is_resident(key));
+            assert_eq!(manager.stats(), stats_before_reset);
+            assert_eq!(manager.arena().stats(), arena_before_reset);
+            assert_eq!(resident_ptr, reservation.ptr);
+            assert_eq!(
+                manager
+                    .resident_weight(0, MoeExpertProjection::GateUp)
+                    .expect("resident weight after reset")
+                    .as_ptr(),
+                resident_ptr
+            );
+        },
+    );
 }
 
 #[test]
@@ -772,6 +1021,117 @@ fn async_prefetch_can_evict_when_enabled() {
         assert!(manager.is_resident(e1));
         assert_eq!(manager.stats().async_completed_pages, 1);
     });
+}
+
+#[test]
+fn moved_pending_predicted_prefetch_owner_drains_before_hip_drop() {
+    with_supported_vmm_backend(
+        "moved_pending_predicted_prefetch_owner_drains_before_hip_drop",
+        |backend| {
+            if backend != Backend::Hip {
+                return;
+            }
+            let probe_tmp = synthetic_store(1, 4096);
+            let probe_store = BakedStore::open(probe_tmp.path()).expect("open probe store");
+            let mut probe =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            probe
+                .register_tensor(
+                    &probe_store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    1,
+                )
+                .expect("register probe tensor");
+            let expert_bytes = probe.tensors[0].page_bytes;
+
+            let tmp = synthetic_store(2, expert_bytes);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(2).unwrap());
+            for projection in [MoeExpertProjection::GateUp, MoeExpertProjection::Down] {
+                manager
+                    .register_tensor(
+                        &store,
+                        0,
+                        projection,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        2,
+                    )
+                    .expect("register predicted-prefetch tensor");
+            }
+            manager
+                .enable_async_prefetch(2)
+                .expect("enable async prefetch");
+
+            let previous_topk_by_layer = vec![vec![1]];
+            let mut next_topk_by_layer = vec![Vec::new()];
+            crate::qwen36_moe::prefetch::handle_moe_expert_prefetch(
+                &mut manager,
+                &store,
+                crate::qwen36_moe_config::MoeIslandPrefetchMode::PreviousToken,
+                1,
+                0.9,
+                false,
+                None,
+                None,
+                &previous_topk_by_layer,
+                &mut next_topk_by_layer,
+                false,
+                None,
+                None,
+                None,
+                ExpertPrefetchPhase::Lookahead,
+                0,
+                &[],
+            )
+            .expect("schedule predicted prefetch");
+            assert_eq!(manager.stats().async_scheduled_pages, 2);
+            assert_eq!(manager.pending_pages.len(), 2);
+
+            std::thread::spawn(move || {
+                assert_eq!(manager.pending_pages.len(), 2);
+                drop(manager);
+            })
+            .join()
+            .expect("drop moved pending residency owner");
+        },
+    );
+}
+
+#[test]
+fn async_prefetch_rejects_reinitializing_the_live_owner() {
+    with_supported_vmm_backend(
+        "async_prefetch_rejects_reinitializing_the_live_owner",
+        |backend| {
+            if backend != Backend::Hip {
+                return;
+            }
+            let tmp = synthetic_store(1, 4096);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            manager
+                .register_tensor(
+                    &store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    1,
+                )
+                .expect("register tensor");
+            manager
+                .enable_async_prefetch(1)
+                .expect("enable async prefetch");
+
+            let error = manager
+                .enable_async_prefetch(1)
+                .expect_err("async prefetch owner must not be replaced");
+
+            assert!(error.to_string().contains("already enabled"));
+        },
+    );
 }
 
 #[test]

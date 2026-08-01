@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use model_store::{BakedStore, FlmLoadOptions};
+use supersonic_runtime::flm_tokenizer::load_qwen_bpe_from_flm;
 
 #[test]
 fn flm_native_qwen_bpe_tokenizer_matches_embedded_hf_json_for_basic_prompt() {
@@ -39,15 +40,19 @@ fn flm_native_qwen_bpe_tokenizer_matches_embedded_hf_json_for_basic_prompt() {
         }
     };
 
-    let native = runner::flm_tokenizer::load_qwen_bpe_from_flm(runtime)
-        .expect("load native Qwen BPE tokenizer from FLM assets");
+    let native =
+        load_qwen_bpe_from_flm(runtime).expect("load native Qwen BPE tokenizer from FLM assets");
+    let legacy = runner::flm_tokenizer::load_qwen_bpe_from_flm(runtime)
+        .expect("load native Qwen BPE tokenizer through runner re-export");
     let oracle = tokenizers::Tokenizer::from_bytes(oracle_json)
         .expect("load embedded Hugging Face tokenizer oracle");
 
     for prompt in ["Hello", "The quick brown fox", "GPU quantization"] {
         let native_ids = native.encode(prompt, true).unwrap().get_ids().to_vec();
+        let legacy_ids = legacy.encode(prompt, true).unwrap().get_ids().to_vec();
         let oracle_ids = oracle.encode(prompt, true).unwrap().get_ids().to_vec();
         assert_eq!(native_ids, oracle_ids, "prompt={prompt:?}");
+        assert_eq!(legacy_ids, native_ids, "prompt={prompt:?}");
     }
 }
 
@@ -79,8 +84,8 @@ fn flm_native_qwen_bpe_tokenizer_loads_without_hf_json() {
 
     assert!(runtime.asset_by_kind("hf_tokenizer_json").is_none());
 
-    let native = runner::flm_tokenizer::load_qwen_bpe_from_flm(runtime)
-        .expect("load native Qwen BPE tokenizer from FLM assets");
+    let native =
+        load_qwen_bpe_from_flm(runtime).expect("load native Qwen BPE tokenizer from FLM assets");
     let hello = native.encode("Hello", true).unwrap().get_ids().to_vec();
     let quantization = native
         .encode("GPU quantization", true)

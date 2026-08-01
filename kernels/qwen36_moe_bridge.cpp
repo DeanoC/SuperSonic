@@ -14,13 +14,16 @@
 // Int4ScaleDesc} from qwen36_moe.hip above.
 #include "qwen36_moe_persistent/persistent_decode.hip"
 
+#include <cstddef>
 #include <cstdlib>
 #include <cstdio>
+#include <limits>
 #ifndef SUPERSONIC_QWEN36_CUDA_BRIDGE
 #include <hip/hip_runtime.h>
 #endif
 #include <mutex>
 #include <stdint.h>
+#include <vector>
 
 namespace {
 
@@ -66,9 +69,21 @@ bool device_supports_wmma_bf16(int device_ordinal) {
 #endif
 }
 
+bool ffn_step_supports_wmma_bf16(int device_ordinal) {
+    // The caller supplies descriptor qualification. This hardware check is
+    // safe to enable by default because encoding-1 and unusual layouts never
+    // reach the G32 WMMA dispatch policy.
+    return device_supports_wmma_bf16(device_ordinal);
+}
+
 bool sync_each_kernel_enabled() {
     const char* env = std::getenv("SUPERSONIC_SYNC_EACH_KERNEL");
     return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+uint64_t backend_failure(int project_status, hipError_t native_status) {
+    return static_cast<uint32_t>(project_status) |
+           (static_cast<uint64_t>(static_cast<uint32_t>(native_status)) << 32);
 }
 
 struct ScopedHipDevice {
@@ -94,15 +109,427 @@ static_assert(sizeof(qwen36_moe::DecodeLayerDesc) == 344,
               "Qwen36MoeDecodeLayerDesc size drift — Rust side is pinned to 344 bytes; "
               "if you appended a field, update both sides in the same commit");
 
+using Qwen36Int4WeightDesc = qwen36_moe::Qwen36MoeInt4WeightDesc;
+using Qwen36Int4ScaleDesc = qwen36_moe::Int4ScaleDesc;
+
+static_assert(sizeof(Qwen36Int4WeightDesc) == 64);
+static_assert(alignof(Qwen36Int4WeightDesc) == 8);
+static_assert(offsetof(Qwen36Int4WeightDesc, scale) == 0);
+static_assert(offsetof(Qwen36Int4WeightDesc, zero) == 8);
+static_assert(offsetof(Qwen36Int4WeightDesc, packed_row_stride_bytes) == 16);
+static_assert(offsetof(Qwen36Int4WeightDesc, packed_expert_stride_bytes) == 24);
+static_assert(offsetof(Qwen36Int4WeightDesc, scale_row_stride_elements) == 32);
+static_assert(offsetof(Qwen36Int4WeightDesc, scale_expert_stride_elements) == 40);
+static_assert(offsetof(Qwen36Int4WeightDesc, input_group_size) == 48);
+static_assert(offsetof(Qwen36Int4WeightDesc, output_group_size) == 52);
+static_assert(offsetof(Qwen36Int4WeightDesc, implicit_zero_code) == 56);
+static_assert(offsetof(Qwen36Int4WeightDesc, encoding) == 60);
+
+static_assert(sizeof(Qwen36Int4ScaleDesc) == 768);
+static_assert(alignof(Qwen36Int4ScaleDesc) == 8);
+static_assert(offsetof(Qwen36Int4ScaleDesc, q_proj) == 0);
+static_assert(offsetof(Qwen36Int4ScaleDesc, k_proj) == 64);
+static_assert(offsetof(Qwen36Int4ScaleDesc, v_proj) == 128);
+static_assert(offsetof(Qwen36Int4ScaleDesc, o_proj) == 192);
+static_assert(offsetof(Qwen36Int4ScaleDesc, linear_in_proj_qkv) == 256);
+static_assert(offsetof(Qwen36Int4ScaleDesc, linear_in_proj_z) == 320);
+static_assert(offsetof(Qwen36Int4ScaleDesc, linear_out_proj) == 384);
+static_assert(offsetof(Qwen36Int4ScaleDesc, experts_gate_up) == 448);
+static_assert(offsetof(Qwen36Int4ScaleDesc, experts_down) == 512);
+static_assert(offsetof(Qwen36Int4ScaleDesc, shared_expert_gate_proj) == 576);
+static_assert(offsetof(Qwen36Int4ScaleDesc, shared_expert_up_proj) == 640);
+static_assert(offsetof(Qwen36Int4ScaleDesc, shared_expert_down_proj) == 704);
+
 static_assert(sizeof(qwen36_moe::KVCacheFp8Desc) == 16,
               "Qwen36MoeKVCacheFp8Desc layout drift — must be exactly 2 pointers");
 
+bool checked_strided_extent(
+    uint64_t rows,
+    uint64_t row_stride,
+    uint64_t logical_row_elements,
+    uint64_t* extent
+) {
+    const uint64_t preceding_rows = rows - 1;
+    if (preceding_rows != 0 &&
+        row_stride >
+            (std::numeric_limits<uint64_t>::max() - logical_row_elements) /
+                preceding_rows) {
+        return false;
+    }
+    *extent = preceding_rows * row_stride + logical_row_elements;
+    return true;
+}
+
+int validate_int4_descriptor_geometry(
+    const Qwen36Int4WeightDesc& desc,
+    int experts,
+    int out_rows,
+    int in_cols
+) {
+    if (desc.scale == nullptr || experts <= 0 || out_rows <= 0 || in_cols <= 0) {
+        return 171;
+    }
+    if (desc.input_group_size <= 0 || desc.output_group_size <= 0 ||
+        in_cols % desc.input_group_size != 0 ||
+        out_rows % desc.output_group_size != 0) {
+        return 172;
+    }
+    if (desc.encoding == 1) {
+        if (desc.zero == nullptr || desc.implicit_zero_code >= 0 ||
+            desc.input_group_size != 128 || desc.output_group_size != 128) {
+            return 173;
+        }
+    } else if (desc.encoding == 2) {
+        if (desc.zero != nullptr || desc.input_group_size != 32 ||
+            desc.output_group_size != 1 || desc.implicit_zero_code != 8) {
+            return 174;
+        }
+    } else {
+        return 175;
+    }
+
+    const uint64_t packed_row_elements = static_cast<uint64_t>(in_cols / 2);
+    const uint64_t scale_row_elements =
+        static_cast<uint64_t>(in_cols / desc.input_group_size);
+    if (desc.packed_row_stride_bytes < packed_row_elements ||
+        desc.scale_row_stride_elements < scale_row_elements) {
+        return 176;
+    }
+    const uint64_t scale_rows =
+        static_cast<uint64_t>(out_rows / desc.output_group_size);
+    uint64_t packed_expert_elements = 0;
+    uint64_t scale_expert_elements = 0;
+    if (!checked_strided_extent(
+            static_cast<uint64_t>(out_rows),
+            desc.packed_row_stride_bytes,
+            packed_row_elements,
+            &packed_expert_elements) ||
+        !checked_strided_extent(
+            scale_rows,
+            desc.scale_row_stride_elements,
+            scale_row_elements,
+            &scale_expert_elements)) {
+        return 179;
+    }
+    if (experts > 1 &&
+        (desc.packed_expert_stride_bytes < packed_expert_elements ||
+         desc.scale_expert_stride_elements < scale_expert_elements)) {
+        return 177;
+    }
+    return 0;
+}
+
+bool is_int4_execution_desc(const Qwen36Int4WeightDesc& desc) {
+    return desc.encoding == 1 || desc.encoding == 2;
+}
+
+bool is_row_group_execution_desc(const Qwen36Int4WeightDesc& desc) {
+    return desc.encoding == 2;
+}
+
+bool is_canonical_g32_execution_desc(
+    const Qwen36Int4WeightDesc& desc,
+    int                              experts,
+    int                              out_rows,
+    int                              in_cols
+) {
+    if (experts <= 0 || out_rows <= 0 || in_cols < 32 || (in_cols & 31) != 0 ||
+        desc.encoding != 2 || desc.scale == nullptr || desc.zero != nullptr ||
+        desc.input_group_size != 32 || desc.output_group_size != 1 ||
+        desc.implicit_zero_code != 8 ||
+        desc.packed_row_stride_bytes != static_cast<uint64_t>(in_cols / 2) ||
+        desc.scale_row_stride_elements != static_cast<uint64_t>(in_cols / 32)) {
+        return false;
+    }
+
+    uint64_t packed_extent = 0;
+    uint64_t scale_extent = 0;
+    if (!checked_strided_extent(
+            static_cast<uint64_t>(out_rows),
+            desc.packed_row_stride_bytes,
+            static_cast<uint64_t>(in_cols / 2),
+            &packed_extent) ||
+        !checked_strided_extent(
+            static_cast<uint64_t>(out_rows),
+            desc.scale_row_stride_elements,
+            static_cast<uint64_t>(in_cols / 32),
+            &scale_extent)) {
+        return false;
+    }
+
+    const bool rank2 = desc.packed_expert_stride_bytes == 0 &&
+                       desc.scale_expert_stride_elements == 0;
+    if (rank2) return experts == 1;
+    if (desc.packed_expert_stride_bytes < packed_extent ||
+        desc.scale_expert_stride_elements < scale_extent ||
+        desc.packed_expert_stride_bytes % desc.packed_row_stride_bytes != 0 ||
+        desc.scale_expert_stride_elements % desc.scale_row_stride_elements != 0) {
+        return false;
+    }
+    return experts > 1 &&
+           desc.packed_expert_stride_bytes / desc.packed_row_stride_bytes ==
+               desc.scale_expert_stride_elements /
+                   desc.scale_row_stride_elements;
+}
+
+enum class Int4DispatchPolicy : int {
+    Scalar = 0,
+    Wmma = 1,
+    Reject = 2,
+};
+
+Int4DispatchPolicy select_attention_int4_dispatch(
+    bool any_int4,
+    bool any_row_group,
+    bool shape_valid,
+    bool wmma_supported
+) {
+    if (any_row_group) {
+        return shape_valid && wmma_supported
+            ? Int4DispatchPolicy::Wmma
+            : Int4DispatchPolicy::Reject;
+    }
+    return any_int4 && shape_valid && wmma_supported
+        ? Int4DispatchPolicy::Wmma
+        : Int4DispatchPolicy::Scalar;
+}
+
+Int4DispatchPolicy select_ffn_int4_dispatch(
+    bool routed_int4,
+    bool any_row_group,
+    bool shape_valid,
+    bool wmma_supported
+) {
+    if (any_row_group) return Int4DispatchPolicy::Scalar;
+    return routed_int4 && shape_valid && wmma_supported
+        ? Int4DispatchPolicy::Wmma
+        : Int4DispatchPolicy::Scalar;
+}
+
+Int4DispatchPolicy select_g32_ffn_int4_dispatch(
+    bool routed_g32_wmma,
+    bool shared_down_wmma_compatible,
+    bool shape_valid,
+    bool wmma_supported
+) {
+    return routed_g32_wmma && shared_down_wmma_compatible && shape_valid &&
+            wmma_supported
+        ? Int4DispatchPolicy::Wmma
+        : Int4DispatchPolicy::Scalar;
+}
+
+struct PersistentFfnWmmaCacheEntry {
+    const Qwen36Int4ScaleDesc* int4_scales;
+    size_t                     device_ordinal;
+    int                        num_layers;
+    int                        start_layer;
+    int                        end_layer_exclusive;
+    int                        hidden;
+    int                        num_experts;
+    int                        moe_intermediate;
+    int                        shared_intermediate;
+    bool                       qualified;
+};
+
+bool persistent_ffn_wmma_qualified(
+    const Qwen36Int4ScaleDesc* int4_scales,
+    size_t                      device_ordinal,
+    int                         num_layers,
+    int                         start_layer,
+    int                         end_layer_exclusive,
+    int                         hidden,
+    int                         num_experts,
+    int                         moe_intermediate,
+    int                         shared_intermediate
+) {
+    if (int4_scales == nullptr || num_layers <= 0 || start_layer < 0 ||
+        end_layer_exclusive <= start_layer || end_layer_exclusive > num_layers ||
+        hidden <= 0 || num_experts <= 0 || moe_intermediate <= 0 ||
+        shared_intermediate <= 0) {
+        return false;
+    }
+
+    const bool shape_valid = hidden % 16 == 0 && moe_intermediate % 16 == 0;
+    const bool wmma_supported = ffn_step_supports_wmma_bf16(
+        static_cast<int>(device_ordinal));
+    if (!shape_valid || !wmma_supported) return false;
+
+    static std::mutex cache_mutex;
+    static std::vector<PersistentFfnWmmaCacheEntry> cache;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        for (const auto& entry : cache) {
+            if (entry.int4_scales == int4_scales &&
+                entry.device_ordinal == device_ordinal &&
+                entry.num_layers == num_layers &&
+                entry.start_layer == start_layer &&
+                entry.end_layer_exclusive == end_layer_exclusive &&
+                entry.hidden == hidden &&
+                entry.num_experts == num_experts &&
+                entry.moe_intermediate == moe_intermediate &&
+                entry.shared_intermediate == shared_intermediate) {
+                return entry.qualified;
+            }
+        }
+    }
+
+    // The persistent kernel receives descriptors in device memory. Qualify the
+    // whole range once, then cache the result by the stable descriptor address;
+    // decode tokens reuse the same uploaded descriptor array.
+    std::vector<Qwen36Int4ScaleDesc> host_scales(
+        static_cast<size_t>(num_layers));
+    if (hipMemcpy(
+            host_scales.data(),
+            int4_scales,
+            host_scales.size() * sizeof(Qwen36Int4ScaleDesc),
+            hipMemcpyDeviceToHost) != hipSuccess) {
+        return false;
+    }
+
+    bool qualified = true;
+    for (int li = start_layer; li < end_layer_exclusive; ++li) {
+        const auto& quant = host_scales[static_cast<size_t>(li)];
+        const bool routed_g32_wmma =
+            is_canonical_g32_execution_desc(
+                quant.experts_gate_up,
+                num_experts,
+                2 * moe_intermediate,
+                hidden) &&
+            is_canonical_g32_execution_desc(
+                quant.experts_down,
+                num_experts,
+                hidden,
+                moe_intermediate);
+        const bool shared_down_g32 = is_canonical_g32_execution_desc(
+            quant.shared_expert_down_proj,
+            1,
+            hidden,
+            shared_intermediate);
+        const bool shared_down_wmma_compatible =
+            quant.shared_expert_down_proj.encoding == 0 || shared_down_g32;
+        if (select_g32_ffn_int4_dispatch(
+                routed_g32_wmma,
+                shared_down_wmma_compatible,
+                shape_valid,
+                wmma_supported) != Int4DispatchPolicy::Wmma) {
+            qualified = false;
+            break;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.push_back({
+            int4_scales,
+            device_ordinal,
+            num_layers,
+            start_layer,
+            end_layer_exclusive,
+            hidden,
+            num_experts,
+            moe_intermediate,
+            shared_intermediate,
+            qualified,
+        });
+        if (cache.size() > 32) cache.erase(cache.begin());
+    }
+    return qualified;
+}
+
+bool attention_desc_has_row_group(const Qwen36Int4ScaleDesc& desc) {
+    return is_row_group_execution_desc(desc.q_proj) ||
+        is_row_group_execution_desc(desc.k_proj) ||
+        is_row_group_execution_desc(desc.v_proj) ||
+        is_row_group_execution_desc(desc.o_proj) ||
+        is_row_group_execution_desc(desc.linear_in_proj_qkv) ||
+        is_row_group_execution_desc(desc.linear_in_proj_z) ||
+        is_row_group_execution_desc(desc.linear_out_proj);
+}
+
+bool persistent_mode_runs_attention(int mode) {
+    return mode == 0 || mode == 1 || mode == 3 || (mode >= 9 && mode <= 13);
+}
+
+int persistent_int4_prelaunch_status(
+    int mode,
+    bool attention_has_row_group,
+    bool use_attention_wmma
+) {
+    return persistent_mode_runs_attention(mode) && attention_has_row_group &&
+            !use_attention_wmma
+        ? 150
+        : 0;
+}
+
+int validate_execution_descriptor(
+    const Qwen36Int4WeightDesc& desc,
+    int experts,
+    int out_rows,
+    int in_cols
+) {
+    if (desc.encoding == 0) {
+        return (desc.scale == nullptr && desc.zero == nullptr) ? 0 : 181;
+    }
+    if (is_int4_execution_desc(desc)) {
+        return validate_int4_descriptor_geometry(desc, experts, out_rows, in_cols);
+    }
+    if (desc.encoding != 3 || desc.scale == nullptr || desc.zero != nullptr ||
+        desc.input_group_size <= 0 || desc.output_group_size <= 0 ||
+        in_cols % desc.input_group_size != 0 ||
+        out_rows % desc.output_group_size != 0) {
+        return 182;
+    }
+    return 0;
+}
+
 } // namespace
+
+extern "C" uint64_t supersonic_qwen36_encode_bridge_status(
+    int project_status,
+    int native_status
+) {
+    return native_status == 0
+        ? static_cast<uint32_t>(project_status)
+        : backend_failure(project_status, static_cast<hipError_t>(native_status));
+}
+
+extern "C" int qwen36_moe_hip_int4_dispatch_policy_probe(
+    int phase,
+    int encoding,
+    int shape_valid,
+    int wmma_supported
+) {
+    if (encoding != 1 && encoding != 2) {
+        return static_cast<int>(Int4DispatchPolicy::Reject);
+    }
+    const bool row_group = encoding == 2;
+    const auto policy = phase == 3
+        ? select_ffn_int4_dispatch(
+              true, row_group, shape_valid != 0, wmma_supported != 0)
+        : select_attention_int4_dispatch(
+              true, row_group, shape_valid != 0, wmma_supported != 0);
+    return static_cast<int>(policy);
+}
+
+extern "C" int qwen36_moe_hip_persistent_int4_prelaunch_status_probe(
+    int mode,
+    int full_attention_encoding,
+    int linear_attention_encoding,
+    int shape_valid,
+    int wmma_supported
+) {
+    const bool attention_has_row_group =
+        full_attention_encoding == 2 || linear_attention_encoding == 2;
+    return persistent_int4_prelaunch_status(
+        mode,
+        attention_has_row_group,
+        shape_valid != 0 && wmma_supported != 0);
+}
 
 // `dtype` encoding follows the Qwen/Gemma/Phi bridges: 0 = half, 2 = bf16.
 // The stub ignores dtype because it does no math; the real kernel will
 // branch on it.
-extern "C" int qwen36_moe_hip_stub_launch(
+extern "C" uint64_t qwen36_moe_hip_stub_launch(
     int                                  dtype,
     size_t                               device_ordinal,
     size_t                               num_layers,
@@ -122,9 +549,10 @@ extern "C" int qwen36_moe_hip_stub_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
@@ -132,8 +560,9 @@ extern "C" int qwen36_moe_hip_stub_launch(
 
     // Zero the cooperative counter before launch. The kernel uses
     // `atomicAdd` to claim layer indices.
-    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counters, 0, sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     hipLaunchKernelGGL(qwen36_moe::qwen36_moe_descriptor_walk_stub,
@@ -149,15 +578,15 @@ extern "C" int qwen36_moe_hip_stub_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
 // PR 4b2 staged-attention parity launcher.
 // `dtype` follows the project convention: 2 = bf16. Other values are
 // rejected so the matching kernel template is unambiguous.
-extern "C" int qwen36_moe_hip_attn_step_launch(
+extern "C" uint64_t qwen36_moe_hip_attn_step_launch(
     int           dtype,
     size_t        device_ordinal,
     int           stage,
@@ -180,15 +609,7 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     const void*   q_norm_w,
     const void*   k_norm_w,
     const void*   o_proj_w,
-    int           int4_group_size,
-    const void*   q_proj_scale,
-    const void*   q_proj_zero,
-    const void*   k_proj_scale,
-    const void*   k_proj_zero,
-    const void*   v_proj_scale,
-    const void*   v_proj_zero,
-    const void*   o_proj_scale,
-    const void*   o_proj_zero,
+    const Qwen36Int4ScaleDesc* int4_desc,
     void*         output,
     float*        workspace,
     void*         kv_cache_k,
@@ -209,23 +630,17 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
         barrier_flag == nullptr) {
         return 113;
     }
-    // Quant sidecars: positive group_size = INT4 (scale+zero pairs),
-    // negative group_size = FP8-native (scale only), 0 = disabled.
-    const bool fp8_mode = int4_group_size < 0;
-    auto pair_ok = [fp8_mode](const void* s, const void* z) -> bool {
-        return fp8_mode ? (z == nullptr) : ((s == nullptr) == (z == nullptr));
-    };
-    if (!pair_ok(q_proj_scale, q_proj_zero) ||
-        !pair_ok(k_proj_scale, k_proj_zero) ||
-        !pair_ok(v_proj_scale, v_proj_zero) ||
-        !pair_ok(o_proj_scale, o_proj_zero)) {
+    const Qwen36Int4ScaleDesc quant =
+        int4_desc != nullptr ? *int4_desc : Qwen36Int4ScaleDesc{};
+    const int q_rows = 2 * num_heads * head_dim;
+    const int kv_rows = num_kv_heads * head_dim;
+    const int o_cols = num_heads * head_dim;
+    if (validate_execution_descriptor(quant.q_proj, 1, q_rows, hidden) != 0 ||
+        validate_execution_descriptor(quant.k_proj, 1, kv_rows, hidden) != 0 ||
+        validate_execution_descriptor(quant.v_proj, 1, kv_rows, hidden) != 0 ||
+        validate_execution_descriptor(quant.o_proj, 1, hidden, o_cols) != 0) {
         return 115;
     }
-    const bool any_quant =
-        (q_proj_scale != nullptr) || (k_proj_scale != nullptr) ||
-        (v_proj_scale != nullptr) || (o_proj_scale != nullptr);
-    if (any_quant && int4_group_size == 0) return 116;
-    if (!any_quant && int4_group_size != 0) return 117;
 
     // KV cache: pointers must be paired (both null or both non-null), and
     // kv_max_t must be positive when enabled + the *effective* slot
@@ -241,9 +656,10 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
@@ -253,8 +669,9 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     // expects all three to start at 0; sync_buf is documented as 32 zero
     // bytes by the Rust-side wrapper but a defence-in-depth memset here
     // keeps a misuse from corrupting the launch.
-    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counters, 0, sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
@@ -264,19 +681,30 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     // K-chunk is 16; per-lane `in_range` checks handle non-16-aligned
     // output dims (`q_out_dim = 2*H*d`, `Hkv*d`, `hidden`).
     const bool any_int4_attn =
-        (int4_group_size > 0) &&
-        ((q_proj_scale != nullptr) ||
-         (k_proj_scale != nullptr) ||
-         (v_proj_scale != nullptr) ||
-         (o_proj_scale != nullptr));
+        is_int4_execution_desc(quant.q_proj) ||
+        is_int4_execution_desc(quant.k_proj) ||
+        is_int4_execution_desc(quant.v_proj) ||
+        is_int4_execution_desc(quant.o_proj);
+    const bool any_row_group_attn =
+        is_row_group_execution_desc(quant.q_proj) ||
+        is_row_group_execution_desc(quant.k_proj) ||
+        is_row_group_execution_desc(quant.v_proj) ||
+        is_row_group_execution_desc(quant.o_proj);
+    auto wmma_group_ok = [](const Qwen36Int4WeightDesc& desc) {
+        return !is_int4_execution_desc(desc) ||
+            desc.input_group_size % 16 == 0;
+    };
     const bool wmma_dims_ok_attn =
-        (hidden % 16 == 0) &&
-        (int4_group_size > 0) &&
-        (int4_group_size % 16 == 0);
-    const bool use_wmma_attn =
-        any_int4_attn &&
-        wmma_dims_ok_attn &&
-        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+        (hidden % 16 == 0) && (o_cols % 16 == 0) &&
+        wmma_group_ok(quant.q_proj) && wmma_group_ok(quant.k_proj) &&
+        wmma_group_ok(quant.v_proj) && wmma_group_ok(quant.o_proj);
+    const auto attn_dispatch = select_attention_int4_dispatch(
+        any_int4_attn,
+        any_row_group_attn,
+        wmma_dims_ok_attn,
+        device_supports_wmma_bf16(static_cast<int>(device_ordinal)));
+    if (attn_dispatch == Int4DispatchPolicy::Reject) return 116;
+    const bool use_wmma_attn = attn_dispatch == Int4DispatchPolicy::Wmma;
 
     if (use_wmma_attn) {
         hipLaunchKernelGGL(
@@ -294,15 +722,7 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
             static_cast<const hip_bfloat16*>(q_norm_w),
             static_cast<const hip_bfloat16*>(k_norm_w),
             static_cast<const hip_bfloat16*>(o_proj_w),
-            int4_group_size,
-            static_cast<const hip_bfloat16*>(q_proj_scale),
-            static_cast<const hip_bfloat16*>(q_proj_zero),
-            static_cast<const hip_bfloat16*>(k_proj_scale),
-            static_cast<const hip_bfloat16*>(k_proj_zero),
-            static_cast<const hip_bfloat16*>(v_proj_scale),
-            static_cast<const hip_bfloat16*>(v_proj_zero),
-            static_cast<const hip_bfloat16*>(o_proj_scale),
-            static_cast<const hip_bfloat16*>(o_proj_zero),
+            quant.q_proj, quant.k_proj, quant.v_proj, quant.o_proj,
             static_cast<hip_bfloat16*>(output),
             workspace,
             static_cast<hip_bfloat16*>(kv_cache_k),
@@ -325,15 +745,7 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
             static_cast<const hip_bfloat16*>(q_norm_w),
             static_cast<const hip_bfloat16*>(k_norm_w),
             static_cast<const hip_bfloat16*>(o_proj_w),
-            int4_group_size,
-            static_cast<const hip_bfloat16*>(q_proj_scale),
-            static_cast<const hip_bfloat16*>(q_proj_zero),
-            static_cast<const hip_bfloat16*>(k_proj_scale),
-            static_cast<const hip_bfloat16*>(k_proj_zero),
-            static_cast<const hip_bfloat16*>(v_proj_scale),
-            static_cast<const hip_bfloat16*>(v_proj_zero),
-            static_cast<const hip_bfloat16*>(o_proj_scale),
-            static_cast<const hip_bfloat16*>(o_proj_zero),
+            quant.q_proj, quant.k_proj, quant.v_proj, quant.o_proj,
             static_cast<hip_bfloat16*>(output),
             workspace,
             static_cast<hip_bfloat16*>(kv_cache_k),
@@ -352,14 +764,14 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     // instead of the immediate per-step return; launch-config errors are
     // still caught here via `hipGetLastError`.
     hipError_t launch_err = hipGetLastError();
-    if (launch_err != hipSuccess) return 254;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
     return 0;
 }
 
 // PR 4b3 staged linear-attention parity launcher.
 // `dtype` follows the project convention: 2 = bf16. Other values are
 // rejected so the matching kernel template is unambiguous.
-extern "C" int qwen36_moe_hip_linear_step_launch(
+extern "C" uint64_t qwen36_moe_hip_linear_step_launch(
     int           dtype,
     size_t        device_ordinal,
     int           stage,
@@ -384,13 +796,7 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
     const void*   out_proj_w,
     void*         conv_state,
     float*        recurrent_state,
-    int           int4_group_size,
-    const void*   in_proj_qkv_scale,
-    const void*   in_proj_qkv_zero,
-    const void*   in_proj_z_scale,
-    const void*   in_proj_z_zero,
-    const void*   out_proj_scale,
-    const void*   out_proj_zero,
+    const Qwen36Int4ScaleDesc* int4_desc,
     void*         output,
     float*        workspace,
     unsigned int* counters,
@@ -410,37 +816,35 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
         barrier_flag == nullptr) {
         return 123;
     }
-    // Quant sidecars: positive group_size = INT4 (scale+zero pairs),
-    // negative group_size = FP8-native (scale only), 0 = disabled.
-    const bool fp8_mode = int4_group_size < 0;
-    auto pair_ok = [fp8_mode](const void* s, const void* z) -> bool {
-        return fp8_mode ? (z == nullptr) : ((s == nullptr) == (z == nullptr));
-    };
-    if (!pair_ok(in_proj_qkv_scale, in_proj_qkv_zero) ||
-        !pair_ok(in_proj_z_scale, in_proj_z_zero) ||
-        !pair_ok(out_proj_scale, out_proj_zero)) {
+    const Qwen36Int4ScaleDesc quant =
+        int4_desc != nullptr ? *int4_desc : Qwen36Int4ScaleDesc{};
+    const int key_dim = num_k_heads * head_k_dim;
+    const int value_dim = num_v_heads * head_v_dim;
+    const int qkv_dim = 2 * key_dim + value_dim;
+    if (validate_execution_descriptor(
+            quant.linear_in_proj_qkv, 1, qkv_dim, hidden) != 0 ||
+        validate_execution_descriptor(
+            quant.linear_in_proj_z, 1, value_dim, hidden) != 0 ||
+        validate_execution_descriptor(
+            quant.linear_out_proj, 1, hidden, value_dim) != 0) {
         return 125;
     }
-    const bool any_quant =
-        (in_proj_qkv_scale != nullptr) ||
-        (in_proj_z_scale != nullptr) ||
-        (out_proj_scale != nullptr);
-    if (any_quant && int4_group_size == 0) return 126;
-    if (!any_quant && int4_group_size != 0) return 127;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
     constexpr int block_size = 256;
 
-    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counters, 0, sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
@@ -451,20 +855,31 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
     // via per-lane `in_range` checks so non-16-aligned qkv_dim / val_dim
     // / hidden output dims still work; the only hard requirement is that
     // the K-chunk size (16) divides hidden and the quant group_size.
-    // 35B-A3B (hidden=2048, group_size=128) satisfies both.
+    // 35B-A3B (hidden=2048, group_size=32 or 128) satisfies both.
     const bool any_int4_routed_lin =
-        (int4_group_size > 0) &&
-        ((in_proj_qkv_scale != nullptr) ||
-         (in_proj_z_scale   != nullptr) ||
-         (out_proj_scale    != nullptr));
+        is_int4_execution_desc(quant.linear_in_proj_qkv) ||
+        is_int4_execution_desc(quant.linear_in_proj_z) ||
+        is_int4_execution_desc(quant.linear_out_proj);
+    const bool any_row_group_lin =
+        is_row_group_execution_desc(quant.linear_in_proj_qkv) ||
+        is_row_group_execution_desc(quant.linear_in_proj_z) ||
+        is_row_group_execution_desc(quant.linear_out_proj);
     const bool wmma_dims_ok_lin =
         (hidden % 16 == 0) &&
-        (int4_group_size > 0) &&
-        (int4_group_size % 16 == 0);
-    const bool use_wmma_lin =
-        any_int4_routed_lin &&
-        wmma_dims_ok_lin &&
-        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+        (value_dim % 16 == 0) &&
+        (!is_int4_execution_desc(quant.linear_in_proj_qkv) ||
+         quant.linear_in_proj_qkv.input_group_size % 16 == 0) &&
+        (!is_int4_execution_desc(quant.linear_in_proj_z) ||
+         quant.linear_in_proj_z.input_group_size % 16 == 0) &&
+        (!is_int4_execution_desc(quant.linear_out_proj) ||
+         quant.linear_out_proj.input_group_size % 16 == 0);
+    const auto linear_dispatch = select_attention_int4_dispatch(
+        any_int4_routed_lin,
+        any_row_group_lin,
+        wmma_dims_ok_lin,
+        device_supports_wmma_bf16(static_cast<int>(device_ordinal)));
+    if (linear_dispatch == Int4DispatchPolicy::Reject) return 126;
+    const bool use_wmma_lin = linear_dispatch == Int4DispatchPolicy::Wmma;
 
     if (use_wmma_lin) {
         hipLaunchKernelGGL(
@@ -489,13 +904,9 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
             static_cast<const hip_bfloat16*>(out_proj_w),
             static_cast<hip_bfloat16*>(conv_state),
             recurrent_state,
-            int4_group_size,
-            static_cast<const hip_bfloat16*>(in_proj_qkv_scale),
-            static_cast<const hip_bfloat16*>(in_proj_qkv_zero),
-            static_cast<const hip_bfloat16*>(in_proj_z_scale),
-            static_cast<const hip_bfloat16*>(in_proj_z_zero),
-            static_cast<const hip_bfloat16*>(out_proj_scale),
-            static_cast<const hip_bfloat16*>(out_proj_zero),
+            quant.linear_in_proj_qkv,
+            quant.linear_in_proj_z,
+            quant.linear_out_proj,
             static_cast<hip_bfloat16*>(output),
             workspace, counters, barrier_counter, barrier_flag);
     } else {
@@ -521,13 +932,9 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
             static_cast<const hip_bfloat16*>(out_proj_w),
             static_cast<hip_bfloat16*>(conv_state),
             recurrent_state,
-            int4_group_size,
-            static_cast<const hip_bfloat16*>(in_proj_qkv_scale),
-            static_cast<const hip_bfloat16*>(in_proj_qkv_zero),
-            static_cast<const hip_bfloat16*>(in_proj_z_scale),
-            static_cast<const hip_bfloat16*>(in_proj_z_zero),
-            static_cast<const hip_bfloat16*>(out_proj_scale),
-            static_cast<const hip_bfloat16*>(out_proj_zero),
+            quant.linear_in_proj_qkv,
+            quant.linear_in_proj_z,
+            quant.linear_out_proj,
             static_cast<hip_bfloat16*>(output),
             workspace, counters, barrier_counter, barrier_flag);
     }
@@ -535,14 +942,14 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
     // Async dispatch: see attn_step_launch above for the rationale (default
     // stream serializes; chain-end D2H is the implicit barrier).
     hipError_t launch_err_lin = hipGetLastError();
-    if (launch_err_lin != hipSuccess) return 254;
+    if (launch_err_lin != hipSuccess) return backend_failure(254, launch_err_lin);
     return 0;
 }
 
 // PR 4b4 staged MoE FFN parity launcher.
 // `dtype` follows the project convention: 2 = bf16. Other values are
 // rejected so the matching kernel template is unambiguous.
-extern "C" int qwen36_moe_hip_ffn_step_launch(
+extern "C" uint64_t qwen36_moe_hip_ffn_step_launch(
     int           dtype,
     size_t        device_ordinal,
     int           stage,
@@ -561,17 +968,7 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     const void*   shared_up_proj_w,
     const void*   shared_down_proj_w,
     const void*   shared_expert_gate_w,
-    int           int4_group_size,
-    const void*   gate_up_proj_scale,
-    const void*   gate_up_proj_zero,
-    const void*   down_proj_scale,
-    const void*   down_proj_zero,
-    const void*   shared_gate_proj_scale,
-    const void*   shared_gate_proj_zero,
-    const void*   shared_up_proj_scale,
-    const void*   shared_up_proj_zero,
-    const void*   shared_down_proj_scale,
-    const void*   shared_down_proj_zero,
+    const Qwen36Int4ScaleDesc* int4_desc,
     void*         output,
     int*          output_idx,
     float*        workspace,
@@ -597,33 +994,33 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
         barrier_counter == nullptr || barrier_flag == nullptr) {
         return 133;
     }
-    // Quant mode: positive group_size = INT4 (scale+zero pairs),
-    // negative group_size = FP8-native (scale only), 0 = disabled.
-    const bool fp8_mode = int4_group_size < 0;
-    auto pair_ok = [fp8_mode](const void* s, const void* z) -> bool {
-        return fp8_mode ? (z == nullptr) : ((s == nullptr) == (z == nullptr));
-    };
-    if (!pair_ok(gate_up_proj_scale, gate_up_proj_zero) ||
-        !pair_ok(down_proj_scale, down_proj_zero) ||
-        !pair_ok(shared_gate_proj_scale, shared_gate_proj_zero) ||
-        !pair_ok(shared_up_proj_scale, shared_up_proj_zero) ||
-        !pair_ok(shared_down_proj_scale, shared_down_proj_zero)) {
+    const Qwen36Int4ScaleDesc quant =
+        int4_desc != nullptr ? *int4_desc : Qwen36Int4ScaleDesc{};
+    if (validate_execution_descriptor(
+            quant.experts_gate_up, num_experts,
+            2 * moe_intermediate, hidden) != 0 ||
+        validate_execution_descriptor(
+            quant.experts_down, num_experts,
+            hidden, moe_intermediate) != 0 ||
+        validate_execution_descriptor(
+            quant.shared_expert_gate_proj, 1,
+            shared_intermediate, hidden) != 0 ||
+        validate_execution_descriptor(
+            quant.shared_expert_up_proj, 1,
+            shared_intermediate, hidden) != 0 ||
+        validate_execution_descriptor(
+            quant.shared_expert_down_proj, 1,
+            hidden, shared_intermediate) != 0) {
         return 135;
     }
-    const bool any_quant =
-        (gate_up_proj_scale != nullptr) || (down_proj_scale != nullptr) ||
-        (shared_gate_proj_scale != nullptr) ||
-        (shared_up_proj_scale != nullptr) ||
-        (shared_down_proj_scale != nullptr);
-    if (any_quant && int4_group_size == 0) return 136;
-    if (!any_quant && int4_group_size != 0) return 137;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
@@ -635,8 +1032,10 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     // memset just guards single-launch callers (parity tests) that allocate
     // sync_buf via `GpuBuffer::zeros` (already zero) and would only fail if
     // someone reused a sync_buf without resetting.
-    if (hipMemsetAsync(counters, 0, 2 * top_k * sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err =
+        hipMemsetAsync(counters, 0, 2 * top_k * sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
@@ -645,22 +1044,31 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     //   - hidden % 16 == 0 (Phase G K-chunk + Phase I output rows)
     //   - moe_intermediate % 16 == 0 (Phase G output rows ÷ 2 + Phase I K-chunk)
     //   - int4_group_size % 16 == 0  (one scale per 16-element K-chunk)
-    //   - INT4 routed weights present (gate_up_proj_scale / down_proj_scale)
-    // 35B-A3B (hidden=2048, I=512, group_size=128) satisfies all of these;
-    // synthetic fixtures use 16-divisible dims too. The shared expert path
-    // (Phase D/F) stays scalar in both variants — Phase 2 of the roadmap.
-    const bool routed_int4 =
-        (int4_group_size > 0) &&
-        (gate_up_proj_scale != nullptr) && (down_proj_scale != nullptr);
+    //   - canonical G32 routed weights present (gate_up_proj_scale /
+    //     down_proj_scale); encoding-1 and unusual layouts remain scalar
+    // 35B-A3B (hidden=2048, I=512, group_size=32 or 128) satisfies all of these;
+    // synthetic fixtures use 16-divisible dims too. Shared gate/up remains
+    // scalar; shared down may use WMMA only when it is canonical G32.
     const bool wmma_dims_ok =
         (hidden % 16 == 0) &&
         (moe_intermediate % 16 == 0) &&
-        (int4_group_size > 0) &&
-        (int4_group_size % 16 == 0);
-    const bool use_wmma =
-        routed_int4 &&
-        wmma_dims_ok &&
-        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+        (quant.experts_gate_up.input_group_size % 16 == 0) &&
+        (quant.experts_down.input_group_size % 16 == 0);
+    const bool routed_g32_wmma =
+        is_canonical_g32_execution_desc(
+            quant.experts_gate_up, num_experts, 2 * moe_intermediate, hidden) &&
+        is_canonical_g32_execution_desc(
+            quant.experts_down, num_experts, hidden, moe_intermediate);
+    const bool shared_down_g32 = is_canonical_g32_execution_desc(
+        quant.shared_expert_down_proj, 1, hidden, shared_intermediate);
+    const bool shared_down_wmma_compatible =
+        quant.shared_expert_down_proj.encoding == 0 || shared_down_g32;
+    const bool use_wmma = select_g32_ffn_int4_dispatch(
+        routed_g32_wmma,
+        shared_down_wmma_compatible,
+        wmma_dims_ok,
+        ffn_step_supports_wmma_bf16(static_cast<int>(device_ordinal))) ==
+        Int4DispatchPolicy::Wmma;
 
     if (use_wmma) {
         hipLaunchKernelGGL(
@@ -680,17 +1088,11 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
             static_cast<const hip_bfloat16*>(shared_up_proj_w),
             static_cast<const hip_bfloat16*>(shared_down_proj_w),
             static_cast<const hip_bfloat16*>(shared_expert_gate_w),
-            int4_group_size,
-            static_cast<const hip_bfloat16*>(gate_up_proj_scale),
-            static_cast<const hip_bfloat16*>(gate_up_proj_zero),
-            static_cast<const hip_bfloat16*>(down_proj_scale),
-            static_cast<const hip_bfloat16*>(down_proj_zero),
-            static_cast<const hip_bfloat16*>(shared_gate_proj_scale),
-            static_cast<const hip_bfloat16*>(shared_gate_proj_zero),
-            static_cast<const hip_bfloat16*>(shared_up_proj_scale),
-            static_cast<const hip_bfloat16*>(shared_up_proj_zero),
-            static_cast<const hip_bfloat16*>(shared_down_proj_scale),
-            static_cast<const hip_bfloat16*>(shared_down_proj_zero),
+            quant.experts_gate_up,
+            quant.experts_down,
+            quant.shared_expert_gate_proj,
+            quant.shared_expert_up_proj,
+            quant.shared_expert_down_proj,
             static_cast<hip_bfloat16*>(output),
             output_idx,
             workspace, counters, barrier_counter, barrier_flag);
@@ -712,17 +1114,11 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
             static_cast<const hip_bfloat16*>(shared_up_proj_w),
             static_cast<const hip_bfloat16*>(shared_down_proj_w),
             static_cast<const hip_bfloat16*>(shared_expert_gate_w),
-            int4_group_size,
-            static_cast<const hip_bfloat16*>(gate_up_proj_scale),
-            static_cast<const hip_bfloat16*>(gate_up_proj_zero),
-            static_cast<const hip_bfloat16*>(down_proj_scale),
-            static_cast<const hip_bfloat16*>(down_proj_zero),
-            static_cast<const hip_bfloat16*>(shared_gate_proj_scale),
-            static_cast<const hip_bfloat16*>(shared_gate_proj_zero),
-            static_cast<const hip_bfloat16*>(shared_up_proj_scale),
-            static_cast<const hip_bfloat16*>(shared_up_proj_zero),
-            static_cast<const hip_bfloat16*>(shared_down_proj_scale),
-            static_cast<const hip_bfloat16*>(shared_down_proj_zero),
+            quant.experts_gate_up,
+            quant.experts_down,
+            quant.shared_expert_gate_proj,
+            quant.shared_expert_up_proj,
+            quant.shared_expert_down_proj,
             static_cast<hip_bfloat16*>(output),
             output_idx,
             workspace, counters, barrier_counter, barrier_flag);
@@ -730,7 +1126,7 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
 
     // Async dispatch: see attn_step_launch above for the rationale.
     hipError_t launch_err_ffn = hipGetLastError();
-    if (launch_err_ffn != hipSuccess) return 254;
+    if (launch_err_ffn != hipSuccess) return backend_failure(254, launch_err_ffn);
     return 0;
 }
 
@@ -738,7 +1134,7 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
 // Drives `qwen36_moe::int4_dequant_smoke_kernel` over a small `[out_rows,
 // in_cols]` slab and writes both helpers' outputs to separate buffers.
 // The Rust-side test validates byte-for-byte against a host reference.
-extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
+extern "C" uint64_t qwen36_moe_hip_int4_dequant_smoke_launch(
     size_t         device_ordinal,
     const uint8_t* packed,
     const void*    scale,
@@ -769,8 +1165,85 @@ extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
+    return 0;
+}
+
+extern "C" uint64_t qwen36_moe_hip_int4_descriptor_dequant_smoke_launch(
+    size_t                         device_ordinal,
+    const uint8_t*                 packed,
+    const Qwen36Int4WeightDesc*    desc,
+    int                            experts,
+    int                            out_rows,
+    int                            in_cols,
+    float*                         dq_8_out,
+    float*                         dq_scalar_out) {
+    if (packed == nullptr || desc == nullptr || desc->scale == nullptr ||
+        dq_8_out == nullptr || dq_scalar_out == nullptr) {
+        return 170;
+    }
+    const int descriptor_status =
+        validate_int4_descriptor_geometry(*desc, experts, out_rows, in_cols);
+    if (descriptor_status != 0) return descriptor_status;
+    if (in_cols % 8 != 0) return 178;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+    constexpr int block_size = 256;
+    if (static_cast<size_t>(experts) >
+        std::numeric_limits<size_t>::max() / static_cast<size_t>(out_rows)) {
+        return 179;
+    }
+    const size_t logical_rows = static_cast<size_t>(experts) * out_rows;
+    const size_t spans_per_row = static_cast<size_t>(in_cols / 8);
+    if (logical_rows > std::numeric_limits<size_t>::max() / spans_per_row) {
+        return 179;
+    }
+    const size_t span_count = logical_rows * spans_per_row;
+    const size_t requested_blocks = (span_count - 1) / block_size + 1;
+    const unsigned int blocks = requested_blocks > 65535
+        ? 65535
+        : static_cast<unsigned int>(requested_blocks);
+    hipLaunchKernelGGL(qwen36_moe::int4_descriptor_dequant_smoke_kernel,
+                       dim3(blocks), dim3(block_size), 0, 0,
+                       packed, *desc, experts, out_rows, in_cols,
+                       dq_8_out, dq_scalar_out);
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
+    return 0;
+}
+
+extern "C" uint64_t qwen36_moe_hip_int4_descriptor_wmma_parity_launch(
+    size_t                         device_ordinal,
+    const uint8_t*                 packed,
+    const Qwen36Int4WeightDesc*    desc,
+    const void*                    activation,
+    int                            out_rows,
+    int                            in_cols,
+    float*                         scalar_out,
+    float*                         wmma_out) {
+    if (packed == nullptr || desc == nullptr || desc->scale == nullptr ||
+        activation == nullptr || scalar_out == nullptr || wmma_out == nullptr) {
+        return 180;
+    }
+    if (out_rows != 32 || in_cols != 128) return 181;
+    const int descriptor_status =
+        validate_int4_descriptor_geometry(*desc, 1, out_rows, in_cols);
+    if (descriptor_status != 0) return descriptor_status;
+    if (!device_supports_wmma_bf16(static_cast<int>(device_ordinal))) return 182;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+    hipLaunchKernelGGL(qwen36_moe::int4_descriptor_wmma_parity_kernel,
+                       dim3(1), dim3(32), 0, 0,
+                       packed, *desc,
+                       static_cast<const hip_bfloat16*>(activation),
+                       out_rows, in_cols, scalar_out, wmma_out);
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -788,7 +1261,7 @@ extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
 //   - `hidden % block_size == 0` (block reduction lane scheme assumes it).
 //   - `vocab > 0`; the work-stealing loop self-terminates when
 //     `my_row >= vocab`.
-extern "C" int qwen36_moe_hip_lm_head_launch(
+extern "C" uint64_t qwen36_moe_hip_lm_head_launch(
     int           dtype,
     size_t        device_ordinal,
     int           hidden,
@@ -814,9 +1287,10 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
 
     const int ordinal_int = static_cast<int>(device_ordinal);
@@ -852,8 +1326,8 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
         hipError_t launch_err = hipGetLastError();
         hipError_t sync_err =
             sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-        if (launch_err != hipSuccess) return 254;
-        if (sync_err != hipSuccess) return 255;
+        if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+        if (sync_err != hipSuccess) return backend_failure(255, sync_err);
         return 0;
     }
 
@@ -862,8 +1336,9 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
     constexpr int block_size = 256;
 
-    if (hipMemsetAsync(counter, 0, sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counter, 0, sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     // shared_scratch [block_size] + x_norm_lds [hidden], both F32.
@@ -886,8 +1361,8 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -899,7 +1374,7 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
 // in a single WMMA tile per vocab block. WMMA-only (gfx11xx + bf16);
 // callers that need a fallback should call the single-M launch in a
 // loop. Status codes match the single-M launcher.
-extern "C" int qwen36_moe_hip_lm_head_batched_launch(
+extern "C" uint64_t qwen36_moe_hip_lm_head_batched_launch(
     int           dtype,
     size_t        device_ordinal,
     int           m,                     // 1..=16
@@ -969,8 +1444,8 @@ extern "C" int qwen36_moe_hip_lm_head_batched_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -982,7 +1457,7 @@ extern "C" int qwen36_moe_hip_lm_head_batched_launch(
 //   fused  = mtp.fc @ cat([e_norm, h_norm], dim=-1)
 // All BF16-rounded to match the Phase 6.2a Python oracle byte-for-byte
 // through the rounding boundary. Status codes match the lm_head launcher.
-extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
+extern "C" uint64_t qwen36_moe_hip_mtp_pre_fusion_launch(
     int           dtype,
     size_t        device_ordinal,
     int           hidden,
@@ -1035,8 +1510,8 @@ extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1049,11 +1524,8 @@ extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
 // phases. Replaces 81 step-kernel launches/token (40 attn + 40 ffn + 1
 // lm_head; lm_head still launches separately at this stage) with one.
 //
-// Returns:
-//   0   on success
-//   100..200  config-validation errors (see body)
-//   254 if `hipGetLastError` reports a launch failure
-//   255 if `hipDeviceSynchronize` reports a kernel failure
+// Returns the project status in the low word and the native HIP/CUDA runtime
+// status in the high word. Native status is zero for validation failures.
 //
 // Caller responsibility:
 //   - `hidden_ping` is uploaded with the initial hidden BF16 bytes; the
@@ -1067,7 +1539,7 @@ extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
 //     barrier_flag at +68). Caller zeros the whole sync_buf before launch
 //     (this fn also zeros the entire 96 bytes defensively).
 
-extern "C" int qwen36_moe_hip_persistent_decode_launch(
+extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
     int           dtype,
     size_t        device_ordinal,
     int           num_layers,
@@ -1224,9 +1696,10 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
@@ -1234,42 +1707,118 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
 
     // Zero the full 96-byte sync_buf before launch — counters[0..16] (64
     // bytes) + barrier_counter (4) + barrier_flag (4) + 24 bytes of pad.
-    if (hipMemsetAsync(counters, 0, 96) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counters, 0, 96);
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     const size_t lds_bytes =
         static_cast<size_t>(hidden + block_size) * sizeof(float);
 
-    // WMMA gate. Two phase classes have different requirements here:
-    //
-    //  * Layer phases (full_attn / linear_attn / ffn) self-gate the
-    //    WMMA tile path on per-tensor `*_scale != nullptr` — only INT4
-    //    weights need the dequant-to-LDS WMMA pattern; BF16 weights
-    //    fall through to the scalar reduction inside the same template.
-    //    Setting `USE_WMMA=true` on a pure-BF16 model produces
-    //    identical output to `USE_WMMA=false` (extra branches compile
-    //    in but never fire at runtime).
-    //
-    //  * Phase 3f folded lm_head uses BF16 weights directly (the
-    //    engine pre-dequants INT4 lm_head to BF16 at startup) — its
-    //    WMMA path runs unconditionally when the template parameter
-    //    is true, regardless of `int4_scales`.
-    //
-    // Pre-3f the bridge AND'd `int4_scales != nullptr` into the gate,
-    // mirroring "INT4 in play anywhere" semantics. After 3f that
-    // would force BF16-only models onto the scalar lm_head fallback
-    // even on WMMA-capable hardware (Codex P1 review on PR #140), so
-    // the gate now asks only "is the device WMMA-capable".
+    // The persistent kernel carries independent WMMA template bits. Attention
+    // and FFN are qualified separately; lm-head remains scalar until its own
+    // numerical gate is complete.
     const bool disable_wmma =
         std::getenv("SUPERSONIC_QWEN36_DISABLE_PERSISTENT_WMMA") != nullptr;
-    const bool use_wmma =
-        !disable_wmma &&
+    const int64_t full_attn_width =
+        static_cast<int64_t>(num_heads) * static_cast<int64_t>(head_dim);
+    const int64_t linear_value_width =
+        static_cast<int64_t>(num_v_heads) * static_cast<int64_t>(head_v_dim);
+    const bool persistent_wmma_dims_ok =
+        hidden % 16 == 0 && full_attn_width % 16 == 0 &&
+        linear_value_width % 16 == 0;
+    const bool use_attn_wmma =
+        !disable_wmma && persistent_wmma_dims_ok &&
         device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+    // The FFN WMMA path is parity-sensitive across a multi-token persistent
+    // prefill: its different F32 accumulation order can perturb the hidden
+    // state that seeds the first generated token. Keep prefill on the scalar
+    // reference while retaining the qualified path for one-token decode.
+    const bool use_ffn_wmma =
+        !disable_wmma && prefill_len <= 1 &&
+        persistent_ffn_wmma_qualified(
+            int4_scales,
+            device_ordinal,
+            num_layers,
+            start_layer,
+            end_layer_exclusive,
+            hidden,
+            num_experts,
+            moe_intermediate,
+            shared_intermediate);
 
-    if (use_wmma) {
+    // Encoding 2 is qualified only through BF16-WMMA reconstruction. The
+    // descriptors live on device, so inspect them only on the exceptional
+    // non-WMMA path; qualified gfx11 production launches pay no D2H cost.
+    if (!use_attn_wmma && persistent_mode_runs_attention(mode) &&
+        int4_scales != nullptr) {
+        std::vector<qwen36_moe::Int4ScaleDesc> host_scales(
+            static_cast<size_t>(num_layers));
+        hipError_t copy_err = hipMemcpy(
+            host_scales.data(),
+            int4_scales,
+            host_scales.size() * sizeof(qwen36_moe::Int4ScaleDesc),
+            hipMemcpyDeviceToHost);
+        if (copy_err != hipSuccess) return backend_failure(251, copy_err);
+        for (int li = start_layer; li < end_layer_exclusive; ++li) {
+            const int prelaunch_status = persistent_int4_prelaunch_status(
+                mode,
+                attention_desc_has_row_group(host_scales[static_cast<size_t>(li)]),
+                use_attn_wmma);
+            if (prelaunch_status != 0) return prelaunch_status;
+        }
+    }
+
+    if (use_attn_wmma && use_ffn_wmma) {
         hipLaunchKernelGGL(
-            (qwen36_moe::qwen36_moe_persistent_decode_kernel<hip_bfloat16, true>),
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<
+                hip_bfloat16, true, true, false>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            num_layers, start_layer, end_layer_exclusive, mode,
+            layers, int4_scales, kv_fp8_descs,
+            hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
+            num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
+            num_experts, moe_intermediate, shared_intermediate, top_k,
+            vocab, rope_theta, rms_norm_eps, position, cache_pos,
+            static_cast<const hip_bfloat16*>(embed_w), token_id,
+            token_ids, prefill_len,
+            static_cast<hip_bfloat16*>(hidden_ping),
+            static_cast<hip_bfloat16*>(hidden_pong),
+            workspace, ffn_topk_idx_scratch,
+            static_cast<const hip_bfloat16*>(final_norm_w),
+            static_cast<const hip_bfloat16*>(lm_head_w),
+            static_cast<hip_bfloat16*>(logits_out),
+            top1_out,
+            counters, barrier_counter, barrier_flag);
+    } else if (use_attn_wmma) {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<
+                hip_bfloat16, true, false, false>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            num_layers, start_layer, end_layer_exclusive, mode,
+            layers, int4_scales, kv_fp8_descs,
+            hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
+            num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
+            num_experts, moe_intermediate, shared_intermediate, top_k,
+            vocab, rope_theta, rms_norm_eps, position, cache_pos,
+            static_cast<const hip_bfloat16*>(embed_w), token_id,
+            token_ids, prefill_len,
+            static_cast<hip_bfloat16*>(hidden_ping),
+            static_cast<hip_bfloat16*>(hidden_pong),
+            workspace, ffn_topk_idx_scratch,
+            static_cast<const hip_bfloat16*>(final_norm_w),
+            static_cast<const hip_bfloat16*>(lm_head_w),
+            static_cast<hip_bfloat16*>(logits_out),
+            top1_out,
+            counters, barrier_counter, barrier_flag);
+    } else if (use_ffn_wmma) {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<
+                hip_bfloat16, false, true, false>),
             dim3(static_cast<unsigned int>(num_blocks)),
             dim3(block_size),
             lds_bytes, 0,
@@ -1291,7 +1840,8 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             counters, barrier_counter, barrier_flag);
     } else {
         hipLaunchKernelGGL(
-            (qwen36_moe::qwen36_moe_persistent_decode_kernel<hip_bfloat16, false>),
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<
+                hip_bfloat16, false, false, false>),
             dim3(static_cast<unsigned int>(num_blocks)),
             dim3(block_size),
             lds_bytes, 0,
@@ -1316,8 +1866,8 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1336,7 +1886,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
 // launch_tiled guard from PR #219).
 // =============================================================================
 
-extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
+extern "C" uint64_t qwen36_moe_hip_batched_prefill_attn_full_launch(
     int           dtype,
     size_t        device_ordinal,
     int           batch_size,
@@ -1363,8 +1913,10 @@ extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) != hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     if (props.warpSize != 32) {
         // Fall through to the per-token path on wave64; this kernel
@@ -1413,8 +1965,8 @@ extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
 
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err   = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1433,10 +1985,10 @@ extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
 //   141 num_experts > 256                  (LDS pinned at MAX_EXPERTS=256)
 //   142 top_k > 16                         (sanity bound)
 //   143 n_tokens * top_k > 16384           (would exceed reasonable scratch)
-//   254 launch error                       255 sync error
+//   254 launch error (with native status) 255 sync error (with native status)
 // =============================================================================
 
-extern "C" int qwen36_moe_hip_batched_prefill_router_permute_launch(
+extern "C" uint64_t qwen36_moe_hip_batched_prefill_router_permute_launch(
     size_t      device_ordinal,
     int         n_tokens,
     int         top_k,
@@ -1472,8 +2024,8 @@ extern "C" int qwen36_moe_hip_batched_prefill_router_permute_launch(
 
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err   = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1497,16 +2049,16 @@ extern "C" int qwen36_moe_hip_batched_prefill_router_permute_launch(
 // Status codes:
 //   150 invalid args (zero/negative dims)
 //   151 num_experts > 256
-//   152 hidden / moe_intermediate not divisible by group_size
-//   153 group_size != 128
+//   152 hidden / moe_intermediate not divisible by 16
+//   153 missing or invalid INT4 descriptor
 //   154 top_k * n_tokens > 16384
 //   155 dtype != bf16 (only path supported initially)
 //   156 LDS overflow (>48 KiB)
-//   254 launch error
-//   255 sync error
+//   254 launch error (with native status)
+//   255 sync error (with native status)
 // =============================================================================
 
-extern "C" int qwen36_moe_hip_batched_prefill_grouped_expert_launch(
+extern "C" uint64_t qwen36_moe_hip_batched_prefill_grouped_expert_launch(
     int           dtype,
     size_t        device_ordinal,
     int           n_tokens,
@@ -1514,41 +2066,44 @@ extern "C" int qwen36_moe_hip_batched_prefill_grouped_expert_launch(
     int           num_experts,
     int           hidden,
     int           moe_intermediate,
-    int           group_size,
     const void*   x_norm,
     const void*   expert_offsets,
     const void*   permuted_token_idx,
     const void*   experts_gate_up_w,
-    const void*   experts_gate_up_scale,
-    const void*   experts_gate_up_zero,
+    const Qwen36Int4WeightDesc* experts_gate_up_desc,
     const void*   experts_down_w,
-    const void*   experts_down_scale,
-    const void*   experts_down_zero,
+    const Qwen36Int4WeightDesc* experts_down_desc,
     void*         expert_out,
     void*         counters
 ) {
     if (n_tokens <= 0 || top_k <= 0 || num_experts <= 0) return 150;
     if (hidden <= 0 || moe_intermediate <= 0) return 150;
     if (num_experts > 256) return 151;
-    if (group_size <= 0) return 153;
-    if (group_size != 128) return 153;
-    if ((hidden % group_size) != 0) return 152;
-    if ((moe_intermediate % group_size) != 0) return 152;
+    if (experts_gate_up_desc == nullptr || experts_down_desc == nullptr) return 153;
+    if (validate_int4_descriptor_geometry(
+            *experts_gate_up_desc, num_experts,
+            2 * moe_intermediate, hidden) != 0 ||
+        validate_int4_descriptor_geometry(
+            *experts_down_desc, num_experts,
+            hidden, moe_intermediate) != 0) {
+        return 153;
+    }
     if (static_cast<int64_t>(n_tokens) * static_cast<int64_t>(top_k) > 16384) return 154;
     if (dtype != 2) return 155;
 
     // Reduction dims must be multiples of 16 for both the WMMA path
     // (`wmma_int4_matvec_partial_16rows` strides K by 16) and the scalar
-    // 8-wide dq8 path (strides cols by 8). group_size=128 already enforces
-    // 16-divisibility for both `hidden` and `moe_intermediate`, so this is
-    // belt-and-braces.
+    // 8-wide dq8 path (strides cols by 8). Descriptor validation enforces
+    // the quant geometry; the compute tile itself additionally requires 16.
     if ((hidden % 16) != 0 || (moe_intermediate % 16) != 0) return 152;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) != hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
 
     constexpr int BLOCK = 256;
@@ -1567,46 +2122,45 @@ extern "C" int qwen36_moe_hip_batched_prefill_grouped_expert_launch(
     dim3 grid(static_cast<unsigned int>(num_blocks), 1u, 1u);
     dim3 block(static_cast<unsigned int>(BLOCK), 1u, 1u);
 
-    const bool wmma = device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+    const bool wmma =
+        experts_gate_up_desc->input_group_size % 16 == 0 &&
+        experts_down_desc->input_group_size % 16 == 0 &&
+        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
 
     if (wmma) {
         hipLaunchKernelGGL(
             (qwen36_moe::qwen36_moe_batched_prefill_grouped_expert_kernel<hip_bfloat16, true>),
             grid, block, lds_bytes, 0,
-            n_tokens, top_k, num_experts, hidden, moe_intermediate, group_size,
+            n_tokens, top_k, num_experts, hidden, moe_intermediate,
             static_cast<const hip_bfloat16*>(x_norm),
             static_cast<const int*>(expert_offsets),
             static_cast<const int*>(permuted_token_idx),
             static_cast<const uint8_t*>(experts_gate_up_w),
-            static_cast<const hip_bfloat16*>(experts_gate_up_scale),
-            static_cast<const hip_bfloat16*>(experts_gate_up_zero),
+            *experts_gate_up_desc,
             static_cast<const uint8_t*>(experts_down_w),
-            static_cast<const hip_bfloat16*>(experts_down_scale),
-            static_cast<const hip_bfloat16*>(experts_down_zero),
+            *experts_down_desc,
             static_cast<hip_bfloat16*>(expert_out),
             static_cast<unsigned int*>(counters));
     } else {
         hipLaunchKernelGGL(
             (qwen36_moe::qwen36_moe_batched_prefill_grouped_expert_kernel<hip_bfloat16, false>),
             grid, block, lds_bytes, 0,
-            n_tokens, top_k, num_experts, hidden, moe_intermediate, group_size,
+            n_tokens, top_k, num_experts, hidden, moe_intermediate,
             static_cast<const hip_bfloat16*>(x_norm),
             static_cast<const int*>(expert_offsets),
             static_cast<const int*>(permuted_token_idx),
             static_cast<const uint8_t*>(experts_gate_up_w),
-            static_cast<const hip_bfloat16*>(experts_gate_up_scale),
-            static_cast<const hip_bfloat16*>(experts_gate_up_zero),
+            *experts_gate_up_desc,
             static_cast<const uint8_t*>(experts_down_w),
-            static_cast<const hip_bfloat16*>(experts_down_scale),
-            static_cast<const hip_bfloat16*>(experts_down_zero),
+            *experts_down_desc,
             static_cast<hip_bfloat16*>(expert_out),
             static_cast<unsigned int*>(counters));
     }
 
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err   = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1629,11 +2183,11 @@ extern "C" int qwen36_moe_hip_batched_prefill_grouped_expert_launch(
 //   162 dtype != bf16
 //   163 hidden too large (no shared scratch needed; this is a paranoia cap)
 //   164 reserved
-//   254 launch error
-//   255 sync error
+//   254 launch error (with native status)
+//   255 sync error (with native status)
 // =============================================================================
 
-extern "C" int qwen36_moe_hip_batched_prefill_unpermute_combine_launch(
+extern "C" uint64_t qwen36_moe_hip_batched_prefill_unpermute_combine_launch(
     int           dtype,
     size_t        device_ordinal,
     int           n_tokens,
@@ -1672,7 +2226,7 @@ extern "C" int qwen36_moe_hip_batched_prefill_unpermute_combine_launch(
 
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err   = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }

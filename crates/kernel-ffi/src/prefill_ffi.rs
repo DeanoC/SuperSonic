@@ -16,6 +16,160 @@ static METAL_PROFILE: OnceLock<Mutex<MetalProfileAccumulator>> = OnceLock::new()
 static FFI_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 static FFI_PROFILE: OnceLock<Mutex<FfiProfileAccumulator>> = OnceLock::new();
 
+#[derive(Clone, Default)]
+pub struct PrefillFfiLaunchOptions {
+    pub force_host_native: bool,
+    pub force_host_rms_norm: bool,
+    pub force_host_matmul: bool,
+    pub force_host_element_add: bool,
+    pub force_host_cast: bool,
+    pub force_host_transpose_shd_hsd: bool,
+    pub force_host_split_qgate: bool,
+    pub disable_gemv_m1: bool,
+    pub disable_gemv_m1_tiled: bool,
+    pub disable_int4_gemv_m1: bool,
+    pub disable_int4_gemv_m1_tiled: bool,
+    pub metal_profile: bool,
+    pub metal_profile_qwen36_ffn_phases: bool,
+    pub ffi_profile_shapes: bool,
+}
+
+#[cfg(test)]
+mod explicit_options_tests {
+    use super::*;
+
+    #[test]
+    fn prefill_kernel_policy_is_selected_from_explicit_typed_options() {
+        let options = PrefillFfiLaunchOptions {
+            force_host_native: true,
+            force_host_matmul: true,
+            disable_gemv_m1: true,
+            metal_profile: true,
+            ..PrefillFfiLaunchOptions::default()
+        };
+
+        assert!(prefill_native_disabled(Some(&options)));
+        assert!(prefill_launch_flag(
+            Some(&options),
+            |options| options.force_host_matmul,
+            || false,
+        ));
+        assert!(prefill_launch_flag(
+            Some(&options),
+            |options| options.disable_gemv_m1,
+            || false,
+        ));
+        assert!(!prefill_profile_shapes(Some(&options)));
+    }
+
+    #[test]
+    fn lm_head_metal_policy_ignores_opposite_ambient_flags() {
+        const FLAGS: [&str; 5] = [
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+            "SUPERSONIC_METAL_FORCE_HOST_RMS_NORM",
+            "SUPERSONIC_METAL_FORCE_HOST_MATMUL",
+            "SUPERSONIC_METAL_DISABLE_GEMV_M1",
+            "SUPERSONIC_METAL_DISABLE_GEMV_M1_TILED",
+        ];
+        let previous: Vec<_> = FLAGS
+            .iter()
+            .map(|&name| (name, std::env::var_os(name)))
+            .collect();
+        for &name in &FLAGS {
+            unsafe {
+                std::env::set_var(name, "1");
+            }
+        }
+
+        let explicit_off = PrefillFfiLaunchOptions::default();
+        assert!(!prefill_native_disabled(Some(&explicit_off)));
+        assert!(!prefill_launch_flag(
+            Some(&explicit_off),
+            |options| options.force_host_rms_norm,
+            metal_force_host_rms_norm,
+        ));
+        assert!(!prefill_launch_flag(
+            Some(&explicit_off),
+            |options| options.force_host_matmul,
+            metal_force_host_matmul,
+        ));
+        assert!(!prefill_launch_flag(
+            Some(&explicit_off),
+            |options| options.disable_gemv_m1,
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1").is_some(),
+        ));
+        assert!(!prefill_launch_flag(
+            Some(&explicit_off),
+            |options| options.disable_gemv_m1_tiled,
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1_TILED").is_some(),
+        ));
+
+        for &name in &FLAGS {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        let explicit_on = PrefillFfiLaunchOptions {
+            force_host_native: true,
+            force_host_rms_norm: true,
+            force_host_matmul: true,
+            disable_gemv_m1: true,
+            disable_gemv_m1_tiled: true,
+            ..PrefillFfiLaunchOptions::default()
+        };
+        assert!(prefill_native_disabled(Some(&explicit_on)));
+        assert!(prefill_launch_flag(
+            Some(&explicit_on),
+            |options| options.force_host_rms_norm,
+            metal_force_host_rms_norm,
+        ));
+        assert!(prefill_launch_flag(
+            Some(&explicit_on),
+            |options| options.force_host_matmul,
+            metal_force_host_matmul,
+        ));
+        assert!(prefill_launch_flag(
+            Some(&explicit_on),
+            |options| options.disable_gemv_m1,
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1").is_some(),
+        ));
+        assert!(prefill_launch_flag(
+            Some(&explicit_on),
+            |options| options.disable_gemv_m1_tiled,
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1_TILED").is_some(),
+        ));
+
+        for &(name, ref value) in &previous {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
+fn prefill_native_disabled(options: Option<&PrefillFfiLaunchOptions>) -> bool {
+    options
+        .map(|options| options.force_host_native)
+        .unwrap_or_else(metal_native::disabled_by_env)
+}
+
+fn prefill_launch_flag(
+    options: Option<&PrefillFfiLaunchOptions>,
+    field: impl FnOnce(&PrefillFfiLaunchOptions) -> bool,
+    legacy: impl FnOnce() -> bool,
+) -> bool {
+    options.map(field).unwrap_or_else(legacy)
+}
+
+fn prefill_profile_shapes(options: Option<&PrefillFfiLaunchOptions>) -> bool {
+    options
+        .map(|options| options.ffi_profile_shapes)
+        .unwrap_or_else(|| std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some())
+}
+
 #[derive(Debug, Clone)]
 pub struct MetalProfileEntry {
     pub op: String,
@@ -87,7 +241,6 @@ pub fn metal_profile_set_enabled(enabled: bool) {
 
 pub fn metal_profile_enabled() -> bool {
     METAL_PROFILE_ENABLED.load(Ordering::Relaxed)
-        || std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some()
 }
 
 pub fn metal_profile_reset() {
@@ -142,7 +295,19 @@ pub(crate) fn metal_profile_time<T, F>(op: &'static str, path: &'static str, f: 
 where
     F: FnOnce() -> T,
 {
-    if !metal_profile_enabled() {
+    metal_profile_time_explicit(metal_profile_enabled(), op, path, f)
+}
+
+pub(crate) fn metal_profile_time_explicit<T, F>(
+    enabled: bool,
+    op: &'static str,
+    path: &'static str,
+    f: F,
+) -> T
+where
+    F: FnOnce() -> T,
+{
+    if !enabled {
         return f();
     }
     let start = Instant::now();
@@ -166,13 +331,27 @@ where
     result
 }
 
+fn prefill_metal_profile_time<T, F>(
+    options: Option<&PrefillFfiLaunchOptions>,
+    op: &'static str,
+    path: &'static str,
+    f: F,
+) -> T
+where
+    F: FnOnce() -> T,
+{
+    match options {
+        Some(options) => metal_profile_time_explicit(options.metal_profile, op, path, f),
+        None => metal_profile_time(op, path, f),
+    }
+}
+
 pub fn ffi_profile_set_enabled(enabled: bool) {
     FFI_PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 pub fn ffi_profile_enabled() -> bool {
     FFI_PROFILE_ENABLED.load(Ordering::Relaxed)
-        || std::env::var_os("SUPERSONIC_PREFILL_FFI_PROFILE").is_some()
 }
 
 pub fn ffi_profile_reset() {
@@ -269,7 +448,23 @@ pub extern "C" fn supersonic_metal_profile_record(
     if !metal_profile_enabled() || op.is_null() || path.is_null() || !elapsed_ms.is_finite() {
         return;
     }
+    record_metal_profile_ffi_sample(op, path, elapsed_ms);
+}
 
+#[no_mangle]
+pub extern "C" fn supersonic_metal_profile_record_explicit(
+    enabled: c_int,
+    op: *const c_char,
+    path: *const c_char,
+    elapsed_ms: f64,
+) {
+    if enabled == 0 || op.is_null() || path.is_null() || !elapsed_ms.is_finite() {
+        return;
+    }
+    record_metal_profile_ffi_sample(op, path, elapsed_ms);
+}
+
+fn record_metal_profile_ffi_sample(op: *const c_char, path: *const c_char, elapsed_ms: f64) {
     let op = unsafe { CStr::from_ptr(op) }.to_string_lossy().into_owned();
     let path = unsafe { CStr::from_ptr(path) }
         .to_string_lossy()
@@ -297,6 +492,18 @@ where
 {
     metal_native::flush_batch()?;
     metal_profile_time(op, "host", f)
+}
+
+fn prefill_metal_profile_host_time<T, F>(
+    options: Option<&PrefillFfiLaunchOptions>,
+    op: &'static str,
+    f: F,
+) -> Result<T, GpuError>
+where
+    F: FnOnce() -> Result<T, GpuError>,
+{
+    metal_native::flush_batch()?;
+    prefill_metal_profile_time(options, op, "host", f)
 }
 
 pub fn flush_metal_batch() -> Result<(), GpuError> {
@@ -772,6 +979,165 @@ fn ffi_error(msg: String) -> GpuError {
         Backend::Hip => GpuError::backend(Backend::Hip, msg),
         Backend::Cuda => GpuError::backend(Backend::Cuda, msg),
         Backend::Metal => GpuError::backend(Backend::Metal, msg),
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillBridgeStatus(i32);
+
+impl PrefillBridgeStatus {
+    // Native failures set bit 31, keep the project status in bits 16..30,
+    // and preserve the backend's 16-bit runtime status in bits 0..15.
+    const BACKEND_FAILURE_BIT: u32 = 1 << 31;
+
+    const fn project_status(self) -> i32 {
+        let raw = self.0 as u32;
+        if raw & Self::BACKEND_FAILURE_BIT == 0 {
+            self.0
+        } else {
+            ((raw >> 16) & 0x7fff) as i32
+        }
+    }
+
+    const fn native_status(self) -> i32 {
+        let raw = self.0 as u32;
+        if raw & Self::BACKEND_FAILURE_BIT == 0 {
+            0
+        } else {
+            (raw & 0xffff) as i32
+        }
+    }
+}
+
+fn prefill_bridge_result(
+    backend: Backend,
+    operation: &str,
+    raw_status: i32,
+) -> Result<(), GpuError> {
+    let status = PrefillBridgeStatus(raw_status);
+    let native_status = status.native_status();
+    if native_status != 0 {
+        return Err(GpuError::backend_status_in(
+            backend,
+            gpu_hal::BackendApi::Runtime,
+            operation,
+            native_status,
+        ));
+    }
+    let project_status = status.project_status();
+    if project_status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("{operation} failed with project status {project_status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod typed_bridge_status_tests {
+    use super::*;
+
+    unsafe extern "C" {
+        fn supersonic_prefill_encode_bridge_status(
+            project_status: c_int,
+            native_status: c_int,
+        ) -> c_int;
+
+        fn supersonic_qwen35_4b_bf16_matmul_bridge_status(
+            project_status: c_int,
+            native_status: c_int,
+        ) -> c_int;
+    }
+
+    fn encoded_status(project_status: i32, native_status: i32) -> i32 {
+        unsafe { supersonic_prefill_encode_bridge_status(project_status, native_status) }
+    }
+
+    #[test]
+    fn generic_prefill_status_conversion_preserves_native_and_project_failures() {
+        let native = prefill_bridge_result(Backend::Hip, "rms_norm_rows", encoded_status(302, 709))
+            .unwrap_err();
+        assert!(matches!(
+            native,
+            GpuError::DeviceLost {
+                backend: Backend::Hip,
+                api: gpu_hal::BackendApi::Runtime,
+                ref operation,
+                status: 709,
+            } if operation == "rms_norm_rows"
+        ));
+
+        let ordinary = prefill_bridge_result(Backend::Hip, "rms_norm_rows", encoded_status(301, 1))
+            .unwrap_err();
+        assert!(matches!(
+            ordinary,
+            GpuError::BackendStatus {
+                backend: Backend::Hip,
+                api: gpu_hal::BackendApi::Runtime,
+                ref operation,
+                status: 1,
+            } if operation == "rms_norm_rows"
+        ));
+
+        let validation =
+            prefill_bridge_result(Backend::Hip, "rms_norm_rows", encoded_status(340, 0))
+                .unwrap_err();
+        assert!(matches!(
+            validation,
+            GpuError::Backend {
+                backend: Backend::Hip,
+                ref message,
+            } if message == "rms_norm_rows failed with project status 340"
+        ));
+    }
+
+    #[test]
+    fn bf16_matmul_production_branch_status_preserves_native_and_project_failures() {
+        let branch_status = |project_status, native_status| unsafe {
+            supersonic_qwen35_4b_bf16_matmul_bridge_status(project_status, native_status)
+        };
+
+        let device_lost = prefill_bridge_result(
+            Backend::Hip,
+            "matmul_rhs_transposed",
+            branch_status(280, 709),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            device_lost,
+            GpuError::DeviceLost {
+                backend: Backend::Hip,
+                api: gpu_hal::BackendApi::Runtime,
+                ref operation,
+                status: 709,
+            } if operation == "matmul_rhs_transposed"
+        ));
+
+        let ordinary =
+            prefill_bridge_result(Backend::Hip, "matmul_rhs_transposed", branch_status(275, 1))
+                .unwrap_err();
+        assert!(matches!(
+            ordinary,
+            GpuError::BackendStatus {
+                backend: Backend::Hip,
+                api: gpu_hal::BackendApi::Runtime,
+                ref operation,
+                status: 1,
+            } if operation == "matmul_rhs_transposed"
+        ));
+
+        let project =
+            prefill_bridge_result(Backend::Hip, "matmul_rhs_transposed", branch_status(272, 0))
+                .unwrap_err();
+        assert!(matches!(
+            project,
+            GpuError::Backend {
+                backend: Backend::Hip,
+                ref message,
+            } if message == "matmul_rhs_transposed failed with project status 272"
+        ));
     }
 }
 
@@ -2306,6 +2672,49 @@ pub unsafe fn metal_full_attention_prefill_tmajor_bf16_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub unsafe fn metal_full_attention_prefill_tmajor_bf16_f32_with_options(
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key_ptr: *const c_void,
+    value_ptr: *const c_void,
+    out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    if out.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "metal_full_attention_prefill_tmajor_bf16_f32_with_options requires a Metal output buffer"
+                .into(),
+        ));
+    }
+    prefill_metal_profile_time(
+        Some(options),
+        "full_attention_prefill_tmajor",
+        "native",
+        || unsafe {
+            metal_native::full_attention_prefill_tmajor_bf16_f32(
+                q_heads,
+                kv_heads,
+                q_len,
+                kv_len,
+                head_dim,
+                scale,
+                seqlen_offset,
+                query,
+                key_ptr,
+                value_ptr,
+                out,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn metal_full_attention_prefill_tmajor_vec_bf16_f32(
     q_heads: usize,
     kv_heads: usize,
@@ -2340,6 +2749,49 @@ pub unsafe fn metal_full_attention_prefill_tmajor_vec_bf16_f32(
             out,
         )
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn metal_full_attention_prefill_tmajor_vec_bf16_f32_with_options(
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key_ptr: *const c_void,
+    value_ptr: *const c_void,
+    out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    if out.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "metal_full_attention_prefill_tmajor_vec_bf16_f32_with_options requires a Metal output buffer"
+                .into(),
+        ));
+    }
+    prefill_metal_profile_time(
+        Some(options),
+        "full_attention_prefill_tmajor_vec",
+        "native",
+        || unsafe {
+            metal_native::full_attention_prefill_tmajor_vec_bf16_f32(
+                q_heads,
+                kv_heads,
+                q_len,
+                kv_len,
+                head_dim,
+                scale,
+                seqlen_offset,
+                query,
+                key_ptr,
+                value_ptr,
+                out,
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2395,11 +2847,11 @@ pub fn full_attention_decode_flat(
             out.as_mut_ptr(),
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "full_attention_decode_flat failed: {status}"
-        )));
-    }
+    prefill_bridge_result(
+        gpu_hal::current_backend(),
+        "full_attention_decode_flat",
+        status,
+    )?;
     Ok(())
 }
 
@@ -3962,17 +4414,41 @@ pub fn swiglu_mul(
     up: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    swiglu_mul_impl(ordinal, dtype, elem_count, gate, up, out, None)
+}
+
+pub fn swiglu_mul_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    elem_count: usize,
+    gate: &GpuBuffer,
+    up: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    swiglu_mul_impl(ordinal, dtype, elem_count, gate, up, out, Some(options))
+}
+
+fn swiglu_mul_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    elem_count: usize,
+    gate: &GpuBuffer,
+    up: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() {
-            let result = metal_profile_time("swiglu_mul", "native", || {
+        if !prefill_native_disabled(options) {
+            let result = prefill_metal_profile_time(options, "swiglu_mul", "native", || {
                 metal_native::swiglu_mul(dtype, elem_count, gate, up, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_host_time("swiglu_mul", || {
+        return prefill_metal_profile_host_time(options, "swiglu_mul", || {
             metal_host::swiglu_mul(dtype, elem_count, gate, up, out)
         });
     }
@@ -3987,9 +4463,7 @@ pub fn swiglu_mul(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("swiglu_mul failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "swiglu_mul", status)?;
         Ok(())
     })
 }
@@ -4118,11 +4592,11 @@ pub fn rms_norm_gated_sfirst_bf16(
                 out_sfirst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "rms_norm_gated_sfirst_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "rms_norm_gated_sfirst_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -4248,6 +4722,49 @@ pub fn matmul_rhs_transposed(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    matmul_rhs_transposed_impl(ordinal, dtype, batch_elems, m, n, k, lhs, rhs, out, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_rhs_transposed_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    matmul_rhs_transposed_impl(
+        ordinal,
+        dtype,
+        batch_elems,
+        m,
+        n,
+        k,
+        lhs,
+        rhs,
+        out,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matmul_rhs_transposed_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         // M=1 batch=1 GEMV: SIMD-group cooperative reduction. Used by every
@@ -4262,55 +4779,81 @@ pub fn matmul_rhs_transposed(
         if dtype == ScalarType::BF16
             && batch_elems == 1
             && m == 1
-            && !metal_native::disabled_by_env()
-            && !metal_force_host_matmul()
-            && std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1").is_none()
+            && !prefill_native_disabled(options)
+            && !prefill_launch_flag(
+                options,
+                |options| options.force_host_matmul,
+                metal_force_host_matmul,
+            )
+            && !prefill_launch_flag(
+                options,
+                |options| options.disable_gemv_m1,
+                || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1").is_some(),
+            )
         {
-            let tiled_disabled =
-                std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1_TILED").is_some();
+            let tiled_disabled = prefill_launch_flag(
+                options,
+                |options| options.disable_gemv_m1_tiled,
+                || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1_TILED").is_some(),
+            );
             if !tiled_disabled && k <= 4096 {
-                let result =
-                    metal_profile_time("matmul_rhs_transposed_gemv_m1_tiled", "native", || {
-                        metal_native::matmul_rhs_transposed_bf16_gemv_m1_tiled(n, k, lhs, rhs, out)
-                    });
+                let result = prefill_metal_profile_time(
+                    options,
+                    "matmul_rhs_transposed_gemv_m1_tiled",
+                    "native",
+                    || metal_native::matmul_rhs_transposed_bf16_gemv_m1_tiled(n, k, lhs, rhs, out),
+                );
                 if result.is_ok() {
                     return result;
                 }
             }
-            let result = metal_profile_time("matmul_rhs_transposed_gemv_m1", "native", || {
-                metal_native::matmul_rhs_transposed_bf16_gemv_m1(n, k, lhs, rhs, out)
-            });
+            let result = prefill_metal_profile_time(
+                options,
+                "matmul_rhs_transposed_gemv_m1",
+                "native",
+                || metal_native::matmul_rhs_transposed_bf16_gemv_m1(n, k, lhs, rhs, out),
+            );
             if result.is_ok() {
                 return result;
             }
         }
         if dtype == ScalarType::BF16
-            && !metal_native::disabled_by_env()
-            && !metal_force_host_matmul()
+            && !prefill_native_disabled(options)
+            && !prefill_launch_flag(
+                options,
+                |options| options.force_host_matmul,
+                metal_force_host_matmul,
+            )
         {
-            let result = metal_profile_time("matmul_rhs_transposed", "native", || {
-                metal_native::matmul_rhs_transposed_bf16(batch_elems, m, n, k, lhs, rhs, out)
-            });
+            let result =
+                prefill_metal_profile_time(options, "matmul_rhs_transposed", "native", || {
+                    metal_native::matmul_rhs_transposed_bf16(batch_elems, m, n, k, lhs, rhs, out)
+                });
             if result.is_ok() {
                 return result;
             }
         }
         if dtype == ScalarType::F32
-            && !metal_native::disabled_by_env()
-            && !metal_force_host_matmul()
+            && !prefill_native_disabled(options)
+            && !prefill_launch_flag(
+                options,
+                |options| options.force_host_matmul,
+                metal_force_host_matmul,
+            )
         {
-            let result = metal_profile_time("matmul_rhs_transposed", "native", || {
-                metal_native::matmul_rhs_transposed_f32(batch_elems, m, n, k, lhs, rhs, out)
-            });
+            let result =
+                prefill_metal_profile_time(options, "matmul_rhs_transposed", "native", || {
+                    metal_native::matmul_rhs_transposed_f32(batch_elems, m, n, k, lhs, rhs, out)
+                });
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_host_time("matmul_rhs_transposed", || {
+        return prefill_metal_profile_host_time(options, "matmul_rhs_transposed", || {
             metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out)
         });
     }
-    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+    let profile_key = if prefill_profile_shapes(options) {
         format!(
             "qwen.matmul_rhs_transposed[b={} m={} n={} k={} dtype={:?}]",
             batch_elems, m, n, k, dtype
@@ -4332,9 +4875,7 @@ pub fn matmul_rhs_transposed(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("matmul_rhs_transposed failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "matmul_rhs_transposed", status)?;
         Ok(())
     })
 }
@@ -4436,6 +4977,76 @@ pub fn matmul_rhs_transposed_int4(
     quant_type: i32,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    matmul_rhs_transposed_int4_impl(
+        ordinal,
+        batch_elems,
+        m,
+        n,
+        k,
+        lhs,
+        rhs_int4,
+        scale,
+        zero,
+        awq_inv_scale,
+        group_size,
+        quant_type,
+        out,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_rhs_transposed_int4_with_options(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_int4: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: &GpuBuffer,
+    awq_inv_scale: Option<&GpuBuffer>,
+    group_size: usize,
+    quant_type: i32,
+    out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    matmul_rhs_transposed_int4_impl(
+        ordinal,
+        batch_elems,
+        m,
+        n,
+        k,
+        lhs,
+        rhs_int4,
+        scale,
+        zero,
+        awq_inv_scale,
+        group_size,
+        quant_type,
+        out,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matmul_rhs_transposed_int4_impl(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_int4: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: &GpuBuffer,
+    awq_inv_scale: Option<&GpuBuffer>,
+    group_size: usize,
+    quant_type: i32,
+    out: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         // M=1 batch=1 GEMV: SIMD-group cooperative reduction with on-the-fly
@@ -4449,12 +5060,20 @@ pub fn matmul_rhs_transposed_int4(
         // down_proj K=8960).
         if batch_elems == 1
             && m == 1
-            && std::env::var_os("SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1").is_none()
+            && !prefill_launch_flag(
+                options,
+                |options| options.disable_int4_gemv_m1,
+                || std::env::var_os("SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1").is_some(),
+            )
         {
-            let tiled_disabled =
-                std::env::var_os("SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1_TILED").is_some();
+            let tiled_disabled = prefill_launch_flag(
+                options,
+                |options| options.disable_int4_gemv_m1_tiled,
+                || std::env::var_os("SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1_TILED").is_some(),
+            );
             if !tiled_disabled && k <= 4096 {
-                let result = metal_profile_time(
+                let result = prefill_metal_profile_time(
+                    options,
                     "matmul_rhs_transposed_int4_gemv_m1_tiled",
                     "native",
                     || {
@@ -4467,16 +5086,21 @@ pub fn matmul_rhs_transposed_int4(
                     return result;
                 }
             }
-            let result = metal_profile_time("matmul_rhs_transposed_int4_gemv_m1", "native", || {
-                metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1(
-                    n, k, group_size, lhs, rhs_int4, scale, zero, out,
-                )
-            });
+            let result = prefill_metal_profile_time(
+                options,
+                "matmul_rhs_transposed_int4_gemv_m1",
+                "native",
+                || {
+                    metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1(
+                        n, k, group_size, lhs, rhs_int4, scale, zero, out,
+                    )
+                },
+            );
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_time("matmul_rhs_transposed_int4", "native", || {
+        return prefill_metal_profile_time(options, "matmul_rhs_transposed_int4", "native", || {
             metal_native::matmul_rhs_transposed_int4_bf16(
                 batch_elems,
                 m,
@@ -4491,7 +5115,7 @@ pub fn matmul_rhs_transposed_int4(
             )
         });
     }
-    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+    let profile_key = if prefill_profile_shapes(options) {
         format!(
             "qwen.matmul_rhs_transposed_int4[b={} m={} n={} k={} g={} qt={}]",
             batch_elems, m, n, k, group_size, quant_type
@@ -4520,11 +5144,11 @@ pub fn matmul_rhs_transposed_int4(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "matmul_rhs_transposed_int4 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "matmul_rhs_transposed_int4",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -5052,13 +5676,59 @@ pub fn rms_norm_rows(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    rms_norm_rows_impl(
+        ordinal, dtype, n_rows, n_cols, eps, input, weight, out, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_rows_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    rms_norm_rows_impl(
+        ordinal,
+        dtype,
+        n_rows,
+        n_cols,
+        eps,
+        input,
+        weight,
+        out,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rms_norm_rows_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         if dtype == ScalarType::BF16
-            && !metal_native::disabled_by_env()
-            && !metal_force_host_rms_norm()
+            && !prefill_native_disabled(options)
+            && !prefill_launch_flag(
+                options,
+                |options| options.force_host_rms_norm,
+                metal_force_host_rms_norm,
+            )
         {
-            let result = metal_profile_time("rms_norm_rows", "native", || {
+            let result = prefill_metal_profile_time(options, "rms_norm_rows", "native", || {
                 metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, true, input, weight, out)
             });
             if result.is_ok() {
@@ -5066,21 +5736,25 @@ pub fn rms_norm_rows(
             }
         }
         if dtype == ScalarType::F32
-            && !metal_native::disabled_by_env()
-            && !metal_force_host_rms_norm()
+            && !prefill_native_disabled(options)
+            && !prefill_launch_flag(
+                options,
+                |options| options.force_host_rms_norm,
+                metal_force_host_rms_norm,
+            )
         {
-            let result = metal_profile_time("rms_norm_rows", "native", || {
+            let result = prefill_metal_profile_time(options, "rms_norm_rows", "native", || {
                 metal_native::rms_norm_rows_f32(n_rows, n_cols, eps, true, input, weight, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_host_time("rms_norm_rows", || {
+        return prefill_metal_profile_host_time(options, "rms_norm_rows", || {
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out)
         });
     }
-    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+    let profile_key = if prefill_profile_shapes(options) {
         format!(
             "qwen.rms_norm_rows[rows={} cols={} dtype={:?}]",
             n_rows, n_cols, dtype
@@ -5102,9 +5776,7 @@ pub fn rms_norm_rows(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("rms_norm_rows failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "rms_norm_rows", status)?;
         Ok(())
     })
 }
@@ -5172,9 +5844,7 @@ pub fn rms_norm_rows_plain(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("rms_norm_rows_plain failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "rms_norm_rows_plain", status)?;
         Ok(())
     })
 }
@@ -5244,11 +5914,11 @@ pub fn rms_norm_rows_plain_inplace(
                 ptr,
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "rms_norm_rows_plain_inplace failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "rms_norm_rows_plain_inplace",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -5262,6 +5932,28 @@ pub fn element_add_inplace(
     lhs_out: &mut GpuBuffer,
     rhs: &GpuBuffer,
 ) -> Result<(), GpuError> {
+    element_add_inplace_impl(ordinal, dtype, total_elems, lhs_out, rhs, None)
+}
+
+pub fn element_add_inplace_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    total_elems: usize,
+    lhs_out: &mut GpuBuffer,
+    rhs: &GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    element_add_inplace_impl(ordinal, dtype, total_elems, lhs_out, rhs, Some(options))
+}
+
+fn element_add_inplace_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    total_elems: usize,
+    lhs_out: &mut GpuBuffer,
+    rhs: &GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if lhs_out.backend() == Backend::Metal {
         let mut lhs = GpuBuffer::zeros(ordinal, dtype, lhs_out.shape())?;
         metal_native::flush_batch()?;
@@ -5271,15 +5963,22 @@ pub fn element_add_inplace(
             lhs_out.as_ptr(),
             lhs_out.len_bytes(),
         )?;
-        if !metal_native::disabled_by_env() && !metal_force_host_element_add() {
-            let result = metal_profile_time("element_add_inplace", "native", || {
-                metal_native::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
-            });
+        if !prefill_native_disabled(options)
+            && !prefill_launch_flag(
+                options,
+                |options| options.force_host_element_add,
+                metal_force_host_element_add,
+            )
+        {
+            let result =
+                prefill_metal_profile_time(options, "element_add_inplace", "native", || {
+                    metal_native::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
+                });
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_host_time("element_add_inplace", || {
+        return prefill_metal_profile_host_time(options, "element_add_inplace", || {
             metal_host::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
         });
     }
@@ -5294,9 +5993,7 @@ pub fn element_add_inplace(
             ptr,
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!("element_add_inplace failed: {status}")));
-    }
+    prefill_bridge_result(gpu_hal::current_backend(), "element_add_inplace", status)?;
     Ok(())
 }
 
@@ -5329,6 +6026,37 @@ pub fn qwen36_router_softmax_topk_bf16(
     )
 }
 
+pub fn qwen36_router_softmax_topk_bf16_with_options(
+    n_tokens: usize,
+    num_experts: usize,
+    top_k: usize,
+    logits: &GpuBuffer,
+    topk_idx: &mut GpuBuffer,
+    topk_weight: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    if logits.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "qwen36_router_softmax_topk_bf16_with_options requires Metal logits".into(),
+        ));
+    }
+    prefill_metal_profile_time(
+        Some(options),
+        "qwen36_batched_prefill_router_softmax_topk",
+        "native",
+        || {
+            metal_native::qwen36_router_softmax_topk_bf16(
+                n_tokens,
+                num_experts,
+                top_k,
+                logits,
+                topk_idx,
+                topk_weight,
+            )
+        },
+    )
+}
+
 pub fn qwen36_ffn_residual_add_bf16(
     total_elems: usize,
     residual: &mut GpuBuffer,
@@ -5345,6 +6073,26 @@ pub fn qwen36_ffn_residual_add_bf16(
     })
 }
 
+pub fn qwen36_ffn_residual_add_bf16_with_options(
+    total_elems: usize,
+    residual: &mut GpuBuffer,
+    combined: &GpuBuffer,
+    shared: &GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    if residual.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "qwen36_ffn_residual_add_bf16_with_options requires a Metal residual buffer".into(),
+        ));
+    }
+    prefill_metal_profile_time(
+        Some(options),
+        "qwen36_batched_prefill_ffn_residual_add",
+        "native",
+        || metal_native::qwen36_ffn_residual_add_bf16(total_elems, residual, combined, shared),
+    )
+}
+
 // ---- Cast between dtypes ----
 
 /// Cast all elements from one dtype to another on GPU.
@@ -5356,17 +6104,63 @@ pub fn cast(
     input: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    cast_impl(
+        ordinal,
+        input_dtype,
+        output_dtype,
+        total_elems,
+        input,
+        out,
+        None,
+    )
+}
+
+pub fn cast_with_options(
+    ordinal: usize,
+    input_dtype: ScalarType,
+    output_dtype: ScalarType,
+    total_elems: usize,
+    input: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    cast_impl(
+        ordinal,
+        input_dtype,
+        output_dtype,
+        total_elems,
+        input,
+        out,
+        Some(options),
+    )
+}
+
+fn cast_impl(
+    ordinal: usize,
+    input_dtype: ScalarType,
+    output_dtype: ScalarType,
+    total_elems: usize,
+    input: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() && !metal_force_host_cast() {
-            let result = metal_profile_time("cast", "native", || {
+        if !prefill_native_disabled(options)
+            && !prefill_launch_flag(
+                options,
+                |options| options.force_host_cast,
+                metal_force_host_cast,
+            )
+        {
+            let result = prefill_metal_profile_time(options, "cast", "native", || {
                 metal_native::cast(input_dtype, output_dtype, total_elems, input, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_host_time("cast", || {
+        return prefill_metal_profile_host_time(options, "cast", || {
             metal_host::cast(input_dtype, output_dtype, total_elems, input, out)
         });
     }
@@ -5381,9 +6175,7 @@ pub fn cast(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("cast failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "cast", status)?;
         Ok(())
     })
 }
@@ -5424,9 +6216,7 @@ pub fn element_add(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("element_add failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "element_add", status)?;
         Ok(())
     })
 }
@@ -5479,9 +6269,7 @@ pub fn argmax_bf16_rows(
                 out_index.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("argmax_bf16_rows failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "argmax_bf16_rows", status)?;
         Ok(())
     })
 }
@@ -5505,20 +6293,70 @@ pub fn apply_rope_prefill(
     pos_offset: usize,
     data: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    apply_rope_prefill_impl(
+        ordinal, dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset,
+        data, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_rope_prefill_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    pos_offset: usize,
+    data: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    apply_rope_prefill_impl(
+        ordinal,
+        dtype,
+        seq_len,
+        num_heads,
+        head_dim,
+        rotary_dim,
+        cos_table,
+        sin_table,
+        pos_offset,
+        data,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_rope_prefill_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    pos_offset: usize,
+    data: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if data.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() {
-            let result = metal_profile_time("apply_rope_prefill", "native", || {
-                metal_native::apply_rope_prefill(
-                    dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table,
-                    pos_offset, data,
-                )
-            });
+        if !prefill_native_disabled(options) {
+            let result =
+                prefill_metal_profile_time(options, "apply_rope_prefill", "native", || {
+                    metal_native::apply_rope_prefill(
+                        dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table,
+                        pos_offset, data,
+                    )
+                });
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_host_time("apply_rope_prefill", || {
+        return prefill_metal_profile_host_time(options, "apply_rope_prefill", || {
             metal_host::apply_rope_prefill(
                 dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset,
                 data,
@@ -5545,9 +6383,7 @@ pub fn apply_rope_prefill(
                 data.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("apply_rope_prefill failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "apply_rope_prefill", status)?;
         Ok(())
     })
 }
@@ -5614,11 +6450,11 @@ pub fn apply_rope_prefill_indirect(
             data.as_mut_ptr(),
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "apply_rope_prefill_indirect failed: {status}"
-        )));
-    }
+    prefill_bridge_result(
+        gpu_hal::current_backend(),
+        "apply_rope_prefill_indirect",
+        status,
+    )?;
     Ok(())
 }
 
@@ -5720,11 +6556,11 @@ pub fn lookahead_attention_scores(
             scores.as_mut_ptr(),
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "lookahead_attention_scores failed: {status}"
-        )));
-    }
+    prefill_bridge_result(
+        gpu_hal::current_backend(),
+        "lookahead_attention_scores",
+        status,
+    )?;
     Ok(())
 }
 
@@ -5818,9 +6654,7 @@ pub fn pflash_cosine_score(
             scores.as_mut_ptr(),
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!("pflash_cosine_score failed: {status}")));
-    }
+    prefill_bridge_result(gpu_hal::current_backend(), "pflash_cosine_score", status)?;
     Ok(())
 }
 
@@ -5836,17 +6670,51 @@ pub fn transpose_shd_hsd(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    transpose_shd_hsd_impl(ordinal, dtype, s, h, d, src, dst, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn transpose_shd_hsd_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    h: usize,
+    d: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    transpose_shd_hsd_impl(ordinal, dtype, s, h, d, src, dst, Some(options))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transpose_shd_hsd_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    h: usize,
+    d: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() && !metal_force_host_transpose_shd_hsd() {
-            let result = metal_profile_time("transpose_shd_hsd", "native", || {
+        if !prefill_native_disabled(options)
+            && !prefill_launch_flag(
+                options,
+                |options| options.force_host_transpose_shd_hsd,
+                metal_force_host_transpose_shd_hsd,
+            )
+        {
+            let result = prefill_metal_profile_time(options, "transpose_shd_hsd", "native", || {
                 metal_native::transpose_shd_hsd(dtype, s, h, d, src, dst)
             });
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_host_time("transpose_shd_hsd", || {
+        return prefill_metal_profile_host_time(options, "transpose_shd_hsd", || {
             metal_host::transpose_shd_hsd(dtype, s, h, d, src, dst)
         });
     }
@@ -5862,9 +6730,7 @@ pub fn transpose_shd_hsd(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("transpose_shd_hsd failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "transpose_shd_hsd", status)?;
         Ok(())
     })
 }
@@ -5899,11 +6765,7 @@ pub fn transpose_shd_hsd_pair(
                 dst_b.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "transpose_shd_hsd_pair failed: {status}"
-            )));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "transpose_shd_hsd_pair", status)?;
         Ok(())
     })
 }
@@ -5951,11 +6813,11 @@ pub fn transpose_shd_to_cache_bf16(
                 cache.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "transpose_shd_to_cache_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "transpose_shd_to_cache_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -5999,9 +6861,7 @@ pub fn transpose_pad_conv(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("transpose_pad_conv failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "transpose_pad_conv", status)?;
         Ok(())
     })
 }
@@ -6044,9 +6904,7 @@ pub fn extract_conv_state(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("extract_conv_state failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "extract_conv_state", status)?;
         Ok(())
     })
 }
@@ -6083,11 +6941,11 @@ pub fn prepare_conv_input_tail(
                 new_tail.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "prepare_conv_input_tail failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "prepare_conv_input_tail",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -6103,17 +6961,41 @@ pub fn sigmoid_mul(
     gate: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    sigmoid_mul_impl(ordinal, dtype, total_elems, data, gate, out, None)
+}
+
+pub fn sigmoid_mul_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    total_elems: usize,
+    data: &GpuBuffer,
+    gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    sigmoid_mul_impl(ordinal, dtype, total_elems, data, gate, out, Some(options))
+}
+
+fn sigmoid_mul_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    total_elems: usize,
+    data: &GpuBuffer,
+    gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() {
-            let result = metal_profile_time("sigmoid_mul", "native", || {
+        if !prefill_native_disabled(options) {
+            let result = prefill_metal_profile_time(options, "sigmoid_mul", "native", || {
                 metal_native::sigmoid_mul(dtype, total_elems, data, gate, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_host_time("sigmoid_mul", || {
+        return prefill_metal_profile_host_time(options, "sigmoid_mul", || {
             metal_host::sigmoid_mul(dtype, total_elems, data, gate, out)
         });
     }
@@ -6128,9 +7010,7 @@ pub fn sigmoid_mul(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("sigmoid_mul failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "sigmoid_mul", status)?;
         Ok(())
     })
 }
@@ -6160,9 +7040,7 @@ pub fn sigmoid_mul_inplace(
                 data.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("sigmoid_mul_inplace failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "sigmoid_mul_inplace", status)?;
         Ok(())
     })
 }
@@ -6206,11 +7084,11 @@ pub fn cast_transpose_gate_hsd_to_shd_bf16(
                 out_shd.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "cast_transpose_gate_hsd_to_shd_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "cast_transpose_gate_hsd_to_shd_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -6224,22 +7102,46 @@ pub fn sigmoid_mul_row_scalar_bf16(
     row_gate: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    sigmoid_mul_row_scalar_bf16_impl(rows, cols, data, row_gate, out, None)
+}
+
+pub fn sigmoid_mul_row_scalar_bf16_with_options(
+    ordinal: usize,
+    rows: usize,
+    cols: usize,
+    data: &GpuBuffer,
+    row_gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    let _ = ordinal;
+    sigmoid_mul_row_scalar_bf16_impl(rows, cols, data, row_gate, out, Some(options))
+}
+
+fn sigmoid_mul_row_scalar_bf16_impl(
+    rows: usize,
+    cols: usize,
+    data: &GpuBuffer,
+    row_gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if out.backend() != Backend::Metal {
         return Err(GpuError::backend(
             out.backend(),
             "sigmoid_mul_row_scalar_bf16 is currently implemented only for Metal".into(),
         ));
     }
-    let _ = ordinal;
-    if !metal_native::disabled_by_env() {
-        let result = metal_profile_time("sigmoid_mul_row_scalar", "native", || {
-            metal_native::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
-        });
+    if !prefill_native_disabled(options) {
+        let result =
+            prefill_metal_profile_time(options, "sigmoid_mul_row_scalar", "native", || {
+                metal_native::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
+            });
         if result.is_ok() {
             return result;
         }
     }
-    metal_profile_host_time("sigmoid_mul_row_scalar", || {
+    prefill_metal_profile_host_time(options, "sigmoid_mul_row_scalar", || {
         metal_host::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
     })
 }
@@ -6290,9 +7192,7 @@ pub fn compute_beta_g(
                 g.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("compute_beta_g failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "compute_beta_g", status)?;
         Ok(())
     })
 }
@@ -6320,11 +7220,7 @@ pub fn compute_beta_g_ba_bf16(
                 g.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "compute_beta_g_ba_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "compute_beta_g_ba_bf16", status)?;
         Ok(())
     })
 }
@@ -6378,11 +7274,11 @@ pub fn project_ba_compute_beta_g_bf16(
                 g.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "project_ba_compute_beta_g_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "project_ba_compute_beta_g_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -6400,17 +7296,65 @@ pub fn split_qgate(
     query_out: &mut GpuBuffer,
     gate_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    split_qgate_impl(
+        ordinal, dtype, s, num_heads, head_dim, src, query_out, gate_out, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn split_qgate_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    num_heads: usize,
+    head_dim: usize,
+    src: &GpuBuffer,
+    query_out: &mut GpuBuffer,
+    gate_out: &mut GpuBuffer,
+    options: &PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    split_qgate_impl(
+        ordinal,
+        dtype,
+        s,
+        num_heads,
+        head_dim,
+        src,
+        query_out,
+        gate_out,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_qgate_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    num_heads: usize,
+    head_dim: usize,
+    src: &GpuBuffer,
+    query_out: &mut GpuBuffer,
+    gate_out: &mut GpuBuffer,
+    options: Option<&PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if query_out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() && !metal_force_host_split_qgate() {
-            let result = metal_profile_time("split_qgate", "native", || {
+        if !prefill_native_disabled(options)
+            && !prefill_launch_flag(
+                options,
+                |options| options.force_host_split_qgate,
+                metal_force_host_split_qgate,
+            )
+        {
+            let result = prefill_metal_profile_time(options, "split_qgate", "native", || {
                 metal_native::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
             });
             if result.is_ok() {
                 return result;
             }
         }
-        return metal_profile_host_time("split_qgate", || {
+        return prefill_metal_profile_host_time(options, "split_qgate", || {
             metal_host::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
         });
     }
@@ -6427,9 +7371,7 @@ pub fn split_qgate(
                 gate_out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qgate failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qgate", status)?;
         Ok(())
     })
 }
@@ -6482,9 +7424,7 @@ pub fn split_qgate_norm_bf16(
                 gate_out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qgate_norm_bf16 failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qgate_norm_bf16", status)?;
         Ok(())
     })
 }
@@ -6532,9 +7472,7 @@ pub fn split_qkv(
                 v.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qkv failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qkv", status)?;
         Ok(())
     })
 }
@@ -6567,9 +7505,7 @@ pub fn split_qkv_bf16_to_f32(
                 v.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qkv_bf16_to_f32 failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qkv_bf16_to_f32", status)?;
         Ok(())
     })
 }
@@ -6598,9 +7534,7 @@ pub fn split_kv_bf16(
                 v.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_kv_bf16 failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_kv_bf16", status)?;
         Ok(())
     })
 }
@@ -6641,11 +7575,11 @@ pub fn split_norm_transpose_qkv_bf16(
                 v.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "split_norm_transpose_qkv_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "split_norm_transpose_qkv_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -6676,9 +7610,7 @@ pub fn split_qkvz_bf16(
                 z.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qkvz_bf16 failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qkvz_bf16", status)?;
         Ok(())
     })
 }
@@ -6726,11 +7658,11 @@ pub fn repeat_interleave_heads(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "repeat_interleave_heads failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "repeat_interleave_heads",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -6780,11 +7712,11 @@ pub fn repeat_interleave_transpose_hsd(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "repeat_interleave_transpose_hsd failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "repeat_interleave_transpose_hsd",
+            status,
+        )?;
         Ok(())
     })
 }
