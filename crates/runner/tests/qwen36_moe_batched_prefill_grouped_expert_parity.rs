@@ -1,5 +1,5 @@
 //! Kernel-direct parity sweep for the M10 grouped-expert INT4 GEMM kernel
-//! (`qwen36_moe::batched_prefill_grouped_expert_launch`).
+//! (`qwen36_moe::batched_prefill_grouped_expert_launch_with_desc`).
 //!
 //! Runs the GPU kernel against a pure-CPU reference that does the same
 //! gather + gate_up + silu*mul + down sequence per (token, kpos) pair.
@@ -13,7 +13,7 @@
 
 use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use kernel_ffi::qwen36_moe::Qwen36MoeInt4WeightDesc;
-use supersonic_runtime::qwen36_moe::prefill::batched_prefill_grouped_expert_launch;
+use supersonic_runtime::qwen36_moe::prefill::batched_prefill_grouped_expert_launch_with_desc;
 
 // gpu-hal's ScalarType has no I32 variant — we use U32 as the 4-byte
 // storage tag for buffers that semantically hold i32 values. The kernel
@@ -431,7 +431,7 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
     let mut counters_buf =
         GpuBuffer::zeros(ordinal, ScalarType::U32, &[1]).expect("alloc counters");
 
-    batched_prefill_grouped_expert_launch(
+    batched_prefill_grouped_expert_launch_with_desc(
         ordinal,
         shape.n_tokens,
         shape.top_k,

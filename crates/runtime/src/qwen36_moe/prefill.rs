@@ -52,7 +52,7 @@ use model_store::BakedStore;
 
 pub use kernel_ffi::qwen36_moe::{
     batched_prefill_attn_full_launch, batched_prefill_grouped_expert_launch,
-    batched_prefill_router_permute_launch,
+    batched_prefill_grouped_expert_launch_with_desc, batched_prefill_router_permute_launch,
 };
 
 use crate::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};

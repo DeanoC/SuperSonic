@@ -13386,8 +13386,97 @@ fn validate_batched_prefill_grouped_expert_launch(
     Ok(dims)
 }
 
+fn legacy_tile_v1_weight_desc(
+    scale: &GpuBuffer,
+    zero: &GpuBuffer,
+    out_rows: usize,
+    in_cols: usize,
+) -> Qwen36MoeInt4WeightDesc {
+    let packed_row_stride_bytes = in_cols / 2;
+    let scale_row_stride_elements = in_cols / 128;
+    Qwen36MoeInt4WeightDesc {
+        scale: scale.as_ptr(),
+        zero: zero.as_ptr(),
+        packed_row_stride_bytes: packed_row_stride_bytes as u64,
+        packed_expert_stride_bytes: (out_rows * packed_row_stride_bytes) as u64,
+        scale_row_stride_elements: scale_row_stride_elements as u64,
+        scale_expert_stride_elements: ((out_rows / 128) * scale_row_stride_elements) as u64,
+        input_group_size: 128,
+        output_group_size: 128,
+        implicit_zero_code: -1,
+        encoding: 1,
+    }
+}
+
+/// Compatibility wrapper for the pre-descriptor grouped-expert launcher.
+///
+/// `kernel-lab compare-ref` overlays the candidate harness crate onto a base
+/// worktree, so this public signature must remain callable against the base
+/// `kernel-ffi`. The descriptor-native implementation lives in
+/// [`batched_prefill_grouped_expert_launch_with_desc`].
 #[allow(clippy::too_many_arguments)]
 pub fn batched_prefill_grouped_expert_launch(
+    ordinal: usize,
+    n_tokens: usize,
+    top_k: usize,
+    num_experts: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    group_size: usize,
+    x_norm: &GpuBuffer,
+    expert_offsets: &GpuBuffer,
+    permuted_token_idx: &GpuBuffer,
+    experts_gate_up_w: &GpuBuffer,
+    experts_gate_up_scale: &GpuBuffer,
+    experts_gate_up_zero: &GpuBuffer,
+    experts_down_w: &GpuBuffer,
+    experts_down_scale: &GpuBuffer,
+    experts_down_zero: &GpuBuffer,
+    expert_out: &mut GpuBuffer,
+    counters: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if group_size != 128 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::batched_prefill_grouped_expert_launch: group_size {group_size} is not 128"
+        )));
+    }
+    let gate_up_desc = legacy_tile_v1_weight_desc(
+        experts_gate_up_scale,
+        experts_gate_up_zero,
+        2 * moe_intermediate,
+        hidden,
+    );
+    let down_desc = legacy_tile_v1_weight_desc(
+        experts_down_scale,
+        experts_down_zero,
+        hidden,
+        moe_intermediate,
+    );
+    batched_prefill_grouped_expert_launch_with_desc(
+        ordinal,
+        n_tokens,
+        top_k,
+        num_experts,
+        hidden,
+        moe_intermediate,
+        x_norm,
+        expert_offsets,
+        permuted_token_idx,
+        experts_gate_up_w,
+        experts_gate_up_scale,
+        Some(experts_gate_up_zero),
+        &gate_up_desc,
+        experts_down_w,
+        experts_down_scale,
+        Some(experts_down_zero),
+        &down_desc,
+        expert_out,
+        counters,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn batched_prefill_grouped_expert_launch_with_desc(
     ordinal: usize,
     n_tokens: usize,
     top_k: usize,
@@ -13678,6 +13767,30 @@ mod tests {
 
     static PROFILE_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn grouped_expert_launcher_keeps_legacy_compare_ref_signature() {
+        let _: fn(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            &GpuBuffer,
+            &GpuBuffer,
+            &GpuBuffer,
+            &GpuBuffer,
+            &GpuBuffer,
+            &GpuBuffer,
+            &GpuBuffer,
+            &GpuBuffer,
+            &GpuBuffer,
+            &mut GpuBuffer,
+            &mut GpuBuffer,
+        ) -> Result<(), GpuError> = batched_prefill_grouped_expert_launch;
+    }
+
     fn tile_v1_weight_desc(
         scale: &GpuBuffer,
         zero: &GpuBuffer,
@@ -13803,7 +13916,7 @@ mod tests {
             moe_intermediate: usize,
             x_norm: Option<&GpuBuffer>,
         ) -> Result<(), GpuError> {
-            batched_prefill_grouped_expert_launch(
+            batched_prefill_grouped_expert_launch_with_desc(
                 ordinal,
                 n_tokens,
                 1,
