@@ -14,10 +14,9 @@
 // namespace and translation unit; they are NOT shared with the qwen35
 // kernels.
 //
-// The production decode path intentionally uses a fast reconstruction:
-//   recon = nibble * scale - zero * scale
-// This differs from the original oracle's per-nibble BF16 RNE but was kept
-// after 35B A3B full-harness benchmarking as a measured decode win.
+// The production decode path uses the same BF16 reconstruction contract as
+// the WMMA operand builder: each dequantized weight is rounded to BF16 before
+// it participates in the F32 accumulation.
 
 #pragma once
 
@@ -211,7 +210,8 @@ __device__ __forceinline__ void qwen36_g32_dequant_span_8(
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int code = static_cast<int>((packed_word >> (i * 4)) & 0x0f);
-        out[i] = (static_cast<float>(code) - 8.0f) * scale;
+        out[i] = bf16_round_rne_f32(
+            (static_cast<float>(code) - 8.0f) * scale);
     }
 }
 

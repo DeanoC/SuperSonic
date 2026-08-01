@@ -96,8 +96,8 @@ entered.
 
 The Qwen3.6 35B-A3B MoE FLM path uses the same single-source contract for the
 HIP decode path. The canonical producer-to-consumer gate prepares or reuses
-the native artifact, validates it, runs the benchmark, and checks first-class
-FLM evidence in the resulting JSON:
+the G32 row-group direct artifact, validates it, runs the benchmark, and checks
+first-class FLM evidence in the resulting JSON:
 
 ```bash
 cd /home/deano/projects/SuperSonicBase
@@ -111,7 +111,7 @@ python3 tests/gfx1100/run_qwen36_flm_first_class_e2e.py \
 ```
 
 By default, the verifier strictly reuses the artifact only after the
-`supersonic-qwen36-moe-native-int4` structural validation passes, then runs
+`supersonic-qwen36-moe-row-group-int4` structural validation passes, then runs
 full payload verification with `--verify-payload-hashes`. Pass `--regenerate`
 to force a fresh geo-quant export. Exports are written to a PID-specific
 `.partial-*` file and are renamed into the canonical path only after full
@@ -165,15 +165,15 @@ CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
   cargo test -q -p server
 ```
 
-For low-level diagnosis, validate the native SuperSonic-layout artifact with
-geo-quant's no-HF profile:
+For low-level diagnosis, validate the row-group SuperSonic-layout artifact
+with geo-quant's no-HF profile:
 
 ```bash
 cd /home/deano/projects/geo-quant
 /home/deano/projects/geo-quant/.venv-rocm/bin/python \
   -m geoquant.formats.flm_validate \
   /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
-  --profile supersonic-qwen36-moe-native-int4 \
+  --profile supersonic-qwen36-moe-row-group-int4 \
   --verify-payload-hashes
 ```
 

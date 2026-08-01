@@ -250,6 +250,28 @@ fn descriptor_scalar_pair_and_wmma_routes_have_g32_fast_branches() {
 }
 
 #[test]
+fn canonical_g32_scalar_and_wmma_weights_share_bf16_reconstruction() {
+    let scalar = helper_region(
+        "qwen36_g32_dequant_span_8(",
+        "struct qwen36_float_pair",
+    );
+    assert!(
+        scalar.contains("bf16_round_rne_f32"),
+        "scalar G32 reconstruction must round each weight to BF16"
+    );
+    let wmma = helper_region(
+        "qwen36_g32_wmma_operand(",
+        "template <typename Activation>",
+    );
+    assert!(wmma.contains("qwen36_bf16_operand_bits"));
+    assert!(
+        FFN_PHASE.contains("qwen36_g32_matvec_partial")
+            && FFN_PHASE.contains("qwen36_wmma_int4_matvec_partial_16rows"),
+        "FFN must retain both scalar and WMMA G32 routes"
+    );
+}
+
+#[test]
 fn persistent_ffn_has_a_prevalidated_g32_matrix_route_and_generic_fallback() {
     let ffn = include_str!("../../../kernels/qwen36_moe_persistent/ffn_phase.cuh");
     for required in [

@@ -667,6 +667,11 @@ fn flm_read_index_entries(
             ))
         })?;
 
+        if entries.contains_key(name) {
+            return Err(Error::Other(format!(
+                "duplicate FLM tensor name {name} in tensor index"
+            )));
+        }
         entries.insert(
             name.clone(),
             FlmIndexEntry {
@@ -5233,6 +5238,36 @@ mod tests {
         let norm = store.meta("model.norm.weight").unwrap();
         assert_eq!(norm.dtype, "bf16");
         assert_eq!(norm.shape, vec![2]);
+    }
+
+    #[test]
+    fn open_flm_rejects_duplicate_tensor_index_names() {
+        let data = build_test_flm(&[
+            TestFlmTensor {
+                name: "duplicate.tensor",
+                shape: vec![1],
+                dtype: 4,
+                codec: 0,
+                payload: vec![1],
+            },
+            TestFlmTensor {
+                name: "duplicate.tensor",
+                shape: vec![1],
+                dtype: 4,
+                codec: 0,
+                payload: vec![2],
+            },
+        ]);
+        let file = write_temp_flm(&data);
+
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("duplicate FLM tensor names must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("duplicate FLM tensor name"),
+            "unexpected duplicate-name error: {err}"
+        );
     }
 
     #[test]
