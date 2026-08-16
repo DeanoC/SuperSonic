@@ -197,6 +197,15 @@ fn descriptor_contract(view: &Int4StorageView) -> Result<DescriptorContract> {
             }
             (1, true, -1)
         }
+        Int4StorageKind::CtSymmetric => {
+            if view.group_size != 128
+                || view.output_group_size != 1
+                || view.implicit_zero_code != Some(8)
+            {
+                bail!("CT symmetric INT4 requires G128/output-G1 and implicit code 8");
+            }
+            (1, true, 8)
+        }
     };
     if cols % 2 != 0 || cols % view.group_size != 0 || rows % view.output_group_size != 0 {
         bail!("INT4 diagnostic view shape is not group aligned");
@@ -434,6 +443,7 @@ fn descriptor_evidence(sidecar: &LoadedInt4Sidecar) -> Result<Value> {
         "storage_kind": match sidecar.view.kind {
             Int4StorageKind::TileV1 => "tile-v1",
             Int4StorageKind::RowGroupSymmetric => "row-group-symmetric",
+            Int4StorageKind::CtSymmetric => "ct-symmetric",
         },
         "logical_shape": sidecar.view.logical_shape,
         "scale_tensor": sidecar.view.scale_tensor,

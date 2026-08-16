@@ -1251,6 +1251,15 @@ pub fn build_int4_weight_desc(sidecar: &LoadedInt4Sidecar) -> Result<Qwen36MoeIn
             }
             3
         }
+        Int4StorageKind::CtSymmetric => {
+            if view.implicit_zero_code != Some(8) {
+                return Err(anyhow!(
+                    "CT symmetric INT4 requires an implicit zero code of 8"
+                ));
+            }
+            // Same packed-nibble layout as tile-v1; zeros are implicit code 8.
+            1
+        }
     };
     if view.group_size == 0 || view.output_group_size == 0 {
         return Err(anyhow!("quantized storage group sizes must be nonzero"));

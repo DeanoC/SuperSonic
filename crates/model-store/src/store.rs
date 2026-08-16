@@ -177,6 +177,7 @@ struct CtSymInt4Bf16Fallback {
 pub enum Int4StorageKind {
     TileV1,
     RowGroupSymmetric,
+    CtSymmetric,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1417,6 +1418,7 @@ fn build_stage3_int4_storage(
     upload_views: &mut HashMap<String, TensorUploadView>,
     ct_int4_bf16_fallbacks: &mut HashMap<String, CtSymInt4Bf16Fallback>,
     int4_storage_views: &mut HashMap<String, Int4StorageView>,
+    synthetic: &mut HashMap<String, Vec<u8>>,
     index_entries: &HashMap<String, FlmIndexEntry>,
     insert_logical_aliases: bool,
 ) -> Result<(), Error> {
@@ -1424,6 +1426,7 @@ fn build_stage3_int4_storage(
     let mut staged_upload_views = upload_views.clone();
     let mut staged_ct_int4_bf16_fallbacks = ct_int4_bf16_fallbacks.clone();
     let mut staged_int4_storage_views = int4_storage_views.clone();
+    let mut staged_synthetic = synthetic.clone();
 
     build_stage3_int4_storage_staged(
         runtime,
@@ -1431,6 +1434,7 @@ fn build_stage3_int4_storage(
         &mut staged_upload_views,
         &mut staged_ct_int4_bf16_fallbacks,
         &mut staged_int4_storage_views,
+        &mut staged_synthetic,
         index_entries,
         insert_logical_aliases,
     )?;
@@ -1439,6 +1443,7 @@ fn build_stage3_int4_storage(
     *upload_views = staged_upload_views;
     *ct_int4_bf16_fallbacks = staged_ct_int4_bf16_fallbacks;
     *int4_storage_views = staged_int4_storage_views;
+    *synthetic = staged_synthetic;
     Ok(())
 }
 
@@ -1446,8 +1451,9 @@ fn build_stage3_int4_storage_staged(
     runtime: &crate::flm::FlmRuntimeDirectory,
     index: &mut HashMap<String, TensorMeta>,
     upload_views: &mut HashMap<String, TensorUploadView>,
-    ct_int4_bf16_fallbacks: &mut HashMap<String, CtSymInt4Bf16Fallback>,
+    _ct_int4_bf16_fallbacks: &mut HashMap<String, CtSymInt4Bf16Fallback>,
     int4_storage_views: &mut HashMap<String, Int4StorageView>,
+    synthetic: &mut HashMap<String, Vec<u8>>,
     index_entries: &HashMap<String, FlmIndexEntry>,
     insert_logical_aliases: bool,
 ) -> Result<(), Error> {
@@ -1556,14 +1562,13 @@ fn build_stage3_int4_storage_staged(
             })?;
             if logical.rank != 2 {
                 return Err(Error::Other(format!(
-                    "FLM Stage 3 INT4 tensor {} rank {} is unsupported for CT BF16 fallback",
+                    "FLM Stage 3 INT4 tensor {} rank {} is unsupported for CT direct INT4",
                     logical.name, logical.rank
                 )));
             }
-            let shape = vec![logical.shape[0] as usize, logical.shape[1] as usize];
             if scale.storage_dtype != FLM_DTYPE_BF16 {
                 return Err(Error::Other(format!(
-                    "FLM Stage 3 INT4 tensor {} scale binding dtype {} is unsupported for BF16 fallback",
+                    "FLM Stage 3 INT4 tensor {} scale binding dtype {} is unsupported for CT direct INT4",
                     logical.name, scale.storage_dtype
                 )));
             }
@@ -1571,47 +1576,154 @@ fn build_stage3_int4_storage_staged(
                 || storage_abi.bits != 4
             {
                 return Err(Error::Other(format!(
-                    "FLM Stage 3 INT4 tensor {} uses unsupported CT fallback ABI codec={} bits={}",
+                    "FLM Stage 3 INT4 tensor {} uses unsupported CT ABI codec={} bits={}",
                     logical.name, storage_abi.codec_semantic_id, storage_abi.bits
                 )));
             }
+            if packed_step.target_dtype != FLM_DTYPE_UINT8 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 CT INT4 tensor {} packed plan must target UINT8, got {}",
+                    logical.name, packed_step.target_dtype
+                )));
+            }
             let group_size = usize::from(storage_abi.group_size);
-            let byte_len = shape
+            if group_size == 0 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 CT INT4 tensor {} has zero group size",
+                    logical.name
+                )));
+            }
+            let logical_shape = flm_logical_shape(logical)?;
+            let packed_shape = flm_plan_target_shape(packed_step)?;
+            let scale_shape = flm_plan_target_shape(scale_step)?;
+            let expected_packed = vec![logical_shape[0], logical_shape[1].div_ceil(2)];
+            let expected_scale = vec![logical_shape[0], logical_shape[1].div_ceil(group_size)];
+            let expected_packed_len = expected_packed
                 .iter()
-                .try_fold(2usize, |acc, dim| acc.checked_mul(*dim))
+                .try_fold(1u64, |acc, dim| acc.checked_mul(*dim as u64))
                 .ok_or_else(|| {
                     Error::Other(format!(
-                        "FLM Stage 3 INT4 tensor {} BF16 fallback byte_len overflows",
+                        "FLM Stage 3 CT INT4 tensor {} packed byte_len overflows",
                         logical.name
                     ))
                 })?;
+            if packed_shape != expected_packed || packed_meta.byte_len != expected_packed_len {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 CT INT4 tensor {} packed plan shape {:?} / stored {} does not match UINT8 view {:?} ({expected_packed_len} bytes)",
+                    logical.name, packed_shape, packed_meta.byte_len, expected_packed
+                )));
+            }
+            let expected_scale_len = expected_scale
+                .iter()
+                .try_fold(2u64, |acc, dim| acc.checked_mul(*dim as u64))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 CT INT4 tensor {} scale byte_len overflows",
+                        logical.name
+                    ))
+                })?;
+            if scale_step.target_dtype != FLM_DTYPE_BF16
+                || scale_shape != expected_scale
+                || scale_meta.byte_len != expected_scale_len
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 CT INT4 tensor {} scale plan dtype {} / shape {:?} / stored {} does not match BF16 view {:?} ({expected_scale_len} bytes)",
+                    logical.name, scale_step.target_dtype, scale_shape, scale_meta.byte_len, expected_scale
+                )));
+            }
             if insert_logical_aliases {
+                let logical_identity = if logical.name == packed.tensor_name {
+                    Stage3AliasIdentity::LogicalPackedRebind {
+                        physical: &packed_meta,
+                    }
+                } else {
+                    Stage3AliasIdentity::New
+                };
                 apply_stage3_alias(
                     index,
                     upload_views,
                     TensorMeta {
                         name: logical.name.clone(),
-                        shape: shape.clone(),
+                        shape: packed_shape.clone(),
+                        dtype: "u8".to_string(),
+                        layout: LayoutTag::Int4Quantized,
+                        offset: packed_meta.offset,
+                        byte_len: packed_meta.byte_len,
+                    },
+                    TensorUploadView {
+                        dtype: "u8".to_string(),
+                        shape: packed_shape.clone(),
+                    },
+                    logical_identity,
+                )?;
+
+                let scale_alias = stage3_int4_sidecar_alias(&logical.name, "scale");
+                let scale_identity = if scale_alias == scale.tensor_name {
+                    Stage3AliasIdentity::ExactPhysicalReuse {
+                        physical: &scale_meta,
+                    }
+                } else {
+                    Stage3AliasIdentity::New
+                };
+                apply_stage3_alias(
+                    index,
+                    upload_views,
+                    TensorMeta {
+                        name: scale_alias.clone(),
+                        shape: scale_shape.clone(),
                         dtype: "bf16".to_string(),
                         layout: LayoutTag::Raw,
-                        offset: packed_meta.offset,
-                        byte_len: byte_len as u64,
+                        offset: scale_meta.offset,
+                        byte_len: scale_meta.byte_len,
                     },
                     TensorUploadView {
                         dtype: "bf16".to_string(),
-                        shape: shape.clone(),
+                        shape: scale_shape.clone(),
+                    },
+                    scale_identity,
+                )?;
+
+                let zero_alias = stage3_int4_sidecar_alias(&logical.name, "zero");
+                apply_stage3_alias(
+                    index,
+                    upload_views,
+                    TensorMeta {
+                        name: zero_alias.clone(),
+                        shape: scale_shape.clone(),
+                        dtype: "bf16".to_string(),
+                        layout: LayoutTag::Raw,
+                        offset: 0,
+                        byte_len: expected_scale_len,
+                    },
+                    TensorUploadView {
+                        dtype: "bf16".to_string(),
+                        shape: scale_shape.clone(),
                     },
                     Stage3AliasIdentity::New,
                 )?;
-                ct_int4_bf16_fallbacks
-                    .entry(logical.name.clone())
-                    .or_insert_with(|| CtSymInt4Bf16Fallback {
-                        packed_tensor: packed.tensor_name.clone(),
-                        scale_tensor: scale.tensor_name.clone(),
-                        shape,
-                        group_size,
-                    });
+                synthetic
+                    .entry(zero_alias)
+                    .or_insert_with(|| bf16_eight_bytes(expected_scale_len as usize));
             }
+            int4_storage_views.insert(
+                logical.name.clone(),
+                Int4StorageView {
+                    kind: Int4StorageKind::CtSymmetric,
+                    group_size,
+                    packed_tensor: packed.tensor_name.clone(),
+                    scale_tensor: scale.tensor_name.clone(),
+                    zero_tensor: None,
+                    logical_shape,
+                    packed_row_stride_bytes: expected_packed[1],
+                    packed_expert_stride_bytes: expected_packed[0]
+                        .saturating_mul(expected_packed[1]),
+                    scale_row_stride_elements: expected_scale[1],
+                    scale_expert_stride_elements: expected_scale[0]
+                        .saturating_mul(expected_scale[1]),
+                    output_group_size: 1,
+                    implicit_zero_code: Some(8),
+                },
+            );
             continue;
         }
         if kind == crate::flm::FlmStage3DirectWeightKind::RowGroupInt4 {
@@ -2313,6 +2425,7 @@ impl BakedStore {
                     &mut upload_views,
                     &mut ct_int4_bf16_fallbacks,
                     &mut int4_storage_views,
+                    &mut synthetic,
                     &index_entries,
                     options.flm_int4_logical_aliases,
                 )?;
@@ -5874,7 +5987,7 @@ mod tests {
     }
 
     #[test]
-    fn open_flm_builds_ct_int4_stage3_binding_as_bf16_fallback() {
+    fn open_flm_builds_ct_int4_stage3_binding_as_direct_int4() {
         let data = build_test_flm_with_stage3_logical_bindings();
         let file = write_temp_flm(&data);
 
@@ -5889,17 +6002,35 @@ mod tests {
 
         let alias = store
             .meta("model.language_model.layers.0.mlp.gate_proj.weight")
-            .expect("logical INT4 fallback alias");
-        assert_eq!(alias.layout, LayoutTag::Raw);
-        assert_eq!(alias.dtype, "bf16");
-        assert_eq!(alias.shape, vec![128, 64]);
-        assert_eq!(alias.byte_len, 128 * 64 * 2);
+            .expect("logical CT INT4 packed alias");
+        assert_eq!(alias.layout, LayoutTag::Int4Quantized);
+        assert_eq!(alias.dtype, "u8");
+        assert_eq!(alias.shape, vec![128, 32]);
+        assert_eq!(alias.byte_len, 128 * 32);
 
         let upload_view = store
             .upload_view("model.language_model.layers.0.mlp.gate_proj.weight")
-            .expect("logical INT4 fallback upload view");
-        assert_eq!(upload_view.dtype, "bf16");
-        assert_eq!(upload_view.shape, vec![128, 64]);
+            .expect("logical CT INT4 upload view");
+        assert_eq!(upload_view.dtype, "u8");
+        assert_eq!(upload_view.shape, vec![128, 32]);
+
+        let scale = store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight_int4_scale")
+            .expect("CT INT4 scale alias");
+        assert_eq!(scale.dtype, "bf16");
+        assert_eq!(scale.shape, vec![128, 1]);
+
+        let zero = store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight_int4_zero")
+            .expect("CT INT4 implicit-zero alias");
+        assert_eq!(zero.dtype, "bf16");
+        assert_eq!(zero.shape, vec![128, 1]);
+
+        let view = store
+            .int4_storage_view("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("CT INT4 storage view");
+        assert_eq!(view.kind, Int4StorageKind::CtSymmetric);
+        assert_eq!(view.implicit_zero_code, Some(8));
     }
 
     #[test]
@@ -6131,12 +6262,14 @@ mod tests {
             HashMap::from([(fixture.logical_name.to_string(), stale_upload.clone())]);
         let mut fallbacks = HashMap::new();
         let mut views = HashMap::new();
+        let mut synthetic = HashMap::new();
         let err = build_stage3_int4_storage(
             &runtime,
             &mut index,
             &mut upload_views,
             &mut fallbacks,
             &mut views,
+            &mut synthetic,
             &HashMap::new(),
             true,
         )
@@ -6177,6 +6310,7 @@ mod tests {
         let mut upload_views = HashMap::new();
         let mut fallbacks = HashMap::new();
         let mut views = HashMap::new();
+        let mut synthetic = HashMap::new();
         let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
 
         let err = build_stage3_int4_storage(
@@ -6185,6 +6319,7 @@ mod tests {
             &mut upload_views,
             &mut fallbacks,
             &mut views,
+            &mut synthetic,
             &HashMap::new(),
             true,
         )
@@ -6312,38 +6447,38 @@ mod tests {
         let assert_ct_publication =
             |candidate_index: &HashMap<String, TensorMeta>,
              candidate_upload_views: &HashMap<String, TensorUploadView>,
-             candidate_fallbacks: &HashMap<String, CtSymInt4Bf16Fallback>| {
+             candidate_fallbacks: &HashMap<String, CtSymInt4Bf16Fallback>,
+             candidate_views: &HashMap<String, Int4StorageView>| {
                 let alias = candidate_index
                     .get(TEST_CT_INT4_LOGICAL_NAME)
                     .expect("staged CT logical alias");
                 assert_eq!(alias.name, TEST_CT_INT4_LOGICAL_NAME);
-                assert_eq!(alias.shape, vec![128, 64]);
-                assert_eq!(alias.dtype, "bf16");
-                assert_eq!(alias.layout, LayoutTag::Raw);
+                assert_eq!(alias.shape, vec![128, 32]);
+                assert_eq!(alias.dtype, "u8");
+                assert_eq!(alias.layout, LayoutTag::Int4Quantized);
                 assert_eq!(alias.offset, 0);
-                assert_eq!(alias.byte_len, 16_384);
+                assert_eq!(alias.byte_len, 4_096);
                 assert_eq!(
                     candidate_upload_views.get(TEST_CT_INT4_LOGICAL_NAME),
                     Some(&TensorUploadView {
-                        dtype: "bf16".to_string(),
-                        shape: vec![128, 64],
+                        dtype: "u8".to_string(),
+                        shape: vec![128, 32],
                     })
                 );
-                assert_eq!(
-                    candidate_fallbacks.get(TEST_CT_INT4_LOGICAL_NAME),
-                    Some(&CtSymInt4Bf16Fallback {
-                        packed_tensor: TEST_CT_INT4_PACKED_NAME.to_string(),
-                        scale_tensor: TEST_CT_INT4_SCALE_NAME.to_string(),
-                        shape: vec![128, 64],
-                        group_size: 128,
-                    })
-                );
+                assert!(!candidate_fallbacks.contains_key(TEST_CT_INT4_LOGICAL_NAME));
+                let view = candidate_views
+                    .get(TEST_CT_INT4_LOGICAL_NAME)
+                    .expect("staged CT storage view");
+                assert_eq!(view.kind, Int4StorageKind::CtSymmetric);
+                assert_eq!(view.group_size, 128);
+                assert_eq!(view.implicit_zero_code, Some(8));
             };
 
         let mut staged_index = index.clone();
         let mut staged_upload_views = upload_views.clone();
         let mut staged_fallbacks = fallbacks.clone();
         let mut staged_views = views.clone();
+        let mut staged_synthetic = HashMap::new();
         let index_entries = HashMap::new();
         build_stage3_int4_storage_staged(
             &ct_runtime,
@@ -6351,17 +6486,22 @@ mod tests {
             &mut staged_upload_views,
             &mut staged_fallbacks,
             &mut staged_views,
+            &mut staged_synthetic,
             &index_entries,
             true,
         )
-        .expect("publish CT fallback into staged maps");
+        .expect("publish CT direct INT4 into staged maps");
 
-        assert_ct_publication(&staged_index, &staged_upload_views, &staged_fallbacks);
+        assert_ct_publication(
+            &staged_index,
+            &staged_upload_views,
+            &staged_fallbacks,
+            &staged_views,
+        );
         assert_eq!(
             staged_fallbacks.get("preexisting/fallback"),
             Some(&existing_fallback)
         );
-        assert!(staged_views.is_empty());
         assert_eq!(
             stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views),
             before,
@@ -6374,6 +6514,7 @@ mod tests {
             &mut staged_upload_views,
             &mut staged_fallbacks,
             &mut staged_views,
+            &mut staged_synthetic,
             &index_entries,
             true,
         )
@@ -6385,14 +6526,21 @@ mod tests {
                 && staged_message.contains(canonical.scale_name),
             "unexpected staged error: {staged_err}"
         );
-        assert_ct_publication(&staged_index, &staged_upload_views, &staged_fallbacks);
+        assert_ct_publication(
+            &staged_index,
+            &staged_upload_views,
+            &staged_fallbacks,
+            &staged_views,
+        );
 
+        let mut synthetic = HashMap::new();
         let err = build_stage3_int4_storage(
             &runtime,
             &mut index,
             &mut upload_views,
             &mut fallbacks,
             &mut views,
+            &mut synthetic,
             &index_entries,
             true,
         )
@@ -6438,6 +6586,7 @@ mod tests {
         let mut upload_views = HashMap::new();
         let mut fallbacks = HashMap::new();
         let mut views = HashMap::new();
+        let mut synthetic = HashMap::new();
         let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
 
         let err = build_stage3_int4_storage(
@@ -6446,6 +6595,7 @@ mod tests {
             &mut upload_views,
             &mut fallbacks,
             &mut views,
+            &mut synthetic,
             &HashMap::new(),
             true,
         )
@@ -6524,6 +6674,7 @@ mod tests {
         let mut upload_views = HashMap::new();
         let mut fallbacks = HashMap::new();
         let mut views = HashMap::new();
+        let mut synthetic = HashMap::new();
         let before = stage3_publication_snapshot(&index, &upload_views, &fallbacks, &views);
 
         let err = build_stage3_int4_storage(
@@ -6532,6 +6683,7 @@ mod tests {
             &mut upload_views,
             &mut fallbacks,
             &mut views,
+            &mut synthetic,
             &index_entries,
             true,
         )
@@ -6984,13 +7136,13 @@ mod tests {
             kind,
             Some(crate::flm::FlmStage3DirectWeightKind::CtInt4Bf16Fallback)
         );
-        assert!(
-            store
-                .tensor_storage_extent("model.language_model.layers.0.mlp.gate_proj.weight")
-                .expect("CT fallback storage extent")
-                .is_none(),
-            "CT fallback aliases are materialized transforms and must not expose a single file extent"
-        );
+        let extent = store
+            .tensor_storage_extent("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("CT direct storage extent")
+            .expect("CT packed UINT8 view is file-backed");
+        assert_eq!(extent.upload_dtype, "u8");
+        assert_eq!(extent.upload_shape, vec![128, 32]);
+        assert_eq!(extent.byte_len, 128 * 32);
     }
 
     #[test]
@@ -7082,7 +7234,7 @@ mod tests {
     }
 
     #[test]
-    fn open_flm_materializes_ct_int4_stage3_fallback_upload_bytes() {
+    fn open_flm_materializes_ct_int4_stage3_direct_upload_bytes() {
         let data = build_test_flm_with_stage3_logical_bindings();
         let file = write_temp_flm(&data);
 
@@ -7098,22 +7250,26 @@ mod tests {
         let logical_name = "model.language_model.layers.0.mlp.gate_proj.weight";
         let (dtype, shape, bytes) = store
             .materialize_upload_for_test(logical_name)
-            .expect("materialize CT INT4 BF16 fallback");
-        assert_eq!(dtype, ScalarType::BF16);
-        assert_eq!(shape, vec![128, 64]);
+            .expect("materialize CT INT4 packed UINT8 view");
+        assert_eq!(dtype, ScalarType::U8);
+        assert_eq!(shape, vec![128, 32]);
+        assert_eq!(
+            bytes,
+            test_ct_int4_packed_bytes(128, 64, |_row, col| (col % 16) as i32 - 8)
+        );
 
-        let expected = test_bf16_bytes((0..128).flat_map(|row| {
-            (0..64).map(move |col| {
-                let code = (col % 16) as i32 - 8;
-                let scale = if row % 2 == 0 { 1.0 } else { 0.5 };
-                code as f32 * scale
-            })
-        }));
-        assert_eq!(bytes, expected);
+        let (zero_dtype, zero_shape, zero_bytes) = store
+            .materialize_upload_for_test(
+                "model.language_model.layers.0.mlp.gate_proj.weight_int4_zero",
+            )
+            .expect("materialize implicit CT zero plane");
+        assert_eq!(zero_dtype, ScalarType::BF16);
+        assert_eq!(zero_shape, vec![128, 1]);
+        assert_eq!(zero_bytes, bf16_eight_bytes(256));
     }
 
     #[test]
-    fn open_flm_rejects_virtual_arena_for_ct_int4_stage3_fallback_alias() {
+    fn open_flm_reserves_virtual_arena_for_ct_int4_stage3_direct_alias() {
         let data = build_test_flm_with_stage3_logical_bindings();
         let file = write_temp_flm(&data);
 
@@ -7127,19 +7283,13 @@ mod tests {
         .expect("open FLM with Stage 3 bindings");
 
         let mut arena = BakedStore::virtual_weight_arena(0);
-        let err = store
+        store
             .reserve_virtual_arena(
                 &mut arena,
                 "model.language_model.layers.0.mlp.gate_proj.weight",
                 VirtualAllocationRole::Weights,
             )
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            err.contains("transformed FLM logical alias"),
-            "unexpected error: {err}"
-        );
+            .expect("direct CT INT4 packed alias is file-backed");
     }
 
     #[test]
@@ -9120,7 +9270,7 @@ mod tests {
     }
 
     #[test]
-    fn flm_qwen36_35b_ct_int4_fallback_uploads_bf16_to_hip() {
+    fn flm_qwen36_35b_ct_int4_uploads_packed_u8_to_hip() {
         let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_CT_INT4_FLM_HIP_UPLOAD") else {
             eprintln!(
                 "skip: SUPERSONIC_QWEN36_35B_CT_INT4_FLM_HIP_UPLOAD not set. Point it at a \
@@ -9141,22 +9291,22 @@ mod tests {
         let logical_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
         let meta = store
             .meta(logical_name)
-            .expect("CT INT4 logical BF16 fallback alias");
-        assert_eq!(meta.layout, LayoutTag::Raw);
-        assert_eq!(meta.dtype, "bf16");
-        assert_eq!(meta.shape, vec![8192, 2048]);
+            .expect("CT INT4 logical packed alias");
+        assert_eq!(meta.layout, LayoutTag::Int4Quantized);
+        assert_eq!(meta.dtype, "u8");
+        assert_eq!(meta.shape, vec![8192, 1024]);
         assert!(
-            store.raw_bytes(logical_name).is_none(),
-            "transformed fallback aliases must not expose raw mmap bytes"
+            store.raw_bytes(logical_name).is_some(),
+            "direct CT INT4 aliases expose packed mmap bytes"
         );
 
         let weight = store
             .load_to_gpu(logical_name, 0)
-            .expect("upload CT INT4 logical alias through BF16 fallback");
-        assert_eq!(weight.dtype(), ScalarType::BF16);
-        assert_eq!(weight.shape(), &[8192, 2048]);
+            .expect("upload CT INT4 packed UINT8 view");
+        assert_eq!(weight.dtype(), ScalarType::U8);
+        assert_eq!(weight.shape(), &[8192, 1024]);
 
-        eprintln!("[flm-upload] OK — 35B CT INT4 fallback uploaded BF16 logical view to HIP");
+        eprintln!("[flm-upload] OK — 35B CT INT4 packed UINT8 view uploaded to HIP");
     }
 
     #[test]
