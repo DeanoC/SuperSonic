@@ -210,6 +210,9 @@ pub(crate) fn model_variant_from_flm_identity(
     identity: model_store::FlmRuntimeIdentity,
 ) -> Option<ModelVariant> {
     match (identity.architecture_id, identity.model_id) {
+        (model_store::flm::ARCH_QWEN3_6_DENSE, model_store::flm::MODEL_QWEN3_8_DENSE_V1) => {
+            Some(ModelVariant::Qwen3_8_27B)
+        }
         (model_store::flm::ARCH_QWEN3_6_DENSE, model_store::flm::MODEL_QWEN3_6_DENSE_V1) => {
             Some(ModelVariant::Qwen3_6_27B)
         }
@@ -255,7 +258,9 @@ pub(crate) fn flm_source_is_authoritative_for_model(
 ) -> bool {
     matches!(
         model_variant,
-        ModelVariant::Qwen3_6_27B | ModelVariant::Qwen3_6_35B_A3B
+        ModelVariant::Qwen3_6_27B
+            | ModelVariant::Qwen3_8_27B
+            | ModelVariant::Qwen3_6_35B_A3B
     ) && effective_flm_source(cli).is_some()
 }
 
@@ -268,7 +273,9 @@ pub(crate) fn validate_effective_flm_source_model(
     };
     if matches!(
         model_variant,
-        ModelVariant::Qwen3_6_27B | ModelVariant::Qwen3_6_35B_A3B
+        ModelVariant::Qwen3_6_27B
+            | ModelVariant::Qwen3_8_27B
+            | ModelVariant::Qwen3_6_35B_A3B
     ) {
         return Ok(());
     }
@@ -278,7 +285,7 @@ pub(crate) fn validate_effective_flm_source_model(
         "--model-dir"
     };
     anyhow::bail!(
-        "FLM source from {source_flag} {} currently supports only --model qwen3.6-27b or qwen3.6-35b-a3b; got --model {}",
+        "FLM source from {source_flag} {} currently supports only --model qwen3.6-27b, qwen3.8-27b, or qwen3.6-35b-a3b; got --model {}",
         flm_source.display(),
         model_variant
     );
