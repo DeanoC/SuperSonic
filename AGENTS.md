@@ -2,6 +2,20 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
+## Slim HIP/Qwen branch
+
+`slim-hip-qwen` is an aggressive cut: **HIP only**, **Qwen family only**,
+**FLM-first loading**. CUDA, Metal, Gemma, Phi, and Llama are not compiled.
+Default `SUPERSONIC_BACKENDS=hip`. Product models:
+
+- Qwen3.5 0.8B–9B (dense hybrid, canary + kernel template)
+- Qwen3.6-27B and **Qwen3.8-27B** (same dense hybrid geometry)
+- Qwen3.6-35B-A3B (hybrid MoE)
+
+Qwen3.8-27B reuses the Qwen3.6-27B HIP 4B-kernel registry row. A dense
+FLM (`ARCH_QWEN3_6_DENSE`) loads as 3.6-27B unless `--model qwen3.8-27b`
+or `MODEL_QWEN3_8_DENSE_V1` is set.
+
 ## Project Overview
 
 SuperSonic is a persistent decode megakernel for LLM inference on AMD GPUs (ROCm/HIP), targeting two model families:

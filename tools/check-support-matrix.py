@@ -16,7 +16,7 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "support" / "matrix.toml"
 
-VALID_BACKENDS = {"hip", "cuda", "metal"}
+VALID_BACKENDS = {"hip"}
 VALID_STATUSES = {"validated", "tbm", "experimental", "inherited", "pending", "unsupported"}
 VALID_QUANTS = {"bf16", "int4", "fp8-runtime", "kv-fp8", "int8"}
 VALID_MODEL_SOURCES = {"hf-snapshot", "flm"}
@@ -25,10 +25,6 @@ EXPECTED_ARCHES = {
     "gfx1150",
     "gfx1201",
     "gfx942",
-    "sm86",
-    "sm90",
-    "apple-m4",
-    "apple-m5-max",
 }
 
 

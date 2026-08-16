@@ -8,13 +8,8 @@ mod decode_engine;
 mod dflash_ddtree;
 mod flm_model_source;
 mod flm_tokenizer;
-mod gemma4_engine;
-mod gemma4_int4_engine;
-mod gemma4_runtime;
-mod llama31_engine;
 mod model_files;
 mod oracle;
-mod phi4_engine;
 mod policy;
 mod prefill_engine;
 mod profiling;
@@ -65,7 +60,6 @@ mod qwen36_moe_state;
 mod qwen36_moe_telemetry;
 #[path = "qwen36_moe/types.rs"]
 mod qwen36_moe_types;
-mod qwen3_moe;
 mod registry;
 mod specprefill;
 mod specprefill_engine;
@@ -81,7 +75,6 @@ use backend_runtime::{
 };
 pub(crate) use bakes::{should_fetch_exact_bake, try_download_bake};
 pub(crate) use cli::Cli;
-use gemma4_runtime::run_gemma4;
 pub(crate) use model_files::{load_tokenizer, resolve_prompt_token_ids};
 use policy::{
     q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags,
@@ -129,32 +122,17 @@ fn main() -> Result<()> {
     validate_dflash_flags(&cli, &model_variant)?;
     validate_specprefill_flags(&cli, &model_variant, backend)?;
 
-    // Teacher-forced is currently implemented for Llama 3.1, Qwen3.5, Gemma 4, and Phi-4.
-    // Bail early for unsupported families so the user gets a clear message.
     if cli.teacher_forced {
         match model_variant.family() {
-            ModelFamily::Llama31
-            | ModelFamily::Qwen35
-            | ModelFamily::Gemma4
-            | ModelFamily::Phi4 => {} // supported; handled inside engine
-            ModelFamily::Qwen3Moe => {
-                anyhow::bail!("Qwen3-MoE teacher-forced decode is out of v1 scope")
-            }
+            ModelFamily::Qwen35 => {}
             ModelFamily::Qwen36Moe => {
                 anyhow::bail!("Qwen3.6-MoE teacher-forced out of Phase 1 scope")
             }
+            other => anyhow::bail!("{other} is not part of the slim HIP/Qwen CLI"),
         }
     }
 
     match model_variant.family() {
-        ModelFamily::Gemma4 => run_gemma4(&cli, &model_variant, entry, ordinal, gpu.total_vram),
-        ModelFamily::Phi4 => {
-            phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, gpu.total_vram)
-        }
-        ModelFamily::Llama31 => {
-            llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, gpu.total_vram)
-        }
-        ModelFamily::Qwen3Moe => qwen3_moe::run(&cli, entry, gpu.total_vram),
         ModelFamily::Qwen36Moe => {
             // Route Qwen3.6-MoE through the SpecPrefill orchestrator when the
             // drafter flag is set, so the cross-family R1 path
@@ -183,5 +161,6 @@ fn main() -> Result<()> {
             gpu.total_vram,
             q4km_like,
         ),
+        other => anyhow::bail!("{other} is not part of the slim HIP/Qwen CLI"),
     }
 }

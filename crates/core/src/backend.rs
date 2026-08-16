@@ -18,7 +18,7 @@ impl BackendChoice {
     }
 }
 
-pub const BACKEND_CHOICES: &str = "auto | hip | cuda | metal";
+pub const BACKEND_CHOICES: &str = "auto | hip";
 
 pub fn compiled_backends_display() -> String {
     gpu_hal::compiled_backends()

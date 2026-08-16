@@ -37,7 +37,13 @@ impl DFlashOptions {
         }
         let block = match self.block {
             Some(block) => block,
-            None if matches!(model_variant, ModelVariant::Qwen3_6_27B) => draft_block_size,
+            None if matches!(
+                model_variant,
+                ModelVariant::Qwen3_6_27B | ModelVariant::Qwen3_8_27B
+            ) =>
+            {
+                draft_block_size
+            }
             None => 3.min(draft_block_size),
         };
         if block == 0 || block > draft_block_size {

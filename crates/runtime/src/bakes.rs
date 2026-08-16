@@ -102,23 +102,6 @@ pub(crate) fn ensure_qwen35_bake_available(
     Ok(())
 }
 
-pub(crate) fn ensure_gemma4_int4_bake_available(cfg: &LoaderConfig, target: &Path) -> Result<()> {
-    if model_store::version_ok(target) {
-        return Ok(());
-    }
-    let downloaded = try_download_bake(cfg, model_store::fetch::BakeVariant::Int4Gptq, target)?;
-    if downloaded && model_store::version_ok(target) {
-        return Ok(());
-    }
-    bail!(
-        "no Gemma 4 INT4 bake at {} and download unavailable. Run \
-         `python oracle/bake_int4_gemma4.py --model-dir {}` on a bigger machine \
-         or rerun without --no-download to fetch from the GitHub bakes-v1 release.",
-        target.display(),
-        cfg.model_dir.display(),
-    );
-}
-
 /// Attempt to fetch the requested bake from the GitHub `bakes-v{FORMAT_VERSION}`
 /// release. Returns `Ok(true)` on success, `Ok(false)` when download is
 /// disabled via `--no-download`, `Err(_)` when the fetch itself failed.

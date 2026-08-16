@@ -10,8 +10,6 @@ use anyhow::{anyhow, Result};
 
 use crate::decode_engine::{DecodeEngine, DecodeEngineSnapshot};
 use crate::dflash::{DFlashGenerateOutput, DFlashSession};
-use crate::gemma4_engine::{Gemma4Engine, Gemma4EngineSnapshot};
-use crate::gemma4_int4_engine::{Gemma4Int4Engine, Gemma4Int4EngineSnapshot};
 use crate::qwen36_moe::engine::{Qwen36MoeEngine, Qwen36MoePrefillBoundary};
 
 #[cfg(test)]
@@ -253,8 +251,6 @@ pub enum InferenceSession {
     Qwen(DecodeEngine),
     QwenDFlash(DFlashSession),
     Qwen36Moe(Qwen36MoeEngine),
-    Gemma4Bf16(Gemma4Engine),
-    Gemma4Int4(Gemma4Int4Engine),
     #[cfg(test)]
     Qwen36MoeTestAdapter(DeterministicSession),
     #[cfg(test)]
@@ -263,8 +259,6 @@ pub enum InferenceSession {
 
 pub enum SessionSnapshot {
     Qwen(DecodeEngineSnapshot),
-    Gemma4Bf16(Gemma4EngineSnapshot),
-    Gemma4Int4(Gemma4Int4EngineSnapshot),
     #[cfg(test)]
     Deterministic {
         logits: Vec<f32>,
@@ -510,9 +504,6 @@ impl SessionSnapshot {
     pub fn to_disk_bytes(&self) -> Result<Vec<u8>> {
         match self {
             Self::Qwen(s) => s.to_disk_bytes(),
-            Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
-                "disk prefix snapshots are currently implemented for Qwen only"
-            )),
             #[cfg(test)]
             Self::Deterministic { .. } => {
                 Err(anyhow!("deterministic snapshot has no disk representation"))
@@ -523,8 +514,6 @@ impl SessionSnapshot {
     pub fn resident_bytes(&self) -> usize {
         match self {
             Self::Qwen(s) => s.resident_bytes(),
-            Self::Gemma4Bf16(s) => s.resident_bytes(),
-            Self::Gemma4Int4(s) => s.resident_bytes(),
             #[cfg(test)]
             Self::Deterministic { logits } => logits.len() * std::mem::size_of::<f32>(),
         }
@@ -533,8 +522,6 @@ impl SessionSnapshot {
     pub fn try_clone(&self) -> Result<Self> {
         match self {
             Self::Qwen(s) => Ok(Self::Qwen(s.try_clone()?)),
-            Self::Gemma4Bf16(s) => Ok(Self::Gemma4Bf16(s.try_clone()?)),
-            Self::Gemma4Int4(s) => Ok(Self::Gemma4Int4(s.try_clone()?)),
             #[cfg(test)]
             Self::Deterministic { logits } => Ok(Self::Deterministic {
                 logits: logits.clone(),
@@ -545,8 +532,6 @@ impl SessionSnapshot {
     pub fn logits(&self) -> &[f32] {
         match self {
             Self::Qwen(s) => &s.logits,
-            Self::Gemma4Bf16(s) => &s.logits,
-            Self::Gemma4Int4(s) => &s.logits,
             #[cfg(test)]
             Self::Deterministic { logits } => logits,
         }
@@ -576,12 +561,6 @@ impl InferenceSession {
             Self::Qwen36Moe(_) => qwen36_moe_features(),
             #[cfg(test)]
             Self::Qwen36MoeTestAdapter(_) => qwen36_moe_features(),
-            Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => SessionFeatures {
-                plain_prefill_decode: true,
-                native_dflash_generate: false,
-                prefix_snapshot: true,
-                disk_prefix_snapshot: false,
-            },
             #[cfg(test)]
             Self::Deterministic(session) => session.features,
         }
@@ -596,8 +575,6 @@ impl InferenceSession {
             Self::Qwen36Moe(e) => qwen36_reset(e),
             #[cfg(test)]
             Self::Qwen36MoeTestAdapter(e) => qwen36_reset(e),
-            Self::Gemma4Bf16(e) => e.reset(),
-            Self::Gemma4Int4(e) => e.reset(),
             #[cfg(test)]
             Self::Deterministic(e) => e.reset(),
         };
@@ -620,8 +597,6 @@ impl InferenceSession {
             Self::Qwen36Moe(e) => qwen36_prefill(e, prompt_ids),
             #[cfg(test)]
             Self::Qwen36MoeTestAdapter(e) => qwen36_prefill(e, prompt_ids),
-            Self::Gemma4Bf16(e) => e.prefill(prompt_ids),
-            Self::Gemma4Int4(e) => e.prefill(prompt_ids),
             #[cfg(test)]
             Self::Deterministic(e) => e.prefill(prompt_ids),
         }
@@ -672,8 +647,6 @@ impl InferenceSession {
             Self::Qwen36Moe(e) => qwen36_decode(e, token_id, pos),
             #[cfg(test)]
             Self::Qwen36MoeTestAdapter(e) => qwen36_decode(e, token_id, pos),
-            Self::Gemma4Bf16(e) => e.decode_step(token_id, pos),
-            Self::Gemma4Int4(e) => e.decode_step(token_id, pos),
             #[cfg(test)]
             Self::Deterministic(e) => e.decode_step(token_id, pos),
         }
@@ -696,9 +669,6 @@ impl InferenceSession {
             #[cfg(test)]
             Self::Qwen36MoeTestAdapter(_) => Err(anyhow!(
                 "replay-prefill decode is not implemented for Qwen3.6 MoE sessions"
-            )),
-            Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
-                "replay-prefill decode is only implemented for the Qwen3.5 engine"
             )),
             #[cfg(test)]
             Self::Deterministic(_) => Err(anyhow!(
@@ -727,14 +697,6 @@ impl InferenceSession {
                 "Qwen3.6 MoE",
             )
             .into()),
-            Self::Gemma4Bf16(e) => e
-                .snapshot_prefix(logits)
-                .map(SessionSnapshot::Gemma4Bf16)
-                .map_err(|error| cache_operation_error(PrefixSnapshotOperation::Capture, error)),
-            Self::Gemma4Int4(e) => e
-                .snapshot_prefix(logits)
-                .map(SessionSnapshot::Gemma4Int4)
-                .map_err(|error| cache_operation_error(PrefixSnapshotOperation::Capture, error)),
             #[cfg(test)]
             Self::Deterministic(session) if !session.features.prefix_snapshot => Err(
                 UnsupportedPrefixSnapshot::new(PrefixSnapshotOperation::Capture, "Qwen3.6 MoE")
@@ -761,8 +723,6 @@ impl InferenceSession {
             Self::Qwen36Moe(_) => usize::MAX,
             #[cfg(test)]
             Self::Qwen36MoeTestAdapter(_) => usize::MAX,
-            Self::Gemma4Bf16(e) => e.prefix_snapshot_bytes(logits_len),
-            Self::Gemma4Int4(e) => e.prefix_snapshot_bytes(logits_len),
             #[cfg(test)]
             Self::Deterministic(_) => logits_len * std::mem::size_of::<f32>(),
         }
@@ -787,12 +747,6 @@ impl InferenceSession {
                 "Qwen3.6 MoE",
             )
             .into()),
-            (Self::Gemma4Bf16(e), SessionSnapshot::Gemma4Bf16(s)) => e
-                .restore_prefix(&s)
-                .map_err(|error| cache_operation_error(PrefixSnapshotOperation::Restore, error)),
-            (Self::Gemma4Int4(e), SessionSnapshot::Gemma4Int4(s)) => e
-                .restore_prefix(&s)
-                .map_err(|error| cache_operation_error(PrefixSnapshotOperation::Restore, error)),
             #[cfg(test)]
             (Self::Deterministic(session), _other) if !session.features.prefix_snapshot => Err(
                 UnsupportedPrefixSnapshot::new(PrefixSnapshotOperation::Restore, "Qwen3.6 MoE")
@@ -837,9 +791,6 @@ impl InferenceSession {
                 "Qwen3.6 MoE",
             )
             .into()),
-            Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
-                "disk prefix snapshots are currently implemented for Qwen only"
-            )),
             #[cfg(test)]
             Self::Deterministic(session) if !session.features.prefix_snapshot => Err(
                 UnsupportedPrefixSnapshot::new(PrefixSnapshotOperation::LoadDisk, "Qwen3.6 MoE")

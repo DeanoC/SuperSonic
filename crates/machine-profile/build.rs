@@ -57,10 +57,21 @@ fn main() {
     //   kernel-ffi and gpu-hal prefer CUDA, so we must NOT compile HIP here
     //   either, otherwise the rest of the workspace would build CUDA while
     //   this crate links amdhip64.
-    let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "auto".to_string());
+    let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "hip".to_string());
     let normalized = requested.trim().to_ascii_lowercase();
-    let explicit_hip = normalized.split(',').any(|p| p.trim() == "hip");
-    let explicit_metal = normalized.split(',').any(|p| p.trim() == "metal");
+    if normalized.split(',').any(|p| {
+        let p = p.trim();
+        p == "cuda" || p == "metal"
+    }) {
+        panic!(
+            "SUPERSONIC_BACKENDS={requested} is disabled on the slim HIP/Qwen branch. \
+             Build with SUPERSONIC_BACKENDS=hip (the default)."
+        );
+    }
+    let explicit_hip = normalized == "hip"
+        || normalized == "auto"
+        || normalized.split(',').any(|p| p.trim() == "hip");
+    let explicit_metal = false;
     let auto = normalized == "auto";
     let is_macos = env::var("CARGO_CFG_TARGET_OS")
         .map(|os| os == "macos")

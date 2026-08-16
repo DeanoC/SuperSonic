@@ -239,18 +239,6 @@ const HIP_BRIDGES: &[KernelBridge] = &[
         context: "building prefill helpers HIP bridge",
     },
     KernelBridge {
-        group: "hip-gemma4",
-        src_name: "gemma4_bridge.cpp",
-        obj_name: "gemma4_hip.o",
-        context: "building Gemma 4 HIP bridge",
-    },
-    KernelBridge {
-        group: "hip-phi4",
-        src_name: "phi4_bridge.cpp",
-        obj_name: "phi4_hip.o",
-        context: "building Phi-4 HIP bridge",
-    },
-    KernelBridge {
         group: "hip-dflash",
         src_name: "dflash_draft_bridge.cpp",
         obj_name: "dflash_draft_hip.o",
@@ -262,58 +250,9 @@ const HIP_BRIDGES: &[KernelBridge] = &[
         obj_name: "qwen36_moe_hip.o",
         context: "building Qwen3.6-MoE HIP bridge",
     },
-    KernelBridge {
-        group: "hip-qwen3-moe",
-        src_name: "qwen3_moe_bridge.cpp",
-        obj_name: "qwen3_moe_hip.o",
-        context: "building Qwen3-MoE HIP bridge",
-    },
 ];
 
-const CUDA_BRIDGES: &[KernelBridge] = &[
-    KernelBridge {
-        group: "cuda-qwen35",
-        src_name: "full_attention_bridge_cuda.cu",
-        obj_name: "qwen35_megakernel_cuda.o",
-        context: "building qwen35 megakernel CUDA bridge",
-    },
-    KernelBridge {
-        group: "cuda-qwen35",
-        src_name: "full_attention_bridge_4b_cuda.cu",
-        obj_name: "qwen35_4b_megakernel_cuda.o",
-        context: "building qwen35-4b megakernel CUDA bridge",
-    },
-    KernelBridge {
-        group: "cuda-qwen35",
-        src_name: "prefill_helpers_bridge_cuda.cu",
-        obj_name: "qwen35_prefill_helpers_cuda.o",
-        context: "building prefill helpers CUDA bridge",
-    },
-    KernelBridge {
-        group: "cuda-llama31",
-        src_name: "certified_kv_bridge_cuda.cu",
-        obj_name: "llama31_certified_kv_cuda.o",
-        context: "building Llama31 certified KV CUDA bridge",
-    },
-    KernelBridge {
-        group: "cuda-phi4",
-        src_name: "phi4_bridge_cuda.cu",
-        obj_name: "phi4_cuda.o",
-        context: "building Phi-4 CUDA bridge",
-    },
-    KernelBridge {
-        group: "cuda-gemma4",
-        src_name: "gemma4_bridge_cuda.cu",
-        obj_name: "gemma4_cuda.o",
-        context: "building Gemma 4 CUDA bridge",
-    },
-    KernelBridge {
-        group: "cuda-qwen36-moe",
-        src_name: "qwen36_moe_bridge_cuda.cu",
-        obj_name: "qwen36_moe_cuda.o",
-        context: "building Qwen3.6-MoE CUDA bridge",
-    },
-];
+const CUDA_BRIDGES: &[KernelBridge] = &[];
 
 const KERNEL_RERUN_PATHS: &[&str] = &[
     "full_attention.hip",
@@ -581,23 +520,29 @@ fn main() {
             .display()
     );
 
-    let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "auto".to_string());
+    let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "hip".to_string());
     let normalized = requested.trim().to_ascii_lowercase();
-    let want_hip = normalized == "auto" || normalized.split(',').any(|part| part.trim() == "hip");
-    let want_cuda = normalized == "auto" || normalized.split(',').any(|part| part.trim() == "cuda");
-    let want_metal =
-        normalized == "auto" || normalized.split(',').any(|part| part.trim() == "metal");
+    if normalized.split(',').any(|part| {
+        let part = part.trim();
+        part == "cuda" || part == "metal"
+    }) {
+        panic!(
+            "SUPERSONIC_BACKENDS={requested} is disabled on the slim HIP/Qwen branch. \
+             Build with SUPERSONIC_BACKENDS=hip (the default)."
+        );
+    }
+    let want_hip = normalized == "auto"
+        || normalized == "hip"
+        || normalized.split(',').any(|part| part.trim() == "hip");
+    let want_cuda = false;
+    let want_metal = false;
     let have_hip_toolchain = want_hip && command_exists("hipcc");
-    let have_cuda_toolchain = want_cuda && command_exists("nvcc");
-    let have_metal_backend = want_metal
-        && env::var("CARGO_CFG_TARGET_OS")
-            .map(|os| os == "macos")
-            .unwrap_or(false);
+    let have_cuda_toolchain = false;
+    let have_metal_backend = false;
 
     assert!(
-        have_hip_toolchain || have_cuda_toolchain || have_metal_backend,
-        "No supported kernel toolchain found for SUPERSONIC_BACKENDS={requested}. \
-         Install hipcc and/or nvcc, or set SUPERSONIC_BACKENDS to an available backend."
+        have_hip_toolchain,
+        "No HIP toolchain found for SUPERSONIC_BACKENDS={requested}. Install hipcc."
     );
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));

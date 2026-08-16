@@ -143,7 +143,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_cuda)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_metal)");
 
-    let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "auto".to_string());
+    let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "hip".to_string());
     let normalized = requested.trim().to_ascii_lowercase();
     let is_auto = normalized == "auto";
 
@@ -152,31 +152,19 @@ fn main() {
     let explicit_metal = !is_auto && normalized.split(',').any(|part| part.trim() == "metal");
 
     let have_hip_toolchain = command_exists("hipcc");
-    let have_cuda_toolchain = command_exists("nvcc");
-    let have_metal_runtime = env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("macos");
 
-    if explicit_hip && !have_hip_toolchain {
+    if explicit_cuda || explicit_metal {
+        panic!(
+            "SUPERSONIC_BACKENDS={requested} is disabled on the slim HIP/Qwen branch. \
+             Build with SUPERSONIC_BACKENDS=hip (the default)."
+        );
+    }
+    if (explicit_hip || is_auto) && !have_hip_toolchain {
         panic!("SUPERSONIC_BACKENDS requested HIP, but hipcc is not available in PATH");
     }
-    if explicit_cuda && !have_cuda_toolchain {
-        panic!("SUPERSONIC_BACKENDS requested CUDA, but nvcc is not available in PATH");
-    }
-    if explicit_metal && !have_metal_runtime {
-        panic!("SUPERSONIC_BACKENDS requested Metal, but this target is not macOS");
-    }
 
-    // Mirror kernel-ffi: in auto mode, prefer CUDA when both are present; otherwise
-    // fall back to whichever toolchain is available. Explicit selection wins.
-    let (enable_hip, enable_cuda, enable_metal) = if explicit_hip || explicit_cuda || explicit_metal
-    {
-        (explicit_hip, explicit_cuda, explicit_metal)
-    } else if have_cuda_toolchain {
-        (false, true, false)
-    } else if have_hip_toolchain {
-        (true, false, false)
-    } else {
-        (false, false, have_metal_runtime)
-    };
+    // Slim branch: HIP is the only compiled backend. `auto` means HIP.
+    let (enable_hip, enable_cuda, enable_metal) = (true, false, false);
 
     assert!(
         enable_hip || enable_cuda || enable_metal,
@@ -193,7 +181,11 @@ fn main() {
                     .cpp(true)
                     .file("src/hipfile_bridge.cc")
                     .include(hipfile_root.join("include"))
-                    .flag("-std=c++17");
+                    .flag("-std=c++17")
+                    // Host-side HIP headers (ROCm 7+) refuse to parse unless the
+                    // platform is selected. hipcc defines this automatically;
+                    // the cc crate compiles this bridge with the host C++ compiler.
+                    .define("__HIP_PLATFORM_AMD__", None);
                 build.compile("gpu_hal_hipfile");
                 println!("cargo:rustc-link-search=native={}", hipfile_lib_dir.display());
                 println!("cargo:rustc-link-lib=hipfile");

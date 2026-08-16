@@ -20,57 +20,9 @@ name = "int4_real_test"
 path = "src/bin/int4_real_test.rs"
 
 [[bin]]
-name = "gemma4_primitive_test"
-path = "src/bin/gemma4_primitive_test.rs"
-
-[[bin]]
-name = "gemma4_layer0_validate"
-path = "src/bin/gemma4_layer0_validate.rs"
-
-[[bin]]
-name = "gemma4_decode_validate"
-path = "src/bin/gemma4_decode_validate.rs"
-
-[[bin]]
-name = "gemma4_e2e_validate"
-path = "src/bin/gemma4_e2e_validate.rs"
-
-[[bin]]
-name = "gemma4_fused_decode_validate"
-path = "src/bin/gemma4_fused_decode_validate.rs"
-
-[[bin]]
-name = "gemma4_mega_decode_validate"
-path = "src/bin/gemma4_mega_decode_validate.rs"
-
-[[bin]]
-name = "gemma4_bench"
-path = "src/bin/gemma4_bench.rs"
-
-[[bin]]
-name = "gemma4_corpus_test"
-path = "src/bin/gemma4_corpus_test.rs"
-
-[[bin]]
-name = "gemma4_int4_matvec_test"
-path = "src/bin/gemma4_int4_matvec_test.rs"
-
-[[bin]]
-name = "gemma4_fused_int4_validate"
-path = "src/bin/gemma4_fused_int4_validate.rs"
-
-[[bin]]
-name = "gemma4_int4_layer_diag"
-path = "src/bin/gemma4_int4_layer_diag.rs"
-
-[[bin]]
 name = "qwen35_bughunt"
 path = "src/bin/qwen35_bughunt.rs"
 required-features = ["bughunt"]
-
-[[bin]]
-name = "llama31_certified_kv_microbench"
-path = "src/bin/llama31_certified_kv_microbench.rs"
 
 [[bin]]
 name = "bench_prefill_attn"
@@ -97,10 +49,7 @@ kernel-ffi = { path = "../kernel-ffi" }
 model-store = { path = "../model-store" }
 qwen35 = { path = "../qwen35" }
 qwen35_dflash = { path = "../qwen35_dflash" }
-qwen3_moe = { path = "../qwen3_moe" }
 qwen36_moe = { path = "../qwen36_moe" }
-gemma4 = { path = "../gemma4" }
-phi4 = { path = "../phi4" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

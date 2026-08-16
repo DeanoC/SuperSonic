@@ -1,8 +1,4 @@
-# Machine-readable inventory for SuperSonic development tools.
-#
-# The first covered surface is the runner binary set. Keep existing command
-# names working until a replacement command is documented, validated, and
-# wrapped by an alias.
+# Slim HIP/Qwen runner binary inventory.
 
 version = 1
 
@@ -11,7 +7,7 @@ name = "supersonic"
 path = "crates/runner/src/main.rs"
 class = "stable"
 future_home = "crates/runner/src/main.rs"
-notes = "Primary user-facing CLI; keep as the normal entrypoint until runtime/server APIs are fully split."
+notes = "Primary user-facing CLI."
 
 [[runner_bin]]
 name = "bench_prefill_attn"
@@ -19,90 +15,6 @@ path = "crates/runner/src/bin/bench_prefill_attn.rs"
 class = "microbench"
 future_home = "tools/microbench"
 notes = "Focused prefill attention benchmark."
-
-[[runner_bin]]
-name = "gemma4_batched_divergent_test"
-path = "crates/runner/src/bin/gemma4_batched_divergent_test.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 batched divergent correctness coverage."
-
-[[runner_bin]]
-name = "gemma4_bench"
-path = "crates/runner/src/bin/gemma4_bench.rs"
-class = "microbench"
-future_home = "tools/microbench"
-notes = "Gemma 4 focused benchmark harness."
-
-[[runner_bin]]
-name = "gemma4_corpus_test"
-path = "crates/runner/src/bin/gemma4_corpus_test.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 corpus validation coverage."
-
-[[runner_bin]]
-name = "gemma4_decode_validate"
-path = "crates/runner/src/bin/gemma4_decode_validate.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 decode validation."
-
-[[runner_bin]]
-name = "gemma4_e2e_validate"
-path = "crates/runner/src/bin/gemma4_e2e_validate.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 end-to-end validation."
-
-[[runner_bin]]
-name = "gemma4_fused_decode_validate"
-path = "crates/runner/src/bin/gemma4_fused_decode_validate.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 fused decode validation."
-
-[[runner_bin]]
-name = "gemma4_fused_int4_validate"
-path = "crates/runner/src/bin/gemma4_fused_int4_validate.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 fused INT4 validation."
-
-[[runner_bin]]
-name = "gemma4_int4_layer_diag"
-path = "crates/runner/src/bin/gemma4_int4_layer_diag.rs"
-class = "lab"
-future_home = "tools/lab"
-notes = "Gemma 4 INT4 layer diagnostic."
-
-[[runner_bin]]
-name = "gemma4_int4_matvec_test"
-path = "crates/runner/src/bin/gemma4_int4_matvec_test.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 INT4 matvec validation."
-
-[[runner_bin]]
-name = "gemma4_layer0_validate"
-path = "crates/runner/src/bin/gemma4_layer0_validate.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 layer zero validation."
-
-[[runner_bin]]
-name = "gemma4_mega_decode_validate"
-path = "crates/runner/src/bin/gemma4_mega_decode_validate.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 mega decode validation."
-
-[[runner_bin]]
-name = "gemma4_primitive_test"
-path = "crates/runner/src/bin/gemma4_primitive_test.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Gemma 4 primitive validation."
 
 [[runner_bin]]
 name = "int4_real_test"
@@ -119,27 +31,6 @@ future_home = "tools/validation"
 notes = "INT4 validation harness."
 
 [[runner_bin]]
-name = "llama31_certified_kv_microbench"
-path = "crates/runner/src/bin/llama31_certified_kv_microbench.rs"
-class = "microbench"
-future_home = "tools/microbench"
-notes = "Llama 3.1 certified KV focused benchmark."
-
-[[runner_bin]]
-name = "llama31_int8_downproj_diag"
-path = "crates/runner/src/bin/llama31_int8_downproj_diag.rs"
-class = "lab"
-future_home = "tools/lab"
-notes = "Llama 3.1 INT8 down-projection diagnostic."
-
-[[runner_bin]]
-name = "llama31_int8_matmul_test"
-path = "crates/runner/src/bin/llama31_int8_matmul_test.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Llama 3.1 INT8 matmul validation."
-
-[[runner_bin]]
 name = "qwen35_bughunt"
 path = "crates/runner/src/bin/qwen35_bughunt.rs"
 class = "lab"
@@ -153,6 +44,13 @@ path = "crates/runner/src/bin/qwen36_ffn_expert_microbench.rs"
 class = "microbench"
 future_home = "tools/microbench"
 notes = "Qwen3.6 MoE FFN expert focused benchmark."
+
+[[runner_bin]]
+name = "qwen36_flm_upload_probe"
+path = "crates/runner/src/bin/qwen36_flm_upload_probe.rs"
+class = "lab"
+future_home = "tools/lab"
+notes = "FLM upload/load probe."
 
 [[runner_bin]]
 name = "qwen36_q4km_manifest_audit"

@@ -104,6 +104,7 @@ pub fn capabilities_for_variant(
         | ModelVariant::Qwen3_5_4B
         | ModelVariant::Qwen3_5_9B
         | ModelVariant::Qwen3_6_27B
+        | ModelVariant::Qwen3_8_27B
         | ModelVariant::Gemma4_E2B
         | ModelVariant::Gemma4_E4B
         | ModelVariant::Qwen3_6_35B_A3B => ServeStatus::Ready,

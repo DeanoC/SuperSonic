@@ -36,7 +36,7 @@ pub enum ArchitectureFamily {
     Llama31,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelVariant {
     Qwen3_5_0_8B,
     Qwen3_5_2B,
@@ -45,6 +45,7 @@ pub enum ModelVariant {
     Qwen3_5_35B_A3B,
     Qwen3_30B_A3B,
     Qwen3_6_27B,
+    Qwen3_8_27B,
     Qwen3_6_35B_A3B,
     Gemma4_E2B,
     Gemma4_E4B,
@@ -69,6 +70,9 @@ impl ModelVariant {
             "qwen3.6-27b" | "qwen36-27b" | "qwen3.6-27b-fp8" | "qwen36-27b-fp8" => {
                 Some(Self::Qwen3_6_27B)
             }
+            "qwen3.8-27b" | "qwen38-27b" | "qwen3.8-27b-fp8" | "qwen38-27b-fp8" => {
+                Some(Self::Qwen3_8_27B)
+            }
             "qwen3.6-35b-a3b" | "qwen36-35b-a3b" | "qwen3.6-35b-a3b-fp8" | "qwen36-35b-a3b-fp8" => {
                 Some(Self::Qwen3_6_35B_A3B)
             }
@@ -89,6 +93,7 @@ impl ModelVariant {
             Self::Qwen3_5_35B_A3B => "Qwen/Qwen3.5-35B-A3B",
             Self::Qwen3_30B_A3B => "Qwen/Qwen3-30B-A3B",
             Self::Qwen3_6_27B => "Qwen/Qwen3.6-27B-FP8",
+            Self::Qwen3_8_27B => "Qwen/Qwen3.8-27B",
             Self::Qwen3_6_35B_A3B => "Qwen/Qwen3.6-35B-A3B-FP8",
             Self::Gemma4_E2B => "google/gemma-4-E2B",
             Self::Gemma4_E4B => "google/gemma-4-E4B",
@@ -103,7 +108,8 @@ impl ModelVariant {
             | Self::Qwen3_5_2B
             | Self::Qwen3_5_4B
             | Self::Qwen3_5_9B
-            | Self::Qwen3_6_27B => ModelFamily::Qwen35,
+            | Self::Qwen3_6_27B
+            | Self::Qwen3_8_27B => ModelFamily::Qwen35,
             Self::Qwen3_5_35B_A3B => ModelFamily::Qwen36Moe,
             Self::Qwen3_30B_A3B => ModelFamily::Qwen3Moe,
             Self::Qwen3_6_35B_A3B => ModelFamily::Qwen36Moe,
@@ -119,7 +125,8 @@ impl ModelVariant {
             | Self::Qwen3_5_2B
             | Self::Qwen3_5_4B
             | Self::Qwen3_5_9B
-            | Self::Qwen3_6_27B => ArchitectureFamily::QwenHybridDense,
+            | Self::Qwen3_6_27B
+            | Self::Qwen3_8_27B => ArchitectureFamily::QwenHybridDense,
             Self::Qwen3_5_35B_A3B | Self::Qwen3_30B_A3B | Self::Qwen3_6_35B_A3B => {
                 ArchitectureFamily::QwenHybridMoE
             }
@@ -140,6 +147,7 @@ impl fmt::Display for ModelVariant {
             Self::Qwen3_5_35B_A3B => write!(f, "qwen3.5-35b-a3b"),
             Self::Qwen3_30B_A3B => write!(f, "qwen3-30b-a3b"),
             Self::Qwen3_6_27B => write!(f, "qwen3.6-27b"),
+            Self::Qwen3_8_27B => write!(f, "qwen3.8-27b"),
             Self::Qwen3_6_35B_A3B => write!(f, "qwen3.6-35b-a3b"),
             Self::Gemma4_E2B => write!(f, "gemma4-e2b"),
             Self::Gemma4_E4B => write!(f, "gemma4-e4b"),
@@ -466,6 +474,23 @@ static REGISTRY: &[RegistryEntry] = &[
         }),
     },
     RegistryEntry {
+        model: ModelVariant::Qwen3_8_27B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 22 * GIB,
+            overhead_factor: 1.05,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            // Same hybrid-dense geometry as Qwen3.6-27B (64L, hidden 5120).
+            proj_buf_floats: 16480,
+            attn_scratch_floats: 24576,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
         model: ModelVariant::Qwen3_5_0_8B,
         backend: Backend::Hip,
         arch: GpuArch::Gfx1201,
@@ -542,6 +567,22 @@ static REGISTRY: &[RegistryEntry] = &[
             proj_buf_floats: 16480,
             // Floor for 3*nh*hd + nh*aligned_kv_t at short contexts.
             // The runner still expands this from --context-size.
+            attn_scratch_floats: 24576,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_8_27B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1201,
+        vram: VramBudget {
+            fixed_bytes: 22 * GIB,
+            overhead_factor: 1.05,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 16480,
             attn_scratch_floats: 24576,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
@@ -1259,6 +1300,13 @@ pub fn lookup(
 pub fn supported_models_list() -> Vec<&'static str> {
     let mut models: Vec<&str> = REGISTRY
         .iter()
+        .filter(|e| {
+            matches!(e.backend, Backend::Hip)
+                && matches!(
+                    e.model.family(),
+                    ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+                )
+        })
         .map(|e| match &e.model {
             ModelVariant::Qwen3_5_0_8B => "qwen3.5-0.8b",
             ModelVariant::Qwen3_5_2B => "qwen3.5-2b",
@@ -1267,6 +1315,7 @@ pub fn supported_models_list() -> Vec<&'static str> {
             ModelVariant::Qwen3_5_35B_A3B => "qwen3.5-35b-a3b",
             ModelVariant::Qwen3_30B_A3B => "qwen3-30b-a3b",
             ModelVariant::Qwen3_6_27B => "qwen3.6-27b",
+            ModelVariant::Qwen3_8_27B => "qwen3.8-27b",
             ModelVariant::Qwen3_6_35B_A3B => "qwen3.6-35b-a3b",
             ModelVariant::Gemma4_E2B => "gemma4-e2b",
             ModelVariant::Gemma4_E4B => "gemma4-e4b",
@@ -1474,12 +1523,23 @@ mod tests {
         );
         assert_eq!(ModelVariant::Qwen3_6_27B.to_string(), "qwen3.6-27b");
         assert_eq!(
+            ModelVariant::from_cli_str("qwen3.8-27b"),
+            Some(ModelVariant::Qwen3_8_27B)
+        );
+        assert_eq!(ModelVariant::Qwen3_8_27B.to_string(), "qwen3.8-27b");
+        assert_eq!(
+            ModelVariant::Qwen3_8_27B.architecture_family(),
+            ArchitectureFamily::QwenHybridDense
+        );
+        assert_eq!(
             ModelVariant::Qwen3_6_35B_A3B.family(),
             ModelFamily::Qwen36Moe
         );
         assert_eq!(ModelVariant::Qwen3_6_35B_A3B.to_string(), "qwen3.6-35b-a3b");
         assert!(supported_models_list().contains(&"qwen3.6-27b"));
+        assert!(supported_models_list().contains(&"qwen3.8-27b"));
         assert!(supported_models_list().contains(&"qwen3.6-35b-a3b"));
+        assert!(!supported_models_list().contains(&"gemma4-e2b"));
     }
 
     #[test]

@@ -19,8 +19,6 @@ pub mod decode_engine;
 pub mod dflash_ddtree;
 pub mod flm_model_source;
 pub mod flm_tokenizer;
-pub mod gemma4_engine;
-pub mod gemma4_int4_engine;
 pub mod oracle;
 pub mod prefill_engine;
 pub mod profile;

@@ -1,8 +1,4 @@
-# Machine-readable seed for the SuperSonic support matrix.
-#
-# This is intentionally not generated into docs yet. Keep it aligned with
-# docs/supported-matrix.md while the schema settles, then promote it to the
-# single data source in a later consolidation PR.
+# Slim HIP/Qwen support matrix. CUDA/Metal/Gemma/Phi/Llama are out of this branch.
 
 version = 1
 
@@ -19,6 +15,27 @@ benchmark_doc = "docs/benchmarks.md#bench-perf"
 notes = "RDNA3 7900 XTX Qwen3.5 lanes are the mature HIP baseline."
 
 [[entry]]
+id = "hip-gfx1100-qwen36-27b"
+backend = "hip"
+arch = "gfx1100"
+status = "experimental"
+models = ["qwen3.6-27b"]
+quants = ["int4"]
+support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
+notes = "Dense hybrid 27B product lane. Same kernel geometry as Qwen3.8-27B."
+
+[[entry]]
+id = "hip-gfx1100-qwen38-27b"
+backend = "hip"
+arch = "gfx1100"
+status = "experimental"
+models = ["qwen3.8-27b"]
+quants = ["int4"]
+model_sources = ["flm"]
+support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
+notes = "Qwen3.8-27B is the same dense hybrid geometry as Qwen3.6-27B. Prefer FLM (GGUF conversion) via --model qwen3.8-27b."
+
+[[entry]]
 id = "hip-gfx1100-qwen36-35b-a3b-int4"
 backend = "hip"
 arch = "gfx1100"
@@ -26,7 +43,7 @@ status = "experimental"
 models = ["qwen3.6-35b-a3b"]
 quants = ["int4"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
-notes = "BF16 is intentionally unsupported for the FP8-native checkpoint. The Markdown matrix documents the INT4 lane, but this manifest keeps it experimental until a named gfx1100 35B gate exists."
+notes = "MoE scale-up lane. FLM-first."
 
 [[entry]]
 id = "hip-gfx1100-qwen36-35b-a3b-flm-int4"
@@ -37,11 +54,7 @@ models = ["qwen3.6-35b-a3b"]
 quants = ["int4"]
 model_sources = ["flm"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
-gate_commands = [
-  "SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm cargo test -q -p runner --test flm_moe_main_path -- --nocapture",
-]
-benchmark_doc = "docs/testing.md#flm-main-path-smoke"
-notes = "First-class no-HF FLM lane: model identity, tokenizer, direct native INT4 weight mode, and load/decode timing come from the FLM artifact rather than HF sidecars or --int4."
+notes = "First-class no-HF FLM lane."
 
 [[entry]]
 id = "hip-gfx1201-qwen35-tbm"
@@ -52,7 +65,7 @@ models = ["qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b"]
 quants = ["bf16", "int4", "fp8-runtime", "kv-fp8"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
 gate_scripts = ["tests/gfx1201/run_matrix.sh"]
-notes = "Registered and buildable on RDNA4, but still TBM until per-model token/parity results promote the cells."
+notes = "Registered and buildable on RDNA4."
 
 [[entry]]
 id = "hip-gfx1201-qwen36-27b-int4"
@@ -63,8 +76,18 @@ models = ["qwen3.6-27b"]
 quants = ["int4"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
 gate_scripts = ["tests/gfx1201/run_matrix.sh"]
-benchmark_doc = "docs/benchmarks.md#rdna4--r9700-smoke-benchmark"
-notes = "R9700 starter lane: RDNA4 WMMA/int4 harness, direct smoke, optional Lucebox/DFlash smoke, and native server smoke when local target/draft artifacts are present."
+notes = "R9700 dense 27B lane."
+
+[[entry]]
+id = "hip-gfx1201-qwen38-27b"
+backend = "hip"
+arch = "gfx1201"
+status = "experimental"
+models = ["qwen3.8-27b"]
+quants = ["int4"]
+model_sources = ["flm"]
+support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
+notes = "Qwen3.8-27B on R9700; same HIP 4B-kernel path as 3.6-27B."
 
 [[entry]]
 id = "hip-gfx1150-qwen35-all-lanes"
@@ -80,7 +103,6 @@ gate_scripts = [
   "tests/gfx1150/run_4b_fp8.sh",
   "tests/gfx1150/run_quant_regression.sh",
 ]
-benchmark_doc = "docs/benchmarks.md#correctness-gates"
 notes = "RDNA3.5 iGPU correctness lane."
 
 [[entry]]
@@ -92,144 +114,4 @@ models = ["qwen3.6-35b-a3b"]
 quants = ["int4"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx942"
 gate_scripts = ["tests/gfx942/run_qwen36_verify_suite.sh"]
-notes = "CDNA3 host-orchestrated chained decode path; performance work remains pending."
-
-[[entry]]
-id = "cuda-sm86-qwen35-all-lanes"
-backend = "cuda"
-arch = "sm86"
-status = "validated"
-models = ["qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b"]
-quants = ["bf16", "int4", "fp8-runtime", "kv-fp8"]
-support_doc = "docs/supported-matrix.md#cuda-on-sm86"
-gate_scripts = [
-  "tests/sm86/run.sh",
-  "tests/sm86/run_4b.sh",
-  "tests/sm86/run_qwen35_matrix.sh",
-]
-benchmark_doc = "docs/benchmarks.md#bench-perf"
-notes = "RTX 3090-class CUDA baseline for Qwen3.5."
-
-[[entry]]
-id = "cuda-sm86-gemma4-e2b-bf16"
-backend = "cuda"
-arch = "sm86"
-status = "validated"
-models = ["gemma4-e2b"]
-quants = ["bf16"]
-support_doc = "docs/supported-matrix.md#cuda-on-sm86"
-gate_scripts = ["tests/sm86/run_gemma4.sh"]
-notes = "Native Gemma 4 CUDA v1 lane; batch size is constrained by the support doc."
-
-[[entry]]
-id = "cuda-sm90-qwen35-inherited-all-lanes"
-backend = "cuda"
-arch = "sm90"
-status = "inherited"
-models = [
-  "qwen3.5-0.8b",
-  "qwen3.5-2b",
-  "qwen3.5-4b",
-  "qwen3.5-9b",
-]
-quants = ["bf16", "int4", "fp8-runtime", "kv-fp8"]
-support_doc = "docs/supported-matrix.md#cuda-on-sm90"
-benchmark_doc = "docs/detailed_performance.md#cuda--sm90-nvidia-h100-80gb-hbm3"
-notes = "H100 Qwen3.5 lanes currently inherit CUDA sm86 registry geometry and kernel families unless otherwise noted."
-
-[[entry]]
-id = "cuda-sm90-gemma4-e2b-inherited-bf16"
-backend = "cuda"
-arch = "sm90"
-status = "inherited"
-models = ["gemma4-e2b"]
-quants = ["bf16"]
-support_doc = "docs/supported-matrix.md#cuda-on-sm90"
-notes = "H100 Gemma 4 E2B inherits the CUDA BF16 lane; INT4, FP8-runtime, and KV-FP8 are not advertised."
-
-[[entry]]
-id = "cuda-sm90-phi4-mini-inherited-non-kv"
-backend = "cuda"
-arch = "sm90"
-status = "inherited"
-models = ["phi4-mini"]
-quants = ["bf16", "int4", "fp8-runtime"]
-support_doc = "docs/supported-matrix.md#cuda-on-sm90"
-notes = "H100 Phi-4 mini inherits BF16, INT4, and FP8-runtime lanes; KV-FP8 remains pending in the support table."
-
-[[entry]]
-id = "cuda-sm90-llama31-8b-inherited-bf16-kv"
-backend = "cuda"
-arch = "sm90"
-status = "inherited"
-models = ["llama3.1-8b"]
-quants = ["bf16", "kv-fp8"]
-support_doc = "docs/supported-matrix.md#cuda-on-sm90"
-notes = "H100 Llama 3.1 8B inherits BF16 and KV-FP8 lanes only."
-
-[[entry]]
-id = "metal-apple-m4-qwen35-bf16"
-backend = "metal"
-arch = "apple-m4"
-status = "validated"
-models = ["qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b"]
-quants = ["bf16"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
-gate_scripts = ["tests/metal/qwen35_bughunt_gate.sh"]
-notes = "Apple M4 remains the small Qwen3.5 Metal validation lane."
-
-[[entry]]
-id = "metal-apple-m5-max-qwen3-moe-int4"
-backend = "metal"
-arch = "apple-m5-max"
-status = "validated"
-models = ["qwen3-30b-a3b"]
-quants = ["int4"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
-gate_commands = [
-  "cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture",
-]
-benchmark_doc = "docs/benchmarks.md#external-references"
-notes = "Apple M5 Max Qwen3 MoE INT4 correctness lane through component and chained Metal paths."
-
-[[entry]]
-id = "metal-apple-m5-max-qwen36-moe-int4"
-backend = "metal"
-arch = "apple-m5-max"
-status = "validated"
-models = ["qwen3.6-35b-a3b"]
-quants = ["int4"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
-gate_commands = [
-  "cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture",
-]
-benchmark_doc = "docs/benchmarks.md#external-references"
-notes = "Apple M5 Max Qwen3.6 MoE INT4 correctness lane through component and chained Metal paths."
-
-[[entry]]
-id = "metal-apple-m5-max-gemma4-bf16-int4"
-backend = "metal"
-arch = "apple-m5-max"
-status = "validated"
-models = ["gemma4-e2b", "gemma4-e4b"]
-quants = ["bf16", "int4"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
-gate_commands = [
-  "cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture",
-]
-benchmark_doc = "docs/benchmarks.md#external-references"
-notes = "Apple M5 Max Gemma 4 BF16 and INT4 correctness lane."
-
-[[entry]]
-id = "metal-apple-m5-max-phi4-bf16-int4-fp8"
-backend = "metal"
-arch = "apple-m5-max"
-status = "validated"
-models = ["phi4-mini"]
-quants = ["bf16", "int4", "fp8-runtime"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
-gate_commands = [
-  "cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture",
-]
-benchmark_doc = "docs/benchmarks.md#external-references"
-notes = "Apple M5 Max Phi-4 mini BF16, INT4, and FP8-runtime correctness lane."
+notes = "CDNA3 host-orchestrated chained decode path."

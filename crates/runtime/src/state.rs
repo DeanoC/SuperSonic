@@ -15,7 +15,7 @@ use supersonic_core::registry::{self, Backend, GpuArch, ModelFamily, ModelVarian
 
 use crate::backend_resolver::resolve_backend;
 use crate::bakes::ensure_hf_metadata_present;
-use crate::builders::{build_gemma4, build_qwen};
+use crate::builders::build_qwen;
 use crate::chat_template::ChatTemplate;
 use crate::generate::{GenerationTelemetry, MockGeneration};
 use crate::prefix_cache::{PrefixCache, PrefixCacheConfig};
@@ -242,20 +242,11 @@ pub fn build_resolved(
 
             let (session, eos_ids) = match variant.family() {
                 ModelFamily::Qwen35 => build_qwen(&cfg, entry, max_context)?,
-                ModelFamily::Qwen3Moe => {
-                    bail!("qwen3-30b-a3b MoE runtime is not implemented yet")
-                }
                 ModelFamily::Qwen36Moe => {
-                    bail!("directory startup is not implemented for qwen3.6-35b-a3b")
+                    bail!("directory startup is not implemented for qwen3.6-35b-a3b; use an FLM source")
                 }
-                ModelFamily::Gemma4 => build_gemma4(&cfg, entry, max_context)?,
-                ModelFamily::Phi4 => {
-                    bail!(
-                        "Phi-4 engine is under development — not yet exposed via supersonic-serve"
-                    );
-                }
-                ModelFamily::Llama31 => {
-                    bail!("Llama 3.1 is available through the supersonic CLI but is not wired into supersonic-serve yet");
+                other => {
+                    bail!("{other} is not part of the slim HIP/Qwen serving surface")
                 }
             };
             (
@@ -603,35 +594,13 @@ fn validate_runtime_policy(
         );
     }
 
-    if backend == Backend::Metal {
-        if *variant != ModelVariant::Qwen3_5_0_8B {
-            bail!("Metal v1 only supports --model qwen3.5-0.8b");
-        }
-        if cfg.int4 {
-            bail!("Metal does not support --int4 yet");
-        }
-        if cfg.fp8_runtime {
-            bail!("Metal does not support --fp8-runtime yet");
-        }
-        if cfg.kv_fp8 {
-            bail!("Metal does not support --kv-fp8 yet");
-        }
+    if backend != Backend::Hip {
+        bail!("slim HIP/Qwen branch only supports --backend hip (got {backend})");
     }
 
     match variant.family() {
-        ModelFamily::Qwen35 | ModelFamily::Gemma4 => Ok(runtime_policy),
-        ModelFamily::Qwen3Moe => {
-            bail!("qwen3-30b-a3b MoE runtime is not implemented yet")
-        }
-        ModelFamily::Qwen36Moe => {
-            bail!("qwen3.6-35b-a3b MoE runtime is not implemented yet")
-        }
-        ModelFamily::Phi4 => {
-            bail!("Phi-4 engine is under development — not yet exposed via supersonic-serve");
-        }
-        ModelFamily::Llama31 => {
-            bail!("Llama 3.1 is available through the supersonic CLI but is not wired into supersonic-serve yet");
-        }
+        ModelFamily::Qwen35 | ModelFamily::Qwen36Moe => Ok(runtime_policy),
+        other => bail!("{other} is not part of the slim HIP/Qwen serving surface"),
     }
 }
 

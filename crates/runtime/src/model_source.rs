@@ -76,7 +76,19 @@ fn resolve_model_source_with(
             if let Some(explicit_model) = explicit_model {
                 let explicit = parse_model_variant(explicit_model)?;
                 if explicit != model {
-                    bail!("--model {explicit} does not match FLM runtime descriptor model {model}");
+                    if same_dense_hybrid_geometry(explicit, model) {
+                        // GGUF→FLM converters emit the dense-hybrid architecture id.
+                        // `--model qwen3.8-27b` selects the 3.8 registry row.
+                        return Ok(ResolvedModelSource {
+                            source: ModelSource::Flm(path),
+                            model: explicit,
+                        });
+                    }
+                    bail!(
+                        "--model {} does not match FLM runtime descriptor model {}",
+                        explicit,
+                        model
+                    );
                 }
             }
             Ok(ResolvedModelSource {
@@ -102,8 +114,22 @@ fn model_variant_from_flm_identity(identity: FlmRuntimeIdentity) -> Option<Model
         (model_store::flm::ARCH_QWEN3_6_MOE, model_store::flm::MODEL_QWEN3_6_MOE_V1) => {
             Some(ModelVariant::Qwen3_6_35B_A3B)
         }
+        (model_store::flm::ARCH_QWEN3_6_DENSE, model_store::flm::MODEL_QWEN3_8_DENSE_V1) => {
+            Some(ModelVariant::Qwen3_8_27B)
+        }
+        (model_store::flm::ARCH_QWEN3_6_DENSE, _) => Some(ModelVariant::Qwen3_6_27B),
         _ => None,
     }
+}
+
+fn same_dense_hybrid_geometry(a: ModelVariant, b: ModelVariant) -> bool {
+    matches!(
+        (a, b),
+        (
+            ModelVariant::Qwen3_6_27B | ModelVariant::Qwen3_8_27B,
+            ModelVariant::Qwen3_6_27B | ModelVariant::Qwen3_8_27B
+        )
+    )
 }
 
 #[cfg(test)]

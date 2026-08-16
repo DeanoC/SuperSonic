@@ -483,49 +483,7 @@ pub(crate) fn load_qwen35_weights(
         .map_err(|e| anyhow::anyhow!("load baked weights: {e}"))
 }
 
-pub(crate) fn ensure_gemma4_int4_bake(
-    cli: &Cli,
-    model_variant: &ModelVariant,
-    bootstrap_downloaded: bool,
-) -> Result<()> {
-    let target = crate::gemma4_int4_engine::int4_bake_dir(&cli.model_dir);
-    let _lock = model_store::BakeLock::acquire(&cli.model_dir)
-        .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-    if should_fetch_bake(
-        cli.download_bake,
-        bootstrap_downloaded,
-        crate::gemma4_int4_engine::int4_bake_ok(&cli.model_dir),
-    ) {
-        let canonical_model = model_variant.to_string();
-        match try_download_bake(
-            cli,
-            model_store::fetch::BakeVariant::Int4Gptq,
-            &canonical_model,
-            &target,
-        ) {
-            Ok(true) => eprintln!(
-                "[fetch] installed Gemma 4 INT4 bake at {}",
-                target.display()
-            ),
-            Ok(false) => {
-                anyhow::bail!(
-                    "No INT4 bake at {} and --no-download set.\nRun on a bigger machine:\n  python oracle/bake_int4_gemma4.py --model-dir {}",
-                    target.display(),
-                    cli.model_dir.display(),
-                );
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "could not obtain Gemma 4 INT4 bake: {e}\n\nRun on a bigger machine:\n  python oracle/bake_int4_gemma4.py --model-dir {}\nthen `python oracle/upload_bake.py --model {} --int4 --model-dir {}` to publish.",
-                    cli.model_dir.display(),
-                    cli.model,
-                    cli.model_dir.display(),
-                );
-            }
-        }
-    }
-    Ok(())
-}
+
 
 fn repo_root() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
