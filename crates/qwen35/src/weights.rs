@@ -179,9 +179,9 @@ pub fn ggml_k_row_bytes(qtype: i32, cols: usize) -> Option<usize> {
         LOWBIT_GGML_Q4_K => Some(blocks * 144),
         LOWBIT_GGML_Q5_K => Some(blocks * 176),
         LOWBIT_GGML_Q6_K => Some(blocks * 210),
-        LOWBIT_GQH3 => Some(blocks * 105),
-        LOWBIT_GQH2_H => Some(blocks * 73),
-        LOWBIT_GQH2_C => Some(blocks * 66),
+        LOWBIT_GQH3 => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh3, cols),
+        LOWBIT_GQH2_H => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh2H, cols),
+        LOWBIT_GQH2_C => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh2C, cols),
         _ => None,
     }
 }

@@ -421,15 +421,26 @@ impl GgufWeightLoader {
                             tensor.tensor_type
                         ))
                     })?;
-                let row_bytes = model_store::gqh::packed_nbytes(rung, 1, logical_cols)
+                let file_row = model_store::gqh::packed_nbytes(rung, 1, logical_cols)
                     .map_err(|e| LoadError::UnexpectedTensor(e.to_string()))?;
+                if data.len() != logical_rows * file_row {
+                    return Err(LoadError::UnexpectedTensor(format!(
+                        "GGUF GQH tensor {name} size {} != {logical_rows}*{file_row}",
+                        data.len()
+                    )));
+                }
+                let bytes = model_store::gqh::planarize(rung, logical_rows, logical_cols, data)
+                    .map_err(|e| LoadError::UnexpectedTensor(e.to_string()))?;
+                let row_bytes = model_store::gqh::device_row_bytes(rung, logical_cols).ok_or_else(
+                    || LoadError::UnexpectedTensor(format!("GQH device row cols={logical_cols}")),
+                )?;
                 Ok(LinearHostParts {
                     dtype: ScalarType::U8,
                     quant_type: tensor.tensor_type as i32,
                     logical_rows,
                     logical_cols,
                     upload_shape: vec![logical_rows, row_bytes],
-                    bytes: data.to_vec(),
+                    bytes,
                     row_bytes,
                 })
             }

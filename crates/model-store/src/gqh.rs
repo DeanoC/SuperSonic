@@ -103,6 +103,94 @@ pub fn packed_nbytes(rung: GqhRung, rows: usize, cols: usize) -> Result<usize, E
         .ok_or_else(|| Error::Other("GQH packed byte length overflows".into()))
 }
 
+const GQH_PLANE_ALIGN: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneLayout {
+    pub off_ratio: usize,
+    pub off_lo: usize,
+    pub off_hi: usize,
+    pub stride: usize,
+}
+
+/// Per-row 4-plane layout. Must match `gqh_plane_offsets` in kernels/gqh-stride.h.
+pub fn plane_layout(nsb: usize, is3: bool) -> PlaneLayout {
+    let mut o = (nsb + 7) & !7;
+    let off_ratio = o;
+    o += nsb * 8;
+    o = (o + (GQH_PLANE_ALIGN - 1)) & !(GQH_PLANE_ALIGN - 1);
+    let off_lo = o;
+    o += nsb * 64;
+    let off_hi = o;
+    if is3 {
+        o += nsb * 32;
+    }
+    let stride = (o + (GQH_PLANE_ALIGN - 1)) & !(GQH_PLANE_ALIGN - 1);
+    PlaneLayout {
+        off_ratio,
+        off_lo,
+        off_hi,
+        stride,
+    }
+}
+
+pub fn device_row_bytes(rung: GqhRung, cols: usize) -> Option<usize> {
+    if cols == 0 || cols % tables::SUPERBLOCK != 0 {
+        return None;
+    }
+    if matches!(rung, GqhRung::Gqh2C) {
+        return Some((cols / tables::SUPERBLOCK) * tables::GQH2C_SB_BYTES);
+    }
+    Some(plane_layout(cols / tables::SUPERBLOCK, matches!(rung, GqhRung::Gqh3)).stride)
+}
+
+pub fn device_nbytes(rung: GqhRung, rows: usize, cols: usize) -> Result<usize, Error> {
+    let row = device_row_bytes(rung, cols).ok_or_else(|| {
+        Error::Other(format!(
+            "GQH input axis {cols} is not a positive multiple of {}",
+            tables::SUPERBLOCK
+        ))
+    })?;
+    rows.checked_mul(row)
+        .ok_or_else(|| Error::Other("GQH device byte length overflows".into()))
+}
+
+/// Scatter tight AoS superblocks into 4 planes (d / ratio / lo / hi).
+pub fn planarize(rung: GqhRung, rows: usize, cols: usize, tight: &[u8]) -> Result<Vec<u8>, Error> {
+    let want = packed_nbytes(rung, rows, cols)?;
+    if tight.len() != want {
+        return Err(Error::Other(format!(
+            "GQH tight wire {} B, expected {want} B",
+            tight.len()
+        )));
+    }
+    if matches!(rung, GqhRung::Gqh2C) {
+        return Ok(tight.to_vec());
+    }
+    let nsb = cols / tables::SUPERBLOCK;
+    let payload = rung.superblock_bytes();
+    let is3 = matches!(rung, GqhRung::Gqh3);
+    let lay = plane_layout(nsb, is3);
+    let mut out = vec![0u8; rows * lay.stride];
+    for r in 0..rows {
+        let src_row = r * nsb * payload;
+        let dst_row = r * lay.stride;
+        for sb in 0..nsb {
+            let src = src_row + sb * payload;
+            out[dst_row + sb] = tight[src];
+            let ratio = dst_row + lay.off_ratio + sb * 8;
+            out[ratio..ratio + 8].copy_from_slice(&tight[src + 1..src + 9]);
+            let lo = dst_row + lay.off_lo + sb * 64;
+            out[lo..lo + 64].copy_from_slice(&tight[src + 9..src + 73]);
+            if is3 {
+                let hi = dst_row + lay.off_hi + sb * 32;
+                out[hi..hi + 32].copy_from_slice(&tight[src + 73..src + 105]);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn decode_row(
     rung: GqhRung,
     packed: &[u8],
@@ -397,6 +485,32 @@ mod tests {
             let (wire, reference) = load_case(name, rows, cols);
             let got = decode_wire(rung, rows, cols, &wire).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_bits_eq(&got, &reference, &format!("{name} {rows}x{cols}"));
+        }
+    }
+
+    #[test]
+    fn planarize_scatters_fields_onto_shifted_planes() {
+        let rows = 2usize;
+        let cols = 256usize;
+        let nsb = 1usize;
+        let mut tight = vec![0u8; rows * 105];
+        for r in 0..rows {
+            let b = r * 105;
+            tight[b] = 0x10 + r as u8;
+            tight[b + 1] = 0x20 + r as u8;
+            tight[b + 9] = 0x30 + r as u8;
+            tight[b + 73] = 0x40 + r as u8;
+        }
+        let plane = planarize(GqhRung::Gqh3, rows, cols, &tight).expect("planarize");
+        let lay = plane_layout(nsb, true);
+        assert_eq!(plane.len(), rows * lay.stride);
+        assert_eq!(lay.off_lo % 64, 0);
+        for r in 0..rows {
+            let row = r * lay.stride;
+            assert_eq!(plane[row], 0x10 + r as u8);
+            assert_eq!(plane[row + lay.off_ratio], 0x20 + r as u8);
+            assert_eq!(plane[row + lay.off_lo], 0x30 + r as u8);
+            assert_eq!(plane[row + lay.off_hi], 0x40 + r as u8);
         }
     }
 

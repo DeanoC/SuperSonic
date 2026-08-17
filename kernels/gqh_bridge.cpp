@@ -132,7 +132,8 @@ extern "C" int supersonic_gqh_hip_decode(
         return 405;
     }
     ScopedHipDevice scoped(device_ordinal);
-    const int64_t nsb_total = static_cast<int64_t>(rows) * (cols / GQH_SUPERBLOCK);
+    const int nsb = cols / GQH_SUPERBLOCK;
+    const int64_t nsb_total = static_cast<int64_t>(rows) * nsb;
     auto* packed = static_cast<const uint8_t*>(wire);
     auto* out = static_cast<float*>(dst);
     switch (rung) {
@@ -146,7 +147,8 @@ extern "C" int supersonic_gqh_hip_decode(
                 packed,
                 tensor_scale,
                 load_gqh3_grid(grid_code),
-                out);
+                out,
+                nsb);
             break;
         case GQH_RUNG_GQH2_H:
             hipLaunchKernelGGL(
@@ -158,7 +160,8 @@ extern "C" int supersonic_gqh_hip_decode(
                 packed,
                 tensor_scale,
                 load_gqh2h_grid(grid_code),
-                out);
+                out,
+                nsb);
             break;
         case GQH_RUNG_GQH2_C:
             hipLaunchKernelGGL(

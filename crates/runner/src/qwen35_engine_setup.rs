@@ -76,7 +76,7 @@ pub(crate) fn load_qwen35_engine(
     }
     if !weights.gqh_headers.is_empty() {
         eprintln!(
-            "[weights] GQH megakernel dequant ({} headers)",
+            "[weights] GQH megakernel dequant ({} headers, 4-plane d/ratio/lo/hi)",
             weights.gqh_headers.len()
         );
     }

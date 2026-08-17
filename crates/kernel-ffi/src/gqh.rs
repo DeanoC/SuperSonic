@@ -266,6 +266,10 @@ mod tests {
         }
     }
 
+    fn device_packed(rung: GqhRung, rows: usize, cols: usize, tight: &[u8]) -> Vec<u8> {
+        model_store::gqh::planarize(rung, rows, cols, tight).expect("planarize device wire")
+    }
+
     fn assert_bits_eq(got: &[f32], want: &[f32], label: &str) {
         assert_eq!(got.len(), want.len(), "{label} length");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -385,11 +389,12 @@ mod tests {
             let cpu = decode_wire(cpu_rung, rows, cols, &wire).expect("cpu decode");
             assert_bits_eq(&cpu, &reference, &format!("{name} cpu {rows}x{cols}"));
             let (scale, grid_code, packed) = split_wire(cpu_rung, &wire);
+            let packed = device_packed(cpu_rung, rows, cols, packed);
             let packed_buf = GpuBuffer::from_host_bytes(
                 ordinal,
                 ScalarType::U8,
                 &[packed.len()],
-                packed,
+                &packed,
             )
             .expect("upload packed");
             let mut dst =
@@ -468,8 +473,9 @@ mod tests {
                 .as_ref()
                 .map(|h| (h.tensor_scale, h.grid_code))
                 .unwrap_or((0.0, 0));
+            let device = device_packed(cpu_rung, rows, cols, packed);
             let packed_buf =
-                GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[packed.len()], packed)
+                GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[device.len()], &device)
                     .expect("upload packed");
             let mut dst =
                 GpuBuffer::zeros(ordinal, ScalarType::F32, &[rows * cols]).expect("alloc dst");
@@ -553,8 +559,9 @@ mod tests {
                 .as_ref()
                 .map(|h| (h.tensor_scale, h.grid_code))
                 .unwrap_or((0.0, 0));
+            let device = device_packed(rung, 1, cols, packed);
             let packed_buf =
-                GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[packed.len()], packed)
+                GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[device.len()], &device)
                     .expect("upload");
             let mut dst = GpuBuffer::zeros(ordinal, ScalarType::F32, &[cols]).expect("dst");
             decode(
@@ -599,11 +606,12 @@ mod tests {
                 .collect();
             let want = kernel_order_matvec(&weights, &x, rows, cols);
 
+            let device = device_packed(cpu_rung, rows, cols, packed);
             let packed_buf = GpuBuffer::from_host_bytes(
                 ordinal,
                 ScalarType::U8,
-                &[packed.len()],
-                packed,
+                &[device.len()],
+                &device,
             )
             .expect("upload packed");
             let x_buf =

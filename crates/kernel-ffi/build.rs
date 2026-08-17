@@ -292,6 +292,7 @@ const KERNEL_RERUN_PATHS: &[&str] = &[
     "gqh.hip",
     "gqh_bridge.cpp",
     "gqh-tables.h",
+    "gqh-stride.h",
     "full_attention_cuda.cuh",
     "full_attention_4b_cuda.cuh",
     "prefill_helpers_cuda.cuh",

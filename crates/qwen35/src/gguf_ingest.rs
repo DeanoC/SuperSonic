@@ -297,13 +297,24 @@ fn upload_packed(
     let cols = tensor.dims[0];
     let rows = tensor.dims[1];
     let data = file.tensor_bytes(name)?;
-    let row_bytes = if let Some(rung) = GqhRung::from_ggml_type(tensor.tensor_type) {
+    let (upload, row_bytes) = if let Some(rung) = GqhRung::from_ggml_type(tensor.tensor_type) {
         if let Some(h) = file.gqh_header(name) {
             headers.insert(header_key.to_string(), h.clone());
         } else if rung.has_header() {
             return Err(err(format!("{name} is GQH but has no header")));
         }
-        gqh::packed_nbytes(rung, 1, cols)?
+        let file_row = gqh::packed_nbytes(rung, 1, cols)?;
+        if data.len() != rows * file_row {
+            return Err(err(format!(
+                "{name} packed size {} != {rows}*{file_row}",
+                data.len()
+            )));
+        }
+        let aligned = gqh::planarize(rung, rows, cols, data)?;
+        let row_bytes = gqh::device_row_bytes(rung, cols).ok_or_else(|| {
+            err(format!("{name} invalid GQH device row cols={cols}"))
+        })?;
+        (aligned, row_bytes)
     } else {
         let qtype = match tensor.tensor_type {
             8 => LOWBIT_GGML_Q8_0,
@@ -317,17 +328,18 @@ fn upload_packed(
                 )))
             }
         };
-        ggml_k_row_bytes(qtype, cols).ok_or_else(|| {
+        let row_bytes = ggml_k_row_bytes(qtype, cols).ok_or_else(|| {
             err(format!("{name} invalid packed row for type {qtype} cols={cols}"))
-        })?
+        })?;
+        if data.len() != rows * row_bytes {
+            return Err(err(format!(
+                "{name} packed size {} != {rows}*{row_bytes}",
+                data.len()
+            )));
+        }
+        (data.to_vec(), row_bytes)
     };
-    if data.len() != rows * row_bytes {
-        return Err(err(format!(
-            "{name} packed size {} != {rows}*{row_bytes}",
-            data.len()
-        )));
-    }
-    let buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_bytes], data)
+    let buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_bytes], &upload)
         .map_err(model_store::Error::from)?;
     if let Some(h) = headers.get(header_key) {
         kernel_ffi::gqh::register_header(buf.as_ptr(), h.tensor_scale, h.grid_code);

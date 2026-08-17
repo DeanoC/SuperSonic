@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "gqh-tables.h"
+#include "gqh-stride.h"
 
 // Host writes this before a split-kernel graph replay so seqlen is not
 // baked into captured node params.
@@ -422,30 +422,45 @@ __device__ inline float qwen35_gqh_subblock_scale(
 }
 
 __device__ inline int qwen35_gqh_row_bytes(int qtype, int cols) {
-    const int blocks = cols / GQH_SUPERBLOCK;
-    if (qtype == QWEN35_LOWBIT_GQH3) return blocks * GQH3_SB_BYTES;
-    if (qtype == QWEN35_LOWBIT_GQH2_H) return blocks * GQH2H_SB_BYTES;
-    if (qtype == QWEN35_LOWBIT_GQH2_C) return blocks * GQH2C_SB_BYTES;
+    const int nsb = cols / GQH_SUPERBLOCK;
+    if (qtype == QWEN35_LOWBIT_GQH3) return gqh_plane_row_bytes(nsb, 1);
+    if (qtype == QWEN35_LOWBIT_GQH2_H) return gqh_plane_row_bytes(nsb, 0);
+    if (qtype == QWEN35_LOWBIT_GQH2_C) return nsb * GQH2C_SB_BYTES;
     return 0;
+}
+
+__device__ inline float qwen35_gqh_scale_planes(
+    uint8_t d, const uint8_t* __restrict__ ratio8, int sub, float tensor_scale) {
+    const float d_real =
+        qwen35_gqh_bits(QWEN35_GQH_E4M3[d >> 3][d & 7]) * tensor_scale;
+    const uint8_t rb = ratio8[sub >> 1];
+    const int ratio = (sub & 1) ? (rb >> 4) : (rb & 0x0f);
+    return d_real * qwen35_gqh_bits(QWEN35_GQH_RATIO_Q[ratio][0]);
 }
 
 __device__ inline float qwen35_gqh_dequant_scalar(
     const void* w_ptr, int qtype, int row, int col, int cols,
     float tensor_scale, int grid_code) {
-    const int sb_bytes = qwen35_gqh_row_bytes(qtype, GQH_SUPERBLOCK);
+    const int nsb = cols / GQH_SUPERBLOCK;
+    const int is3 = qtype == QWEN35_LOWBIT_GQH3;
+    int off_r, off_lo, off_hi, stride;
+    gqh_plane_offsets(nsb, is3, &off_r, &off_lo, &off_hi, &stride);
     const uint8_t* rowbase = static_cast<const uint8_t*>(w_ptr) +
-        static_cast<size_t>(row) * qwen35_gqh_row_bytes(qtype, cols);
+        static_cast<size_t>(row) * static_cast<size_t>(stride);
     const int sb = col / GQH_SUPERBLOCK;
     const int j = col % GQH_SUPERBLOCK;
-    const uint8_t* b = rowbase + static_cast<size_t>(sb) * sb_bytes;
-    const float s_b = qwen35_gqh_subblock_scale(b, j >> 4, tensor_scale);
-    if (qtype == QWEN35_LOWBIT_GQH3) {
-        const int lo = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
-        const int hi = (b[73 + (j >> 3)] >> (j & 7)) & 0x01;
+    const uint8_t d = rowbase[sb];
+    const uint8_t* rat = rowbase + off_r + (sb << 3);
+    const uint8_t* lo_p = rowbase + off_lo + (sb << 6);
+    const float s_b = qwen35_gqh_scale_planes(d, rat, j >> 4, tensor_scale);
+    if (is3) {
+        const uint8_t* hi_p = rowbase + off_hi + (sb << 5);
+        const int lo = (lo_p[j >> 2] >> (2 * (j & 3))) & 0x03;
+        const int hi = (hi_p[j >> 3] >> (j & 7)) & 0x01;
         return qwen35_gqh_bits(QWEN35_GQH3_GRID[grid_code][lo | (hi << 2)]) * s_b;
     }
     if (qtype == QWEN35_LOWBIT_GQH2_H) {
-        const int code = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+        const int code = (lo_p[j >> 2] >> (2 * (j & 3))) & 0x03;
         return qwen35_gqh_bits(QWEN35_GQH2H_GRID[grid_code][code]) * s_b;
     }
     return 0.0f;
@@ -454,22 +469,28 @@ __device__ inline float qwen35_gqh_dequant_scalar(
 __device__ inline void qwen35_gqh_dequant_8(
     const void* w_ptr, int qtype, int row, int col, int cols,
     float tensor_scale, int grid_code, float out[8]) {
-    const int sb_bytes = qwen35_gqh_row_bytes(qtype, GQH_SUPERBLOCK);
+    const int nsb = cols / GQH_SUPERBLOCK;
+    const int is3 = qtype == QWEN35_LOWBIT_GQH3;
+    int off_r, off_lo, off_hi, stride;
+    gqh_plane_offsets(nsb, is3, &off_r, &off_lo, &off_hi, &stride);
     const uint8_t* rowbase = static_cast<const uint8_t*>(w_ptr) +
-        static_cast<size_t>(row) * qwen35_gqh_row_bytes(qtype, cols);
+        static_cast<size_t>(row) * static_cast<size_t>(stride);
     const int sb = col / GQH_SUPERBLOCK;
     const int j0 = col % GQH_SUPERBLOCK;
-    const uint8_t* b = rowbase + static_cast<size_t>(sb) * sb_bytes;
-    const float s_b = qwen35_gqh_subblock_scale(b, j0 >> 4, tensor_scale);
+    const uint8_t d = rowbase[sb];
+    const uint8_t* rat = rowbase + off_r + (sb << 3);
+    const uint8_t* lo_p = rowbase + off_lo + (sb << 6);
+    const uint8_t* hi_p = is3 ? rowbase + off_hi + (sb << 5) : nullptr;
+    const float s_b = qwen35_gqh_scale_planes(d, rat, j0 >> 4, tensor_scale);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int j = j0 + i;
-        if (qtype == QWEN35_LOWBIT_GQH3) {
-            const int lo = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
-            const int hi = (b[73 + (j >> 3)] >> (j & 7)) & 0x01;
+        if (is3) {
+            const int lo = (lo_p[j >> 2] >> (2 * (j & 3))) & 0x03;
+            const int hi = (hi_p[j >> 3] >> (j & 7)) & 0x01;
             out[i] = qwen35_gqh_bits(QWEN35_GQH3_GRID[grid_code][lo | (hi << 2)]) * s_b;
         } else if (qtype == QWEN35_LOWBIT_GQH2_H) {
-            const int code = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+            const int code = (lo_p[j >> 2] >> (2 * (j & 3))) & 0x03;
             out[i] = qwen35_gqh_bits(QWEN35_GQH2H_GRID[grid_code][code]) * s_b;
         } else {
             out[i] = 0.0f;
@@ -491,6 +512,14 @@ __device__ inline void qwen35_gqh_hdr(
 
 // Same register-grid + packed-code walk as kernels/gqh.hip. Each lane owns
 // 8 consecutive weights in the 256-wide superblock (lane*8).
+__device__ inline float qwen35_gqh_with_sign(float mag, int positive) {
+    uint32_t bits;
+    memcpy(&bits, &mag, 4);
+    bits ^= (uint32_t)(positive - 1) & 0x80000000u;
+    memcpy(&mag, &bits, 4);
+    return mag;
+}
+
 __device__ inline float qwen35_gqh_level(int code, float4 mag, bool is3) {
     if (is3) {
         const int hi = (code >> 2) & 1;
@@ -499,11 +528,11 @@ __device__ inline float qwen35_gqh_level(int code, float4 mag, bool is3) {
         const float e0 = (idx & 1) ? mag.y : mag.x;
         const float e1 = (idx & 1) ? mag.w : mag.z;
         const float m = (idx & 2) ? e1 : e0;
-        return hi ? m : -m;
+        return qwen35_gqh_with_sign(m, hi);
     }
     const int hi = (code >> 1) & 1;
     const float m = ((code & 1) != hi) ? mag.x : 1.0f;
-    return hi ? m : -m;
+    return qwen35_gqh_with_sign(m, hi);
 }
 
 __device__ inline float4 qwen35_gqh_mag(int qtype, int grid_code) {
@@ -527,26 +556,26 @@ __device__ __noinline__ float qwen35_gqh_lane_dot_range(
     float tensor_scale, int grid_code,
     const float* __restrict__ x, int sb0, int nsb, int lane) {
     const bool is3 = qtype == QWEN35_LOWBIT_GQH3;
-    const int sb_bytes = qwen35_gqh_row_bytes(qtype, GQH_SUPERBLOCK);
     const int row_nsb = cols / GQH_SUPERBLOCK;
+    int off_r, off_lo, off_hi, stride;
+    gqh_plane_offsets(row_nsb, is3 ? 1 : 0, &off_r, &off_lo, &off_hi, &stride);
     const uint8_t* rowbase = static_cast<const uint8_t*>(w_ptr) +
-        (static_cast<size_t>(row) * static_cast<size_t>(row_nsb) +
-         static_cast<size_t>(sb0)) * static_cast<size_t>(sb_bytes);
+        static_cast<size_t>(row) * static_cast<size_t>(stride);
     const int j0 = lane * 8;
     const int sub = j0 >> 4;
     const float4 mag = qwen35_gqh_mag(qtype, grid_code);
     float acc = 0.0f;
     for (int sb = 0; sb < nsb; ++sb) {
-        const uint8_t* b = rowbase + static_cast<size_t>(sb) * static_cast<size_t>(sb_bytes);
-        const uint8_t d = b[0];
+        const int s = sb0 + sb;
+        const uint8_t d = rowbase[s];
         const float d_real =
             qwen35_gqh_bits(QWEN35_GQH_E4M3[d >> 3][d & 7]) * tensor_scale;
-        const uint8_t rb = b[1 + (sub >> 1)];
+        const uint8_t rb = rowbase[off_r + (s << 3) + (sub >> 1)];
         const int ratio = (sub & 1) ? (rb >> 4) : (rb & 0x0f);
         const float s_b = d_real * qwen35_gqh_bits(QWEN35_GQH_RATIO_Q[ratio][0]);
         uint16_t lo2;
-        memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
-        const uint8_t hi1 = is3 ? b[73 + lane] : 0;
+        memcpy(&lo2, rowbase + off_lo + (s << 6) + lane * 2, sizeof(lo2));
+        const uint8_t hi1 = is3 ? rowbase[off_hi + (s << 5) + lane] : 0;
         const float4 x0 = *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0);
         const float4 x1 = *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0 + 4);
         const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
@@ -567,13 +596,14 @@ __device__ __noinline__ void qwen35_gqh_lane_dot_pair(
     const float* __restrict__ x, int nsb, int lane,
     float* acc0, float* acc1) {
     const bool is3 = qtype == QWEN35_LOWBIT_GQH3;
-    const int sb_bytes = qwen35_gqh_row_bytes(qtype, GQH_SUPERBLOCK);
     const int row_nsb = cols / GQH_SUPERBLOCK;
+    int off_r, off_lo, off_hi, stride;
+    gqh_plane_offsets(row_nsb, is3 ? 1 : 0, &off_r, &off_lo, &off_hi, &stride);
     const uint8_t* base0 = static_cast<const uint8_t*>(w_ptr) +
-        static_cast<size_t>(row0) * static_cast<size_t>(row_nsb) * static_cast<size_t>(sb_bytes);
+        static_cast<size_t>(row0) * static_cast<size_t>(stride);
     const uint8_t* base1 = (row1 >= 0)
         ? static_cast<const uint8_t*>(w_ptr) +
-            static_cast<size_t>(row1) * static_cast<size_t>(row_nsb) * static_cast<size_t>(sb_bytes)
+            static_cast<size_t>(row1) * static_cast<size_t>(stride)
         : nullptr;
     const int j0 = lane * 8;
     const int sub = j0 >> 4;
@@ -584,29 +614,27 @@ __device__ __noinline__ void qwen35_gqh_lane_dot_pair(
         const float4 x0 = *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0);
         const float4 x1v = *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0 + 4);
         const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1v.x, x1v.y, x1v.z, x1v.w};
-        const uint8_t* b0 = base0 + static_cast<size_t>(sb) * static_cast<size_t>(sb_bytes);
-        const uint8_t d0 = b0[0];
+        const uint8_t d0 = base0[sb];
         const float d_real0 =
             qwen35_gqh_bits(QWEN35_GQH_E4M3[d0 >> 3][d0 & 7]) * tensor_scale;
-        const uint8_t rb0 = b0[1 + (sub >> 1)];
+        const uint8_t rb0 = base0[off_r + (sb << 3) + (sub >> 1)];
         const float s0 = d_real0 * qwen35_gqh_bits(
             QWEN35_GQH_RATIO_Q[(sub & 1) ? (rb0 >> 4) : (rb0 & 0x0f)][0]);
         uint16_t lo0;
-        memcpy(&lo0, b0 + 9 + lane * 2, sizeof(lo0));
-        const uint8_t hi0 = is3 ? b0[73 + lane] : 0;
+        memcpy(&lo0, base0 + off_lo + (sb << 6) + lane * 2, sizeof(lo0));
+        const uint8_t hi0 = is3 ? base0[off_hi + (sb << 5) + lane] : 0;
         float s1 = 0.0f;
         uint16_t lo1 = 0;
         uint8_t hi1 = 0;
         if (base1 != nullptr) {
-            const uint8_t* b1 = base1 + static_cast<size_t>(sb) * static_cast<size_t>(sb_bytes);
-            const uint8_t d1 = b1[0];
+            const uint8_t d1 = base1[sb];
             const float d_real1 =
                 qwen35_gqh_bits(QWEN35_GQH_E4M3[d1 >> 3][d1 & 7]) * tensor_scale;
-            const uint8_t rb1 = b1[1 + (sub >> 1)];
+            const uint8_t rb1 = base1[off_r + (sb << 3) + (sub >> 1)];
             s1 = d_real1 * qwen35_gqh_bits(
                 QWEN35_GQH_RATIO_Q[(sub & 1) ? (rb1 >> 4) : (rb1 & 0x0f)][0]);
-            memcpy(&lo1, b1 + 9 + lane * 2, sizeof(lo1));
-            hi1 = is3 ? b1[73 + lane] : 0;
+            memcpy(&lo1, base1 + off_lo + (sb << 6) + lane * 2, sizeof(lo1));
+            hi1 = is3 ? base1[off_hi + (sb << 5) + lane] : 0;
         }
 #pragma unroll
         for (int t = 0; t < 8; ++t) {
