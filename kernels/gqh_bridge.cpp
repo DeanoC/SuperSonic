@@ -106,6 +106,13 @@ float4 load_gqh2h_mag(int grid_code) {
     return mag;
 }
 
+size_t gqh_x_lds_bytes(int in_dim) {
+    if (in_dim <= 0 || in_dim > GQH_LDS_X_MAX) {
+        return 0;
+    }
+    return static_cast<size_t>(in_dim) * sizeof(float);
+}
+
 }  // namespace
 
 extern "C" int supersonic_gqh_hip_decode(
@@ -204,6 +211,7 @@ extern "C" int supersonic_gqh_hip_matvec(
         static_cast<unsigned int>(ncols),
         1);
     const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
+    const size_t lds = gqh_x_lds_bytes(in_dim);
     auto* packed = static_cast<const uint8_t*>(wire);
     auto* xv = static_cast<const float*>(x);
     auto* yv = static_cast<float*>(y);
@@ -213,7 +221,7 @@ extern "C" int supersonic_gqh_hip_matvec(
                 HIP_KERNEL_NAME(gqh_matvec_kernel<true>),
                 blocks,
                 threads,
-                0,
+                lds,
                 0,
                 packed,
                 xv,
@@ -230,7 +238,7 @@ extern "C" int supersonic_gqh_hip_matvec(
                 HIP_KERNEL_NAME(gqh_matvec_kernel<false>),
                 blocks,
                 threads,
-                0,
+                lds,
                 0,
                 packed,
                 xv,
@@ -298,6 +306,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
         static_cast<unsigned int>(ncols),
         1);
     const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
+    const size_t lds = gqh_x_lds_bytes(in_dim);
     auto* packed = static_cast<const uint8_t*>(wire);
     auto* xv = static_cast<const float*>(x);
     auto* yv = static_cast<float*>(y);
@@ -308,7 +317,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
                 HIP_KERNEL_NAME(gqh_matvec_kernel<true>),
                 blocks,
                 threads,
-                0,
+                lds,
                 hs,
                 packed,
                 xv,
@@ -325,7 +334,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
                 HIP_KERNEL_NAME(gqh_matvec_kernel<false>),
                 blocks,
                 threads,
-                0,
+                lds,
                 hs,
                 packed,
                 xv,
@@ -393,6 +402,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
         static_cast<unsigned int>(ncols),
         1);
     const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
+    const size_t lds = gqh_x_lds_bytes(in_dim);
     auto* packed = static_cast<const uint8_t*>(wire);
     auto* xv = static_cast<const float*>(x);
     auto* yv = static_cast<float*>(y);
@@ -403,7 +413,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
                 HIP_KERNEL_NAME((gqh_matvec_kernel<true, true>)),
                 blocks,
                 threads,
-                0,
+                lds,
                 hs,
                 packed,
                 xv,
@@ -420,7 +430,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
                 HIP_KERNEL_NAME((gqh_matvec_kernel<false, true>)),
                 blocks,
                 threads,
-                0,
+                lds,
                 hs,
                 packed,
                 xv,
@@ -434,6 +444,136 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
             break;
         default:
             return 401;
+    }
+    return launch_result(421, 422);
+}
+
+extern "C" int supersonic_gqh_hip_matvec_stream_pair(
+    int device_ordinal,
+    int rung_a,
+    int rung_b,
+    const void* wire_a,
+    const void* wire_b,
+    const void* x,
+    void* y_a,
+    void* y_b,
+    int in_dim,
+    int out_dim,
+    float scale_a,
+    float scale_b,
+    int grid_a,
+    int grid_b,
+    void* stream) {
+    if (rung_a != GQH_RUNG_GQH3 && rung_a != GQH_RUNG_GQH2_H) {
+        return 401;
+    }
+    if (rung_b != GQH_RUNG_GQH3 && rung_b != GQH_RUNG_GQH2_H) {
+        return 401;
+    }
+    const int shape_a = validate_shape(rung_a, out_dim, in_dim, grid_a);
+    const int shape_b = validate_shape(rung_b, out_dim, in_dim, grid_b);
+    if (shape_a != 0) {
+        return shape_a;
+    }
+    if (shape_b != 0) {
+        return shape_b;
+    }
+    if (wire_a == nullptr || wire_b == nullptr || x == nullptr || y_a == nullptr ||
+        y_b == nullptr) {
+        return 405;
+    }
+    if ((reinterpret_cast<uintptr_t>(x) % sizeof(float4)) != 0) {
+        return 404;
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    const dim3 blocks(
+        static_cast<unsigned int>((out_dim + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS),
+        1,
+        1);
+    const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
+    const size_t lds = gqh_x_lds_bytes(in_dim);
+    auto* pa = static_cast<const uint8_t*>(wire_a);
+    auto* pb = static_cast<const uint8_t*>(wire_b);
+    auto* xv = static_cast<const float*>(x);
+    auto* ya = static_cast<float*>(y_a);
+    auto* yb = static_cast<float*>(y_b);
+    hipStream_t hs = static_cast<hipStream_t>(stream);
+    const float4 mag_a = (rung_a == GQH_RUNG_GQH3) ? load_gqh3_mag(grid_a)
+                                                   : load_gqh2h_mag(grid_a);
+    const float4 mag_b = (rung_b == GQH_RUNG_GQH3) ? load_gqh3_mag(grid_b)
+                                                   : load_gqh2h_mag(grid_b);
+    if (rung_a == GQH_RUNG_GQH3 && rung_b == GQH_RUNG_GQH3) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_matvec_pair_kernel<true, true>)),
+            blocks,
+            threads,
+            lds,
+            hs,
+            pa,
+            pb,
+            xv,
+            ya,
+            yb,
+            in_dim,
+            out_dim,
+            scale_a,
+            scale_b,
+            mag_a,
+            mag_b);
+    } else if (rung_a == GQH_RUNG_GQH3 && rung_b == GQH_RUNG_GQH2_H) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_matvec_pair_kernel<true, false>)),
+            blocks,
+            threads,
+            lds,
+            hs,
+            pa,
+            pb,
+            xv,
+            ya,
+            yb,
+            in_dim,
+            out_dim,
+            scale_a,
+            scale_b,
+            mag_a,
+            mag_b);
+    } else if (rung_a == GQH_RUNG_GQH2_H && rung_b == GQH_RUNG_GQH3) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_matvec_pair_kernel<false, true>)),
+            blocks,
+            threads,
+            lds,
+            hs,
+            pa,
+            pb,
+            xv,
+            ya,
+            yb,
+            in_dim,
+            out_dim,
+            scale_a,
+            scale_b,
+            mag_a,
+            mag_b);
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_matvec_pair_kernel<false, false>)),
+            blocks,
+            threads,
+            lds,
+            hs,
+            pa,
+            pb,
+            xv,
+            ya,
+            yb,
+            in_dim,
+            out_dim,
+            scale_a,
+            scale_b,
+            mag_a,
+            mag_b);
     }
     return launch_result(421, 422);
 }

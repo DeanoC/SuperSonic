@@ -68,6 +68,23 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
     int grid_code,
     void* stream);
 
+extern "C" int supersonic_gqh_hip_matvec_stream_pair(
+    int device_ordinal,
+    int rung_a,
+    int rung_b,
+    const void* wire_a,
+    const void* wire_b,
+    const void* x,
+    void* y_a,
+    void* y_b,
+    int in_dim,
+    int out_dim,
+    float scale_a,
+    float scale_b,
+    int grid_a,
+    int grid_b,
+    void* stream);
+
 namespace {
 
 int gqh_rung_from_qtype(int qtype) {
@@ -338,6 +355,38 @@ hipError_t launch_gqh_gemv(
         out_dim,
         h.scale,
         h.grid,
+        stream);
+    return st == 0 ? hipSuccess : hipErrorInvalidValue;
+}
+
+hipError_t launch_gqh_gemv_pair(
+    int ordinal,
+    const GqhProjHdr& a,
+    const GqhProjHdr& b,
+    const float* x,
+    float* y_a,
+    float* y_b,
+    int in_dim,
+    int out_dim,
+    hipStream_t stream) {
+    if (a.rung < 0 || b.rung < 0 || a.wire == nullptr || b.wire == nullptr) {
+        return hipErrorInvalidValue;
+    }
+    const int st = supersonic_gqh_hip_matvec_stream_pair(
+        ordinal,
+        a.rung,
+        b.rung,
+        a.wire,
+        b.wire,
+        x,
+        y_a,
+        y_b,
+        in_dim,
+        out_dim,
+        a.scale,
+        b.scale,
+        a.grid,
+        b.grid,
         stream);
     return st == 0 ? hipSuccess : hipErrorInvalidValue;
 }
@@ -7734,7 +7783,10 @@ int persistent_decode_device(
                 if (use_gqh_gemv) {
                     const GqhMixerLayer& mx = mlp_hdrs.mix[layer];
                     if (mx.layer_type == 1) {
-                        mid_g = mx.attn_heads > 0 ? mx.attn_heads : 1;
+                        const int nh = mx.attn_heads > 0 ? mx.attn_heads : 1;
+                        // 24-block mid wins once KV is long; at Hello-length
+                        // the grid_barrier tax is larger than the head parallel.
+                        mid_g = (seqlen_offset < 24) ? 1 : nh;
                     } else {
                         if (proj_can_gemv(mx.b) && mx.b.qtype == 8) {
                             mid_flags |= 8;
@@ -7867,23 +7919,39 @@ int persistent_decode_device(
                 err = launch_split(4, layer, 0, grid_gate, stream);
                 if (err != hipSuccess) return err;
                 if (use_gqh_gemv) {
-                    err = launch_gqh_gemv(
-                        device_ordinal,
-                        mlp_hdrs.gate[layer],
-                        ws_normed,
-                        ws_gate,
-                        hidden_dim,
-                        intermediate_size,
-                        stream);
-                    if (err != hipSuccess) return err;
-                    err = launch_gqh_gemv(
-                        device_ordinal,
-                        mlp_hdrs.up[layer],
-                        ws_normed,
-                        ws_up,
-                        hidden_dim,
-                        intermediate_size,
-                        stream);
+                    const GqhProjHdr& gate_h = mlp_hdrs.gate[layer];
+                    const GqhProjHdr& up_h = mlp_hdrs.up[layer];
+                    if (gate_h.rung >= 0 && up_h.rung >= 0) {
+                        err = launch_gqh_gemv_pair(
+                            device_ordinal,
+                            gate_h,
+                            up_h,
+                            ws_normed,
+                            ws_gate,
+                            ws_up,
+                            hidden_dim,
+                            intermediate_size,
+                            stream);
+                    } else {
+                        err = launch_gqh_gemv(
+                            device_ordinal,
+                            gate_h,
+                            ws_normed,
+                            ws_gate,
+                            hidden_dim,
+                            intermediate_size,
+                            stream);
+                        if (err == hipSuccess) {
+                            err = launch_gqh_gemv(
+                                device_ordinal,
+                                up_h,
+                                ws_normed,
+                                ws_up,
+                                hidden_dim,
+                                intermediate_size,
+                                stream);
+                        }
+                    }
                     if (err != hipSuccess) return err;
                     launch_swiglu_f32(ws_gate, ws_up, intermediate_size, stream);
                     if (mlp_hdrs.down[layer].rung >= 0) {

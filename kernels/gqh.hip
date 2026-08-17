@@ -99,6 +99,11 @@ __global__ void gqh2c_decode_kernel(
 #define GQH_WARP 32
 #define GQH_MATVEC_WARPS 8
 #define GQH_PER_LANE (GQH_SUPERBLOCK / GQH_WARP)
+// Stage the full activation vector in LDS when it fits. 5120×f32 = 20 KiB.
+// Per-superblock staging was slower: 2 syncthreads × nsb dominated the GEMV.
+#define GQH_LDS_X_MAX 5120
+
+extern __shared__ char gqh_dyn_smem[];
 
 static __device__ __forceinline__ float gqh_warp_shfl_down(float v, int off) {
 #if defined(__HIP_PLATFORM_AMD__)
@@ -140,51 +145,54 @@ __global__ void gqh_matvec_kernel(
     const int col = blockIdx.y;
 
     __shared__ float s_ratio[16];
-    __shared__ float s_x[GQH_SUPERBLOCK];
+    float* s_x = reinterpret_cast<float*>(gqh_dyn_smem);
     if (threadIdx.x < 16) {
         s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+    }
+    const bool use_lds = (in <= GQH_LDS_X_MAX);
+    const float* __restrict__ xc = x + (int64_t)col * x_col_stride;
+    if (use_lds) {
+        for (int i = threadIdx.x; i < in; i += blockDim.x) {
+            s_x[i] = xc[i];
+        }
     }
     __syncthreads();
 
     const bool valid = row < out;
+    if (!valid) {
+        return;
+    }
+
     const int nsb = in / GQH_SUPERBLOCK;
-    const uint8_t* __restrict__ rowbase =
-        valid ? data + (int64_t)row * nsb * sb_bytes : data;
-    const float* __restrict__ xc = x + (int64_t)col * x_col_stride;
+    const uint8_t* __restrict__ rowbase = data + (int64_t)row * nsb * sb_bytes;
+    const float* __restrict__ xsrc = use_lds ? s_x : xc;
 
     const int j0 = lane * GQH_PER_LANE;
     const int sub = j0 >> 4;
 
     float acc = 0.0f;
     for (int sb = 0; sb < nsb; ++sb) {
-        for (int i = threadIdx.x; i < GQH_SUPERBLOCK; i += blockDim.x) {
-            s_x[i] = xc[sb * GQH_SUPERBLOCK + i];
-        }
-        __syncthreads();
-        if (valid) {
-            const uint8_t* __restrict__ b = rowbase + (int64_t)sb * sb_bytes;
+        const uint8_t* __restrict__ b = rowbase + (int64_t)sb * sb_bytes;
 
-            const uint8_t d = b[0];
-            const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
-            const uint8_t rb = b[1 + (sub >> 1)];
-            const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
+        const uint8_t d = b[0];
+        const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
+        const uint8_t rb = b[1 + (sub >> 1)];
+        const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
 
-            const float4 x0 = *reinterpret_cast<const float4*>(s_x + j0);
-            const float4 x1 = *reinterpret_cast<const float4*>(s_x + j0 + 4);
-            const float xs[GQH_PER_LANE] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        const float4 x0 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0);
+        const float4 x1 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0 + 4);
+        const float xs[GQH_PER_LANE] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 
-            uint16_t lo2;
-            memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
-            const uint8_t hi1 = IS_GQH3 ? b[73 + lane] : 0;
+        uint16_t lo2;
+        memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
+        const uint8_t hi1 = IS_GQH3 ? b[73 + lane] : 0;
 
 #pragma unroll
-            for (int t = 0; t < GQH_PER_LANE; ++t) {
-                const int lo = (lo2 >> (2 * t)) & 0x03;
-                const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
-                acc += (gqh_level<IS_GQH3>(code, mag) * s_b) * xs[t];
-            }
+        for (int t = 0; t < GQH_PER_LANE; ++t) {
+            const int lo = (lo2 >> (2 * t)) & 0x03;
+            const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
+            acc += (gqh_level<IS_GQH3>(code, mag) * s_b) * xs[t];
         }
-        __syncthreads();
     }
 
 #pragma unroll
@@ -198,6 +206,102 @@ __global__ void gqh_matvec_kernel(
         } else {
             y[yi] = acc;
         }
+    }
+}
+
+// One launch, one x load, two independent row dots (gate + up). Same
+// product order as gqh_matvec_kernel; the two accs never mix.
+template <bool A_IS_GQH3, bool B_IS_GQH3>
+__global__ void gqh_matvec_pair_kernel(
+    const uint8_t* __restrict__ data_a,
+    const uint8_t* __restrict__ data_b,
+    const float* __restrict__ x,
+    float* __restrict__ y_a,
+    float* __restrict__ y_b,
+    int in,
+    int out,
+    float scale_a,
+    float scale_b,
+    float4 mag_a,
+    float4 mag_b) {
+    const int sb_a = A_IS_GQH3 ? GQH3_SB_BYTES : GQH2H_SB_BYTES;
+    const int sb_b = B_IS_GQH3 ? GQH3_SB_BYTES : GQH2H_SB_BYTES;
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int row = blockIdx.x * warps_per_block + (threadIdx.x / GQH_WARP);
+    const int lane = threadIdx.x % GQH_WARP;
+
+    __shared__ float s_ratio[16];
+    float* s_x = reinterpret_cast<float*>(gqh_dyn_smem);
+    if (threadIdx.x < 16) {
+        s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+    }
+    const bool use_lds = (in <= GQH_LDS_X_MAX);
+    if (use_lds) {
+        for (int i = threadIdx.x; i < in; i += blockDim.x) {
+            s_x[i] = x[i];
+        }
+    }
+    __syncthreads();
+    if (row >= out) {
+        return;
+    }
+
+    const int nsb = in / GQH_SUPERBLOCK;
+    const uint8_t* __restrict__ base_a = data_a + (int64_t)row * nsb * sb_a;
+    const uint8_t* __restrict__ base_b = data_b + (int64_t)row * nsb * sb_b;
+    const float* __restrict__ xsrc = use_lds ? s_x : x;
+    const int j0 = lane * GQH_PER_LANE;
+    const int sub = j0 >> 4;
+
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const float4 x0 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0);
+        const float4 x1 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0 + 4);
+        const float xs[GQH_PER_LANE] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+
+        {
+            const uint8_t* __restrict__ b = base_a + (int64_t)sb * sb_a;
+            const uint8_t d = b[0];
+            const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * scale_a;
+            const uint8_t rb = b[1 + (sub >> 1)];
+            const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
+            uint16_t lo2;
+            memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
+            const uint8_t hi1 = A_IS_GQH3 ? b[73 + lane] : 0;
+#pragma unroll
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                const int lo = (lo2 >> (2 * t)) & 0x03;
+                const int code = A_IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
+                acc_a += (gqh_level<A_IS_GQH3>(code, mag_a) * s_b) * xs[t];
+            }
+        }
+        {
+            const uint8_t* __restrict__ b = base_b + (int64_t)sb * sb_b;
+            const uint8_t d = b[0];
+            const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * scale_b;
+            const uint8_t rb = b[1 + (sub >> 1)];
+            const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
+            uint16_t lo2;
+            memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
+            const uint8_t hi1 = B_IS_GQH3 ? b[73 + lane] : 0;
+#pragma unroll
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                const int lo = (lo2 >> (2 * t)) & 0x03;
+                const int code = B_IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
+                acc_b += (gqh_level<B_IS_GQH3>(code, mag_b) * s_b) * xs[t];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
+        acc_a += gqh_warp_shfl_down(acc_a, off);
+        acc_b += gqh_warp_shfl_down(acc_b, off);
+    }
+    if (lane == 0) {
+        y_a[row] = acc_a;
+        y_b[row] = acc_b;
     }
 }
 
