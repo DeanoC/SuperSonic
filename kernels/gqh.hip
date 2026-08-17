@@ -196,7 +196,73 @@ static __device__ __forceinline__ float gqh_level(int code, const float4& m) {
     return gqh2h_level(code, m.x);
 }
 
-template <bool IS_GQH3, bool kAcc = false>
+// One superblock's per-lane payload. Fat-K (nsb=68) issues the next
+// pack while the current FMA chain runs. Product order is unchanged:
+// d_real = e4m3(d)*tensor_scale, s_b = d_real*(ratio/15), then
+// acc += (lvl * s_b) * x, superblocks in order.
+struct gqh_sb_pack {
+    uint8_t d;
+    uint8_t hi1;
+    uint16_t lo2;
+    uint64_t r64;
+    float4 x0;
+    float4 x1;
+};
+
+template <bool IS_GQH3>
+static __device__ __forceinline__ gqh_sb_pack gqh_load_sb(
+    const uint8_t* __restrict__ d_row,
+    const uint8_t* __restrict__ ratio_row,
+    const uint8_t* __restrict__ lo_row,
+    const uint8_t* __restrict__ hi_row,
+    const float* __restrict__ xsrc,
+    int sb,
+    int lane,
+    int j0) {
+    gqh_sb_pack p;
+    p.d = d_row[sb];
+    p.r64 = gqh_ld_u64(ratio_row + (sb << 3));
+    p.lo2 = gqh_ld_u16(lo_row + (sb << 6) + lane * 2);
+    p.hi1 = IS_GQH3 ? gqh_hi_byte(hi_row + (sb << 5), lane) : 0;
+    p.x0 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0);
+    p.x1 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0 + 4);
+    return p;
+}
+
+static __device__ __forceinline__ void gqh_pipe_barrier() {
+    // Stop clang sinking the next-SB loads into the FMA body.
+    asm volatile("" ::: "memory");
+}
+
+#pragma clang fp contract(off)
+template <bool IS_GQH3>
+static __device__ __forceinline__ float gqh_sb_fma(
+    float acc,
+    const gqh_sb_pack& p,
+    float tensor_scale,
+    const float* __restrict__ s_ratio,
+    const float* __restrict__ s_mag,
+    float m0,
+    int sub) {
+    const uint8_t rb = gqh_ratio_byte(p.r64, sub);
+    const float d_real = gqh_bits(GQH_E4M3_D[p.d >> 3][p.d & 7]) * tensor_scale;
+    const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
+    const float xs[GQH_PER_LANE] = {
+        p.x0.x, p.x0.y, p.x0.z, p.x0.w, p.x1.x, p.x1.y, p.x1.z, p.x1.w};
+#pragma unroll
+    for (int t = 0; t < GQH_PER_LANE; ++t) {
+        const int lo = (p.lo2 >> (2 * t)) & 0x03;
+        const int code = IS_GQH3 ? (lo | (((p.hi1 >> t) & 1) << 2)) : lo;
+        const float lvl = IS_GQH3 ? gqh3_level_tbl(code, s_mag)
+                                  : gqh2h_level(code, m0);
+        acc += (lvl * s_b) * xs[t];
+    }
+    return acc;
+}
+
+// kPipe=1: depth-1 software pipeline for fat-K (down, nsb=68).
+// kPipe=0: original loop; hidden-width singles stay on this codegen.
+template <bool IS_GQH3, bool kAcc = false, int kPipe = 0>
 __global__ void gqh_matvec_kernel(
     const uint8_t* __restrict__ data, const float* __restrict__ x, float* __restrict__ y,
     int in, int out, float tensor_scale, float4 mag, int64_t x_col_stride,
@@ -246,27 +312,43 @@ __global__ void gqh_matvec_kernel(
     const float m0 = mag.x, m1 = mag.y, m2 = mag.z, m3 = mag.w;
 
     float acc = 0.0f;
-    for (int sb = 0; sb < nsb; ++sb) {
-        const uint8_t d = d_row[sb];
-        const uint64_t r64 = gqh_ld_u64(ratio_row + (sb << 3));
-        const uint8_t rb = gqh_ratio_byte(r64, sub);
-        const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
-        const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
+    if constexpr (kPipe != 0) {
+        // Issue SB[i+1] under SB[i] FMAs. Same SB order and products.
+        gqh_sb_pack cur = gqh_load_sb<IS_GQH3>(
+            d_row, ratio_row, lo_row, hi_row, xsrc, 0, lane, j0);
+        for (int sb = 0; sb < nsb - 1; ++sb) {
+            gqh_sb_pack nxt = gqh_load_sb<IS_GQH3>(
+                d_row, ratio_row, lo_row, hi_row, xsrc, sb + 1, lane, j0);
+            gqh_pipe_barrier();
+            acc = gqh_sb_fma<IS_GQH3>(
+                acc, cur, tensor_scale, s_ratio, s_mag, m0, sub);
+            cur = nxt;
+        }
+        acc = gqh_sb_fma<IS_GQH3>(
+            acc, cur, tensor_scale, s_ratio, s_mag, m0, sub);
+    } else {
+        for (int sb = 0; sb < nsb; ++sb) {
+            const uint8_t d = d_row[sb];
+            const uint64_t r64 = gqh_ld_u64(ratio_row + (sb << 3));
+            const uint8_t rb = gqh_ratio_byte(r64, sub);
+            const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
+            const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
 
-        const float4 x0 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0);
-        const float4 x1 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0 + 4);
-        const float xs[GQH_PER_LANE] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            const float4 x0 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0);
+            const float4 x1 = *reinterpret_cast<const float4*>(xsrc + sb * GQH_SUPERBLOCK + j0 + 4);
+            const float xs[GQH_PER_LANE] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 
-        const uint16_t lo2 = gqh_ld_u16(lo_row + (sb << 6) + lane * 2);
-        const uint8_t hi1 = IS_GQH3 ? gqh_hi_byte(hi_row + (sb << 5), lane) : 0;
+            const uint16_t lo2 = gqh_ld_u16(lo_row + (sb << 6) + lane * 2);
+            const uint8_t hi1 = IS_GQH3 ? gqh_hi_byte(hi_row + (sb << 5), lane) : 0;
 
 #pragma unroll
-        for (int t = 0; t < GQH_PER_LANE; ++t) {
-            const int lo = (lo2 >> (2 * t)) & 0x03;
-            const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
-            const float lvl = IS_GQH3 ? gqh3_level_tbl(code, s_mag)
-                                      : gqh2h_level(code, m0);
-            acc += (lvl * s_b) * xs[t];
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                const int lo = (lo2 >> (2 * t)) & 0x03;
+                const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
+                const float lvl = IS_GQH3 ? gqh3_level_tbl(code, s_mag)
+                                          : gqh2h_level(code, m0);
+                acc += (lvl * s_b) * xs[t];
+            }
         }
     }
 

@@ -113,6 +113,98 @@ size_t gqh_x_lds_bytes(int in_dim) {
     return static_cast<size_t>(in_dim) * sizeof(float);
 }
 
+// Fat-K down is nsb=68. Hidden-width singles stay on the original
+// loop so their VGPR/occupancy codegen does not change.
+template <bool kAcc>
+void launch_gqh12_matvec(
+    int rung,
+    dim3 blocks,
+    dim3 threads,
+    size_t lds,
+    hipStream_t stream,
+    const uint8_t* packed,
+    const float* xv,
+    float* yv,
+    int in_dim,
+    int out_dim,
+    float tensor_scale,
+    int grid_code,
+    int64_t x_col_stride,
+    int64_t y_col_stride) {
+    const bool fat = (in_dim / GQH_SUPERBLOCK) >= 64;
+    if (rung == GQH_RUNG_GQH3) {
+        const float4 mag = load_gqh3_mag(grid_code);
+        if (fat) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh_matvec_kernel<true, kAcc, 1>)),
+                blocks,
+                threads,
+                lds,
+                stream,
+                packed,
+                xv,
+                yv,
+                in_dim,
+                out_dim,
+                tensor_scale,
+                mag,
+                x_col_stride,
+                y_col_stride);
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh_matvec_kernel<true, kAcc, 0>)),
+                blocks,
+                threads,
+                lds,
+                stream,
+                packed,
+                xv,
+                yv,
+                in_dim,
+                out_dim,
+                tensor_scale,
+                mag,
+                x_col_stride,
+                y_col_stride);
+        }
+        return;
+    }
+    const float4 mag = load_gqh2h_mag(grid_code);
+    if (fat) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_matvec_kernel<false, kAcc, 1>)),
+            blocks,
+            threads,
+            lds,
+            stream,
+            packed,
+            xv,
+            yv,
+            in_dim,
+            out_dim,
+            tensor_scale,
+            mag,
+            x_col_stride,
+            y_col_stride);
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_matvec_kernel<false, kAcc, 0>)),
+            blocks,
+            threads,
+            lds,
+            stream,
+            packed,
+            xv,
+            yv,
+            in_dim,
+            out_dim,
+            tensor_scale,
+            mag,
+            x_col_stride,
+            y_col_stride);
+    }
+}
+
 }  // namespace
 
 extern "C" int supersonic_gqh_hip_decode(
@@ -220,25 +312,9 @@ extern "C" int supersonic_gqh_hip_matvec(
     auto* yv = static_cast<float*>(y);
     switch (rung) {
         case GQH_RUNG_GQH3:
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gqh_matvec_kernel<true>),
-                blocks,
-                threads,
-                lds,
-                0,
-                packed,
-                xv,
-                yv,
-                in_dim,
-                out_dim,
-                tensor_scale,
-                load_gqh3_mag(grid_code),
-                x_col_stride,
-                y_col_stride);
-            break;
         case GQH_RUNG_GQH2_H:
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gqh_matvec_kernel<false>),
+            launch_gqh12_matvec<false>(
+                rung,
                 blocks,
                 threads,
                 lds,
@@ -249,7 +325,7 @@ extern "C" int supersonic_gqh_hip_matvec(
                 in_dim,
                 out_dim,
                 tensor_scale,
-                load_gqh2h_mag(grid_code),
+                grid_code,
                 x_col_stride,
                 y_col_stride);
             break;
@@ -316,25 +392,9 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
     hipStream_t hs = static_cast<hipStream_t>(stream);
     switch (rung) {
         case GQH_RUNG_GQH3:
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gqh_matvec_kernel<true>),
-                blocks,
-                threads,
-                lds,
-                hs,
-                packed,
-                xv,
-                yv,
-                in_dim,
-                out_dim,
-                tensor_scale,
-                load_gqh3_mag(grid_code),
-                x_col_stride,
-                y_col_stride);
-            break;
         case GQH_RUNG_GQH2_H:
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gqh_matvec_kernel<false>),
+            launch_gqh12_matvec<false>(
+                rung,
                 blocks,
                 threads,
                 lds,
@@ -345,7 +405,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
                 in_dim,
                 out_dim,
                 tensor_scale,
-                load_gqh2h_mag(grid_code),
+                grid_code,
                 x_col_stride,
                 y_col_stride);
             break;
@@ -412,25 +472,9 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
     hipStream_t hs = static_cast<hipStream_t>(stream);
     switch (rung) {
         case GQH_RUNG_GQH3:
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME((gqh_matvec_kernel<true, true>)),
-                blocks,
-                threads,
-                lds,
-                hs,
-                packed,
-                xv,
-                yv,
-                in_dim,
-                out_dim,
-                tensor_scale,
-                load_gqh3_mag(grid_code),
-                x_col_stride,
-                y_col_stride);
-            break;
         case GQH_RUNG_GQH2_H:
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME((gqh_matvec_kernel<false, true>)),
+            launch_gqh12_matvec<true>(
+                rung,
                 blocks,
                 threads,
                 lds,
@@ -441,7 +485,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
                 in_dim,
                 out_dim,
                 tensor_scale,
-                load_gqh2h_mag(grid_code),
+                grid_code,
                 x_col_stride,
                 y_col_stride);
             break;
