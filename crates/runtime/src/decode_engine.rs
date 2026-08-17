@@ -2,7 +2,7 @@
 
 use std::env;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -67,6 +67,151 @@ fn logsumexp(values: &[f32]) -> f32 {
     }
     let sum: f32 = values.iter().map(|v| (*v - max_v).exp()).sum();
     max_v + sum.ln()
+}
+
+fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+fn gqh_state_dump_enabled() -> bool {
+    env::var_os("SUPERSONIC_QWEN35_GQH_STATE_DUMP").is_some()
+}
+
+fn checksum_kv_prefix_and_slot(
+    buf: &GpuBuffer,
+    nkv: usize,
+    cap: usize,
+    hd: usize,
+    prefix_len: usize,
+    slot: usize,
+) -> anyhow::Result<(u64, u64, String)> {
+    let bytes = buf.to_host_bytes()?;
+    let elem = 2usize;
+    let head_stride = cap * hd * elem;
+    let mut prefix = Vec::with_capacity(nkv * prefix_len.min(cap) * hd * elem);
+    for h in 0..nkv {
+        let start = h * head_stride;
+        let end = start + prefix_len.min(cap) * hd * elem;
+        if end <= bytes.len() {
+            prefix.extend_from_slice(&bytes[start..end]);
+        }
+    }
+    let mut slot_bytes = Vec::new();
+    let mut slot_head = String::from("na");
+    if slot < cap {
+        for h in 0..nkv {
+            let start = h * head_stride + slot * hd * elem;
+            let end = start + hd * elem;
+            if end <= bytes.len() {
+                slot_bytes.extend_from_slice(&bytes[start..end]);
+                if h == 0 {
+                    slot_head = bytes[start..start + (8 * elem).min(hd * elem)]
+                        .chunks_exact(2)
+                        .map(|c| {
+                            format!(
+                                "{:.4}",
+                                half::bf16::from_le_bytes([c[0], c[1]]).to_f32()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                }
+            }
+        }
+    }
+    Ok((fnv1a64_bytes(&prefix), fnv1a64_bytes(&slot_bytes), slot_head))
+}
+
+fn maybe_dump_gqh_decode_state(
+    state: &ModelState,
+    config: &TextConfig,
+    hidden_io: Option<&GpuBuffer>,
+    when: &str,
+    token_id: u32,
+    seqlen_offset: usize,
+    path: &str,
+) {
+    if !gqh_state_dump_enabled() {
+        return;
+    }
+    static DUMPS: AtomicU32 = AtomicU32::new(0);
+    if DUMPS.fetch_add(1, Ordering::Relaxed) >= 12 {
+        return;
+    }
+    let nkv = config.num_key_value_heads;
+    let hd = config.head_dim;
+    let mut full_idx = None;
+    let mut lin_idx = None;
+    for (i, ls) in state.layers.iter().enumerate() {
+        if full_idx.is_none() && config.is_full_attention(i) {
+            full_idx = Some(i);
+        }
+        if lin_idx.is_none() && !config.is_full_attention(i) {
+            lin_idx = Some(i);
+        }
+        if full_idx.is_some() && lin_idx.is_some() {
+            break;
+        }
+    }
+    let mut msg = format!(
+        "[gqh-dump] path={path} when={when} token={token_id} seqlen={seqlen_offset}"
+    );
+    if let Some(idx) = full_idx {
+        let ls = &state.layers[idx];
+        let cap = ls.kv_capacity();
+        msg.push_str(&format!(
+            " full_l{idx} kv_filled={} kv_cap={cap}",
+            ls.kv_filled
+        ));
+        if let (Some(k), Some(v)) = (ls.kv_cache_k.as_ref(), ls.kv_cache_v.as_ref()) {
+            match (
+                checksum_kv_prefix_and_slot(k, nkv, cap, hd, ls.kv_filled, seqlen_offset),
+                checksum_kv_prefix_and_slot(v, nkv, cap, hd, ls.kv_filled, seqlen_offset),
+            ) {
+                (Ok((k_pre, k_slot, k_head)), Ok((v_pre, v_slot, v_head))) => {
+                    msg.push_str(&format!(
+                        " k_pre={k_pre:016x} k_slot={k_slot:016x} k0=[{k_head}] v_pre={v_pre:016x} v_slot={v_slot:016x} v0=[{v_head}]"
+                    ));
+                }
+                (k_res, v_res) => {
+                    msg.push_str(&format!(" kv_err={k_res:?}/{v_res:?}"));
+                }
+            }
+        } else {
+            msg.push_str(" kv=missing");
+        }
+    }
+    if let Some(idx) = lin_idx {
+        let ls = &state.layers[idx];
+        let conv = ls
+            .conv_state
+            .as_ref()
+            .and_then(|b| b.to_host_bytes().ok())
+            .map(|b| fnv1a64_bytes(&b));
+        let rec = ls
+            .recurrent_state
+            .as_ref()
+            .and_then(|b| b.to_host_bytes().ok())
+            .map(|b| fnv1a64_bytes(&b));
+        match (conv, rec) {
+            (Some(c), Some(r)) => {
+                msg.push_str(&format!(" lin_l{idx} conv={c:016x} rec={r:016x}"))
+            }
+            _ => msg.push_str(&format!(" lin_l{idx} conv={conv:?} rec={rec:?}")),
+        }
+    }
+    if let Some(hidden) = hidden_io {
+        match hidden.to_host_bytes() {
+            Ok(bytes) => msg.push_str(&format!(" hidden={:016x}", fnv1a64_bytes(&bytes))),
+            Err(e) => msg.push_str(&format!(" hidden_err={e}")),
+        }
+    }
+    eprintln!("{msg}");
 }
 
 fn certified_kv_score_delta_from_channel_max(
@@ -11178,6 +11323,15 @@ impl DecodeEngine {
                 self.ordinal,
             )?,
         };
+        maybe_dump_gqh_decode_state(
+            &self.state,
+            &self.weights.config,
+            Some(&self.hidden_io),
+            "before",
+            token_id,
+            seqlen_offset,
+            "component",
+        );
         let start = Instant::now();
         let result = prefill_engine::metal_v2_decode_step(
             &self.weights,
@@ -11191,6 +11345,15 @@ impl DecodeEngine {
         );
         self.metal_v2_scratch = Some(scratch);
         let logits = result?;
+        maybe_dump_gqh_decode_state(
+            &self.state,
+            &self.weights.config,
+            Some(&self.hidden_io),
+            "after",
+            token_id,
+            seqlen_offset,
+            "component",
+        );
         let mut timings = DecodeStageTimings::default();
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
         Ok((logits, timings))
@@ -12681,6 +12844,15 @@ impl DecodeEngine {
 
         // 3. Build layer descriptors (weights only, per-sequence state in batch descs)
         let descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
+        maybe_dump_gqh_decode_state(
+            &self.state,
+            config,
+            Some(&self.hidden_io),
+            "before",
+            token_ids[0],
+            seqlen_offset,
+            "megakernel",
+        );
         self.scratch
             .upload_descs(&descs)
             .map_err(|e| anyhow::anyhow!("upload descs: {e}"))?;
@@ -12967,6 +13139,15 @@ impl DecodeEngine {
                 }
             }
         }
+        maybe_dump_gqh_decode_state(
+            &self.state,
+            config,
+            Some(&self.hidden_io),
+            "after",
+            token_ids[0],
+            seqlen_offset,
+            "megakernel",
+        );
 
         // 7-9. Final multi-row RMSNorm + tiled lm_head matmul, then one D2H.
         let start = Instant::now();

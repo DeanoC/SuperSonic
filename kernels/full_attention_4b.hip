@@ -8899,9 +8899,10 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         __syncthreads();
                         float inv = rsqrtf(lds[0] / static_cast<float>(hd) + 1e-6f);
                         const T* qnw = static_cast<const T*>(L.q_norm_w);
+                        const float qk_unit = L.rms_norm_add_unit_offset ? 1.0f : 0.0f;
                         for (int d = tid; d < hd; d += bs) {
                             qh[d] = bf16_round_rne_f32_finite(
-                                qh[d] * inv * (supersonic_qwen35_to_float(qnw[d]) + 1.0f));
+                                qh[d] * inv * (supersonic_qwen35_to_float(qnw[d]) + qk_unit));
                         }
                         __syncthreads();
                     }
@@ -8920,9 +8921,10 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         __syncthreads();
                         float inv = rsqrtf(lds[0] / static_cast<float>(hd) + 1e-6f);
                         const T* knw = static_cast<const T*>(L.k_norm_w);
+                        const float qk_unit = L.rms_norm_add_unit_offset ? 1.0f : 0.0f;
                         for (int d = tid; d < hd; d += bs) {
                             kh[d] = bf16_round_rne_f32_finite(
-                                kh[d] * inv * (supersonic_qwen35_to_float(knw[d]) + 1.0f));
+                                kh[d] * inv * (supersonic_qwen35_to_float(knw[d]) + qk_unit));
                         }
                         __syncthreads();
                     }
