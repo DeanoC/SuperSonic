@@ -725,3 +725,4 @@ fn rung10_linear_layer0_norm_projs_mlp() {
         down_vals.iter().map(|v| v * v).sum::<f32>()
     );
 }
+

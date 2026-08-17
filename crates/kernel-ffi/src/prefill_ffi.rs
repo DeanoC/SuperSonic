@@ -5201,10 +5201,35 @@ pub fn matmul_rhs_transposed_gqh(
             ncols * n
         )));
     }
+    thread_local! {
+        static GQH_X: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };
+        static GQH_Y: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };
+    }
+    let take_scratch = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+                        elems: usize|
+     -> Result<GpuBuffer, GpuError> {
+        slot.with(|cell| {
+            let mut held = cell.borrow_mut();
+            if let Some(buf) = held.as_ref() {
+                if buf.elem_count() >= elems {
+                    return Ok(held.take().expect("scratch present"));
+                }
+            }
+            held.take();
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[elems])
+        })
+    };
+    let put_scratch = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+                       buf: GpuBuffer| {
+        slot.with(|cell| {
+            *cell.borrow_mut() = Some(buf);
+        });
+    };
+
     let x_f32 = if lhs.dtype() == ScalarType::F32 {
         None
     } else {
-        let mut buf = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols, k])?;
+        let mut buf = take_scratch(&GQH_X, ncols * k)?;
         cast(
             ordinal,
             ScalarType::BF16,
@@ -5219,7 +5244,7 @@ pub fn matmul_rhs_transposed_gqh(
     let mut y_f32 = if out.dtype() == ScalarType::F32 {
         None
     } else {
-        Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols, n])?)
+        Some(take_scratch(&GQH_Y, ncols * n)?)
     };
     let y_ref = y_f32.as_mut().unwrap_or(out);
     crate::gqh::matvec(
@@ -5245,6 +5270,12 @@ pub fn matmul_rhs_transposed_gqh(
             y,
             out,
         )?;
+    }
+    if let Some(buf) = x_f32 {
+        put_scratch(&GQH_X, buf);
+    }
+    if let Some(buf) = y_f32 {
+        put_scratch(&GQH_Y, buf);
     }
     Ok(())
 }

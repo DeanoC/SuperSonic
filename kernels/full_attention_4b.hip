@@ -515,7 +515,8 @@ __device__ inline float4 qwen35_gqh_mag(int qtype, int grid_code) {
 }
 
 // x[0] is column sb0 * 256. nsb is the number of superblocks to walk.
-__device__ inline float qwen35_gqh_lane_dot_range(
+// noinline keeps the giant persistent kernel's VGPR live ranges smaller.
+__device__ __noinline__ float qwen35_gqh_lane_dot_range(
     const void* w_ptr, int qtype, int row, int cols,
     float tensor_scale, int grid_code,
     const float* __restrict__ x, int sb0, int nsb, int lane) {
@@ -554,7 +555,7 @@ __device__ inline float qwen35_gqh_lane_dot_range(
 }
 
 // Two output rows, one activation pass. Cuts x traffic in half on fat K.
-__device__ inline void qwen35_gqh_lane_dot_pair(
+__device__ __noinline__ void qwen35_gqh_lane_dot_pair(
     const void* w_ptr, int qtype, int row0, int row1, int cols,
     float tensor_scale, int grid_code,
     const float* __restrict__ x, int nsb, int lane,
@@ -8551,7 +8552,7 @@ __device__ __forceinline__ void qwen35_4b_hip_record_timing(
 }
 
 template <typename T>
-__global__ void supersonic_qwen35_persistent_decode_kernel(
+__global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_kernel(
     int num_layers,
     int hidden_dim,
     int intermediate_size,
