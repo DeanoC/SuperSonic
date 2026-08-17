@@ -8243,7 +8243,7 @@ __global__ void supersonic_qwen35_add_round_f32_kernel(
 // Same wave-per-row walk as steal o/out: lane owns columns lane, lane+32, ...
 // then xor-reduce. Per-block scales are hoisted; the product order matches
 // ggml_k_dequant_scalar_from_row so GQH-mixed ggml-K rows stay bit-exact.
-template <int kQtype>
+template <int kQtype, bool kAcc = false>
 __global__ void supersonic_qwen35_ggml_k_matvec_kernel(
     const uint8_t* __restrict__ w,
     const float* __restrict__ x,
@@ -8372,7 +8372,12 @@ __global__ void supersonic_qwen35_ggml_k_matvec_kernel(
         p += __shfl_xor(p, off);
     }
     if (lane == 0) {
-        y[row] = p;
+        if constexpr (kAcc) {
+            y[row] = bf16_round_rne_f32_finite(
+                y[row] + bf16_round_rne_f32_finite(p));
+        } else {
+            y[row] = p;
+        }
     }
 }
 
@@ -9361,10 +9366,54 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         const size_t kv_head_base =
                             static_cast<size_t>(kvh) * kv_max_b * hd;
 
-                        for (int t = 0; t < kv_len_b; ++t) {
+                        int t = 0;
+                        for (; t + 1 < kv_len_b; t += 2) {
+                            const size_t pos0 = kv_head_base +
+                                static_cast<size_t>(t) * hd;
+                            const size_t pos1 = pos0 + hd;
+                            const float p0 = q_val *
+                                supersonic_qwen35_to_float(ck[pos0 + tid]);
+                            const float p1 = q_val *
+                                supersonic_qwen35_to_float(ck[pos1 + tid]);
+                            const float w0 = wave_reduce_sum_f32(p0);
+                            const float w1 = wave_reduce_sum_f32(p1);
+                            if (attn_lane == 0) {
+                                lds[attn_wave] = w0;
+                                lds[attn_nwaves + attn_wave] = w1;
+                            }
+                            __syncthreads();
+                            float tot0 = 0.0f;
+                            float tot1 = 0.0f;
+                            for (int w = 0; w < attn_nwaves; ++w) {
+                                tot0 += lds[w];
+                                tot1 += lds[attn_nwaves + w];
+                            }
+                            const float s0 = tot0 * scale;
+                            const float s1 = tot1 * scale;
+                            if (emit_attention_trace && tid == 0) {
+                                saved_scores[qh * kv_max_b + t] = s0;
+                                saved_scores[qh * kv_max_b + t + 1] = s1;
+                            }
+                            const float v0 =
+                                supersonic_qwen35_to_float(cv[pos0 + tid]);
+                            const float v1 =
+                                supersonic_qwen35_to_float(cv[pos1 + tid]);
+                            float old_max = my_max;
+                            my_max = fmaxf(my_max, s0);
+                            float rescale = expf(old_max - my_max);
+                            float wt = expf(s0 - my_max);
+                            my_acc = my_acc * rescale + wt * v0;
+                            my_sum = my_sum * rescale + wt;
+                            old_max = my_max;
+                            my_max = fmaxf(my_max, s1);
+                            rescale = expf(old_max - my_max);
+                            wt = expf(s1 - my_max);
+                            my_acc = my_acc * rescale + wt * v1;
+                            my_sum = my_sum * rescale + wt;
+                        }
+                        if (t < kv_len_b) {
                             const size_t pos_base = kv_head_base +
                                 static_cast<size_t>(t) * hd;
-
                             float partial = q_val *
                                 supersonic_qwen35_to_float(ck[pos_base + tid]);
                             float wave_sum = wave_reduce_sum_f32(partial);
@@ -9376,16 +9425,14 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                             if (emit_attention_trace && tid == 0) {
                                 saved_scores[qh * kv_max_b + t] = score_val;
                             }
-
                             float v_val =
                                 supersonic_qwen35_to_float(cv[pos_base + tid]);
-
                             float old_max = my_max;
                             my_max = fmaxf(my_max, score_val);
                             float rescale = expf(old_max - my_max);
-                            float w = expf(score_val - my_max);
-                            my_acc = my_acc * rescale + w * v_val;
-                            my_sum = my_sum * rescale + w;
+                            float wt = expf(score_val - my_max);
+                            my_acc = my_acc * rescale + wt * v_val;
+                            my_sum = my_sum * rescale + wt;
                         }
 
                         attn_flat[qh * hd + tid] =
@@ -10617,8 +10664,9 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
         } // kSplit 6: up + SwiGLU
 
         if constexpr (kSplit == 5) {
-        // Dedicated GQH GEMV wrote mlp_out. Fold residual and continue.
+        // Dedicated GEMV may have already fused the residual into hidden.
         const unsigned long long mlp_down_clock = clock64();
+        if ((io_flags & 64) == 0) {
         for (int b = 0; b < B; b++) {
             const float* add = mlp_out + b * hidden_dim;
             float* hid = hidden_f32 + b * hidden_dim;
@@ -10629,6 +10677,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
         }
         __syncthreads();
         grid_barrier(barrier_counter, barrier_flag, nb);
+        }
         qwen35_4b_hip_record_timing(
             layer_timing_slots, QWEN35_4B_TIMING_MLP_DOWN, mlp_down_clock);
         if (tap_workspace != nullptr) {

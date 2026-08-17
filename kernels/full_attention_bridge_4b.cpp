@@ -53,6 +53,21 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
     int grid_code,
     void* stream);
 
+extern "C" int supersonic_gqh_hip_matvec_stream_acc(
+    int device_ordinal,
+    int rung,
+    const void* wire,
+    const void* x,
+    void* y,
+    int in_dim,
+    int out_dim,
+    int ncols,
+    int64_t x_col_stride,
+    int64_t y_col_stride,
+    float tensor_scale,
+    int grid_code,
+    void* stream);
+
 namespace {
 
 int gqh_rung_from_qtype(int qtype) {
@@ -325,6 +340,31 @@ hipError_t launch_gqh_gemv(
     return st == 0 ? hipSuccess : hipErrorInvalidValue;
 }
 
+hipError_t launch_gqh_gemv_acc(
+    int ordinal,
+    const GqhProjHdr& h,
+    const float* x,
+    float* y,
+    int in_dim,
+    int out_dim,
+    hipStream_t stream) {
+    const int st = supersonic_gqh_hip_matvec_stream_acc(
+        ordinal,
+        h.rung,
+        h.wire,
+        x,
+        y,
+        in_dim,
+        out_dim,
+        1,
+        in_dim,
+        out_dim,
+        h.scale,
+        h.grid,
+        stream);
+    return st == 0 ? hipSuccess : hipErrorInvalidValue;
+}
+
 void launch_round_f32(float* y, int n, hipStream_t stream) {
     const int bs = 256;
     const int gs = (n + bs - 1) / bs;
@@ -445,6 +485,101 @@ hipError_t launch_ggml_k_gemv(
             return hipErrorInvalidValue;
     }
     return hipGetLastError();
+}
+
+hipError_t launch_ggml_k_gemv_acc(
+    const GqhProjHdr& h,
+    const float* x,
+    float* y,
+    int in_dim,
+    int out_dim,
+    hipStream_t stream) {
+    if (out_dim <= 0 || in_dim <= 0 || h.wire == nullptr || x == nullptr ||
+        y == nullptr) {
+        return hipErrorInvalidValue;
+    }
+    constexpr int kWarps = 4;
+    constexpr int kThreads = kWarps * 32;
+    const dim3 blocks(static_cast<unsigned int>((out_dim + kWarps - 1) / kWarps));
+    const dim3 threads(kThreads);
+    auto* packed = static_cast<const uint8_t*>(h.wire);
+    switch (h.qtype) {
+        case 8:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((supersonic_qwen35_ggml_k_matvec_kernel<8, true>)),
+                blocks,
+                threads,
+                0,
+                stream,
+                packed,
+                x,
+                y,
+                in_dim,
+                out_dim);
+            break;
+        case 12:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((supersonic_qwen35_ggml_k_matvec_kernel<12, true>)),
+                blocks,
+                threads,
+                0,
+                stream,
+                packed,
+                x,
+                y,
+                in_dim,
+                out_dim);
+            break;
+        case 13:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((supersonic_qwen35_ggml_k_matvec_kernel<13, true>)),
+                blocks,
+                threads,
+                0,
+                stream,
+                packed,
+                x,
+                y,
+                in_dim,
+                out_dim);
+            break;
+        case 14:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((supersonic_qwen35_ggml_k_matvec_kernel<14, true>)),
+                blocks,
+                threads,
+                0,
+                stream,
+                packed,
+                x,
+                y,
+                in_dim,
+                out_dim);
+            break;
+        default:
+            return hipErrorInvalidValue;
+    }
+    return hipGetLastError();
+}
+
+hipError_t launch_mixer_proj_acc(
+    int ordinal,
+    const GqhProjHdr& h,
+    const float* x,
+    float* y,
+    int in_dim,
+    int out_dim,
+    hipStream_t stream) {
+    if (out_dim <= 0 || h.wire == nullptr) {
+        return hipSuccess;
+    }
+    if (h.rung >= 0) {
+        return launch_gqh_gemv_acc(ordinal, h, x, y, in_dim, out_dim, stream);
+    }
+    if (ggml_k_qtype(h.qtype)) {
+        return launch_ggml_k_gemv_acc(h, x, y, in_dim, out_dim, stream);
+    }
+    return hipSuccess;
 }
 
 hipError_t launch_mixer_proj(
@@ -7606,13 +7741,13 @@ int persistent_decode_device(
                     const bool do_lin = mx.layer_type == 0 &&
                         (host_out_mask & 1) != 0 && proj_can_gemv(mx.lin_out);
                     if (do_full) {
-                        err = launch_mixer_proj(
-                            device_ordinal, mx.o, ws_proj, ws_token,
-                            mx.attn_size, hidden_dim, stream, false);
+                        err = launch_mixer_proj_acc(
+                            device_ordinal, mx.o, ws_proj, ws_hidden,
+                            mx.attn_size, hidden_dim, stream);
                     } else if (do_lin) {
-                        err = launch_mixer_proj(
-                            device_ordinal, mx.lin_out, ws_attn, ws_token,
-                            mx.val_dim, hidden_dim, stream, false);
+                        err = launch_mixer_proj_acc(
+                            device_ordinal, mx.lin_out, ws_attn, ws_hidden,
+                            mx.val_dim, hidden_dim, stream);
                     }
                     if (err != hipSuccess) return err;
                     if (do_full || do_lin) {
@@ -7707,11 +7842,6 @@ int persistent_decode_device(
                                 hidden_dim);
                             (void)saved;
                         } else {
-                            if (std::getenv("SUPERSONIC_QWEN35_GQH_GEMV_OUT_NOADD") ==
-                                nullptr) {
-                                launch_add_round_f32(
-                                    ws_hidden, ws_token, hidden_dim, stream);
-                            }
                             out_flags = 4;
                         }
                     }
@@ -7743,21 +7873,36 @@ int persistent_decode_device(
                         stream);
                     if (err != hipSuccess) return err;
                     launch_swiglu_f32(ws_gate, ws_up, intermediate_size, stream);
-                    err = launch_gqh_gemv(
-                        device_ordinal,
-                        mlp_hdrs.down[layer],
-                        ws_gate,
-                        ws_mlp,
-                        intermediate_size,
-                        hidden_dim,
-                        stream);
+                    if (mlp_hdrs.down[layer].rung >= 0) {
+                        err = launch_gqh_gemv_acc(
+                            device_ordinal,
+                            mlp_hdrs.down[layer],
+                            ws_gate,
+                            ws_hidden,
+                            intermediate_size,
+                            hidden_dim,
+                            stream);
+                    } else {
+                        err = launch_gqh_gemv(
+                            device_ordinal,
+                            mlp_hdrs.down[layer],
+                            ws_gate,
+                            ws_mlp,
+                            intermediate_size,
+                            hidden_dim,
+                            stream);
+                    }
                     if (err != hipSuccess) return err;
+                    if ((mlp_flags & 2) != 0) {
+                        err = launch_split(5, layer, mlp_flags | 64, grid_down, stream);
+                        if (err != hipSuccess) return err;
+                    }
                 } else {
                     err = launch_split(6, layer, 0, grid_up, stream);
                     if (err != hipSuccess) return err;
+                    err = launch_split(5, layer, mlp_flags, grid_down, stream);
+                    if (err != hipSuccess) return err;
                 }
-                err = launch_split(5, layer, mlp_flags, grid_down, stream);
-                if (err != hipSuccess) return err;
             }
             return hipSuccess;
         };

@@ -28,6 +28,16 @@ static __device__ __forceinline__ float gqh_bits(uint32_t u) {
     return __int_as_float((int)u);
 }
 
+static __device__ __forceinline__ float gqh_bf16_round(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    bits &= 0xFFFF0000u;
+    float y;
+    memcpy(&y, &bits, 4);
+    return y;
+}
+
 #pragma clang fp contract(off)
 static __device__ __forceinline__ float gqh_subblock_scale(
     const uint8_t* __restrict__ b, int sub, float tensor_scale) {
@@ -118,7 +128,7 @@ static __device__ __forceinline__ float gqh_level(int code, const float4& m) {
     return hi ? mag : -mag;
 }
 
-template <bool IS_GQH3>
+template <bool IS_GQH3, bool kAcc = false>
 __global__ void gqh_matvec_kernel(
     const uint8_t* __restrict__ data, const float* __restrict__ x, float* __restrict__ y,
     int in, int out, float tensor_scale, float4 mag, int64_t x_col_stride,
@@ -175,7 +185,12 @@ __global__ void gqh_matvec_kernel(
         acc += gqh_warp_shfl_down(acc, off);
     }
     if (lane == 0) {
-        y[(int64_t)col * y_col_stride + row] = acc;
+        const int64_t yi = (int64_t)col * y_col_stride + row;
+        if constexpr (kAcc) {
+            y[yi] = gqh_bf16_round(y[yi] + gqh_bf16_round(acc));
+        } else {
+            y[yi] = acc;
+        }
     }
 }
 

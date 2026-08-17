@@ -357,3 +357,83 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
     }
     return launch_result(421, 422);
 }
+
+extern "C" int supersonic_gqh_hip_matvec_stream_acc(
+    int device_ordinal,
+    int rung,
+    const void* wire,
+    const void* x,
+    void* y,
+    int in_dim,
+    int out_dim,
+    int ncols,
+    int64_t x_col_stride,
+    int64_t y_col_stride,
+    float tensor_scale,
+    int grid_code,
+    void* stream) {
+    const int shape_status = validate_shape(rung, out_dim, in_dim, grid_code);
+    if (shape_status != 0) {
+        return shape_status;
+    }
+    if (ncols <= 0 || wire == nullptr || x == nullptr || y == nullptr) {
+        return 405;
+    }
+    if (x_col_stride < in_dim || y_col_stride < out_dim) {
+        return 406;
+    }
+    if ((reinterpret_cast<uintptr_t>(x) % sizeof(float4)) != 0 ||
+        ((x_col_stride * static_cast<int64_t>(sizeof(float))) %
+         static_cast<int64_t>(sizeof(float4))) != 0) {
+        return 404;
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    const dim3 blocks(
+        static_cast<unsigned int>((out_dim + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS),
+        static_cast<unsigned int>(ncols),
+        1);
+    const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
+    auto* packed = static_cast<const uint8_t*>(wire);
+    auto* xv = static_cast<const float*>(x);
+    auto* yv = static_cast<float*>(y);
+    hipStream_t hs = static_cast<hipStream_t>(stream);
+    switch (rung) {
+        case GQH_RUNG_GQH3:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh_matvec_kernel<true, true>)),
+                blocks,
+                threads,
+                0,
+                hs,
+                packed,
+                xv,
+                yv,
+                in_dim,
+                out_dim,
+                tensor_scale,
+                load_gqh3_mag(grid_code),
+                x_col_stride,
+                y_col_stride);
+            break;
+        case GQH_RUNG_GQH2_H:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh_matvec_kernel<false, true>)),
+                blocks,
+                threads,
+                0,
+                hs,
+                packed,
+                xv,
+                yv,
+                in_dim,
+                out_dim,
+                tensor_scale,
+                load_gqh2h_mag(grid_code),
+                x_col_stride,
+                y_col_stride);
+            break;
+        default:
+            return 401;
+    }
+    return launch_result(421, 422);
+}
