@@ -7,6 +7,7 @@ use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
 use kernel_ffi::gqh::{self, RUNG_GQH2_H, RUNG_GQH3};
 use model_store::gguf::GgufFile;
 use model_store::gqh::GqhRung;
+use qwen35::desc_builder::build_int4_scale_descs;
 use qwen35::gguf_ingest::{check_mapping, load_text_config};
 use qwen35::weights::{
     infer_lowbit_type, is_gqh_qtype, matmul_gqh, LayerKind, Qwen35Weights, LOWBIT_GQH2_H,
@@ -159,6 +160,17 @@ fn rung6_load_gguf_weights() {
         "layer0 gate qtype {gate_ty}"
     );
     assert!(weights.gqh_header("layers.0.mlp.gate_proj").is_some());
+    assert!(weights.gqh_sidecars.contains_key("layers.0.mlp.gate_proj"));
+    let descs = build_int4_scale_descs(&weights).expect("GQH scale descs");
+    assert_eq!(descs.len(), 64);
+    assert!(
+        descs[0].gate_proj_type == LOWBIT_GQH3 || descs[0].gate_proj_type == LOWBIT_GQH2_H,
+        "desc gate qtype {}",
+        descs[0].gate_proj_type
+    );
+    assert!(!descs[0].gate_proj_scale.is_null());
+    assert_eq!(descs[0].b_proj_type, LOWBIT_GGML_Q8_0);
+    assert_eq!(descs[0].a_proj_type, LOWBIT_GGML_Q8_0);
 
     let l3 = &weights.layers[3];
     assert!(matches!(l3.kind, LayerKind::Full));
@@ -277,6 +289,113 @@ fn rung7_loaded_ffn_up_gqh_matvec() {
 }
 
 #[test]
+fn rung7b_batched_gqh_matvec_ncols4() {
+    let Some(path) = gguf_path() else {
+        return;
+    };
+    if !hf_dir().join("config.json").is_file() {
+        return;
+    }
+    let Some(ordinal) = require_hip() else {
+        return;
+    };
+    let config = load_text_config(&hf_dir()).expect("hf config");
+    let file = GgufFile::open(&path).expect("open");
+    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let header = weights
+        .gqh_header("layers.0.mlp.up_proj")
+        .cloned()
+        .expect("up header");
+    let tensor = file.tensor("blk.0.ffn_up.weight").expect("up tensor");
+    let rung = GqhRung::from_ggml_type(tensor.tensor_type).expect("gqh");
+    let cols = tensor.dims[0];
+    let rows = 8usize;
+    let ncols = 4usize;
+    let packed_all = file.tensor_bytes("blk.0.ffn_up.weight").expect("bytes");
+    let row_bytes = packed_all.len() / tensor.dims[1];
+    let packed = &packed_all[..row_bytes * rows];
+    let mut cpu_w = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        model_store::gqh::decode_row(
+            rung,
+            &packed[r * row_bytes..(r + 1) * row_bytes],
+            cols,
+            Some(header.clone()),
+            &mut cpu_w[r * cols..(r + 1) * cols],
+        )
+        .expect("cpu decode");
+    }
+    let mut x = vec![0.0f32; ncols * cols];
+    let mut want = vec![0.0f32; ncols * rows];
+    for col in 0..ncols {
+        for i in 0..cols {
+            x[col * cols + i] = ((i + 3 * col) % 17) as f32 - 8.0;
+            x[col * cols + i] /= 8.0;
+        }
+        for r in 0..rows {
+            let mut lane = [0.0f32; 32];
+            for sb in 0..(cols / 256) {
+                for lane_i in 0..32 {
+                    let j0 = lane_i * 8;
+                    for t in 0..8 {
+                        let j = sb * 256 + j0 + t;
+                        lane[lane_i] += cpu_w[r * cols + j] * x[col * cols + j];
+                    }
+                }
+            }
+            let mut accs = lane;
+            let mut off = 16;
+            while off > 0 {
+                for i in 0..off {
+                    accs[i] += accs[i + off];
+                }
+                off >>= 1;
+            }
+            want[col * rows + r] = accs[0];
+        }
+    }
+    let x_buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[ncols, cols], &{
+        x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()
+    })
+    .expect("x");
+    let packed_prefix =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_bytes], packed)
+            .expect("prefix");
+    let mut y = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols, rows]).expect("y");
+    gqh::matvec(
+        ordinal,
+        match rung {
+            GqhRung::Gqh3 => RUNG_GQH3,
+            GqhRung::Gqh2H => RUNG_GQH2_H,
+            GqhRung::Gqh2C => gqh::RUNG_GQH2_C,
+        },
+        &packed_prefix,
+        &x_buf,
+        &mut y,
+        cols,
+        rows,
+        ncols,
+        cols,
+        rows,
+        header.tensor_scale,
+        header.grid_code,
+    )
+    .expect("hip batched matvec");
+    let got_bytes = y.to_host_bytes().expect("d2h");
+    let got: Vec<f32> = got_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "batched ffn_up [{i}] got {g} want {w}"
+        );
+    }
+}
+
+#[test]
 fn rung8_embed_row_then_prefill_gqh_qkv() {
     let Some(path) = gguf_path() else {
         return;
@@ -310,6 +429,7 @@ fn rung8_embed_row_then_prefill_gqh_qkv() {
     let rung = infer_lowbit_type(qkv, hidden, false);
     kernel_ffi::prefill_ffi::matmul_rhs_transposed_gqh(
         ordinal,
+        1,
         n,
         hidden,
         &hidden_bf16,
@@ -415,7 +535,7 @@ fn dispatch_proj(
 ) {
     let qtype = infer_lowbit_type(weight, k, false);
     if is_gqh_qtype(qtype) {
-        matmul_gqh(ordinal, n, k, lhs, weight, qtype, out).unwrap_or_else(|e| {
+        matmul_gqh(ordinal, 1, n, k, lhs, weight, qtype, out).unwrap_or_else(|e| {
             panic!("gqh n={n} k={k} qtype={qtype}: {e}");
         });
         return;

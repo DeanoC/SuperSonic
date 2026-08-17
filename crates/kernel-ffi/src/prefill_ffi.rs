@@ -5153,13 +5153,15 @@ fn matmul_rhs_transposed_int4_impl(
     })
 }
 
-/// GQH fused dequant-matvec used by the Qwen3.8 GGUF path.
+/// GQH fused dequant-matmul used by the Qwen3.8 GGUF path.
 ///
-/// `lhs` is BF16/F32 `[ncols, k]` (or a rank-1 `[k]` vector). `out` is
-/// BF16/F32 `[ncols, n]`. Activations are cast to f32 for the kernel, which
-/// must not reassociate the GQH scale products.
+/// `lhs` is BF16/F32 `[>=ncols, k]` (or a rank-1 `[k]` vector). `out` is
+/// BF16/F32 `[>=ncols, n]`. Only the first `ncols` rows are read/written so
+/// oversized prefill scratch is safe. Activations are cast to f32 for the
+/// kernel, which must not reassociate the GQH scale products.
 pub fn matmul_rhs_transposed_gqh(
     ordinal: usize,
+    ncols: usize,
     n: usize,
     k: usize,
     lhs: &GpuBuffer,
@@ -5181,13 +5183,17 @@ pub fn matmul_rhs_transposed_gqh(
             out.dtype()
         )));
     }
-    if k == 0 || lhs.elem_count() % k != 0 {
+    if ncols == 0 || k == 0 {
         return Err(GpuError::InvalidArg(format!(
-            "gqh matmul lhs has {} elems, not a multiple of k={k}",
+            "gqh matmul ncols={ncols} k={k} must be positive"
+        )));
+    }
+    if lhs.elem_count() < ncols * k {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh matmul lhs has {} elems, need {ncols}*{k}",
             lhs.elem_count()
         )));
     }
-    let ncols = lhs.elem_count() / k;
     if out.elem_count() < ncols * n {
         return Err(GpuError::InvalidArg(format!(
             "gqh matmul out has {} elems, need {}",

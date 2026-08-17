@@ -167,30 +167,47 @@ pub fn build_fp8_scale_descs(weights: &Qwen35Weights) -> Option<Vec<FP8ScaleDesc
     Some(descs)
 }
 
-/// Build INT4 scale descriptors (parallel to layer descs) for runtime INT4 dequant.
-/// Returns None if weights are not INT4.
+/// Build INT4 / ggml-K / GQH scale descriptors (parallel to layer descs).
+/// Returns None if the megakernel has no low-bit weights to dequant.
 pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDesc>> {
-    if !weights.is_int4 {
+    if !weights.is_int4 && weights.gqh_headers.is_empty() {
         return None;
     }
 
     let ptr = |opt: &Option<gpu_hal::GpuBuffer>| -> *const std::ffi::c_void {
         opt.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null())
     };
+    let scale_or_gqh = |role: &str, int4: &Option<gpu_hal::GpuBuffer>| -> *const std::ffi::c_void {
+        weights
+            .gqh_sidecars
+            .get(role)
+            .map(|buf| buf.as_ptr())
+            .unwrap_or_else(|| ptr(int4))
+    };
 
     let mut descs = Vec::with_capacity(weights.layers.len());
-    for lw in &weights.layers {
+    for (idx, lw) in weights.layers.iter().enumerate() {
         let mut d = INT4ScaleDesc::default();
-        d.group_size = weights.int4_group_size as i32;
+        // GQH GGUF has no native INT4 group size; keep this non-zero so the
+        // megakernel's INT4-oriented `row / group_size` prep is defined.
+        d.group_size = if weights.int4_group_size == 0 {
+            128
+        } else {
+            weights.int4_group_size as i32
+        };
+
+        let gate_role = format!("layers.{idx}.mlp.gate_proj");
+        let up_role = format!("layers.{idx}.mlp.up_proj");
+        let down_role = format!("layers.{idx}.mlp.down_proj");
 
         // Common MLP scales/zeros
-        d.gate_proj_scale = ptr(&lw.gate_proj_int4_scale);
+        d.gate_proj_scale = scale_or_gqh(&gate_role, &lw.gate_proj_int4_scale);
         d.gate_proj_zero = ptr(&lw.gate_proj_int4_zero);
         d.gate_proj_awq_inv_scale = ptr(&lw.gate_proj_awq_inv_scale);
-        d.up_proj_scale = ptr(&lw.up_proj_int4_scale);
+        d.up_proj_scale = scale_or_gqh(&up_role, &lw.up_proj_int4_scale);
         d.up_proj_zero = ptr(&lw.up_proj_int4_zero);
         d.up_proj_awq_inv_scale = ptr(&lw.up_proj_awq_inv_scale);
-        d.down_proj_scale = ptr(&lw.down_proj_int4_scale);
+        d.down_proj_scale = scale_or_gqh(&down_role, &lw.down_proj_int4_scale);
         d.down_proj_zero = ptr(&lw.down_proj_int4_zero);
         d.down_proj_awq_inv_scale = ptr(&lw.down_proj_awq_inv_scale);
         d.gate_proj_type = infer_lowbit_type(
@@ -212,13 +229,22 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
         match lw.kind {
             LayerKind::Linear => {
                 let lin = lw.linear.as_ref().unwrap();
-                d.qkv_proj_scale = ptr(&lin.qkv_proj_int4_scale);
+                d.qkv_proj_scale = scale_or_gqh(
+                    &format!("layers.{idx}.linear_attn.in_proj_qkv"),
+                    &lin.qkv_proj_int4_scale,
+                );
                 d.qkv_proj_zero = ptr(&lin.qkv_proj_int4_zero);
                 d.qkv_proj_awq_inv_scale = ptr(&lin.qkv_proj_awq_inv_scale);
-                d.z_proj_scale = ptr(&lin.z_proj_int4_scale);
+                d.z_proj_scale = scale_or_gqh(
+                    &format!("layers.{idx}.linear_attn.in_proj_z"),
+                    &lin.z_proj_int4_scale,
+                );
                 d.z_proj_zero = ptr(&lin.z_proj_int4_zero);
                 d.z_proj_awq_inv_scale = ptr(&lin.z_proj_awq_inv_scale);
-                d.linear_out_proj_scale = ptr(&lin.out_proj_int4_scale);
+                d.linear_out_proj_scale = scale_or_gqh(
+                    &format!("layers.{idx}.linear_attn.out_proj"),
+                    &lin.out_proj_int4_scale,
+                );
                 d.linear_out_proj_zero = ptr(&lin.out_proj_int4_zero);
                 d.linear_out_proj_awq_inv_scale = ptr(&lin.out_proj_awq_inv_scale);
                 d.qkv_proj_type = infer_lowbit_type(
@@ -236,19 +262,41 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
                     weights.config.linear_num_value_heads * weights.config.linear_value_head_dim,
                     lin.out_proj_int4_scale.is_some(),
                 );
+                d.a_proj_type = infer_lowbit_type(
+                    &lin.a_proj_w,
+                    weights.config.hidden_size,
+                    false,
+                );
+                d.b_proj_type = infer_lowbit_type(
+                    &lin.b_proj_w,
+                    weights.config.hidden_size,
+                    false,
+                );
             }
             LayerKind::Full => {
                 let fa = lw.full.as_ref().unwrap();
-                d.q_proj_scale = ptr(&fa.q_proj_int4_scale);
+                d.q_proj_scale = scale_or_gqh(
+                    &format!("layers.{idx}.self_attn.q_proj"),
+                    &fa.q_proj_int4_scale,
+                );
                 d.q_proj_zero = ptr(&fa.q_proj_int4_zero);
                 d.q_proj_awq_inv_scale = ptr(&fa.q_proj_awq_inv_scale);
-                d.k_proj_scale = ptr(&fa.k_proj_int4_scale);
+                d.k_proj_scale = scale_or_gqh(
+                    &format!("layers.{idx}.self_attn.k_proj"),
+                    &fa.k_proj_int4_scale,
+                );
                 d.k_proj_zero = ptr(&fa.k_proj_int4_zero);
                 d.k_proj_awq_inv_scale = ptr(&fa.k_proj_awq_inv_scale);
-                d.v_proj_scale = ptr(&fa.v_proj_int4_scale);
+                d.v_proj_scale = scale_or_gqh(
+                    &format!("layers.{idx}.self_attn.v_proj"),
+                    &fa.v_proj_int4_scale,
+                );
                 d.v_proj_zero = ptr(&fa.v_proj_int4_zero);
                 d.v_proj_awq_inv_scale = ptr(&fa.v_proj_awq_inv_scale);
-                d.o_proj_scale = ptr(&fa.o_proj_int4_scale);
+                d.o_proj_scale = scale_or_gqh(
+                    &format!("layers.{idx}.self_attn.o_proj"),
+                    &fa.o_proj_int4_scale,
+                );
                 d.o_proj_zero = ptr(&fa.o_proj_int4_zero);
                 d.o_proj_awq_inv_scale = ptr(&fa.o_proj_awq_inv_scale);
                 d.q_proj_type = infer_lowbit_type(

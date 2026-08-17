@@ -431,7 +431,7 @@ fn matmul_proj(
         if batch != 1 {
             anyhow::bail!("GQH matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
         }
-        return qwen35::weights::matmul_gqh(ordinal, n, k, lhs, weight, qtype, out)
+        return qwen35::weights::matmul_gqh(ordinal, m, n, k, lhs, weight, qtype, out)
             .map_err(|e| anyhow::anyhow!("matmul_gqh: {e}"));
     }
     if qtype != 0 {
@@ -494,6 +494,7 @@ fn prefill_lm_head_lowbit(
     if qwen35::weights::is_gqh_qtype(qtype) {
         qwen35::weights::matmul_gqh(
             ordinal,
+            count,
             vocab_size,
             hidden_dim,
             lhs,

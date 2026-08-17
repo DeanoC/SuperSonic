@@ -5,6 +5,9 @@
 #include <hip/hip_runtime.h>
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
+
+#include "gqh-tables.h"
 
 // Per-section timing slot layout (mirrors the CUDA kernel's layout so the Rust
 // reader `decode_persistent_4b_timing_slots` is backend-agnostic). Each layer
@@ -350,6 +353,13 @@ struct Qwen35INT4ScaleDesc {
     int k_proj_type;
     int v_proj_type;
     int o_proj_type;
+    int a_proj_type;
+    int b_proj_type;
+};
+
+struct Qwen35GqhHdr {
+    float tensor_scale;
+    int grid_code;
 };
 
 static constexpr int QWEN35_LOWBIT_NATIVE_INT4 = 4;
@@ -357,6 +367,14 @@ static constexpr int QWEN35_LOWBIT_GGML_Q8_0 = 8;
 static constexpr int QWEN35_LOWBIT_GGML_Q4_K = 12;
 static constexpr int QWEN35_LOWBIT_GGML_Q5_K = 13;
 static constexpr int QWEN35_LOWBIT_GGML_Q6_K = 14;
+static constexpr int QWEN35_LOWBIT_GQH3 = 108;
+static constexpr int QWEN35_LOWBIT_GQH2_H = 109;
+static constexpr int QWEN35_LOWBIT_GQH2_C = 110;
+
+static __constant__ uint32_t QWEN35_GQH_E4M3[32][8] = GQH_E4M3_LUT_INIT;
+static __constant__ uint32_t QWEN35_GQH_RATIO_Q[16][1] = GQH_RATIO_Q_INIT;
+static __constant__ uint32_t QWEN35_GQH3_GRID[12][8] = GQH3_GRID_INIT;
+static __constant__ uint32_t QWEN35_GQH2H_GRID[12][4] = GQH2H_GRID_INIT;
 
 __device__ inline bool qwen35_lowbit_native_int4(int qtype) {
     return qtype == QWEN35_LOWBIT_NATIVE_INT4;
@@ -369,8 +387,257 @@ __device__ inline bool qwen35_lowbit_ggml_k(int qtype) {
            qtype == QWEN35_LOWBIT_GGML_Q6_K;
 }
 
+__device__ inline bool qwen35_lowbit_gqh(int qtype) {
+    return qtype == QWEN35_LOWBIT_GQH3 ||
+           qtype == QWEN35_LOWBIT_GQH2_H ||
+           qtype == QWEN35_LOWBIT_GQH2_C;
+}
+
 __device__ inline bool qwen35_lowbit_supported(int qtype) {
-    return qwen35_lowbit_native_int4(qtype) || qwen35_lowbit_ggml_k(qtype);
+    return qwen35_lowbit_native_int4(qtype) || qwen35_lowbit_ggml_k(qtype) ||
+           qwen35_lowbit_gqh(qtype);
+}
+
+#pragma clang fp contract(off)
+__device__ inline float qwen35_gqh_bits(uint32_t u) {
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+__device__ inline float qwen35_gqh_subblock_scale(
+    const uint8_t* __restrict__ b, int sub, float tensor_scale) {
+    const uint8_t d = b[0];
+    const float d_real =
+        qwen35_gqh_bits(QWEN35_GQH_E4M3[d >> 3][d & 7]) * tensor_scale;
+    const uint8_t rb = b[1 + (sub >> 1)];
+    const int ratio = (sub & 1) ? (rb >> 4) : (rb & 0x0f);
+    return d_real * qwen35_gqh_bits(QWEN35_GQH_RATIO_Q[ratio][0]);
+}
+
+__device__ inline int qwen35_gqh_row_bytes(int qtype, int cols) {
+    const int blocks = cols / GQH_SUPERBLOCK;
+    if (qtype == QWEN35_LOWBIT_GQH3) return blocks * GQH3_SB_BYTES;
+    if (qtype == QWEN35_LOWBIT_GQH2_H) return blocks * GQH2H_SB_BYTES;
+    if (qtype == QWEN35_LOWBIT_GQH2_C) return blocks * GQH2C_SB_BYTES;
+    return 0;
+}
+
+__device__ inline float qwen35_gqh_dequant_scalar(
+    const void* w_ptr, int qtype, int row, int col, int cols,
+    float tensor_scale, int grid_code) {
+    const int sb_bytes = qwen35_gqh_row_bytes(qtype, GQH_SUPERBLOCK);
+    const uint8_t* rowbase = static_cast<const uint8_t*>(w_ptr) +
+        static_cast<size_t>(row) * qwen35_gqh_row_bytes(qtype, cols);
+    const int sb = col / GQH_SUPERBLOCK;
+    const int j = col % GQH_SUPERBLOCK;
+    const uint8_t* b = rowbase + static_cast<size_t>(sb) * sb_bytes;
+    const float s_b = qwen35_gqh_subblock_scale(b, j >> 4, tensor_scale);
+    if (qtype == QWEN35_LOWBIT_GQH3) {
+        const int lo = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+        const int hi = (b[73 + (j >> 3)] >> (j & 7)) & 0x01;
+        return qwen35_gqh_bits(QWEN35_GQH3_GRID[grid_code][lo | (hi << 2)]) * s_b;
+    }
+    if (qtype == QWEN35_LOWBIT_GQH2_H) {
+        const int code = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+        return qwen35_gqh_bits(QWEN35_GQH2H_GRID[grid_code][code]) * s_b;
+    }
+    return 0.0f;
+}
+
+__device__ inline void qwen35_gqh_dequant_8(
+    const void* w_ptr, int qtype, int row, int col, int cols,
+    float tensor_scale, int grid_code, float out[8]) {
+    const int sb_bytes = qwen35_gqh_row_bytes(qtype, GQH_SUPERBLOCK);
+    const uint8_t* rowbase = static_cast<const uint8_t*>(w_ptr) +
+        static_cast<size_t>(row) * qwen35_gqh_row_bytes(qtype, cols);
+    const int sb = col / GQH_SUPERBLOCK;
+    const int j0 = col % GQH_SUPERBLOCK;
+    const uint8_t* b = rowbase + static_cast<size_t>(sb) * sb_bytes;
+    const float s_b = qwen35_gqh_subblock_scale(b, j0 >> 4, tensor_scale);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int j = j0 + i;
+        if (qtype == QWEN35_LOWBIT_GQH3) {
+            const int lo = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+            const int hi = (b[73 + (j >> 3)] >> (j & 7)) & 0x01;
+            out[i] = qwen35_gqh_bits(QWEN35_GQH3_GRID[grid_code][lo | (hi << 2)]) * s_b;
+        } else if (qtype == QWEN35_LOWBIT_GQH2_H) {
+            const int code = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+            out[i] = qwen35_gqh_bits(QWEN35_GQH2H_GRID[grid_code][code]) * s_b;
+        } else {
+            out[i] = 0.0f;
+        }
+    }
+}
+
+__device__ inline void qwen35_gqh_hdr(
+    const void* scale_ptr, float* tensor_scale, int* grid_code) {
+    if (scale_ptr == nullptr) {
+        *tensor_scale = 0.0f;
+        *grid_code = 0;
+        return;
+    }
+    const Qwen35GqhHdr* h = static_cast<const Qwen35GqhHdr*>(scale_ptr);
+    *tensor_scale = h->tensor_scale;
+    *grid_code = h->grid_code;
+}
+
+// Same register-grid + packed-code walk as kernels/gqh.hip. Each lane owns
+// 8 consecutive weights in the 256-wide superblock (lane*8).
+__device__ inline float qwen35_gqh_level(int code, float4 mag, bool is3) {
+    if (is3) {
+        const int hi = (code >> 2) & 1;
+        const int k = code & 3;
+        const int idx = hi ? k : (3 - k);
+        const float e0 = (idx & 1) ? mag.y : mag.x;
+        const float e1 = (idx & 1) ? mag.w : mag.z;
+        const float m = (idx & 2) ? e1 : e0;
+        return hi ? m : -m;
+    }
+    const int hi = (code >> 1) & 1;
+    const float m = ((code & 1) != hi) ? mag.x : 1.0f;
+    return hi ? m : -m;
+}
+
+__device__ inline float4 qwen35_gqh_mag(int qtype, int grid_code) {
+    float4 mag;
+    mag.x = mag.y = mag.z = mag.w = 0.0f;
+    if (qtype == QWEN35_LOWBIT_GQH3) {
+        mag.x = qwen35_gqh_bits(QWEN35_GQH3_GRID[grid_code][4]);
+        mag.y = qwen35_gqh_bits(QWEN35_GQH3_GRID[grid_code][5]);
+        mag.z = qwen35_gqh_bits(QWEN35_GQH3_GRID[grid_code][6]);
+        mag.w = qwen35_gqh_bits(QWEN35_GQH3_GRID[grid_code][7]);
+    } else if (qtype == QWEN35_LOWBIT_GQH2_H) {
+        mag.x = qwen35_gqh_bits(QWEN35_GQH2H_GRID[grid_code][2]);
+    }
+    return mag;
+}
+
+// x[0] is column sb0 * 256. nsb is the number of superblocks to walk.
+__device__ inline float qwen35_gqh_lane_dot_range(
+    const void* w_ptr, int qtype, int row, int cols,
+    float tensor_scale, int grid_code,
+    const float* __restrict__ x, int sb0, int nsb, int lane) {
+    const bool is3 = qtype == QWEN35_LOWBIT_GQH3;
+    const int sb_bytes = qwen35_gqh_row_bytes(qtype, GQH_SUPERBLOCK);
+    const int row_nsb = cols / GQH_SUPERBLOCK;
+    const uint8_t* rowbase = static_cast<const uint8_t*>(w_ptr) +
+        (static_cast<size_t>(row) * static_cast<size_t>(row_nsb) +
+         static_cast<size_t>(sb0)) * static_cast<size_t>(sb_bytes);
+    const int j0 = lane * 8;
+    const int sub = j0 >> 4;
+    const float4 mag = qwen35_gqh_mag(qtype, grid_code);
+    float acc = 0.0f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const uint8_t* b = rowbase + static_cast<size_t>(sb) * static_cast<size_t>(sb_bytes);
+        const uint8_t d = b[0];
+        const float d_real =
+            qwen35_gqh_bits(QWEN35_GQH_E4M3[d >> 3][d & 7]) * tensor_scale;
+        const uint8_t rb = b[1 + (sub >> 1)];
+        const int ratio = (sub & 1) ? (rb >> 4) : (rb & 0x0f);
+        const float s_b = d_real * qwen35_gqh_bits(QWEN35_GQH_RATIO_Q[ratio][0]);
+        uint16_t lo2;
+        memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
+        const uint8_t hi1 = is3 ? b[73 + lane] : 0;
+        const float4 x0 = *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0);
+        const float4 x1 = *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0 + 4);
+        const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int lo = (lo2 >> (2 * t)) & 0x03;
+            const int code = is3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
+            acc += (qwen35_gqh_level(code, mag, is3) * s_b) * xs[t];
+        }
+    }
+    return acc;
+}
+
+// Two output rows, one activation pass. Cuts x traffic in half on fat K.
+__device__ inline void qwen35_gqh_lane_dot_pair(
+    const void* w_ptr, int qtype, int row0, int row1, int cols,
+    float tensor_scale, int grid_code,
+    const float* __restrict__ x, int nsb, int lane,
+    float* acc0, float* acc1) {
+    const bool is3 = qtype == QWEN35_LOWBIT_GQH3;
+    const int sb_bytes = qwen35_gqh_row_bytes(qtype, GQH_SUPERBLOCK);
+    const int row_nsb = cols / GQH_SUPERBLOCK;
+    const uint8_t* base0 = static_cast<const uint8_t*>(w_ptr) +
+        static_cast<size_t>(row0) * static_cast<size_t>(row_nsb) * static_cast<size_t>(sb_bytes);
+    const uint8_t* base1 = (row1 >= 0)
+        ? static_cast<const uint8_t*>(w_ptr) +
+            static_cast<size_t>(row1) * static_cast<size_t>(row_nsb) * static_cast<size_t>(sb_bytes)
+        : nullptr;
+    const int j0 = lane * 8;
+    const int sub = j0 >> 4;
+    const float4 mag = qwen35_gqh_mag(qtype, grid_code);
+    float a0 = 0.0f;
+    float a1 = 0.0f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const float4 x0 = *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0);
+        const float4 x1v = *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0 + 4);
+        const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1v.x, x1v.y, x1v.z, x1v.w};
+        const uint8_t* b0 = base0 + static_cast<size_t>(sb) * static_cast<size_t>(sb_bytes);
+        const uint8_t d0 = b0[0];
+        const float d_real0 =
+            qwen35_gqh_bits(QWEN35_GQH_E4M3[d0 >> 3][d0 & 7]) * tensor_scale;
+        const uint8_t rb0 = b0[1 + (sub >> 1)];
+        const float s0 = d_real0 * qwen35_gqh_bits(
+            QWEN35_GQH_RATIO_Q[(sub & 1) ? (rb0 >> 4) : (rb0 & 0x0f)][0]);
+        uint16_t lo0;
+        memcpy(&lo0, b0 + 9 + lane * 2, sizeof(lo0));
+        const uint8_t hi0 = is3 ? b0[73 + lane] : 0;
+        float s1 = 0.0f;
+        uint16_t lo1 = 0;
+        uint8_t hi1 = 0;
+        if (base1 != nullptr) {
+            const uint8_t* b1 = base1 + static_cast<size_t>(sb) * static_cast<size_t>(sb_bytes);
+            const uint8_t d1 = b1[0];
+            const float d_real1 =
+                qwen35_gqh_bits(QWEN35_GQH_E4M3[d1 >> 3][d1 & 7]) * tensor_scale;
+            const uint8_t rb1 = b1[1 + (sub >> 1)];
+            s1 = d_real1 * qwen35_gqh_bits(
+                QWEN35_GQH_RATIO_Q[(sub & 1) ? (rb1 >> 4) : (rb1 & 0x0f)][0]);
+            memcpy(&lo1, b1 + 9 + lane * 2, sizeof(lo1));
+            hi1 = is3 ? b1[73 + lane] : 0;
+        }
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int c0 = is3
+                ? ((lo0 >> (2 * t)) & 0x03) | (((hi0 >> t) & 1) << 2)
+                : ((lo0 >> (2 * t)) & 0x03);
+            a0 += (qwen35_gqh_level(c0, mag, is3) * s0) * xs[t];
+            if (base1 != nullptr) {
+                const int c1 = is3
+                    ? ((lo1 >> (2 * t)) & 0x03) | (((hi1 >> t) & 1) << 2)
+                    : ((lo1 >> (2 * t)) & 0x03);
+                a1 += (qwen35_gqh_level(c1, mag, is3) * s1) * xs[t];
+            }
+        }
+    }
+    *acc0 += a0;
+    *acc1 += a1;
+}
+
+__device__ inline void qwen35_gqh_lane_dots(
+    const void* w_ptr, int qtype, int row, int cols, const void* hdr,
+    const float* __restrict__ x_base, int x_stride, int B,
+    float* acc, int lane) {
+    float tensor_scale;
+    int grid_code;
+    qwen35_gqh_hdr(hdr, &tensor_scale, &grid_code);
+    const int nsb = cols / GQH_SUPERBLOCK;
+    if (B == 1) {
+        acc[0] += qwen35_gqh_lane_dot_range(
+            w_ptr, qtype, row, cols, tensor_scale, grid_code,
+            x_base, 0, nsb, lane);
+        return;
+    }
+    for (int bi = 0; bi < B; ++bi) {
+        acc[bi] += qwen35_gqh_lane_dot_range(
+            w_ptr, qtype, row, cols, tensor_scale, grid_code,
+            x_base + bi * x_stride, 0, nsb, lane);
+    }
 }
 
 // Dequantize 8 INT4 weights from 4 packed bytes.
@@ -719,6 +986,13 @@ __device__ inline float lowbit_dequant_scalar(
     if (qwen35_lowbit_native_int4(qtype)) {
         return int4_dequant_scalar(w_ptr, scale_ptr, zero_ptr, row, col, cols, group_size);
     }
+    if (qwen35_lowbit_gqh(qtype)) {
+        float tensor_scale;
+        int grid_code;
+        qwen35_gqh_hdr(scale_ptr, &tensor_scale, &grid_code);
+        return qwen35_gqh_dequant_scalar(
+            w_ptr, qtype, row, col, cols, tensor_scale, grid_code);
+    }
     return ggml_k_dequant_scalar(w_ptr, qtype, row, col, cols);
 }
 
@@ -743,6 +1017,12 @@ __device__ inline void lowbit_dequant_8(
             scale_cols,
             group_size,
             out);
+    } else if (qwen35_lowbit_gqh(qtype)) {
+        float tensor_scale;
+        int grid_code;
+        qwen35_gqh_hdr(scale_ptr, &tensor_scale, &grid_code);
+        qwen35_gqh_dequant_8(
+            w_ptr, qtype, row, col, cols, tensor_scale, grid_code, out);
     } else {
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -8463,7 +8743,11 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                     for (int b = 0; b < B; b++) p[b] = 0.0f;
                     if (qwen35_lowbit_supported(w_qtype)) {
                         const int gsz = int4_scales[layer].group_size;
-                        if (qwen35_lowbit_native_int4(w_qtype)) {
+                        if (qwen35_lowbit_gqh(w_qtype)) {
+                            qwen35_gqh_lane_dots(
+                                w_raw, w_qtype, row, hidden_dim, w_i4_scale,
+                                lds_input, hidden_dim, B, p, lane_p);
+                        } else if (qwen35_lowbit_native_int4(w_qtype)) {
                             // INT4 dequant: load 4 packed bytes (8 weights) at a time
                             const int byte_cols = hidden_dim / 2;  // packed width
                             const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
@@ -8491,7 +8775,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             }
                         } else {
                             for (int c = lane_p; c < hidden_dim; c += warpSize) {
-                                float w = lowbit_dequant_scalar(w_raw, nullptr, nullptr, w_qtype, row, c, hidden_dim, gsz);
+                                float w = lowbit_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, w_qtype, row, c, hidden_dim, gsz);
                                 for (int b = 0; b < B; b++)
                                     p[b] += w * lds_input[b * hidden_dim + c];
                             }
@@ -8953,7 +9237,12 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                         if (qwen35_lowbit_supported(o_qtype)) {
                             const int gsz = int4_scales[layer].group_size;
                             const void* o_awq_inv = int4_scales[layer].o_proj_awq_inv_scale;
-                            if (kv_fp8 != nullptr) {
+                            if (qwen35_lowbit_gqh(o_qtype) && kv_fp8 == nullptr) {
+                                qwen35_gqh_lane_dots(
+                                    L.o_proj_w, o_qtype, sr, attn_size,
+                                    int4_scales[layer].o_proj_scale,
+                                    lds_input, attn_size, 1, &p, lane_o);
+                            } else if (kv_fp8 != nullptr) {
                                 if (lane_o == 0) {
                                     for (int c = 0; c < attn_size; ++c) {
                                         p += lowbit_dequant_scalar(
@@ -8988,7 +9277,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                          awq_inv_scale_at(o_awq_inv, c) * lds_input[c];
                             } else {
                                 for (int c = lane_o; c < attn_size; c += warpSize)
-                                    p += lowbit_dequant_scalar(L.o_proj_w, nullptr, nullptr, o_qtype, sr, c, attn_size, gsz) *
+                                    p += lowbit_dequant_scalar(L.o_proj_w, int4_scales[layer].o_proj_scale, int4_scales[layer].o_proj_zero, o_qtype, sr, c, attn_size, gsz) *
                                          lds_input[c];
                             }
                         } else if (fp8_scales != nullptr && fp8_scales[layer].o_proj_scale != nullptr) {
@@ -9099,12 +9388,12 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
                         w_raw = L.b_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim;
-                        // b_proj: no INT4 variant
+                        w_qtype = int4_scales[layer].b_proj_type;
                         if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
                     } else {
                         w_raw = L.a_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
-                        // a_proj: no INT4 variant
+                        w_qtype = int4_scales[layer].a_proj_type;
                         if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
                     }
 
@@ -9139,7 +9428,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             }
                         } else {
                             for (int c = tid; c < hidden_dim; c += bs) {
-                                float w = lowbit_dequant_scalar(w_raw, nullptr, nullptr, w_qtype, row, c, hidden_dim, gsz);
+                                float w = lowbit_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, w_qtype, row, c, hidden_dim, gsz);
                                 for (int b = 0; b < B; b++)
                                     p[b] += w * lds_input[b * hidden_dim + c];
                             }
@@ -9212,19 +9501,23 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                         w_raw = L.b_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim;
                         if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
-                        // b_proj: no INT4 variant
+                        if (int4_scales) w_qtype = int4_scales[layer].b_proj_type;
                     } else {
                         w_raw = L.a_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
                         if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
-                        // a_proj: no INT4 variant
+                        if (int4_scales) w_qtype = int4_scales[layer].a_proj_type;
                     }
 
                     float p[MAX_BATCH_SIZE];
                     for (int b = 0; b < B; b++) p[b] = 0.0f;
                     if (qwen35_lowbit_supported(w_qtype)) {
                         const int gsz = int4_scales[layer].group_size;
-                        if (qwen35_lowbit_native_int4(w_qtype)) {
+                        if (qwen35_lowbit_gqh(w_qtype)) {
+                            qwen35_gqh_lane_dots(
+                                w_raw, w_qtype, row, hidden_dim, w_i4_scale,
+                                lds_input, hidden_dim, B, p, lane_p);
+                        } else if (qwen35_lowbit_native_int4(w_qtype)) {
                             const int byte_cols = hidden_dim / 2;
                             const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
                             const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(w_i4_scale);
@@ -9251,7 +9544,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             }
                         } else {
                             for (int c = lane_p; c < hidden_dim; c += warpSize) {
-                                float w = lowbit_dequant_scalar(w_raw, nullptr, nullptr, w_qtype, row, c, hidden_dim, gsz);
+                                float w = lowbit_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, w_qtype, row, c, hidden_dim, gsz);
                                 for (int b = 0; b < B; b++)
                                     p[b] += w * lds_input[b * hidden_dim + c];
                             }
@@ -9598,7 +9891,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                      awq_inv_scale_at(out_awq_inv, c) * lds_input[c];
                         } else {
                             for (int c = tid; c < vd; c += bs)
-                                p += lowbit_dequant_scalar(L.linear_out_proj_w, nullptr, nullptr, out_qtype, sr, c, vd, gsz) *
+                                p += lowbit_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, out_qtype, sr, c, vd, gsz) *
                                      lds_input[c];
                         }
 
@@ -9627,7 +9920,12 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                         if (out_lowbit) {
                             const int gsz = int4_scales[layer].group_size;
                             const void* out_awq_inv = int4_scales[layer].linear_out_proj_awq_inv_scale;
-                            if (qwen35_lowbit_native_int4(out_qtype)) {
+                            if (qwen35_lowbit_gqh(out_qtype)) {
+                                qwen35_gqh_lane_dots(
+                                    L.linear_out_proj_w, out_qtype, sr, vd,
+                                    int4_scales[layer].linear_out_proj_scale,
+                                    lds_input, vd, 1, &p, lane_o);
+                            } else if (qwen35_lowbit_native_int4(out_qtype)) {
                                 const int byte_cols = vd / 2;
                                 const uint8_t* i4_row = static_cast<const uint8_t*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * byte_cols;
                                 const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(int4_scales[layer].linear_out_proj_scale);
@@ -9648,7 +9946,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                          awq_inv_scale_at(out_awq_inv, c) * lds_input[c];
                             } else {
                                 for (int c = lane_o; c < vd; c += warpSize)
-                                    p += lowbit_dequant_scalar(L.linear_out_proj_w, nullptr, nullptr, out_qtype, sr, c, vd, gsz) *
+                                    p += lowbit_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, out_qtype, sr, c, vd, gsz) *
                                          lds_input[c];
                             }
                         } else if (fp8_scales != nullptr && fp8_scales[layer].linear_out_proj_scale != nullptr) {
@@ -9851,7 +10149,16 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                     float up[MAX_BATCH_SIZE];
                     for (int b = 0; b < B; b++) { gp[b] = 0.0f; up[b] = 0.0f; }
 
-                    if (mlp_lowbit) {
+                    if (mlp_lowbit && qwen35_lowbit_gqh(gate_qtype) && qwen35_lowbit_gqh(up_qtype)) {
+                        qwen35_gqh_lane_dots(
+                            L.gate_proj_w, gate_qtype, my_row, hidden_dim,
+                            int4_scales[layer].gate_proj_scale,
+                            lds_input, hidden_dim, B, gp, lane_p);
+                        qwen35_gqh_lane_dots(
+                            L.up_proj_w, up_qtype, my_row, hidden_dim,
+                            int4_scales[layer].up_proj_scale,
+                            lds_input, hidden_dim, B, up, lane_p);
+                    } else if (mlp_lowbit) {
                         const int gsz = int4_scales[layer].group_size;
                         const int byte_cols = hidden_dim / 2;
                         const uint8_t* g_i4 = static_cast<const uint8_t*>(L.gate_proj_w) + static_cast<size_t>(my_row) * byte_cols;
@@ -10046,12 +10353,47 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                     const int lane_d = tid % warpSize;
                     for (;;) {
                         unsigned int my_row;
-                        if (lane_d == 0) my_row = atomicAdd(&counters[0], 1u);
+                        const unsigned int steal =
+                            (down_lowbit && qwen35_lowbit_gqh(down_qtype)) ? 2u : 1u;
+                        if (lane_d == 0) my_row = atomicAdd(&counters[0], steal);
                         my_row = __shfl(my_row, 0);
                         if (my_row >= static_cast<unsigned int>(hidden_dim)) break;
 
                         float p = 0.0f;
-                        if (down_lowbit) {
+                        if (down_lowbit && qwen35_lowbit_gqh(down_qtype)) {
+                            float p1 = 0.0f;
+                            float ts;
+                            int gc;
+                            qwen35_gqh_hdr(
+                                int4_scales[layer].down_proj_scale, &ts, &gc);
+                            const int row1 =
+                                (my_row + 1 < static_cast<unsigned int>(hidden_dim))
+                                    ? static_cast<int>(my_row + 1)
+                                    : -1;
+                            qwen35_gqh_lane_dot_pair(
+                                L.down_proj_w, down_qtype, static_cast<int>(my_row),
+                                row1, L.intermediate_size, ts, gc, swiglu_b,
+                                L.intermediate_size / GQH_SUPERBLOCK, lane_d, &p, &p1);
+                            p = wave_reduce_sum_f32(p);
+                            if (lane_d == 0) {
+                                float add = bf16_round_rne_f32_finite(p);
+                                mlp_out[b * hidden_dim + my_row] = add;
+                                hidden_f32[b * hidden_dim + my_row] =
+                                    bf16_round_rne_f32_finite(
+                                        hidden_f32[b * hidden_dim + my_row] + add);
+                            }
+                            if (row1 >= 0) {
+                                p1 = wave_reduce_sum_f32(p1);
+                                if (lane_d == 0) {
+                                    float add = bf16_round_rne_f32_finite(p1);
+                                    mlp_out[b * hidden_dim + row1] = add;
+                                    hidden_f32[b * hidden_dim + row1] =
+                                        bf16_round_rne_f32_finite(
+                                            hidden_f32[b * hidden_dim + row1] + add);
+                                }
+                            }
+                            continue;
+                        } else if (down_lowbit) {
                             const int gsz = int4_scales[layer].group_size;
                             const void* d_awq_inv = int4_scales[layer].down_proj_awq_inv_scale;
                             const int byte_cols = L.intermediate_size / 2;

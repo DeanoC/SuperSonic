@@ -175,22 +175,10 @@ pub(crate) fn run_qwen35_prefill(
         });
     }
 
-    let gqh_weights = !engine.weights().gqh_headers.is_empty();
-    if gqh_weights || std::env::var_os("SUPERSONIC_QWEN35_PREFILL_DECODE_LOOP").is_some() {
-        if gqh_weights {
-            eprintln!("[prefill] GQH GGUF: sequential component decode-loop prefill");
-        }
-        let mut logits = if gqh_weights {
-            engine.decode_step(prompt_ids[0], 0)?
-        } else {
-            engine.prefill_native(&prompt_ids[..1])?
-        };
+    if std::env::var_os("SUPERSONIC_QWEN35_PREFILL_DECODE_LOOP").is_some() {
+        let mut logits = engine.prefill_native(&prompt_ids[..1])?;
         for (pos, &token_id) in prompt_ids.iter().enumerate().skip(1) {
-            logits = if gqh_weights {
-                engine.decode_step(token_id, pos)?
-            } else {
-                engine.decode_step_batch(&[token_id], pos)?.remove(0)
-            };
+            logits = engine.decode_step_batch(&[token_id], pos)?.remove(0);
         }
         let first = DecodeEngine::greedy_sample(&logits);
         eprintln!(
@@ -203,6 +191,13 @@ pub(crate) fn run_qwen35_prefill(
             native_trace: None,
             next_token: first,
         });
+    }
+
+    if !engine.weights().gqh_headers.is_empty() {
+        eprintln!(
+            "[prefill] GQH GGUF: native batched prefill ({} headers)",
+            engine.weights().gqh_headers.len()
+        );
     }
 
     let dump_layer_hiddens_dir =

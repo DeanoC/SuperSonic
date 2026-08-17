@@ -215,9 +215,11 @@ pub fn is_gqh_qtype(qtype: i32) -> bool {
     kernel_ffi::gqh::rung_from_ggml_type(qtype as u32).is_some()
 }
 
-/// Batch-1 GQH fused matvec using the header registered against `weight`.
+/// GQH fused dequant-matmul using the header registered against `weight`.
+/// `lhs` is `[>=m, k]`, `out` is `[>=m, n]`; only the first `m` rows are used.
 pub fn matmul_gqh(
     ordinal: usize,
+    m: usize,
     n: usize,
     k: usize,
     lhs: &GpuBuffer,
@@ -239,6 +241,7 @@ pub fn matmul_gqh(
         .unwrap_or((0.0, 0));
     kernel_ffi::prefill_ffi::matmul_rhs_transposed_gqh(
         ordinal,
+        m,
         n,
         k,
         lhs,
@@ -283,6 +286,9 @@ pub struct Qwen35Weights {
     pub int8_outlier_threshold: f32,
     /// Per-tensor GQH headers from `geoquant.gqh.headers`, keyed by role name.
     pub gqh_headers: BTreeMap<String, GqhHeader>,
+    /// Device 8-byte `{tensor_scale, grid_code}` sidecars for the megakernel.
+    /// Kept alive so `INT4ScaleDesc` pointers stay valid.
+    pub gqh_sidecars: BTreeMap<String, GpuBuffer>,
 }
 
 impl Qwen35Weights {
@@ -615,6 +621,7 @@ impl Qwen35Weights {
             int8_baked_store: None,
             int8_outlier_threshold: 0.0,
             gqh_headers: BTreeMap::new(),
+            gqh_sidecars: BTreeMap::new(),
         })
     }
 
@@ -904,6 +911,7 @@ impl Qwen35Weights {
             int8_baked_store: None,
             int8_outlier_threshold: 0.0,
             gqh_headers: BTreeMap::new(),
+            gqh_sidecars: BTreeMap::new(),
         })
     }
 }

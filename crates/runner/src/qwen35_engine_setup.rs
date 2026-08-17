@@ -76,7 +76,7 @@ pub(crate) fn load_qwen35_engine(
     }
     if !weights.gqh_headers.is_empty() {
         eprintln!(
-            "[weights] GQH fused matvec ({} headers)",
+            "[weights] GQH megakernel dequant ({} headers)",
             weights.gqh_headers.len()
         );
     }
@@ -130,8 +130,10 @@ pub(crate) fn load_qwen35_engine(
         cli.batch_size,
     )?;
     engine.set_decode_context_limit(context_tokens);
-    let allow_host_lm_head_rescore =
-        cli.no_bake && !engine.weights().is_fp8 && !engine.weights().is_int4;
+    let allow_host_lm_head_rescore = cli.no_bake
+        && !engine.weights().is_fp8
+        && !engine.weights().is_int4
+        && engine.weights().gqh_headers.is_empty();
 
     Ok(Qwen35EngineSetup {
         engine,

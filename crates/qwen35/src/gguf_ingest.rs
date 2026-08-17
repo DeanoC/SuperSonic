@@ -335,6 +335,23 @@ fn upload_packed(
     Ok(buf)
 }
 
+/// 8-byte `{f32 tensor_scale, i32 grid_code}` sidecar for the 4B megakernel.
+fn upload_gqh_sidecars(
+    ordinal: usize,
+    headers: &BTreeMap<String, GqhHeader>,
+) -> Result<BTreeMap<String, GpuBuffer>, model_store::Error> {
+    let mut out = BTreeMap::new();
+    for (role, header) in headers {
+        let mut bytes = [0u8; 8];
+        bytes[0..4].copy_from_slice(&header.tensor_scale.to_le_bytes());
+        bytes[4..8].copy_from_slice(&(i32::from(header.grid_code)).to_le_bytes());
+        let buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[8], &bytes)
+            .map_err(model_store::Error::from)?;
+        out.insert(role.clone(), buf);
+    }
+    Ok(out)
+}
+
 fn load_q2k_embed(
     file: &GgufFile,
     ordinal: usize,
@@ -629,6 +646,8 @@ pub fn load_weights(
         });
     }
 
+    let gqh_sidecars = upload_gqh_sidecars(ordinal, &headers)?;
+
     Ok(Qwen35Weights {
         config: config.clone(),
         weight_prefix: "gguf".to_string(),
@@ -641,6 +660,7 @@ pub fn load_weights(
         norm_weight,
         layers,
         gqh_headers: headers,
+        gqh_sidecars,
         is_fp8: false,
         fp8_block_size: 0,
         is_int4: false,

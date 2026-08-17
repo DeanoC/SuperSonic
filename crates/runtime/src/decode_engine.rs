@@ -460,11 +460,9 @@ fn lm_head_lowbit(
         return Ok(false);
     };
     if qwen35::weights::is_gqh_qtype(qtype) {
-        if m != 1 {
-            anyhow::bail!("{label}: GQH lm_head is m-1 only, got m={m}");
-        }
         qwen35::weights::matmul_gqh(
             ordinal,
+            m,
             vocab_size,
             hidden_dim,
             lhs,
@@ -516,7 +514,7 @@ fn matmul_proj(
         if batch != 1 {
             anyhow::bail!("GQH matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
         }
-        return qwen35::weights::matmul_gqh(ordinal, n, k, lhs, weight, qtype, out)
+        return qwen35::weights::matmul_gqh(ordinal, m, n, k, lhs, weight, qtype, out)
             .map_err(|e| anyhow::anyhow!("matmul_gqh: {e}"));
     }
     if qtype != 0 {

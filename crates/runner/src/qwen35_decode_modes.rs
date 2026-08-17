@@ -22,9 +22,9 @@ pub(crate) fn resolve_qwen35_decode_modes(
     gpu_validate_enabled: bool,
     oracle_output_present: bool,
     cuda_08b_hero_enabled: bool,
-    gqh_weights: bool,
+    _gqh_weights: bool,
 ) -> Qwen35DecodeModes {
-    let force_component_decode = cli.force_component_decode || gqh_weights;
+    let force_component_decode = cli.force_component_decode;
     let cuda_qwen2b_replay_default = backend == Backend::Cuda
         && *model_variant == ModelVariant::Qwen3_5_2B
         && cli.batch_size == 1
