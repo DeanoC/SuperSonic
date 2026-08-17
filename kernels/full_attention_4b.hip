@@ -10226,8 +10226,9 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     float v_conv = 0.0f;
                     if (head_local) {
                         // Block h computes V[h] and Q/K for h%nk from conv
-                        // state. Share-count join on that k-head before the
-                        // owner shifts Q/K taps. Same kern=4 product order.
+                        // state. Arrive after the load so conv overlaps the
+                        // 3-way join; owner waits after conv. Same kern=4
+                        // product order. Sequential L2 keeps the inv exact.
                         const int q_base = q_key_offset + h_k * hkd;
                         const int k_base = k_key_offset + h_k * hkd;
                         const int v_base = v_val_offset + h * hvd;
@@ -10252,36 +10253,14 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                             vx2 = cs[vs * 3 + 2];
                             vnew = supersonic_qwen35_from_float<T>(qkv_f32[vs]);
                         }
-                        __syncthreads();
                         if (tid == 0) {
                             unsigned n_share = 0;
                             for (int hh = h_k; hh < nv; hh += nk) {
                                 ++n_share;
                             }
-                            const unsigned seq_key =
-                                static_cast<unsigned>(seq_off) + 1u;
-                            gqh_kq_arrive(&kq_flag[h_k], seq_key);
-                            if (h < nk) {
-                                gqh_kq_wait(&kq_flag[h_k], seq_key, n_share);
-                            }
-                        }
-                        __syncthreads();
-                        if (h < nk && in_d) {
-                            cs[(q_base + tid) * 3 + 0] = qx1;
-                            cs[(q_base + tid) * 3 + 1] = qx2;
-                            cs[(q_base + tid) * 3 + 2] = qnew;
-                            cs[(k_base + tid) * 3 + 0] = kx1;
-                            cs[(k_base + tid) * 3 + 1] = kx2;
-                            cs[(k_base + tid) * 3 + 2] = knew;
-                        }
-                        if (in_d) {
-                            cs[(v_base + tid) * 3 + 0] = vx1;
-                            cs[(v_base + tid) * 3 + 1] = vx2;
-                            cs[(v_base + tid) * 3 + 2] = vnew;
-                        }
-                        __syncthreads();
-                        if (h < nk && tid == 0) {
-                            atomicExch(&kq_flag[h_k], 0u);
+                            gqh_kq_arrive(
+                                &kq_flag[h_k],
+                                static_cast<unsigned>(seq_off) + 1u);
                         }
                         if (in_d) {
                             const int qw = (q_base + tid) * 4;
@@ -10315,7 +10294,33 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                                 supersonic_qwen35_to_float(cw[vw + 2]),
                                 supersonic_qwen35_to_float(cw[vw + 3]));
                         }
+                        if (tid == 0 && h < nk) {
+                            unsigned n_share = 0;
+                            for (int hh = h_k; hh < nv; hh += nk) {
+                                ++n_share;
+                            }
+                            gqh_kq_wait(
+                                &kq_flag[h_k],
+                                static_cast<unsigned>(seq_off) + 1u,
+                                n_share);
+                        }
                         __syncthreads();
+                        if (h < nk && in_d) {
+                            cs[(q_base + tid) * 3 + 0] = qx1;
+                            cs[(q_base + tid) * 3 + 1] = qx2;
+                            cs[(q_base + tid) * 3 + 2] = qnew;
+                            cs[(k_base + tid) * 3 + 0] = kx1;
+                            cs[(k_base + tid) * 3 + 1] = kx2;
+                            cs[(k_base + tid) * 3 + 2] = knew;
+                        }
+                        if (in_d) {
+                            cs[(v_base + tid) * 3 + 0] = vx1;
+                            cs[(v_base + tid) * 3 + 1] = vx2;
+                            cs[(v_base + tid) * 3 + 2] = vnew;
+                        }
+                        if (h < nk && tid == 0) {
+                            atomicExch(&kq_flag[h_k], 0u);
+                        }
                         if (tid == 0) {
                             float sq = 0.0f;
                             for (int d = 0; d < hkd; ++d)
@@ -10377,13 +10382,24 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     }
 
                     float kv_mem_v = 0.0f;
-#pragma unroll 4
-                    for (int k = 0; k < hkd; ++k) {
+                    float s = sh[v];
+#pragma unroll 8
+                    for (int k = 0; k < hkd - 1; ++k) {
+                        const float s_next = sh[(k + 1) * hvd + v];
                         const float kk = cache_kq
                             ? k_s[k]
                             : conv_out[k_key_offset + h_k * hkd + k];
-                        const float s = sh[k * hvd + v] * decay;
+                        s *= decay;
                         sh[k * hvd + v] = s;
+                        kv_mem_v += s * kk;
+                        s = s_next;
+                    }
+                    {
+                        const float kk = cache_kq
+                            ? k_s[hkd - 1]
+                            : conv_out[k_key_offset + h_k * hkd + (hkd - 1)];
+                        s *= decay;
+                        sh[(hkd - 1) * hvd + v] = s;
                         kv_mem_v += s * kk;
                     }
 
@@ -10393,27 +10409,73 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     const float delta = (val - kv_mem_v) * beta;
 
                     float out_v = 0.0f;
-#pragma unroll 4
-                    for (int k = 0; k < hkd; ++k) {
+                    s = sh[v];
+#pragma unroll 8
+                    for (int k = 0; k < hkd - 1; ++k) {
+                        const float s_next = sh[(k + 1) * hvd + v];
                         const float kk = cache_kq
                             ? k_s[k]
                             : conv_out[k_key_offset + h_k * hkd + k];
                         const float qq = cache_kq
                             ? q_s[k]
                             : conv_out[q_key_offset + h_k * hkd + k];
-                        const float s = sh[k * hvd + v] + kk * delta;
+                        s += kk * delta;
                         sh[k * hvd + v] = s;
+                        out_v += s * qq;
+                        s = s_next;
+                    }
+                    {
+                        const float kk = cache_kq
+                            ? k_s[hkd - 1]
+                            : conv_out[k_key_offset + h_k * hkd + (hkd - 1)];
+                        const float qq = cache_kq
+                            ? q_s[hkd - 1]
+                            : conv_out[q_key_offset + h_k * hkd + (hkd - 1)];
+                        s += kk * delta;
+                        sh[(hkd - 1) * hvd + v] = s;
                         out_v += s * qq;
                     }
 
-                    attn_scratch_b_[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
+                    const float out_r = bf16_round_rne_f32_finite(out_v);
+                    if (head_local) {
+                        k_s[v] = out_r;
+                    } else {
+                        attn_scratch_b_[h * hvd + v] = out_r;
+                    }
                     }
                     __syncthreads();
+                    if (head_local) {
+                        // Sequential RMS sum over the just-rounded outs in
+                        // LDS. Same order as the old tid==h global walk.
+                        if (tid == 0) {
+                            float sq = 0.0f;
+                            for (int j = 0; j < hvd; ++j)
+                                sq += k_s[j] * k_s[j];
+                            q_s[0] = rsqrtf(
+                                sq / static_cast<float>(hvd) + L.linear_norm_eps);
+                        }
+                        __syncthreads();
+                        if (tid < hvd) {
+                            const float* nw =
+                                static_cast<const float*>(L.linear_norm_w);
+                            const float* z_f32_ = proj_b + L.qkv_out_dim;
+                            const float n = k_s[tid] * q_s[0];
+                            const float w = (nw != nullptr)
+                                ? bf16_round_rne_f32_finite(nw[tid])
+                                : 1.0f;
+                            const float zv = z_f32_[h * hvd + tid];
+                            attn_scratch_b_[h * hvd + tid] =
+                                bf16_round_rne_f32_finite(
+                                    n * w *
+                                    (zv * supersonic_qwen35_sigmoid_fast(zv)));
+                        }
+                    }
                 }
             }
             // Gated RMS is already per-block on head h. attn_scratch[h]
             // was written by this block; no grid barrier before step D.
 
+            if (!head_local) {
             {
                 // Step D: Per-head RMSNorm + weight + SiLU(z) gating.
                 // Sequential per-head sum stays on tid 0 (same order as
@@ -10446,6 +10508,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     }
                     __syncthreads();
                 }
+            }
             }
             // kSplit==2: out GEMV is the next launch, so the kernel
             // boundary publishes attn_scratch. kSplit==0 keeps the barrier
