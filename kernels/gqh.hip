@@ -97,7 +97,7 @@ __global__ void gqh2c_decode_kernel(
 }
 
 #define GQH_WARP 32
-#define GQH_MATVEC_WARPS 4
+#define GQH_MATVEC_WARPS 8
 #define GQH_PER_LANE (GQH_SUPERBLOCK / GQH_WARP)
 
 static __device__ __forceinline__ float gqh_warp_shfl_down(float v, int off) {
@@ -140,16 +140,16 @@ __global__ void gqh_matvec_kernel(
     const int col = blockIdx.y;
 
     __shared__ float s_ratio[16];
+    __shared__ float s_x[GQH_SUPERBLOCK];
     if (threadIdx.x < 16) {
         s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
     }
     __syncthreads();
-    if (row >= out) {
-        return;
-    }
 
+    const bool valid = row < out;
     const int nsb = in / GQH_SUPERBLOCK;
-    const uint8_t* __restrict__ rowbase = data + (int64_t)row * nsb * sb_bytes;
+    const uint8_t* __restrict__ rowbase =
+        valid ? data + (int64_t)row * nsb * sb_bytes : data;
     const float* __restrict__ xc = x + (int64_t)col * x_col_stride;
 
     const int j0 = lane * GQH_PER_LANE;
@@ -157,34 +157,41 @@ __global__ void gqh_matvec_kernel(
 
     float acc = 0.0f;
     for (int sb = 0; sb < nsb; ++sb) {
-        const uint8_t* __restrict__ b = rowbase + (int64_t)sb * sb_bytes;
+        for (int i = threadIdx.x; i < GQH_SUPERBLOCK; i += blockDim.x) {
+            s_x[i] = xc[sb * GQH_SUPERBLOCK + i];
+        }
+        __syncthreads();
+        if (valid) {
+            const uint8_t* __restrict__ b = rowbase + (int64_t)sb * sb_bytes;
 
-        const uint8_t d = b[0];
-        const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
-        const uint8_t rb = b[1 + (sub >> 1)];
-        const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
+            const uint8_t d = b[0];
+            const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
+            const uint8_t rb = b[1 + (sub >> 1)];
+            const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
 
-        const float4 x0 = *reinterpret_cast<const float4*>(xc + sb * GQH_SUPERBLOCK + j0);
-        const float4 x1 = *reinterpret_cast<const float4*>(xc + sb * GQH_SUPERBLOCK + j0 + 4);
-        const float xs[GQH_PER_LANE] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            const float4 x0 = *reinterpret_cast<const float4*>(s_x + j0);
+            const float4 x1 = *reinterpret_cast<const float4*>(s_x + j0 + 4);
+            const float xs[GQH_PER_LANE] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 
-        uint16_t lo2;
-        memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
-        const uint8_t hi1 = IS_GQH3 ? b[73 + lane] : 0;
+            uint16_t lo2;
+            memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
+            const uint8_t hi1 = IS_GQH3 ? b[73 + lane] : 0;
 
 #pragma unroll
-        for (int t = 0; t < GQH_PER_LANE; ++t) {
-            const int lo = (lo2 >> (2 * t)) & 0x03;
-            const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
-            acc += (gqh_level<IS_GQH3>(code, mag) * s_b) * xs[t];
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                const int lo = (lo2 >> (2 * t)) & 0x03;
+                const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
+                acc += (gqh_level<IS_GQH3>(code, mag) * s_b) * xs[t];
+            }
         }
+        __syncthreads();
     }
 
 #pragma unroll
     for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
         acc += gqh_warp_shfl_down(acc, off);
     }
-    if (lane == 0) {
+    if (valid && lane == 0) {
         const int64_t yi = (int64_t)col * y_col_stride + row;
         if constexpr (kAcc) {
             y[yi] = gqh_bf16_round(y[yi] + gqh_bf16_round(acc));

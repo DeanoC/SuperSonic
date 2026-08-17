@@ -98,6 +98,7 @@ struct GqhMixerLayer {
     int q_out = 0;
     int k_out = 0;
     int attn_size = 0;
+    int attn_heads = 0;
     int qkv_out = 0;
     int z_out = 0;
     int nv = 0;
@@ -184,6 +185,7 @@ bool load_gqh_mlp_hdrs(
         m.q_out = L.q_out_dim;
         m.k_out = L.k_out_dim;
         m.attn_size = L.attn_num_heads * L.attn_head_dim;
+        m.attn_heads = L.attn_num_heads;
         m.qkv_out = L.qkv_out_dim;
         m.z_out = L.z_out_dim;
         m.nv = L.linear_num_v_heads;
@@ -7712,13 +7714,13 @@ int persistent_decode_device(
                                 ws_proj + mx.qkv_out,
                                 hidden_dim, mx.z_out, stream);
                         }
-                        if (err == hipSuccess) {
+                        if (err == hipSuccess && mx.b.qtype != 8) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.b, ws_normed,
                                 ws_proj + mx.qkv_out + mx.z_out,
                                 hidden_dim, mx.nv, stream);
                         }
-                        if (err == hipSuccess) {
+                        if (err == hipSuccess && mx.a.qtype != 8) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.a, ws_normed,
                                 ws_proj + mx.qkv_out + mx.z_out + mx.nv,
@@ -7727,11 +7729,22 @@ int persistent_decode_device(
                     }
                     if (err != hipSuccess) return err;
                 }
-                const int mid_g =
-                    (use_gqh_gemv && mlp_hdrs.mix[layer].layer_type == 1)
-                    ? 1
-                    : grid_mid;
-                err = launch_split(2, layer, 0, mid_g, stream);
+                int mid_flags = 0;
+                int mid_g = grid_mid;
+                if (use_gqh_gemv) {
+                    const GqhMixerLayer& mx = mlp_hdrs.mix[layer];
+                    if (mx.layer_type == 1) {
+                        mid_g = mx.attn_heads > 0 ? mx.attn_heads : 1;
+                    } else {
+                        if (proj_can_gemv(mx.b) && mx.b.qtype == 8) {
+                            mid_flags |= 8;
+                        }
+                        if (proj_can_gemv(mx.a) && mx.a.qtype == 8) {
+                            mid_flags |= 16;
+                        }
+                    }
+                }
+                err = launch_split(2, layer, mid_flags, mid_g, stream);
                 if (err != hipSuccess) return err;
                 int out_flags = 0;
                 if (use_gqh_gemv) {

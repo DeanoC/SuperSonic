@@ -8240,6 +8240,30 @@ __global__ void supersonic_qwen35_add_round_f32_kernel(
     }
 }
 
+// One Q8_0 row × x, same product order as ggml_k_matvec_kernel<8>.
+// Caller must be a full wave; only lane 0's returned value is the reduction.
+__device__ inline float ggml_q8_0_warp_dot(
+    const uint8_t* __restrict__ w,
+    int row,
+    const float* __restrict__ x,
+    int in_dim) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const uint8_t* row_data =
+        w + static_cast<size_t>(row) * static_cast<size_t>((in_dim / 32) * 34);
+    float p = 0.0f;
+    const int nblk = in_dim / 32;
+    for (int blk = 0; blk < nblk; ++blk) {
+        const uint8_t* b = row_data + static_cast<size_t>(blk) * 34;
+        const float d = ggml_f16_to_f32_unaligned(b);
+        const int8_t q = reinterpret_cast<const int8_t*>(b + 2)[lane];
+        p += (d * static_cast<float>(q)) * x[blk * 32 + lane];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        p += __shfl_xor(p, off);
+    }
+    return p;
+}
+
 // Same wave-per-row walk as steal o/out: lane owns columns lane, lane+32, ...
 // then xor-reduce. Per-block scales are hoisted; the product order matches
 // ggml_k_dequant_scalar_from_row so GQH-mixed ggml-K rows stay bit-exact.
@@ -9062,8 +9086,8 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
 
             if constexpr (kSplit == 0 || kSplit == 2 || kSplit == 3) {
             // Step B-G: QK-norm, RoPE, KV cache, attention, gating, o_proj
-            // Block 0 handles per-head sequential ops (per-sequence loop).
-            // O_proj uses all blocks via work-stealing (per-sequence loop).
+            // Each block owns Q-heads h = bid, bid+nb, ... (full-attn mid
+            // launches nh blocks). O_proj is a separate split / GEMV.
             {
                 const int hd = L.attn_head_dim;       // 256
                 const int nh = L.attn_num_heads;       // 8
@@ -9090,19 +9114,19 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                 void* kv_scale_k_b   = (batch_descs && kv_fp8) ? batch_descs[layer].kv_scale_k[b] : (kv_fp8 ? kv_fp8[layer].kv_scale_k : nullptr);
                 void* kv_scale_v_b   = (batch_descs && kv_fp8) ? batch_descs[layer].kv_scale_v[b] : (kv_fp8 ? kv_fp8[layer].kv_scale_v : nullptr);
 
-                if (blockIdx.x == 0) {
                 float* q_f32 = proj_b;
                 float* k_f32 = proj_b + L.q_out_dim;
                 float* v_f32 = proj_b + L.q_out_dim + L.k_out_dim;
 
-                // Step B: QK-norm — RMSNorm per head on head_dim
-                // Wave-level reduce + cross-wave LDS reduce (2 syncthreads vs 8)
+                // Step B: QK-norm — RMSNorm per head on head_dim.
+                // Each block owns Q-heads h = bid, bid+nb, ... so a 24-head
+                // layer can run 24-wide instead of one serial block.
                 {
                     const int norm_lane = tid % warpSize;
                     const int norm_wave = tid / warpSize;
                     const int norm_nwaves = bs / warpSize;
 
-                    for (int h = 0; h < nh; ++h) {
+                    for (int h = blockIdx.x; h < nh; h += nb) {
                         float* qh = q_f32 + h * hd * 2;
                         float sq = 0.0f;
                         for (int d = tid; d < hd; d += bs) sq += qh[d] * qh[d];
@@ -9124,7 +9148,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         }
                         __syncthreads();
                     }
-                    for (int h = 0; h < nkv; ++h) {
+                    for (int h = blockIdx.x; h < nkv; h += nb) {
                         float* kh = k_f32 + h * hd;
                         float sq = 0.0f;
                         for (int d = tid; d < hd; d += bs) sq += kh[d] * kh[d];
@@ -9154,29 +9178,29 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     const size_t cos_off =
                         static_cast<size_t>(seq_off_b) * half_rot;
 
-                    for (int idx = tid; idx < nh * half_rot; idx += bs) {
-                        const int h = idx / half_rot;
-                        const int i = idx % half_rot;
+                    for (int h = blockIdx.x; h < nh; h += nb) {
                         float* qh = q_f32 + h * hd * 2;
-                        float c = supersonic_qwen35_to_float(cos_table[cos_off + i]);
-                        float s = supersonic_qwen35_to_float(sin_table[cos_off + i]);
-                        float x0 = qh[i];
-                        float x1 = qh[half_rot + i];
-                        qh[i] = bf16_round_rne_f32_finite(x0 * c - x1 * s);
-                        qh[half_rot + i] = bf16_round_rne_f32_finite(x0 * s + x1 * c);
+                        for (int i = tid; i < half_rot; i += bs) {
+                            float c = supersonic_qwen35_to_float(cos_table[cos_off + i]);
+                            float s = supersonic_qwen35_to_float(sin_table[cos_off + i]);
+                            float x0 = qh[i];
+                            float x1 = qh[half_rot + i];
+                            qh[i] = bf16_round_rne_f32_finite(x0 * c - x1 * s);
+                            qh[half_rot + i] = bf16_round_rne_f32_finite(x0 * s + x1 * c);
+                        }
                     }
                     __syncthreads();
 
-                    for (int idx = tid; idx < nkv * half_rot; idx += bs) {
-                        const int h = idx / half_rot;
-                        const int i = idx % half_rot;
+                    for (int h = blockIdx.x; h < nkv; h += nb) {
                         float* kh = k_f32 + h * hd;
-                        float c = supersonic_qwen35_to_float(cos_table[cos_off + i]);
-                        float s = supersonic_qwen35_to_float(sin_table[cos_off + i]);
-                        float x0 = kh[i];
-                        float x1 = kh[half_rot + i];
-                        kh[i] = bf16_round_rne_f32_finite(x0 * c - x1 * s);
-                        kh[half_rot + i] = bf16_round_rne_f32_finite(x0 * s + x1 * c);
+                        for (int i = tid; i < half_rot; i += bs) {
+                            float c = supersonic_qwen35_to_float(cos_table[cos_off + i]);
+                            float s = supersonic_qwen35_to_float(sin_table[cos_off + i]);
+                            float x0 = kh[i];
+                            float x1 = kh[half_rot + i];
+                            kh[i] = bf16_round_rne_f32_finite(x0 * c - x1 * s);
+                            kh[half_rot + i] = bf16_round_rne_f32_finite(x0 * s + x1 * c);
+                        }
                     }
                     __syncthreads();
                 }
@@ -9192,7 +9216,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         float* scale_k_buf = static_cast<float*>(kv_scale_k_b);
                         float* scale_v_buf = static_cast<float*>(kv_scale_v_b);
 
-                        for (int h = 0; h < nkv; ++h) {
+                        for (int h = blockIdx.x; h < nkv; h += nb) {
                             float k_bf16 =
                                 (tid < hd) ? bf16_round_rne_f32_finite(k_f32[h * hd + tid]) : 0.0f;
                             float my_k = (tid < hd) ? fabsf(k_bf16) : 0.0f;
@@ -9240,7 +9264,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     } else {
                         T* cache_k = static_cast<T*>(kv_k_b);
                         T* cache_v = static_cast<T*>(kv_v_b);
-                        for (int h = 0; h < nkv; ++h) {
+                        for (int h = blockIdx.x; h < nkv; h += nb) {
                             for (int d = tid; d < hd; d += bs) {
                                 const size_t offset =
                                     static_cast<size_t>(h) * kv_max_b * hd +
@@ -9259,17 +9283,18 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                 float* saved_pre_gate = saved_gate + nh * hd;
                 float* saved_scores = saved_pre_gate + nh * hd;
                 if (emit_attention_trace) {
-                    for (int i = tid; i < nh * hd; i += bs) {
-                        const int h = i / hd;
-                        const int d = i % hd;
-                        saved_q[i] = bf16_round_rne_f32_finite(q_f32[h * hd * 2 + d]);
+                    for (int h = blockIdx.x; h < nh; h += nb) {
+                        for (int d = tid; d < hd; d += bs) {
+                            saved_q[h * hd + d] = bf16_round_rne_f32_finite(
+                                q_f32[h * hd * 2 + d]);
+                        }
                     }
                 }
-                for (int i = tid; i < nh * hd; i += bs) {
-                    const int h = i / hd;
-                    const int d = i % hd;
-                    saved_gate[i] = bf16_round_rne_f32_finite(
-                        q_f32[h * hd * 2 + hd + d]);
+                for (int h = blockIdx.x; h < nh; h += nb) {
+                    for (int d = tid; d < hd; d += bs) {
+                        saved_gate[h * hd + d] = bf16_round_rne_f32_finite(
+                            q_f32[h * hd * 2 + hd + d]);
+                    }
                 }
                 __syncthreads();
 
@@ -9289,7 +9314,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     const uint8_t* fp8_cv = static_cast<const uint8_t*>(kv_v_b);
                     const float* scale_k_buf = static_cast<const float*>(kv_scale_k_b);
                     const float* scale_v_buf = static_cast<const float*>(kv_scale_v_b);
-                    for (int qh = 0; qh < nh; ++qh) {
+                    for (int qh = blockIdx.x; qh < nh; qh += nb) {
                         const int kvh = qh / kv_groups;
                         const float* q_head = q_f32 + qh * hd * 2;
                         float my_acc = 0.0f;
@@ -9354,7 +9379,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     const T* ck = static_cast<const T*>(kv_k_b);
                     const T* cv = static_cast<const T*>(kv_v_b);
 
-                    for (int qh = 0; qh < nh; ++qh) {
+                    for (int qh = blockIdx.x; qh < nh; qh += nb) {
                         const int kvh = qh / kv_groups;
                         const float* q_head = q_f32 + qh * hd * 2;
 
@@ -9367,6 +9392,81 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                             static_cast<size_t>(kvh) * kv_max_b * hd;
 
                         int t = 0;
+                        for (; t + 3 < kv_len_b; t += 4) {
+                            const size_t pos0 = kv_head_base +
+                                static_cast<size_t>(t) * hd;
+                            const float p0 = q_val *
+                                supersonic_qwen35_to_float(ck[pos0 + tid]);
+                            const float p1 = q_val *
+                                supersonic_qwen35_to_float(ck[pos0 + hd + tid]);
+                            const float p2 = q_val *
+                                supersonic_qwen35_to_float(ck[pos0 + 2 * hd + tid]);
+                            const float p3 = q_val *
+                                supersonic_qwen35_to_float(ck[pos0 + 3 * hd + tid]);
+                            const float r0 = wave_reduce_sum_f32(p0);
+                            const float r1 = wave_reduce_sum_f32(p1);
+                            const float r2 = wave_reduce_sum_f32(p2);
+                            const float r3 = wave_reduce_sum_f32(p3);
+                            if (attn_lane == 0) {
+                                lds[attn_wave] = r0;
+                                lds[attn_nwaves + attn_wave] = r1;
+                                lds[2 * attn_nwaves + attn_wave] = r2;
+                                lds[3 * attn_nwaves + attn_wave] = r3;
+                            }
+                            __syncthreads();
+                            float tot0 = 0.0f;
+                            float tot1 = 0.0f;
+                            float tot2 = 0.0f;
+                            float tot3 = 0.0f;
+                            for (int w = 0; w < attn_nwaves; ++w) {
+                                tot0 += lds[w];
+                                tot1 += lds[attn_nwaves + w];
+                                tot2 += lds[2 * attn_nwaves + w];
+                                tot3 += lds[3 * attn_nwaves + w];
+                            }
+                            const float s0 = tot0 * scale;
+                            const float s1 = tot1 * scale;
+                            const float s2 = tot2 * scale;
+                            const float s3 = tot3 * scale;
+                            if (emit_attention_trace && tid == 0) {
+                                saved_scores[qh * kv_max_b + t] = s0;
+                                saved_scores[qh * kv_max_b + t + 1] = s1;
+                                saved_scores[qh * kv_max_b + t + 2] = s2;
+                                saved_scores[qh * kv_max_b + t + 3] = s3;
+                            }
+                            const float v0 =
+                                supersonic_qwen35_to_float(cv[pos0 + tid]);
+                            const float v1 =
+                                supersonic_qwen35_to_float(cv[pos0 + hd + tid]);
+                            const float v2 =
+                                supersonic_qwen35_to_float(cv[pos0 + 2 * hd + tid]);
+                            const float v3 =
+                                supersonic_qwen35_to_float(cv[pos0 + 3 * hd + tid]);
+                            float old_max = my_max;
+                            my_max = fmaxf(my_max, s0);
+                            float rescale = expf(old_max - my_max);
+                            float wt = expf(s0 - my_max);
+                            my_acc = my_acc * rescale + wt * v0;
+                            my_sum = my_sum * rescale + wt;
+                            old_max = my_max;
+                            my_max = fmaxf(my_max, s1);
+                            rescale = expf(old_max - my_max);
+                            wt = expf(s1 - my_max);
+                            my_acc = my_acc * rescale + wt * v1;
+                            my_sum = my_sum * rescale + wt;
+                            old_max = my_max;
+                            my_max = fmaxf(my_max, s2);
+                            rescale = expf(old_max - my_max);
+                            wt = expf(s2 - my_max);
+                            my_acc = my_acc * rescale + wt * v2;
+                            my_sum = my_sum * rescale + wt;
+                            old_max = my_max;
+                            my_max = fmaxf(my_max, s3);
+                            rescale = expf(old_max - my_max);
+                            wt = expf(s3 - my_max);
+                            my_acc = my_acc * rescale + wt * v3;
+                            my_sum = my_sum * rescale + wt;
+                        }
                         for (; t + 1 < kv_len_b; t += 2) {
                             const size_t pos0 = kv_head_base +
                                 static_cast<size_t>(t) * hd;
@@ -9443,22 +9543,27 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                 }
 
                 if (emit_attention_trace) {
-                    for (int i = tid; i < nh * hd; i += bs) {
-                        saved_pre_gate[i] = attn_flat[i];
+                    for (int h = blockIdx.x; h < nh; h += nb) {
+                        for (int d = tid; d < hd; d += bs) {
+                            saved_pre_gate[h * hd + d] = attn_flat[h * hd + d];
+                        }
                     }
                 }
                 __syncthreads();
 
                 // Step F: Gate
-                for (int i = tid; i < nh * hd; i += bs) {
-                    float gate_val = saved_gate[i];
-                    float sigmoid_gate = supersonic_qwen35_sigmoid_fast(gate_val);
-                    attn_flat[i] = bf16_round_rne_f32_finite(attn_flat[i] * sigmoid_gate);
+                for (int h = blockIdx.x; h < nh; h += nb) {
+                    for (int d = tid; d < hd; d += bs) {
+                        const int i = h * hd + d;
+                        float gate_val = saved_gate[i];
+                        float sigmoid_gate = supersonic_qwen35_sigmoid_fast(gate_val);
+                        attn_flat[i] = bf16_round_rne_f32_finite(
+                            attn_flat[i] * sigmoid_gate);
+                    }
                 }
                 __syncthreads();
 
-                } // end if (blockIdx.x == 0)
-                // Grid barrier: block 0 wrote attn_flat, all blocks need it for o_proj
+                // Grid barrier: every block wrote its Q-heads into attn_flat.
                 grid_barrier(barrier_counter, barrier_flag, nb);
                 qwen35_4b_hip_record_timing(
                     layer_timing_slots,
@@ -9878,6 +9983,46 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             void* conv_b = batch_descs ? batch_descs[layer].conv_state[b] : L.conv_state;
             void* rec_b  = batch_descs ? batch_descs[layer].recurrent_state[b] : L.recurrent_state;
             float* proj_b = proj_buf + b * proj_buf_floats;
+
+            // Tiny Q8_0 a/b (nv rows × hidden) used to be two dedicated GEMV
+            // launches (~30 µs of dispatch each). Compute them here with the
+            // mid grid: block h owns head h. Steal/GEMV skip is io_flags 8/16.
+            if constexpr (kSplit == 2) {
+                if (int4_scales != nullptr &&
+                    ((io_flags & 8) != 0 || (io_flags & 16) != 0)) {
+                    float* b_dst = proj_b + L.qkv_out_dim + L.z_out_dim;
+                    float* a_dst = b_dst + nv_heads;
+                    const float* x_ab = normed + b * hidden_dim;
+                    const int b_qt = int4_scales[layer].b_proj_type;
+                    const int a_qt = int4_scales[layer].a_proj_type;
+                    for (int h = blockIdx.x; h < nv_heads; h += nb) {
+                        if ((io_flags & 8) != 0 &&
+                            b_qt == QWEN35_LOWBIT_GGML_Q8_0 &&
+                            L.b_proj_w != nullptr && tid < 32) {
+                            const float p = ggml_q8_0_warp_dot(
+                                static_cast<const uint8_t*>(L.b_proj_w),
+                                h,
+                                x_ab,
+                                hidden_dim);
+                            if (tid == 0) {
+                                b_dst[h] = bf16_round_rne_f32_finite(p);
+                            }
+                        }
+                        if ((io_flags & 16) != 0 &&
+                            a_qt == QWEN35_LOWBIT_GGML_Q8_0 &&
+                            L.a_proj_w != nullptr && tid >= 32 && tid < 64) {
+                            const float p = ggml_q8_0_warp_dot(
+                                static_cast<const uint8_t*>(L.a_proj_w),
+                                h,
+                                x_ab,
+                                hidden_dim);
+                            if (tid == 32) {
+                                a_dst[h] = bf16_round_rne_f32_finite(p);
+                            }
+                        }
+                    }
+                }
+            }
 
             if (blockIdx.x == 0) {
                 float* qkv_f32 = proj_b;
