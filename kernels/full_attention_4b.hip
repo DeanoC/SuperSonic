@@ -8791,7 +8791,9 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             if constexpr (kSplit == 0 || kSplit == 1) {
             // Step A: Q/K/V projections via work-stealing
             // Q: [q_out_dim, hidden_dim], K: [k_out_dim, hidden_dim], V: same as K
+            const bool skip_in_steal = (kSplit == 1) && ((io_flags & 32) != 0);
             const unsigned long long full_attn_proj_clock = clock64();
+            if (!skip_in_steal) {
             if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
             grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -8945,6 +8947,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                 QWEN35_4B_TIMING_FULL_ATTN_PROJ,
                 full_attn_proj_clock);
             grid_barrier(barrier_counter, barrier_flag, nb);
+            } // !skip_in_steal
             } // kSplit IN: full QKV projs
 
             if constexpr (kSplit == 0 || kSplit == 2 || kSplit == 3) {
@@ -9463,7 +9466,9 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             const int nv_heads = L.linear_num_v_heads;
             if constexpr (kSplit == 0 || kSplit == 1) {
             // Step A: qkv/z/b/a projections via work-stealing
+            const bool skip_in_steal = (kSplit == 1) && ((io_flags & 32) != 0);
             const unsigned long long linear_proj_clock = clock64();
+            if (!skip_in_steal) {
             if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
             grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -9720,6 +9725,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             qwen35_4b_hip_record_timing(
                 layer_timing_slots, QWEN35_4B_TIMING_LINEAR_PROJ, linear_proj_clock);
             grid_barrier(barrier_counter, barrier_flag, nb);
+            } // !skip_in_steal
             } // kSplit IN: linear projs
 
             // Step B-E: conv1d, recurrent state, gated norm, out_proj

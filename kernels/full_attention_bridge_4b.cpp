@@ -7408,12 +7408,35 @@ int persistent_decode_device(
                 occ5,
                 a5.localSizeBytes);
         }
-        const int grid_in = phase_grid(a1.numRegs, a1.localSizeBytes, occ1, 4);
-        const int grid_mid = phase_grid(a2.numRegs, a2.localSizeBytes, occ2, 6);
-        const int grid_out = phase_grid(a3.numRegs, a3.localSizeBytes, occ3, 3);
-        const int grid_gate = phase_grid(a4.numRegs, a4.localSizeBytes, occ4, 4);
+        static GqhMlpHdrs mlp_hdrs;
+        const bool use_gqh_gemv =
+            std::getenv("SUPERSONIC_QWEN35_GQH_NOGEMV") == nullptr
+            && load_gqh_mlp_hdrs(
+                layers_base, int4_base, num_layers, &mlp_hdrs);
+        static bool dumped_gemv = false;
+        if (!dumped_gemv) {
+            dumped_gemv = true;
+            std::fprintf(
+                stderr,
+                "[hip-occ] gqh-split MLP %s\n",
+                use_gqh_gemv ? "dedicated GEMV" : "persistent steal");
+        }
+        const int grid_in = use_gqh_gemv
+            ? 1
+            : phase_grid(a1.numRegs, a1.localSizeBytes, occ1, 4);
+        const int grid_mid = use_gqh_gemv
+            ? 48
+            : phase_grid(a2.numRegs, a2.localSizeBytes, occ2, 6);
+        const int grid_out = use_gqh_gemv
+            ? 1
+            : phase_grid(a3.numRegs, a3.localSizeBytes, occ3, 3);
+        const int grid_gate = use_gqh_gemv
+            ? 1
+            : phase_grid(a4.numRegs, a4.localSizeBytes, occ4, 4);
         const int grid_up = phase_grid(a6.numRegs, a6.localSizeBytes, occ6, 6);
-        const int grid_down = phase_grid(a5.numRegs, a5.localSizeBytes, occ5, 6);
+        const int grid_down = use_gqh_gemv
+            ? ((hidden_dim + block_size - 1) / block_size)
+            : phase_grid(a5.numRegs, a5.localSizeBytes, occ5, 6);
         static bool dumped_grid = false;
         if (!dumped_grid) {
             dumped_grid = true;
@@ -7447,19 +7470,6 @@ int persistent_decode_device(
             int batch_size = 0;
         };
         static SplitGraphCache cache;
-        static GqhMlpHdrs mlp_hdrs;
-        const bool use_gqh_gemv =
-            std::getenv("SUPERSONIC_QWEN35_GQH_NOGEMV") == nullptr
-            && load_gqh_mlp_hdrs(
-                layers_base, int4_base, num_layers, &mlp_hdrs);
-        static bool dumped_gemv = false;
-        if (!dumped_gemv) {
-            dumped_gemv = true;
-            std::fprintf(
-                stderr,
-                "[hip-occ] gqh-split MLP %s\n",
-                use_gqh_gemv ? "dedicated GEMV" : "persistent steal");
-        }
         float* ws_hidden = workspace;
         float* ws_normed = ws_hidden + batch_size * hidden_dim;
         float* ws_gate = ws_normed + batch_size * hidden_dim;
@@ -7506,6 +7516,7 @@ int persistent_decode_device(
                             in_flags |= 16;
                         }
                     }
+                    in_flags |= 32;
                 }
                 err = launch_split(1, layer, in_flags, grid_in, stream);
                 if (err != hipSuccess) return err;
