@@ -10024,38 +10024,20 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                 }
             }
 
-            if (blockIdx.x == 0) {
+            {
                 float* qkv_f32 = proj_b;
-                float* z_f32 = proj_b + L.qkv_out_dim;
-                float* b_f32 = proj_b + L.qkv_out_dim + L.z_out_dim;
-                float* a_f32 = b_f32 + nv_heads;
-                // Batch-strided scratch aliases
                 float* gate_up_b = gate_up + b * intermediate_size * 2;
-                float* attn_scratch_b = attn_scratch + b * attn_scratch_floats;
-                float* mlp_out_b = mlp_out + b * hidden_dim;
 
                 const int conv_dim = L.qkv_out_dim;
                 const int kern = L.conv_kernel_size;
-                const int nv = L.linear_num_v_heads;
-                const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
-                const int hkd = L.linear_head_k_dim;
-                const int hvd = L.linear_head_v_dim;
-                const int key_dim = nk * hkd;         // num_k_heads * k_head_dim
-                const int val_dim = L.linear_value_dim; // 2048
 
-                // Step B: Conv1d stateful update
-                // conv_state: [conv_dim, kern-1] BF16 (sliding window of past values)
-                // New qkv values: qkv_f32[conv_dim] (current step)
-                // Conv: for each channel c, output = sum(conv_state[c,t] * weight[c,t]) + qkv[c] * weight[c,kern-1]
-                // Then update conv_state: shift left, append new value
+                // Step B: depthwise conv. Channels are independent; stride
+                // across the mid grid instead of serializing on block 0.
                 {
                     T* cs = static_cast<T*>(conv_b);
                     const T* cw = static_cast<const T*>(L.conv1d_w);
-                    // cw layout: [conv_dim, 1, kern] — depthwise conv weight
-                    // We treat it as [conv_dim, kern]
-
-                    float* conv_out = gate_up_b;  // reuse MLP scratch for conv output
-                    for (int c = tid; c < conv_dim; c += bs) {
+                    float* conv_out = gate_up_b;
+                    for (int c = tid + blockIdx.x * bs; c < conv_dim; c += bs * nb) {
                         // Depthwise conv: sum(state[t] * weight[t]) + new_value * weight[kern-1]
                         // Match standard path: convert new value to BF16 for consistency
                         T qkv_bf16 = supersonic_qwen35_from_float<T>(qkv_f32[c]);
@@ -10101,40 +10083,24 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                             debug[kern] = conv_out[c];
                         }
                     }
-                    __syncthreads();
-
-                    // conv_out[conv_dim] now has the post-conv, post-SiLU output
-                    // Split into query, key, value
-                    // Layout: [key_dim | key_dim | val_dim] within conv_dim
-                    // Actually conv_dim = key_dim*2 + val_dim = 2048+2048+2048? No...
-                    // conv_dim = 6144. With nv=16, hkd=128, hvd=128:
-                    // key_dim = 16*128 = 2048, val_dim = 16*128 = 2048
-                    // So 6144 = 2048 + 2048 + 2048? That's only if there are separate Q/K/V.
-                    // Actually for linear attention: conv_dim = in_proj_qkv out = 6144
-                    // which packs Q, K, V differently. Let me use the existing split:
-                    // First key_dim values = query (normalized later)
-                    // Next key_dim values = key
-                    // Next val_dim values = value
-                    // But wait, with 16 k_heads * 128 k_dim = 2048 for Q
-                    //          16 k_heads * 128 k_dim = 2048 for K
-                    //          16 v_heads * 128 v_dim = 2048 for V
-                    // Total = 6144 ✓
                 }
 
-                // Step C0: L2-normalize Q and K per-head (matches standard path)
-                // Q_norm = Q / ||Q|| * rsqrt(k_head_dim)
-                // K_norm = K / ||K||
-                {
-                    float* conv_out = gate_up_b;  // reused
-                    // nk already derived above from qkv_out_dim
-                    // Q layout: conv_out[k_head * hkd .. (k_head+1) * hkd]
-                    // K layout: conv_out[key_dim + k_head * hkd .. key_dim + (k_head+1) * hkd]
+            }
+            // All blocks wrote their conv channels. Publish before L2.
+            grid_barrier(barrier_counter, barrier_flag, nb);
 
-                    // Normalize Q and K per head using threads 0..nk-1
-                    if (tid < nk) {
-                        const int h = tid;
-                        // Q head
-                        float* qh = conv_out + h * hkd;  // q_key_offset + h * hkd
+            // Step C0: L2-normalize Q and K per-head. Sequential sum per
+            // head (same order as the old tid==h loop) so the inv stays
+            // bit-exact. Block h owns head h.
+            {
+                float* conv_out = gate_up + b * intermediate_size * 2;
+                const int nv = L.linear_num_v_heads;
+                const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
+                const int hkd = L.linear_head_k_dim;
+                const int key_dim = nk * hkd;
+                for (int h = blockIdx.x; h < nk; h += nb) {
+                    if (tid == 0) {
+                        float* qh = conv_out + h * hkd;
                         float sq = 0.0f;
                         for (int d = 0; d < hkd; ++d)
                             sq += qh[d] * qh[d];
@@ -10142,7 +10108,6 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         for (int d = 0; d < hkd; ++d)
                             qh[d] *= inv;
 
-                        // K head
                         float* kh = conv_out + key_dim + h * hkd;
                         sq = 0.0f;
                         for (int d = 0; d < hkd; ++d)
@@ -10151,12 +10116,8 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         for (int d = 0; d < hkd; ++d)
                             kh[d] *= inv;
                     }
-                    __syncthreads();
                 }
-
-            } // end if (blockIdx.x == 0) for conv1d + L2-norm (steps B + C0)
-            // Sync so all blocks see conv_out (gate_up_b) populated before the
-            // multi-block delta recurrent step below.
+            }
             grid_barrier(barrier_counter, barrier_flag, nb);
 
             // Step C: Parallel delta recurrent state update — multi-block.
@@ -10245,36 +10206,40 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             // runs the gated RMSNorm in step D.
             grid_barrier(barrier_counter, barrier_flag, nb);
 
-            if (blockIdx.x == 0) {
-                // Step D: Per-head RMSNorm + weight + SiLU(z) gating
+            {
+                // Step D: Per-head RMSNorm + weight + SiLU(z) gating.
+                // Sequential per-head sum stays on tid 0 (same order as
+                // the old tid==h loop). Each block applies its own head.
                 const int nv = L.linear_num_v_heads;
                 const int hvd = L.linear_head_v_dim;
-                const int val_dim_ = L.linear_value_dim;
                 const float* nw = static_cast<const float*>(L.linear_norm_w);
                 float* z_f32_ = proj_b + L.qkv_out_dim;
                 float* attn_scratch_bd = attn_scratch + b * attn_scratch_floats;
-                if (tid < nv) {
-                    const int h = tid;
-                    const float* ho = attn_scratch_bd + h * hvd;
-                    float sq = 0.0f;
-                    for (int j = 0; j < hvd; ++j)
-                        sq += ho[j] * ho[j];
-                    lds[h] = rsqrtf(sq / static_cast<float>(hvd) + L.linear_norm_eps);
+                for (int h = blockIdx.x; h < nv; h += nb) {
+                    if (tid == 0) {
+                        const float* ho = attn_scratch_bd + h * hvd;
+                        float sq = 0.0f;
+                        for (int j = 0; j < hvd; ++j)
+                            sq += ho[j] * ho[j];
+                        lds[0] = rsqrtf(
+                            sq / static_cast<float>(hvd) + L.linear_norm_eps);
+                    }
+                    __syncthreads();
+                    const float rms_inv = lds[0];
+                    for (int j = tid; j < hvd; j += bs) {
+                        const int d = h * hvd + j;
+                        float n = attn_scratch_bd[d] * rms_inv;
+                        float w = (nw != nullptr)
+                            ? bf16_round_rne_f32_finite(nw[j])
+                            : 1.0f;
+                        float zv = z_f32_[d];
+                        attn_scratch_bd[d] = bf16_round_rne_f32_finite(
+                            n * w * (zv * supersonic_qwen35_sigmoid_fast(zv)));
+                    }
+                    __syncthreads();
                 }
-                __syncthreads();
-                for (int d = tid; d < val_dim_; d += bs) {
-                    const int h = d / hvd;
-                    const int hd_idx = d % hvd;
-                    float rms_inv = lds[h];
-                    float n = attn_scratch_bd[d] * rms_inv;
-                    float w = (nw != nullptr) ? bf16_round_rne_f32_finite(nw[hd_idx]) : 1.0f;
-                    float zv = z_f32_[d];
-                    attn_scratch_bd[d] = bf16_round_rne_f32_finite(
-                        n * w * (zv * supersonic_qwen35_sigmoid_fast(zv)));
-                }
-                __syncthreads();
             }
-            // Final grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
+            // Publish gated heads before o/out GEMV.
             grid_barrier(barrier_counter, barrier_flag, nb);
             qwen35_4b_hip_record_timing(
                 layer_timing_slots,
