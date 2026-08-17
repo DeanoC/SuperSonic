@@ -12,6 +12,8 @@
 // Host writes this before a split-kernel graph replay so seqlen is not
 // baked into captured node params.
 __device__ int qwen35_split_seqlen;
+// Legacy symbol; steal skip is now per-layer via io_flags bit 4.
+__device__ int qwen35_gemv_out_mask;
 
 // Per-section timing slot layout (mirrors the CUDA kernel's layout so the Rust
 // reader `decode_persistent_4b_timing_slots` is backend-agnostic). Each layer
@@ -8210,6 +8212,96 @@ __global__ void supersonic_qwen35_mlp_down_proj_kernel(
     }
 }
 
+__global__ void supersonic_qwen35_swiglu_f32_kernel(
+    float* __restrict__ gate, const float* __restrict__ up, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float g = bf16_round_rne_f32_finite(gate[i]);
+    const float u = bf16_round_rne_f32_finite(up[i]);
+    const float silu = g / (1.0f + expf(-g));
+    gate[i] = bf16_round_rne_f32_finite(silu * u);
+}
+
+__global__ void supersonic_qwen35_bf16_round_f32_kernel(float* __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = bf16_round_rne_f32_finite(y[i]);
+    }
+}
+
+__global__ void supersonic_qwen35_add_round_f32_kernel(
+    float* __restrict__ dst, const float* __restrict__ add, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = bf16_round_rne_f32_finite(dst[i] + add[i]);
+    }
+}
+
+// Same wave-per-row walk as steal o/out: lane c, c+32, ... then xor-reduce.
+// Keep dequant via ggml_k_dequant_scalar_from_row so GQH-mixed ggml-K rows
+// stay bit-exact with the megakernel.
+template <int kQtype>
+__global__ void supersonic_qwen35_ggml_k_matvec_kernel(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int in_dim,
+    int out_dim) {
+    constexpr int kWarp = 32;
+    constexpr int kWarps = 4;
+    const int row = static_cast<int>(blockIdx.x) * kWarps +
+        (static_cast<int>(threadIdx.x) / kWarp);
+    const int lane = static_cast<int>(threadIdx.x) % kWarp;
+    if (row >= out_dim) {
+        return;
+    }
+    const uint8_t* row_data =
+        w + static_cast<size_t>(row) * ggml_k_row_bytes(kQtype, in_dim);
+    float p = 0.0f;
+    for (int c = lane; c < in_dim; c += kWarp) {
+        p += ggml_k_dequant_scalar_from_row(row_data, kQtype, c, in_dim) * x[c];
+    }
+    for (int off = kWarp / 2; off > 0; off >>= 1) {
+        p += __shfl_xor(p, off);
+    }
+    if (lane == 0) {
+        y[row] = p;
+    }
+}
+
+__global__ void supersonic_qwen35_bf16w_f32_gemv_kernel(
+    const hip_bfloat16* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int in_dim,
+    int out_dim) {
+    const int row = blockIdx.x;
+    if (row >= out_dim) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    float acc = 0.0f;
+    const hip_bfloat16* wr = w + static_cast<size_t>(row) * in_dim;
+    for (int c = tid; c < in_dim; c += bs) {
+        acc += supersonic_qwen35_to_float(wr[c]) * x[c];
+    }
+    __shared__ float sm[256];
+    sm[tid] = acc;
+    __syncthreads();
+    for (int stride = bs / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sm[tid] += sm[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        y[row] = bf16_round_rne_f32_finite(sm[0]);
+    }
+}
+
 // =============================================================================
 // Standalone work-stealing matvec kernel for decode
 // Computes: out[out_dim] = W[out_dim, in_dim] × input[in_dim]
@@ -8552,8 +8644,9 @@ __device__ __forceinline__ void qwen35_4b_hip_record_timing(
 }
 
 // kSplit: 0 = full kernel (legacy). 1 = RMS + in-projections. 2 = attn/linear
-// core. 3 = o/out residual. 4 = post-RMS + MLP. Separate instantiations
-// drop unused VGPR live ranges so a 3-block-per-WGP grid can actually reside.
+// core. 3 = o/out residual. 4 = post-RMS + gate. 6 = up + SwiGLU. 5 = MLP
+// down + residual store. Separate instantiations drop unused VGPR live ranges
+// so a 3-block-per-WGP grid can actually reside.
 // io_flags: bit0 = load hidden_io→workspace, bit1 = store workspace→hidden_io.
 // kSplit==0 always loads and stores.
 template <typename T, int kSplit = 0>
@@ -8710,6 +8803,18 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     if (lane_p == 0) sr = atomicAdd(&counters[0], 1u);
                     sr = __shfl(sr, 0);
                     if (sr >= static_cast<unsigned int>(total_proj)) break;
+                    if constexpr (kSplit == 1) {
+                        if (sr < static_cast<unsigned int>(L.q_out_dim)) {
+                            continue;
+                        }
+                        if (sr < static_cast<unsigned int>(L.q_out_dim + L.k_out_dim)) {
+                            if ((io_flags & 8) != 0) {
+                                continue;
+                            }
+                        } else if ((io_flags & 16) != 0) {
+                            continue;
+                        }
+                    }
 
                     const void* w_raw;
                     const void* w_scale = nullptr;
@@ -9221,6 +9326,15 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                 if constexpr (kSplit == 0 || kSplit == 3) {
                 const unsigned long long full_attn_out_clock = clock64();
                 // Step G: o_proj [hidden_dim, attn_size] × attn_flat → hidden_f32 (fused residual)
+                if constexpr (kSplit == 3) {
+                    if ((io_flags & 4) != 0) {
+                        qwen35_4b_hip_record_timing(
+                            layer_timing_slots,
+                            QWEN35_4B_TIMING_FULL_ATTN_OUT_BASE + b,
+                            full_attn_out_clock);
+                        continue;
+                    }
+                }
                 {
                     const float* x_o = proj_b;
 
@@ -9485,6 +9599,19 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     if (lane_p == 0) sr = atomicAdd(&counters[0], 1u);
                     sr = __shfl(sr, 0);
                     if (sr >= static_cast<unsigned int>(total_proj)) break;
+                    if constexpr (kSplit == 1) {
+                        if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
+                            continue;
+                        }
+                        if (sr < static_cast<unsigned int>(
+                                L.qkv_out_dim + L.z_out_dim + nv_heads)) {
+                            if ((io_flags & 8) != 0) {
+                                continue;
+                            }
+                        } else if ((io_flags & 16) != 0) {
+                            continue;
+                        }
+                    }
 
                     const void* w_raw;
                     const void* w_scale = nullptr;
@@ -9852,6 +9979,15 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             if constexpr (kSplit == 0 || kSplit == 3) {
             const unsigned long long linear_out_clock = clock64();
             // Step E: out_proj [hidden_dim, val_dim] × attn_scratch → hidden_f32 (fused residual)
+            if constexpr (kSplit == 3) {
+                if ((io_flags & 4) != 0) {
+                    qwen35_4b_hip_record_timing(
+                        layer_timing_slots,
+                        QWEN35_4B_TIMING_LINEAR_OUT_BASE + b,
+                        linear_out_clock);
+                    continue;
+                }
+            }
             {
                 const int vd = L.linear_value_dim;  // 2048
                 const float* x_lin = attn_scratch + b * attn_scratch_floats;
@@ -10050,6 +10186,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             }
         }
         grid_barrier(barrier_counter, barrier_flag, nb);
+        if constexpr (kSplit == 0) {
 
         // === Fused MLP gate+up+SwiGLU (all blocks work-steal, BATCHED) ===
         // BF16/FP8 use wave-per-row with shuffle reduction; INT4 keeps
@@ -10160,11 +10297,14 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                             L.gate_proj_w, gate_qtype, my_row, hidden_dim,
                             int4_scales[layer].gate_proj_scale,
                             normed, hidden_dim, B, gp, lane_p);
-                        qwen35_gqh_lane_dots(
-                            L.up_proj_w, up_qtype, my_row, hidden_dim,
-                            int4_scales[layer].up_proj_scale,
-                            normed, hidden_dim, B, up, lane_p);
-                    } else if (mlp_lowbit) {
+                        if constexpr (kSplit == 0) {
+                            qwen35_gqh_lane_dots(
+                                L.up_proj_w, up_qtype, my_row, hidden_dim,
+                                int4_scales[layer].up_proj_scale,
+                                normed, hidden_dim, B, up, lane_p);
+                        }
+                    } else if constexpr (kSplit == 0) {
+                    if (mlp_lowbit) {
                         const int gsz = int4_scales[layer].group_size;
                         const int byte_cols = hidden_dim / 2;
                         const uint8_t* g_i4 = static_cast<const uint8_t*>(L.gate_proj_w) + static_cast<size_t>(my_row) * byte_cols;
@@ -10276,16 +10416,38 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                             }
                         }
                     }
+                    } // kSplit 0: non-GQH fused dequant
 
                     for (int b = 0; b < B; b++) {
                         float g = wave_reduce_sum_f32(gp[b]);
-                        float u = wave_reduce_sum_f32(up[b]);
-                        if (lane_p == 0) {
-                            float gr = bf16_round_rne_f32_finite(g);
-                            float ur = bf16_round_rne_f32_finite(u);
-                            float silu = gr / (1.0f + expf(-gr));
-                            gate_up[b * intermediate_size * 2 + my_row] =
-                                bf16_round_rne_f32_finite(silu * ur);
+                        if constexpr (kSplit == 4) {
+                            const bool gqh_gate_only = mlp_lowbit
+                                && qwen35_lowbit_gqh(gate_qtype)
+                                && qwen35_lowbit_gqh(up_qtype);
+                            if (gqh_gate_only) {
+                                if (lane_p == 0) {
+                                    gate_up[b * intermediate_size * 2 + my_row] =
+                                        bf16_round_rne_f32_finite(g);
+                                }
+                            } else {
+                                float u = wave_reduce_sum_f32(up[b]);
+                                if (lane_p == 0) {
+                                    float gr = bf16_round_rne_f32_finite(g);
+                                    float ur = bf16_round_rne_f32_finite(u);
+                                    float silu = gr / (1.0f + expf(-gr));
+                                    gate_up[b * intermediate_size * 2 + my_row] =
+                                        bf16_round_rne_f32_finite(silu * ur);
+                                }
+                            }
+                        } else {
+                            float u = wave_reduce_sum_f32(up[b]);
+                            if (lane_p == 0) {
+                                float gr = bf16_round_rne_f32_finite(g);
+                                float ur = bf16_round_rne_f32_finite(u);
+                                float silu = gr / (1.0f + expf(-gr));
+                                gate_up[b * intermediate_size * 2 + my_row] =
+                                    bf16_round_rne_f32_finite(silu * ur);
+                            }
                         }
                     }
                 }
@@ -10297,7 +10459,78 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
         qwen35_4b_hip_record_timing(
             layer_timing_slots, QWEN35_4B_TIMING_MLP_GATE_UP, mlp_gate_up_clock);
         grid_barrier(barrier_counter, barrier_flag, nb);
+        } // kSplit 0 fused gate+up
+        } // kSplit 4: post-RMS (gate/up are dedicated GQH GEMVs on the split path)
 
+        if constexpr (kSplit == 6) {
+        // GQH up + SwiGLU. Gate activations were stored raw by kSplit 4.
+        const unsigned long long mlp_up_clock = clock64();
+        if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+        grid_barrier(barrier_counter, barrier_flag, nb);
+        {
+            const int up_qtype =
+                int4_scales != nullptr ? int4_scales[layer].up_proj_type : 0;
+            if (qwen35_lowbit_gqh(up_qtype)) {
+                const int lane_p = tid % warpSize;
+                for (;;) {
+                    unsigned int my_row;
+                    if (lane_p == 0) my_row = atomicAdd(&counters[0], 1u);
+                    my_row = __shfl(my_row, 0);
+                    if (my_row >= static_cast<unsigned int>(L.intermediate_size)) break;
+                    float up[MAX_BATCH_SIZE];
+                    for (int b = 0; b < B; b++) up[b] = 0.0f;
+                    qwen35_gqh_lane_dots(
+                        L.up_proj_w, up_qtype, my_row, hidden_dim,
+                        int4_scales[layer].up_proj_scale,
+                        normed, hidden_dim, B, up, lane_p);
+                    for (int b = 0; b < B; b++) {
+                        float u = wave_reduce_sum_f32(up[b]);
+                        if (lane_p == 0) {
+                            float gr = gate_up[b * intermediate_size * 2 + my_row];
+                            float ur = bf16_round_rne_f32_finite(u);
+                            float silu = gr / (1.0f + expf(-gr));
+                            gate_up[b * intermediate_size * 2 + my_row] =
+                                bf16_round_rne_f32_finite(silu * ur);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        qwen35_4b_hip_record_timing(
+            layer_timing_slots, QWEN35_4B_TIMING_MLP_GATE_UP, mlp_up_clock);
+        grid_barrier(barrier_counter, barrier_flag, nb);
+        } // kSplit 6: up + SwiGLU
+
+        if constexpr (kSplit == 5) {
+        // Dedicated GQH GEMV wrote mlp_out. Fold residual and continue.
+        const unsigned long long mlp_down_clock = clock64();
+        for (int b = 0; b < B; b++) {
+            const float* add = mlp_out + b * hidden_dim;
+            float* hid = hidden_f32 + b * hidden_dim;
+            for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
+                hid[c] = bf16_round_rne_f32_finite(hid[c] + add[c]);
+            }
+        }
+        __syncthreads();
+        grid_barrier(barrier_counter, barrier_flag, nb);
+        qwen35_4b_hip_record_timing(
+            layer_timing_slots, QWEN35_4B_TIMING_MLP_DOWN, mlp_down_clock);
+        if (tap_workspace != nullptr) {
+            for (int t = 0; t < num_taps; ++t) {
+                if (tap_layers[t] == layer) {
+                    for (int b = 0; b < B; ++b) {
+                        for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
+                            tap_workspace[(t * B + b) * hidden_dim + c] =
+                                supersonic_qwen35_from_float<T>(hidden_f32[b * hidden_dim + c]);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            grid_barrier(barrier_counter, barrier_flag, nb);
+        }
+        } else if constexpr (kSplit == 0) {
         // === MLP down_proj (all blocks work-steal, per-sequence) ===
         // Process one batch item at a time: cache SwiGLU output in LDS, work-steal
         const unsigned long long mlp_down_clock = clock64();
@@ -10493,11 +10726,11 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             __syncthreads();
             grid_barrier(barrier_counter, barrier_flag, nb);
         }
-        } // kSplit 4: post-RMS + MLP + taps
+        } // kSplit 0 fused down + taps
     }
 
     // Write back F32 → BF16 for all batch items
-    if constexpr (kSplit == 0 || kSplit == 4) {
+    if constexpr (kSplit == 0 || kSplit == 5) {
         if (kSplit == 0 || (io_flags & 2) != 0) {
             for (int b = 0; b < B; b++) {
                 for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
