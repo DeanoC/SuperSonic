@@ -8235,13 +8235,14 @@ __global__ void supersonic_qwen35_add_round_f32_kernel(
     float* __restrict__ dst, const float* __restrict__ add, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        dst[i] = bf16_round_rne_f32_finite(dst[i] + add[i]);
+        dst[i] = bf16_round_rne_f32_finite(
+            dst[i] + bf16_round_rne_f32_finite(add[i]));
     }
 }
 
-// Same wave-per-row walk as steal o/out: lane c, c+32, ... then xor-reduce.
-// Keep dequant via ggml_k_dequant_scalar_from_row so GQH-mixed ggml-K rows
-// stay bit-exact with the megakernel.
+// Same wave-per-row walk as steal o/out: lane owns columns lane, lane+32, ...
+// then xor-reduce. Per-block scales are hoisted; the product order matches
+// ggml_k_dequant_scalar_from_row so GQH-mixed ggml-K rows stay bit-exact.
 template <int kQtype>
 __global__ void supersonic_qwen35_ggml_k_matvec_kernel(
     const uint8_t* __restrict__ w,
@@ -8260,8 +8261,112 @@ __global__ void supersonic_qwen35_ggml_k_matvec_kernel(
     const uint8_t* row_data =
         w + static_cast<size_t>(row) * ggml_k_row_bytes(kQtype, in_dim);
     float p = 0.0f;
-    for (int c = lane; c < in_dim; c += kWarp) {
-        p += ggml_k_dequant_scalar_from_row(row_data, kQtype, c, in_dim) * x[c];
+    if constexpr (kQtype == QWEN35_LOWBIT_GGML_Q8_0) {
+        const int nblk = in_dim / 32;
+        for (int blk = 0; blk < nblk; ++blk) {
+            const uint8_t* b = row_data + static_cast<size_t>(blk) * 34;
+            const float d = ggml_f16_to_f32_unaligned(b);
+            const int8_t q = reinterpret_cast<const int8_t*>(b + 2)[lane];
+            p += (d * static_cast<float>(q)) * x[blk * 32 + lane];
+        }
+    } else if constexpr (kQtype == QWEN35_LOWBIT_GGML_Q4_K) {
+        const int nblk = in_dim / 256;
+        for (int blk = 0; blk < nblk; ++blk) {
+            const uint8_t* b = row_data + static_cast<size_t>(blk) * 144;
+            const float d = ggml_f16_to_f32_unaligned(b);
+            const float dmin = ggml_f16_to_f32_unaligned(b + 2);
+            const uint8_t* sc = b + 4;
+            const uint8_t* qs = b + 16;
+            const float* xb = x + blk * 256;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const int inb = lane + t * 32;
+                const int g = inb / 64;
+                const int sub = (inb % 64) / 32;
+                const int j = 2 * g + sub;
+                int scale = 0;
+                int minv = 0;
+                ggml_q4_k_scale_min(sc, j, scale, minv);
+                const uint8_t qbyte = qs[g * 32 + (inb % 32)];
+                const int q = sub != 0 ? ((qbyte >> 4) & 0x0F) : (qbyte & 0x0F);
+                p += (d * static_cast<float>(scale) * static_cast<float>(q) -
+                      dmin * static_cast<float>(minv)) *
+                    xb[inb];
+            }
+        }
+    } else if constexpr (kQtype == QWEN35_LOWBIT_GGML_Q5_K) {
+        const int nblk = in_dim / 256;
+        for (int blk = 0; blk < nblk; ++blk) {
+            const uint8_t* b = row_data + static_cast<size_t>(blk) * 176;
+            const float d = ggml_f16_to_f32_unaligned(b);
+            const float dmin = ggml_f16_to_f32_unaligned(b + 2);
+            const uint8_t* sc = b + 4;
+            const uint8_t* qh = b + 16;
+            const uint8_t* ql = b + 48;
+            const float* xb = x + blk * 256;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const int inb = lane + t * 32;
+                const int g = inb / 64;
+                const int sub = (inb % 64) / 32;
+                const int j = 2 * g + sub;
+                int scale = 0;
+                int minv = 0;
+                ggml_q4_k_scale_min(sc, j, scale, minv);
+                const int idx = inb % 32;
+                const uint8_t qbyte = ql[g * 32 + idx];
+                const int lo = sub != 0 ? ((qbyte >> 4) & 0x0F) : (qbyte & 0x0F);
+                const int hi =
+                    (qh[idx] & (sub != 0 ? (2 << (2 * g)) : (1 << (2 * g)))) ? 16
+                                                                            : 0;
+                p += (d * static_cast<float>(scale) * static_cast<float>(lo + hi) -
+                      dmin * static_cast<float>(minv)) *
+                    xb[inb];
+            }
+        }
+    } else if constexpr (kQtype == QWEN35_LOWBIT_GGML_Q6_K) {
+        const int nblk = in_dim / 256;
+        for (int blk = 0; blk < nblk; ++blk) {
+            const uint8_t* b = row_data + static_cast<size_t>(blk) * 210;
+            const uint8_t* ql = b;
+            const uint8_t* qh = b + 128;
+            const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192);
+            const float d = ggml_f16_to_f32_unaligned(b + 208);
+            const float* xb = x + blk * 256;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const int inb = lane + t * 32;
+                const int half_idx = inb / 128;
+                const int pos = inb - half_idx * 128;
+                const int idx = pos % 32;
+                int q = 0;
+                int scale_idx = half_idx * 8 + idx / 16;
+                const uint8_t qh_byte = qh[half_idx * 32 + idx];
+                if (pos < 32) {
+                    q = static_cast<int>(ql[half_idx * 64 + idx] & 0x0F) |
+                        static_cast<int>(((qh_byte >> 0) & 3) << 4);
+                } else if (pos < 64) {
+                    q = static_cast<int>(ql[half_idx * 64 + 32 + idx] & 0x0F) |
+                        static_cast<int>(((qh_byte >> 2) & 3) << 4);
+                    scale_idx += 2;
+                } else if (pos < 96) {
+                    q = static_cast<int>((ql[half_idx * 64 + idx] >> 4) & 0x0F) |
+                        static_cast<int>(((qh_byte >> 4) & 3) << 4);
+                    scale_idx += 4;
+                } else {
+                    q = static_cast<int>((ql[half_idx * 64 + 32 + idx] >> 4) & 0x0F) |
+                        static_cast<int>(((qh_byte >> 6) & 3) << 4);
+                    scale_idx += 6;
+                }
+                p += (d * static_cast<float>(sc[scale_idx]) *
+                      static_cast<float>(q - 32)) *
+                    xb[inb];
+            }
+        }
+    } else {
+        for (int c = lane; c < in_dim; c += kWarp) {
+            p += ggml_k_dequant_scalar_from_row(row_data, kQtype, c, in_dim) * x[c];
+        }
     }
     for (int off = kWarp / 2; off > 0; off >>= 1) {
         p += __shfl_xor(p, off);
@@ -9880,7 +9985,8 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             // h = bid, bid+nb, bid+2*nb, ... — a stride loop so 4B's nv=32
             // still fits in nb=16 blocks (each block handles 2 heads).
             // State slices are disjoint across heads so no cross-block races.
-            if (tid < L.linear_head_v_dim) {
+            // All threads enter so the per-head K/Q LDS cache can syncthreads.
+            {
                 float* proj_b_ = proj_buf + b * proj_buf_floats;
                 float* b_f32_ = proj_b_ + L.qkv_out_dim + L.z_out_dim;
                 float* a_f32_ = b_f32_ + nv_heads;
@@ -9901,9 +10007,19 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                 const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
 
                 const int v = tid;
+                const bool cache_kq = (hkd * 2 <= bs);
+                float* k_s = lds;
+                float* q_s = lds + hkd;
                 for (int h = blockIdx.x; h < nv; h += nb) {
                     float* sh = state + h * hkd * hvd;
+                    const int h_k = h % nk;
+                    if (cache_kq && tid < hkd) {
+                        k_s[tid] = conv_out[k_key_offset + h_k * hkd + tid];
+                        q_s[tid] = conv_out[q_key_offset + h_k * hkd + tid];
+                    }
+                    __syncthreads();
 
+                    if (tid < hvd) {
                     const float beta = 1.0f / (1.0f + expf(-b_f32_[h]));
                     float decay = 1.0f;
                     if (dt_bw != nullptr && ale_w != nullptr) {
@@ -9912,33 +10028,37 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         decay = expf(-sp * supersonic_qwen35_to_float(ale_w[h]));
                     }
 
-                    for (int k = 0; k < hkd; ++k) {
-                        sh[k * hvd + v] *= decay;
-                    }
-
-                    const int h_k = h % nk;
-
                     float kv_mem_v = 0.0f;
+#pragma unroll 4
                     for (int k = 0; k < hkd; ++k) {
-                        kv_mem_v += sh[k * hvd + v]
-                                  * conv_out[k_key_offset + h_k * hkd + k];
+                        const float kk = cache_kq
+                            ? k_s[k]
+                            : conv_out[k_key_offset + h_k * hkd + k];
+                        const float s = sh[k * hvd + v] * decay;
+                        sh[k * hvd + v] = s;
+                        kv_mem_v += s * kk;
                     }
 
                     const float val = conv_out[v_val_offset + h * hvd + v];
                     const float delta = (val - kv_mem_v) * beta;
 
-                    for (int k = 0; k < hkd; ++k) {
-                        sh[k * hvd + v] +=
-                            conv_out[k_key_offset + h_k * hkd + k] * delta;
-                    }
-
                     float out_v = 0.0f;
+#pragma unroll 4
                     for (int k = 0; k < hkd; ++k) {
-                        out_v += sh[k * hvd + v]
-                               * conv_out[q_key_offset + h_k * hkd + k];
+                        const float kk = cache_kq
+                            ? k_s[k]
+                            : conv_out[k_key_offset + h_k * hkd + k];
+                        const float qq = cache_kq
+                            ? q_s[k]
+                            : conv_out[q_key_offset + h_k * hkd + k];
+                        const float s = sh[k * hvd + v] + kk * delta;
+                        sh[k * hvd + v] = s;
+                        out_v += s * qq;
                     }
 
                     attn_scratch_b_[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
+                    }
+                    __syncthreads();
                 }
             }
             // Sync so all blocks see attn_scratch_b populated before block 0
@@ -10515,7 +10635,8 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             const float* add = mlp_out + b * hidden_dim;
             float* hid = hidden_f32 + b * hidden_dim;
             for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
-                hid[c] = bf16_round_rne_f32_finite(hid[c] + add[c]);
+                hid[c] = bf16_round_rne_f32_finite(
+                    hid[c] + bf16_round_rne_f32_finite(add[c]));
             }
         }
         __syncthreads();

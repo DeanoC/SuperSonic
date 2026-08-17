@@ -204,6 +204,18 @@ bool load_gqh_mlp_hdrs(
     cache->ok = true;
     int lin_n = 0, lin_gqh = 0, lin_ggml = 0, full_n = 0, full_gqh = 0,
         full_ggml = 0, full_kv = 0, lin_ab = 0;
+    int ggml_qt[4] = {0, 0, 0, 0};
+    auto bump_ggml = [&](int qt) {
+        if (qt == 8) {
+            ++ggml_qt[0];
+        } else if (qt == 12) {
+            ++ggml_qt[1];
+        } else if (qt == 13) {
+            ++ggml_qt[2];
+        } else if (qt == 14) {
+            ++ggml_qt[3];
+        }
+    };
     for (int li = 0; li < num_layers; ++li) {
         const GqhMixerLayer& m = cache->mix[li];
         if (m.layer_type == 1) {
@@ -216,6 +228,11 @@ bool load_gqh_mlp_hdrs(
             if (proj_can_gemv(m.k) && proj_can_gemv(m.v)) {
                 ++full_kv;
             }
+            bump_ggml(m.k.qtype);
+            bump_ggml(m.v.qtype);
+            if (m.o.rung < 0) {
+                bump_ggml(m.o.qtype);
+            }
         } else {
             ++lin_n;
             if (m.lin_out.rung >= 0) {
@@ -225,6 +242,11 @@ bool load_gqh_mlp_hdrs(
             }
             if (proj_can_gemv(m.a) && proj_can_gemv(m.b)) {
                 ++lin_ab;
+            }
+            bump_ggml(m.a.qtype);
+            bump_ggml(m.b.qtype);
+            if (m.lin_out.rung < 0) {
+                bump_ggml(m.lin_out.qtype);
             }
         }
         if (li < 4) {
@@ -260,7 +282,7 @@ bool load_gqh_mlp_hdrs(
     std::fprintf(
         stderr,
         "[gqh-gemv] out rungs lin=%d/%d gqh + %d ggml-K  full=%d/%d gqh + %d ggml-K  "
-        "in kv=%d/%d ab=%d/%d\n",
+        "in kv=%d/%d ab=%d/%d  ggml-K q8=%d q4k=%d q5k=%d q6k=%d\n",
         lin_gqh,
         lin_n,
         lin_ggml,
@@ -270,7 +292,11 @@ bool load_gqh_mlp_hdrs(
         full_kv,
         full_n,
         lin_ab,
-        lin_n);
+        lin_n,
+        ggml_qt[0],
+        ggml_qt[1],
+        ggml_qt[2],
+        ggml_qt[3]);
     return true;
 }
 
@@ -428,7 +454,8 @@ hipError_t launch_mixer_proj(
     float* y,
     int in_dim,
     int out_dim,
-    hipStream_t stream) {
+    hipStream_t stream,
+    bool do_round = true) {
     if (out_dim <= 0 || h.wire == nullptr) {
         return hipSuccess;
     }
@@ -443,7 +470,9 @@ hipError_t launch_mixer_proj(
     if (err != hipSuccess) {
         return err;
     }
-    launch_round_f32(y, out_dim, stream);
+    if (do_round) {
+        launch_round_f32(y, out_dim, stream);
+    }
     return hipSuccess;
 }
 
@@ -7575,11 +7604,11 @@ int persistent_decode_device(
                     if (do_full) {
                         err = launch_mixer_proj(
                             device_ordinal, mx.o, ws_proj, ws_token,
-                            mx.attn_size, hidden_dim, stream);
+                            mx.attn_size, hidden_dim, stream, false);
                     } else if (do_lin) {
                         err = launch_mixer_proj(
                             device_ordinal, mx.lin_out, ws_attn, ws_token,
-                            mx.val_dim, hidden_dim, stream);
+                            mx.val_dim, hidden_dim, stream, false);
                     }
                     if (err != hipSuccess) return err;
                     if (do_full || do_lin) {
@@ -7700,7 +7729,6 @@ int persistent_decode_device(
                         intermediate_size,
                         stream);
                     if (err != hipSuccess) return err;
-                    launch_round_f32(ws_gate, intermediate_size, stream);
                     err = launch_gqh_gemv(
                         device_ordinal,
                         mlp_hdrs.up[layer],
@@ -7710,7 +7738,6 @@ int persistent_decode_device(
                         intermediate_size,
                         stream);
                     if (err != hipSuccess) return err;
-                    launch_round_f32(ws_up, intermediate_size, stream);
                     launch_swiglu_f32(ws_gate, ws_up, intermediate_size, stream);
                     err = launch_gqh_gemv(
                         device_ordinal,
@@ -7721,7 +7748,6 @@ int persistent_decode_device(
                         hidden_dim,
                         stream);
                     if (err != hipSuccess) return err;
-                    launch_round_f32(ws_mlp, hidden_dim, stream);
                 } else {
                     err = launch_split(6, layer, 0, grid_up, stream);
                     if (err != hipSuccess) return err;
