@@ -9312,18 +9312,12 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                             float wave_sum = wave_reduce_sum_f32(partial);
                             if (attn_lane == 0) lds[attn_wave] = wave_sum;
                             __syncthreads();
-
-                            float score_val = 0.0f;
-                            if (tid == 0) {
-                                float total = 0.0f;
-                                for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
-                                lds[0] = total;
-                                if (emit_attention_trace) {
-                                    saved_scores[qh * kv_max_b + t] = total * scale;
-                                }
+                            float total = 0.0f;
+                            for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
+                            const float score_val = total * scale;
+                            if (emit_attention_trace && tid == 0) {
+                                saved_scores[qh * kv_max_b + t] = score_val;
                             }
-                            __syncthreads();
-                            score_val = lds[0] * scale;
 
                             float v_val = 0.0f;
                             if (kv_shadow_k_b != nullptr && kv_shadow_v_b != nullptr &&
@@ -9373,21 +9367,15 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
 
                             float partial = q_val *
                                 supersonic_qwen35_to_float(ck[pos_base + tid]);
-                            // Wave-level reduce then cross-wave via LDS
                             float wave_sum = wave_reduce_sum_f32(partial);
                             if (attn_lane == 0) lds[attn_wave] = wave_sum;
                             __syncthreads();
-                            float score_val = 0.0f;
-                            if (tid == 0) {
-                                float total = 0.0f;
-                                for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
-                                lds[0] = total;
-                                if (emit_attention_trace) {
-                                    saved_scores[qh * kv_max_b + t] = total * scale;
-                                }
+                            float total = 0.0f;
+                            for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
+                            const float score_val = total * scale;
+                            if (emit_attention_trace && tid == 0) {
+                                saved_scores[qh * kv_max_b + t] = score_val;
                             }
-                            __syncthreads();
-                            score_val = lds[0] * scale;
 
                             float v_val =
                                 supersonic_qwen35_to_float(cv[pos_base + tid]);

@@ -7592,7 +7592,11 @@ int persistent_decode_device(
                     }
                     if (err != hipSuccess) return err;
                 }
-                err = launch_split(2, layer, 0, grid_mid, stream);
+                const int mid_g =
+                    (use_gqh_gemv && mlp_hdrs.mix[layer].layer_type == 1)
+                    ? 1
+                    : grid_mid;
+                err = launch_split(2, layer, 0, mid_g, stream);
                 if (err != hipSuccess) return err;
                 int out_flags = 0;
                 if (use_gqh_gemv) {
