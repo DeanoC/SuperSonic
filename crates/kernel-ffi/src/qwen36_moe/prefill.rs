@@ -14120,6 +14120,7 @@ mod tests {
         assert!(err.to_string().contains("same CUDA backend"), "{err}");
     }
 
+    #[cfg(supersonic_backend_cuda)]
     #[test]
     fn cuda_bridge_prelude_covers_shared_hip_runtime_identifiers() {
         use std::collections::BTreeSet;

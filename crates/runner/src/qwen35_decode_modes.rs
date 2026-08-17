@@ -22,36 +22,38 @@ pub(crate) fn resolve_qwen35_decode_modes(
     gpu_validate_enabled: bool,
     oracle_output_present: bool,
     cuda_08b_hero_enabled: bool,
+    gqh_weights: bool,
 ) -> Qwen35DecodeModes {
+    let force_component_decode = cli.force_component_decode || gqh_weights;
     let cuda_qwen2b_replay_default = backend == Backend::Cuda
         && *model_variant == ModelVariant::Qwen3_5_2B
         && cli.batch_size == 1
         && use_4b_kernel
         && !cli.kv_fp8
         && !cli.force_kernel_decode
-        && !cli.force_component_decode;
+        && !force_component_decode;
     let metal_v2_incremental = backend == Backend::Metal && cli.batch_size == 1;
     let replay_decode_enabled = cli.batch_size == 1
         && !cli.force_kernel_decode
-        && !cli.force_component_decode
+        && !force_component_decode
         && !cli.kv_fp8
         && use_4b_kernel
         && (cli.force_replay_decode || cuda_qwen2b_replay_default);
     let replay_kv_fp8_enabled =
         use_4b_kernel && cli.kv_fp8 && cli.batch_size == 1 && !cli.force_kernel_decode;
     let component_single_decode_enabled =
-        cli.batch_size == 1 && use_4b_kernel && cli.force_component_decode;
+        cli.batch_size == 1 && use_4b_kernel && force_component_decode;
     let kernel_single_decode_enabled = cli.batch_size == 1
         && use_4b_kernel
         && !cli.force_replay_decode
-        && !cli.force_component_decode;
+        && !force_component_decode;
     let cuda_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_FAST_GREEDY").is_some();
     let cuda_fast_greedy_enabled = backend == Backend::Cuda
         && !use_4b_kernel
         && cli.batch_size == 1
         && !cli.validate
         && !gpu_validate_enabled
-        && !cli.force_component_decode
+        && !force_component_decode
         && !cli.force_kernel_decode
         && !cli.kv_fp8
         && !oracle_output_present
@@ -62,7 +64,7 @@ pub(crate) fn resolve_qwen35_decode_modes(
         && metal_v2_incremental
         && !cli.validate
         && !gpu_validate_enabled
-        && !cli.force_component_decode
+        && !force_component_decode
         && !cli.force_kernel_decode
         && !oracle_output_present
         && !metal_fast_greedy_disabled;

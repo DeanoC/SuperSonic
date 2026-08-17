@@ -22,6 +22,7 @@ python3 tools/check-kernel-groups.py
 | `hip-phi4` | HIP | Phi-4 HIP bridge. |
 | `hip-dflash` | HIP | DFlash draft HIP bridge. |
 | `hip-qwen36-moe` | HIP | Qwen3.6 MoE HIP bridge, persistent decode, and batched prefill support sources. |
+| `hip-gqh` | HIP | GQH decode and fused dequant-matvec. |
 | `hip-qwen3-moe` | HIP | Qwen3 MoE HIP bridge. |
 | `cuda-qwen35` | CUDA | Qwen3.5 dense CUDA attention, 4B attention, and prefill helpers. |
 | `cuda-llama31` | CUDA | Llama 3.1 certified-KV CUDA bridge. |

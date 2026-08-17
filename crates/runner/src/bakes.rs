@@ -347,6 +347,31 @@ pub(crate) fn load_qwen35_weights(
     validate_effective_flm_source_model(cli, model_variant)?;
     validate_flm_weight_source_options(cli, q4km_like)?;
 
+    if let Some(gguf_path) = cli.gguf_file.as_ref() {
+        if qwen35::gguf_ingest::is_gqh_gguf(gguf_path)
+            .map_err(|e| anyhow::anyhow!("open GGUF {}: {e}", gguf_path.display()))?
+        {
+            if *model_variant != ModelVariant::Qwen3_8_27B {
+                anyhow::bail!(
+                    "GQH GGUF {} requires --model qwen3.8-27b",
+                    gguf_path.display()
+                );
+            }
+            eprintln!(
+                "[weights] loading GQH GGUF from {} (HIP fused dequant-matvec)",
+                gguf_path.display()
+            );
+            return qwen35::weights::Qwen35Weights::load_gguf(gguf_path, text_config, ordinal)
+                .map_err(|e| anyhow::anyhow!("load GQH GGUF: {e}"));
+        }
+        if !q4km_like {
+            anyhow::bail!(
+                "{} is not a GQH GGUF; pass --q4km to translate it into a native bake",
+                gguf_path.display()
+            );
+        }
+    }
+
     if cli.no_bake {
         eprintln!("[weights] loading from safetensors (--no-bake)...");
         return qwen35::weights::Qwen35Weights::load(

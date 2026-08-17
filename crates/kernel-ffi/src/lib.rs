@@ -1,5 +1,6 @@
 pub mod certified_kv;
 pub mod dflash;
+pub mod gqh;
 mod layer_desc;
 mod metal_host;
 mod metal_native;

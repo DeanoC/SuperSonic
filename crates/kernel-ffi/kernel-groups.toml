@@ -74,3 +74,21 @@ rust_modules = [
 [[group.bridge]]
 source = "kernels/qwen36_moe_bridge.cpp"
 object = "qwen36_moe_hip.o"
+
+[[group]]
+id = "hip-gqh"
+backend = "hip"
+model_family = "gqh"
+default_compiled = true
+notes = "GQH (Geo-Quant Hierarchical) HIP decode and fused dequant-matvec."
+kernel_sources = [
+  "kernels/gqh.hip",
+  "kernels/gqh-tables.h",
+]
+rust_modules = [
+  "crates/kernel-ffi/src/gqh.rs",
+]
+
+[[group.bridge]]
+source = "kernels/gqh_bridge.cpp"
+object = "gqh_hip.o"

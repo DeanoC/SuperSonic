@@ -40,8 +40,28 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
     );
 
     let tokenizer = load_qwen_tokenizer(cli, flm_source.as_ref())?;
+    let prompt_text = if cli.chat {
+        let template = supersonic_runtime::chat_template::ChatTemplate::try_load(&cli.model_dir)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--chat requires a chat template in {}/tokenizer_config.json",
+                    cli.model_dir.display()
+                )
+            })?;
+        let rendered = template.render(
+            &[supersonic_runtime::chat_template::ChatMessage::text(
+                "user",
+                cli.prompt.as_str(),
+            )],
+            true,
+        )?;
+        eprintln!("[chat] rendered {} chars", rendered.len());
+        rendered
+    } else {
+        cli.prompt.clone()
+    };
     let encoding = tokenizer
-        .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
+        .encode(prompt_text.as_str(), !cli.prompt_no_special_tokens && !cli.chat)
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());

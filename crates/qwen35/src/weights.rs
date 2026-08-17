@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use gpu_hal::{GpuBuffer, ScalarType};
+use gpu_hal::{GpuBuffer, GpuError, ScalarType};
+use model_store::gqh::GqhHeader;
 use model_store::manifest::LayoutTag;
 
 use crate::config::TextConfig;
@@ -156,9 +158,13 @@ pub const LOWBIT_HIGGS4: i32 = 20;
 pub const LOWBIT_QUIP_E8: i32 = 21;
 pub const LOWBIT_QTIP_TRELLIS2: i32 = 22;
 pub const LOWBIT_GGML_Q8_0: i32 = 8;
+pub const LOWBIT_GGML_Q2_K: i32 = 10;
 pub const LOWBIT_GGML_Q4_K: i32 = 12;
 pub const LOWBIT_GGML_Q5_K: i32 = 13;
 pub const LOWBIT_GGML_Q6_K: i32 = 14;
+pub const LOWBIT_GQH3: i32 = 108;
+pub const LOWBIT_GQH2_H: i32 = 109;
+pub const LOWBIT_GQH2_C: i32 = 110;
 
 pub fn ggml_k_row_bytes(qtype: i32, cols: usize) -> Option<usize> {
     if qtype == LOWBIT_GGML_Q8_0 {
@@ -169,9 +175,13 @@ pub fn ggml_k_row_bytes(qtype: i32, cols: usize) -> Option<usize> {
     }
     let blocks = cols / 256;
     match qtype {
+        LOWBIT_GGML_Q2_K => Some(blocks * 84),
         LOWBIT_GGML_Q4_K => Some(blocks * 144),
         LOWBIT_GGML_Q5_K => Some(blocks * 176),
         LOWBIT_GGML_Q6_K => Some(blocks * 210),
+        LOWBIT_GQH3 => Some(blocks * 105),
+        LOWBIT_GQH2_H => Some(blocks * 73),
+        LOWBIT_GQH2_C => Some(blocks * 66),
         _ => None,
     }
 }
@@ -186,15 +196,58 @@ pub fn infer_lowbit_type(weight: &GpuBuffer, logical_cols: usize, native_int4: b
     let row_bytes = weight.shape()[1];
     for qtype in [
         LOWBIT_GGML_Q8_0,
+        LOWBIT_GGML_Q2_K,
         LOWBIT_GGML_Q4_K,
         LOWBIT_GGML_Q5_K,
         LOWBIT_GGML_Q6_K,
+        LOWBIT_GQH3,
+        LOWBIT_GQH2_H,
+        LOWBIT_GQH2_C,
     ] {
         if ggml_k_row_bytes(qtype, logical_cols) == Some(row_bytes) {
             return qtype;
         }
     }
     0
+}
+
+pub fn is_gqh_qtype(qtype: i32) -> bool {
+    kernel_ffi::gqh::rung_from_ggml_type(qtype as u32).is_some()
+}
+
+/// Batch-1 GQH fused matvec using the header registered against `weight`.
+pub fn matmul_gqh(
+    ordinal: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    weight: &GpuBuffer,
+    qtype: i32,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let rung = kernel_ffi::gqh::rung_from_ggml_type(qtype as u32).ok_or_else(|| {
+        GpuError::InvalidArg(format!("not a GQH qtype: {qtype}"))
+    })?;
+    let header = kernel_ffi::gqh::lookup_header(weight.as_ptr());
+    if header.is_none() && qtype != LOWBIT_GQH2_C {
+        return Err(GpuError::InvalidArg(
+            "GQH header not registered for weight buffer".into(),
+        ));
+    }
+    let (tensor_scale, grid_code) = header
+        .map(|h| (h.tensor_scale, h.grid_code))
+        .unwrap_or((0.0, 0));
+    kernel_ffi::prefill_ffi::matmul_rhs_transposed_gqh(
+        ordinal,
+        n,
+        k,
+        lhs,
+        weight,
+        tensor_scale,
+        grid_code,
+        rung,
+        out,
+    )
 }
 
 /// All immutable model weights on GPU.
@@ -228,6 +281,8 @@ pub struct Qwen35Weights {
     pub int8_baked_store: Option<Arc<model_store::BakedStore>>,
     /// Outlier threshold used by the mixed INT8 path.
     pub int8_outlier_threshold: f32,
+    /// Per-tensor GQH headers from `geoquant.gqh.headers`, keyed by role name.
+    pub gqh_headers: BTreeMap<String, GqhHeader>,
 }
 
 impl Qwen35Weights {
@@ -251,6 +306,19 @@ impl Qwen35Weights {
             let weight = self.lm_head.as_ref();
             Some((qtype, weight, weight))
         }
+    }
+
+    pub fn gqh_header(&self, role: &str) -> Option<&GqhHeader> {
+        self.gqh_headers.get(role)
+    }
+
+    pub fn load_gguf(
+        gguf_path: &Path,
+        config: &TextConfig,
+        ordinal: usize,
+    ) -> Result<Self, model_store::Error> {
+        let file = model_store::gguf::GgufFile::open(gguf_path)?;
+        crate::gguf_ingest::load_weights(&file, config, ordinal)
     }
 }
 
@@ -546,6 +614,7 @@ impl Qwen35Weights {
             is_int8: false,
             int8_baked_store: None,
             int8_outlier_threshold: 0.0,
+            gqh_headers: BTreeMap::new(),
         })
     }
 
@@ -834,6 +903,7 @@ impl Qwen35Weights {
             is_int8: false,
             int8_baked_store: None,
             int8_outlier_threshold: 0.0,
+            gqh_headers: BTreeMap::new(),
         })
     }
 }

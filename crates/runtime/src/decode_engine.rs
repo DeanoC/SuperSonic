@@ -446,6 +446,54 @@ fn certified_kv_ranking_mismatch(
     false
 }
 
+fn lm_head_lowbit(
+    ordinal: usize,
+    m: usize,
+    vocab_size: usize,
+    hidden_dim: usize,
+    lhs: &GpuBuffer,
+    weights: &Qwen35Weights,
+    out: &mut GpuBuffer,
+    label: &str,
+) -> Result<bool> {
+    let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) else {
+        return Ok(false);
+    };
+    if qwen35::weights::is_gqh_qtype(qtype) {
+        if m != 1 {
+            anyhow::bail!("{label}: GQH lm_head is m-1 only, got m={m}");
+        }
+        qwen35::weights::matmul_gqh(
+            ordinal,
+            vocab_size,
+            hidden_dim,
+            lhs,
+            &*weights.lm_head,
+            qtype,
+            out,
+        )
+        .map_err(|e| anyhow::anyhow!("{label} gqh matmul: {e}"))?;
+        return Ok(true);
+    }
+    kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
+        ordinal,
+        1,
+        m,
+        vocab_size,
+        hidden_dim,
+        lhs,
+        &*weights.lm_head,
+        scale,
+        zero,
+        weights.lm_head_awq_inv_scale.as_ref(),
+        weights.int4_group_size,
+        qtype,
+        out,
+    )
+    .map_err(|e| anyhow::anyhow!("{label} int4 matmul: {e}"))?;
+    Ok(true)
+}
+
 fn matmul_proj(
     ordinal: usize,
     batch: usize,
@@ -464,6 +512,13 @@ fn matmul_proj(
     int4_group_size: usize,
 ) -> Result<()> {
     let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
+    if qwen35::weights::is_gqh_qtype(qtype) {
+        if batch != 1 {
+            anyhow::bail!("GQH matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
+        }
+        return qwen35::weights::matmul_gqh(ordinal, n, k, lhs, weight, qtype, out)
+            .map_err(|e| anyhow::anyhow!("matmul_gqh: {e}"));
+    }
     if qtype != 0 {
         let sc = int4_scale.unwrap_or(weight);
         let zr = int4_zero.unwrap_or(weight);
@@ -3988,23 +4043,16 @@ impl DecodeEngine {
         }
 
         let lm_head_start = Instant::now();
-        if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(hidden_dim) {
-            kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
-                self.ordinal,
-                1,
-                1,
-                vocab_size,
-                hidden_dim,
-                &self.normed_buf,
-                &*self.weights.lm_head,
-                scale,
-                zero,
-                self.weights.lm_head_awq_inv_scale.as_ref(),
-                self.weights.int4_group_size,
-                qtype,
-                &mut self.logits_buf,
-            )
-            .map_err(|e| anyhow::anyhow!("component decode lm_head int4 matmul: {e}"))?;
+        if lm_head_lowbit(
+            self.ordinal,
+            1,
+            vocab_size,
+            hidden_dim,
+            &self.normed_buf,
+            &self.weights,
+            &mut self.logits_buf,
+            "component decode lm_head",
+        )? {
         } else if self.logits_buf.backend() == gpu_hal::Backend::Cuda
             && std::env::var_os("SUPERSONIC_LLAMA31_DISABLE_CUBLAS_LM_HEAD").is_none()
         {
@@ -11345,23 +11393,16 @@ impl DecodeEngine {
             hidden_dim,
         )
         .map_err(|e| anyhow::anyhow!("dflash-taps final rms_norm: {e}"))?;
-        if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(hidden_dim) {
-            kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
-                self.ordinal,
-                1,
-                1,
-                config.vocab_size,
-                hidden_dim,
-                &self.normed_buf,
-                &*self.weights.lm_head,
-                scale,
-                zero,
-                self.weights.lm_head_awq_inv_scale.as_ref(),
-                self.weights.int4_group_size,
-                qtype,
-                &mut self.logits_buf,
-            )
-            .map_err(|e| anyhow::anyhow!("dflash-taps lm_head int4 matmul: {e}"))?;
+        if lm_head_lowbit(
+            self.ordinal,
+            1,
+            config.vocab_size,
+            hidden_dim,
+            &self.normed_buf,
+            &self.weights,
+            &mut self.logits_buf,
+            "dflash-taps lm_head",
+        )? {
         } else {
             kernel_ffi::standalone_matvec_4b(
                 self.ordinal,
@@ -11671,23 +11712,16 @@ impl DecodeEngine {
                 hidden_dim,
             )
             .map_err(|e| anyhow::anyhow!("dflash block-taps final rms_norm: {e}"))?;
-            if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(hidden_dim) {
-                kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
-                    self.ordinal,
-                    1,
-                    1,
-                    vocab_size,
-                    hidden_dim,
-                    &self.normed_buf,
-                    &*self.weights.lm_head,
-                    scale,
-                    zero,
-                    self.weights.lm_head_awq_inv_scale.as_ref(),
-                    self.weights.int4_group_size,
-                    qtype,
-                    &mut self.logits_buf,
-                )
-                .map_err(|e| anyhow::anyhow!("dflash block-taps lm_head int4 matmul: {e}"))?;
+            if lm_head_lowbit(
+                self.ordinal,
+                1,
+                vocab_size,
+                hidden_dim,
+                &self.normed_buf,
+                &self.weights,
+                &mut self.logits_buf,
+                "dflash block-taps lm_head",
+            )? {
             } else {
                 kernel_ffi::standalone_matvec_4b(
                     self.ordinal,
@@ -12395,23 +12429,16 @@ impl DecodeEngine {
         let rms_ms = rms_start.elapsed().as_secs_f64() * 1000.0;
 
         let lm_head_start = Instant::now();
-        if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(hidden_dim) {
-            kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
-                self.ordinal,
-                1,
-                b,
-                vocab_size,
-                hidden_dim,
-                &cache.normed_buf,
-                &*self.weights.lm_head,
-                scale,
-                zero,
-                self.weights.lm_head_awq_inv_scale.as_ref(),
-                self.weights.int4_group_size,
-                qtype,
-                &mut cache.logits_buf,
-            )
-            .map_err(|e| anyhow::anyhow!("fused verify lm_head int4 matmul: {e}"))?;
+        if lm_head_lowbit(
+            self.ordinal,
+            b,
+            vocab_size,
+            hidden_dim,
+            &cache.normed_buf,
+            &self.weights,
+            &mut cache.logits_buf,
+            "fused verify lm_head",
+        )? {
         } else {
             kernel_ffi::matmul_rhs_transposed_4b(
                 self.ordinal,
@@ -12910,23 +12937,16 @@ impl DecodeEngine {
         timings.rms_norm_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let start = Instant::now();
-        if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(config.hidden_size) {
-            kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
-                self.ordinal,
-                1,
-                b,
-                config.vocab_size,
-                config.hidden_size,
-                &self.normed_buf,
-                &*self.weights.lm_head,
-                scale,
-                zero,
-                self.weights.lm_head_awq_inv_scale.as_ref(),
-                self.weights.int4_group_size,
-                qtype,
-                &mut self.logits_buf,
-            )
-            .map_err(|e| anyhow::anyhow!("tiled lm_head batch int4 matmul: {e}"))?;
+        if lm_head_lowbit(
+            self.ordinal,
+            b,
+            config.vocab_size,
+            config.hidden_size,
+            &self.normed_buf,
+            &self.weights,
+            &mut self.logits_buf,
+            "tiled lm_head batch",
+        )? {
         } else {
             kernel_ffi::matmul_rhs_transposed_4b(
                 self.ordinal,

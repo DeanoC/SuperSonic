@@ -74,6 +74,12 @@ pub(crate) fn load_qwen35_engine(
             weights.int4_group_size
         );
     }
+    if !weights.gqh_headers.is_empty() {
+        eprintln!(
+            "[weights] GQH fused matvec ({} headers)",
+            weights.gqh_headers.len()
+        );
+    }
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
     let cuda_08b_hero_disabled = std::env::var_os("SUPERSONIC_DISABLE_CUDA_08B_HERO").is_some();

@@ -250,6 +250,12 @@ const HIP_BRIDGES: &[KernelBridge] = &[
         obj_name: "qwen36_moe_hip.o",
         context: "building Qwen3.6-MoE HIP bridge",
     },
+    KernelBridge {
+        group: "hip-gqh",
+        src_name: "gqh_bridge.cpp",
+        obj_name: "gqh_hip.o",
+        context: "building GQH decode/matvec HIP bridge",
+    },
 ];
 
 const CUDA_BRIDGES: &[KernelBridge] = &[];
@@ -283,6 +289,9 @@ const KERNEL_RERUN_PATHS: &[&str] = &[
     "qwen36_moe_persistent/batched_prefill_grouped_expert.cuh",
     "qwen36_moe_persistent/batched_prefill_router_permute.cuh",
     "qwen36_moe_persistent/batched_prefill_unpermute_combine.cuh",
+    "gqh.hip",
+    "gqh_bridge.cpp",
+    "gqh-tables.h",
     "full_attention_cuda.cuh",
     "full_attention_4b_cuda.cuh",
     "prefill_helpers_cuda.cuh",

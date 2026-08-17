@@ -175,10 +175,18 @@ pub(crate) fn run_qwen35(
         gpu_validate_enabled,
         oracle_output.is_some(),
         cuda_08b_hero_enabled,
+        !engine.weights().gqh_headers.is_empty(),
     );
     report_qwen35_decode_modes(&cli, &decode_modes, use_4b_kernel, cuda_08b_hero_enabled);
 
-    let eos_ids = text_config.eos_token_ids();
+    let mut eos_ids = text_config.eos_token_ids();
+    if cli.chat {
+        if let Some(id) = tokenizer.token_to_id("<|im_end|>") {
+            if !eos_ids.contains(&id) {
+                eos_ids.push(id);
+            }
+        }
+    }
     let decode_output = run_qwen35_decode_loop(Qwen35DecodeLoop {
         cli,
         engine: &mut engine,

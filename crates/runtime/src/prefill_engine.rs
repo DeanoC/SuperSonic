@@ -427,6 +427,13 @@ fn matmul_proj(
     int4_group_size: usize,
 ) -> Result<()> {
     let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
+    if qwen35::weights::is_gqh_qtype(qtype) {
+        if batch != 1 {
+            anyhow::bail!("GQH matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
+        }
+        return qwen35::weights::matmul_gqh(ordinal, n, k, lhs, weight, qtype, out)
+            .map_err(|e| anyhow::anyhow!("matmul_gqh: {e}"));
+    }
     if qtype != 0 {
         let sc = int4_scale.unwrap_or(weight);
         let zr = int4_zero.unwrap_or(weight);
@@ -469,6 +476,64 @@ fn matmul_proj(
             .map_err(|e| anyhow::anyhow!("matmul: {e}")),
         }
     }
+}
+
+fn prefill_lm_head_lowbit(
+    ordinal: usize,
+    count: usize,
+    vocab_size: usize,
+    hidden_dim: usize,
+    lhs: &GpuBuffer,
+    weights: &Qwen35Weights,
+    out: &mut GpuBuffer,
+    label: &str,
+) -> Result<bool> {
+    let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) else {
+        return Ok(false);
+    };
+    if qwen35::weights::is_gqh_qtype(qtype) {
+        qwen35::weights::matmul_gqh(
+            ordinal,
+            vocab_size,
+            hidden_dim,
+            lhs,
+            &*weights.lm_head,
+            qtype,
+            out,
+        )
+        .map_err(|e| anyhow::anyhow!("{label} gqh: {e}"))?;
+        return Ok(true);
+    }
+    if !maybe_matmul_q6_k_mmq_lm_head(
+        ordinal,
+        1,
+        count,
+        vocab_size,
+        hidden_dim,
+        qtype,
+        weights.lm_head_awq_inv_scale.as_ref(),
+        lhs,
+        &*weights.lm_head,
+        out,
+    )? {
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            count,
+            vocab_size,
+            hidden_dim,
+            lhs,
+            &*weights.lm_head,
+            scale,
+            zero,
+            weights.lm_head_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+            qtype,
+            out,
+        )
+        .map_err(|e| anyhow::anyhow!("{label} int4: {e}"))?;
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1144,36 +1209,16 @@ pub fn compute_logits_for_range(
     // INT4 lm_head: when the baked package quantized lm_head weights to GPTQ
     // INT4, dispatch through the INT4 dequant matmul. Saves ~4x device memory
     // bandwidth on what is the dominant matmul on small models.
-    if let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) {
-        if !maybe_matmul_q6_k_mmq_lm_head(
-            ordinal,
-            1,
-            count,
-            vocab_size,
-            hidden_dim,
-            qtype,
-            weights.lm_head_awq_inv_scale.as_ref(),
-            &normed,
-            &*weights.lm_head,
-            &mut logits_buf,
-        )? {
-            prefill_ffi::matmul_rhs_transposed_int4(
-                ordinal,
-                1,
-                count,
-                vocab_size,
-                hidden_dim,
-                &normed,
-                &*weights.lm_head,
-                scale,
-                zero,
-                weights.lm_head_awq_inv_scale.as_ref(),
-                weights.int4_group_size,
-                qtype,
-                &mut logits_buf,
-            )
-            .map_err(|e| anyhow::anyhow!("range lm_head int4: {e}"))?;
-        }
+    if prefill_lm_head_lowbit(
+        ordinal,
+        count,
+        vocab_size,
+        hidden_dim,
+        &normed,
+        weights,
+        &mut logits_buf,
+        "range lm_head",
+    )? {
     } else if count > 1 {
         kernel_ffi::matmul_rhs_transposed_4b(
             ordinal,
@@ -1312,36 +1357,16 @@ fn compute_logits_for_range_f32_hidden(
 
     let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
         .map_err(|e| anyhow::anyhow!("range logits alloc: {e}"))?;
-    if let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) {
-        if !maybe_matmul_q6_k_mmq_lm_head(
-            ordinal,
-            1,
-            count,
-            vocab_size,
-            hidden_dim,
-            qtype,
-            weights.lm_head_awq_inv_scale.as_ref(),
-            &normed,
-            &*weights.lm_head,
-            &mut logits_buf,
-        )? {
-            prefill_ffi::matmul_rhs_transposed_int4(
-                ordinal,
-                1,
-                count,
-                vocab_size,
-                hidden_dim,
-                &normed,
-                &*weights.lm_head,
-                scale,
-                zero,
-                weights.lm_head_awq_inv_scale.as_ref(),
-                weights.int4_group_size,
-                qtype,
-                &mut logits_buf,
-            )
-            .map_err(|e| anyhow::anyhow!("range lm_head int4: {e}"))?;
-        }
+    if prefill_lm_head_lowbit(
+        ordinal,
+        count,
+        vocab_size,
+        hidden_dim,
+        &normed,
+        weights,
+        &mut logits_buf,
+        "range lm_head",
+    )? {
     } else if count > 1 {
         kernel_ffi::matmul_rhs_transposed_4b(
             ordinal,
@@ -1473,7 +1498,7 @@ pub fn compute_greedy_for_range(
     let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[count])
         .map_err(|e| anyhow::anyhow!("range greedy argmax alloc: {e}"))?;
     let mut fused_argmax = false;
-    if let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) {
+    if let Some((qtype, _, _)) = weights.lm_head_lowbit_params(hidden_dim) {
         if count == 16 {
             let lm_head_tiles = (vocab_size + 15) / 16;
             let mut block_best_vals =
@@ -1500,34 +1525,17 @@ pub fn compute_greedy_for_range(
         if !fused_argmax {
             let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
                 .map_err(|e| anyhow::anyhow!("range greedy logits alloc: {e}"))?;
-            if !maybe_matmul_q6_k_mmq_lm_head(
+            if !prefill_lm_head_lowbit(
                 ordinal,
-                1,
                 count,
                 vocab_size,
                 hidden_dim,
-                qtype,
-                weights.lm_head_awq_inv_scale.as_ref(),
                 &normed,
-                &*weights.lm_head,
+                weights,
                 &mut logits_buf,
+                "range greedy lm_head",
             )? {
-                prefill_ffi::matmul_rhs_transposed_int4(
-                    ordinal,
-                    1,
-                    count,
-                    vocab_size,
-                    hidden_dim,
-                    &normed,
-                    &*weights.lm_head,
-                    scale,
-                    zero,
-                    weights.lm_head_awq_inv_scale.as_ref(),
-                    weights.int4_group_size,
-                    qtype,
-                    &mut logits_buf,
-                )
-                .map_err(|e| anyhow::anyhow!("range greedy lm_head int4: {e}"))?;
+                unreachable!("lowbit lm_head params were Some");
             }
             prefill_ffi::argmax_bf16_rows(ordinal, count, vocab_size, &logits_buf, &mut out_index)
                 .map_err(|e| anyhow::anyhow!("range greedy argmax: {e}"))?;
@@ -5642,29 +5650,23 @@ pub fn metal_v2_decode_step_greedy(
 
     let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
         .map_err(|e| anyhow::anyhow!("greedy out_index alloc: {e}"))?;
-    if let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) {
-        // INT4 lm_head: there is no fused INT4 matmul + argmax kernel, so do
+    if weights.lm_head_lowbit_params(hidden_dim).is_some() {
+        // INT4/GQH lm_head: there is no fused matmul + argmax kernel, so do
         // them separately. Both run inside the open Metal batch — the cost of
         // the extra argmax dispatch is dwarfed by the 4x bandwidth win on the
         // matmul.
         let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, vocab_size])
             .map_err(|e| anyhow::anyhow!("greedy int4 logits alloc: {e}"))?;
-        prefill_ffi::matmul_rhs_transposed_int4(
+        prefill_lm_head_lowbit(
             ordinal,
-            1,
             1,
             vocab_size,
             hidden_dim,
             &normed,
-            &*weights.lm_head,
-            scale,
-            zero,
-            weights.lm_head_awq_inv_scale.as_ref(),
-            weights.int4_group_size,
-            qtype,
+            weights,
             &mut logits_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("greedy lm_head int4: {e}"))?;
+            "greedy lm_head",
+        )?;
         kernel_ffi::metal_argmax_bf16_into(&logits_buf, &mut out_index, vocab_size)
             .map_err(|e| anyhow::anyhow!("greedy int4 argmax: {e}"))?;
     } else {

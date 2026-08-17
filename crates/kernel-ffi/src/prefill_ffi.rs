@@ -5153,6 +5153,96 @@ fn matmul_rhs_transposed_int4_impl(
     })
 }
 
+/// GQH fused dequant-matvec used by the Qwen3.8 GGUF path.
+///
+/// `lhs` is BF16/F32 `[ncols, k]` (or a rank-1 `[k]` vector). `out` is
+/// BF16/F32 `[ncols, n]`. Activations are cast to f32 for the kernel, which
+/// must not reassociate the GQH scale products.
+pub fn matmul_rhs_transposed_gqh(
+    ordinal: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    tensor_scale: f32,
+    grid_code: u8,
+    rung: i32,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16 && lhs.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh matmul lhs must be bf16/f32, got {:?}",
+            lhs.dtype()
+        )));
+    }
+    if out.dtype() != ScalarType::BF16 && out.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh matmul out must be bf16/f32, got {:?}",
+            out.dtype()
+        )));
+    }
+    if k == 0 || lhs.elem_count() % k != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh matmul lhs has {} elems, not a multiple of k={k}",
+            lhs.elem_count()
+        )));
+    }
+    let ncols = lhs.elem_count() / k;
+    if out.elem_count() < ncols * n {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh matmul out has {} elems, need {}",
+            out.elem_count(),
+            ncols * n
+        )));
+    }
+    let x_f32 = if lhs.dtype() == ScalarType::F32 {
+        None
+    } else {
+        let mut buf = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols, k])?;
+        cast(
+            ordinal,
+            ScalarType::BF16,
+            ScalarType::F32,
+            ncols * k,
+            lhs,
+            &mut buf,
+        )?;
+        Some(buf)
+    };
+    let x_ref = x_f32.as_ref().unwrap_or(lhs);
+    let mut y_f32 = if out.dtype() == ScalarType::F32 {
+        None
+    } else {
+        Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols, n])?)
+    };
+    let y_ref = y_f32.as_mut().unwrap_or(out);
+    crate::gqh::matvec(
+        ordinal,
+        rung,
+        rhs,
+        x_ref,
+        y_ref,
+        k,
+        n,
+        ncols,
+        k,
+        n,
+        tensor_scale,
+        grid_code,
+    )?;
+    if let Some(y) = y_f32.as_ref() {
+        cast(
+            ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            ncols * n,
+            y,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
 /// Raw GGML low-bit m16 matmul with a BF16 residual-add epilogue.
 ///
 /// Returns `Ok(false)` when the HIP kernel does not handle the shape/qtype, so

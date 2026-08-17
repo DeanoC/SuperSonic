@@ -1064,6 +1064,7 @@ dependencies = [
  "cc",
  "gpu-hal",
  "half",
+ "model-store",
  "serde_json",
  "thiserror",
 ]

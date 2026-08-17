@@ -78,8 +78,13 @@ pub(crate) fn validate_global_flags(
             anyhow::bail!("qwen3-30b-a3b v1 is supported only on HIP and Metal");
         }
     }
-    if cli.gguf_file.is_some() && profile != QuantProfile::Q4Km {
-        anyhow::bail!("--gguf-file requires --q4km");
+    if cli.gguf_file.is_some()
+        && profile != QuantProfile::Q4Km
+        && *model_variant != ModelVariant::Qwen3_8_27B
+    {
+        anyhow::bail!(
+            "--gguf-file requires --q4km, or --model qwen3.8-27b for a GQH GGUF"
+        );
     }
     if cli.no_bake && q4km_like {
         anyhow::bail!("--q4km/--q4km-gptq require a baked package; omit --no-bake");
@@ -162,6 +167,35 @@ mod tests {
         let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
         args.extend_from_slice(extra);
         Cli::parse_from(args)
+    }
+
+    #[test]
+    #[test]
+    fn gguf_file_without_q4km_is_allowed_for_qwen38() {
+        validate_global_flags(
+            &cli(&[
+                "--model",
+                "qwen3.8-27b",
+                "--gguf-file",
+                "/tmp/qwen38.gguf",
+            ]),
+            &ModelVariant::Qwen3_8_27B,
+            Backend::Hip,
+        )
+        .expect("GQH GGUF load does not require --q4km");
+    }
+
+    #[test]
+    fn gguf_file_without_q4km_is_rejected_for_other_models() {
+        let err = validate_global_flags(
+            &cli(&["--gguf-file", "/tmp/model.gguf"]),
+            &ModelVariant::Qwen3_5_4B,
+            Backend::Hip,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--gguf-file"), "{err}");
+        assert!(err.contains("--q4km"), "{err}");
     }
 
     #[test]

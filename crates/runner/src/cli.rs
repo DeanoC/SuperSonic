@@ -31,6 +31,10 @@ pub(crate) struct Cli {
     #[arg(long, required_unless_present = "dry_run", default_value = "")]
     pub(crate) prompt: String,
 
+    /// Wrap `--prompt` as a user message with the model's chat template.
+    #[arg(long)]
+    pub(crate) chat: bool,
+
     /// Do not add tokenizer special tokens when encoding --prompt.
     #[arg(long)]
     pub(crate) prompt_no_special_tokens: bool,
@@ -218,7 +222,8 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) q4km_gptq: bool,
 
-    /// Optional GGUF source file to translate into a native q4km bake.
+    /// GGUF source. With `--q4km` this is translated into a native bake.
+    /// With `--model qwen3.8-27b` a GQH GGUF is loaded directly.
     #[arg(long)]
     pub(crate) gguf_file: Option<PathBuf>,
 
