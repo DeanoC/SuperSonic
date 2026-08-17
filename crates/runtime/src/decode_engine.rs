@@ -11001,6 +11001,9 @@ impl DecodeEngine {
         token_id: u32,
         seqlen_offset: usize,
     ) -> Result<(Vec<f32>, DecodeStageTimings)> {
+        if self.gqh_component_decode_enabled() {
+            return self.decode_step_gqh_component(token_id, seqlen_offset);
+        }
         if self.use_4b_kernel {
             return self.component_decode_step_4b_with_timings(token_id, seqlen_offset);
         }
@@ -11155,7 +11158,48 @@ impl DecodeEngine {
         })
     }
 
+    fn gqh_component_decode_enabled(&self) -> bool {
+        !self.weights.gqh_headers.is_empty()
+            && std::env::var_os("SUPERSONIC_QWEN35_GQH_COMPONENT_DECODE").is_some()
+    }
+
+    /// Dedicated GQH/ggml-K matvecs plus the slim prefill attention/linear/MLP
+    /// cores. The fat persistent 4B kernel cannot occupy well with GQH walkers
+    /// inlined; this path matches the 66 ms standalone proj budget plus cores.
+    fn decode_step_gqh_component(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(Vec<f32>, DecodeStageTimings)> {
+        let mut scratch = match self.metal_v2_scratch.take() {
+            Some(scratch) => scratch,
+            None => prefill_engine::MetalV2DecodeScratch::new(
+                &self.weights.config,
+                self.ordinal,
+            )?,
+        };
+        let start = Instant::now();
+        let result = prefill_engine::metal_v2_decode_step(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            &mut scratch,
+            token_id,
+            seqlen_offset,
+            self.ordinal,
+            self.kv_chunk_size,
+        );
+        self.metal_v2_scratch = Some(scratch);
+        let logits = result?;
+        let mut timings = DecodeStageTimings::default();
+        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
+        Ok((logits, timings))
+    }
+
     pub fn decode_step(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
+        if self.gqh_component_decode_enabled() {
+            return Ok(self.decode_step_gqh_component(token_id, seqlen_offset)?.0);
+        }
         if self.use_4b_kernel {
             return self.component_decode_step_4b(token_id, seqlen_offset);
         }
@@ -12549,6 +12593,11 @@ impl DecodeEngine {
         assert!(self.use_4b_kernel, "batched decode requires 4b kernel");
         let config = &self.weights.config;
         let b = self.batch_size;
+        if b == 1 && self.gqh_component_decode_enabled() {
+            let (logits, timings) =
+                self.decode_step_gqh_component(token_ids[0], seqlen_offset)?;
+            return Ok((vec![logits], timings));
+        }
         let use_qwen35_4b_cuda_long_context_component_fallback = self.hidden_io.backend()
             == gpu_hal::Backend::Cuda
             && is_qwen35_4b_shape(config)

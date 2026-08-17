@@ -177,7 +177,13 @@ pub(crate) fn run_qwen35(
         cuda_08b_hero_enabled,
         !engine.weights().gqh_headers.is_empty(),
     );
-    report_qwen35_decode_modes(&cli, &decode_modes, use_4b_kernel, cuda_08b_hero_enabled);
+    report_qwen35_decode_modes(
+        &cli,
+        &decode_modes,
+        use_4b_kernel,
+        cuda_08b_hero_enabled,
+        !engine.weights().gqh_headers.is_empty(),
+    );
 
     let mut eos_ids = text_config.eos_token_ids();
     if cli.chat {

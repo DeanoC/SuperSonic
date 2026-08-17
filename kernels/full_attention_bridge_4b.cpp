@@ -1,5 +1,6 @@
 #include "full_attention_4b.hip"
 
+#include <cstdio>
 #include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <mutex>
@@ -6587,38 +6588,85 @@ int persistent_decode_device(
     int preset_blocks = 0, preset_coop = 0;
     qwen4b_get_launch_preset(preset_blocks, preset_coop);
     bool preset_coop_hint = false;
+    bool user_grid = false;
     if (const char* bs_env = std::getenv("SUPERSONIC_QWEN4B_BLOCKS")) {
         int override_val = std::atoi(bs_env);
-        if (override_val > 0) { num_blocks = override_val; }
+        if (override_val > 0) {
+            num_blocks = override_val;
+            user_grid = true;
+        }
     } else if (preset_blocks > 0) {
         num_blocks = preset_blocks;
         preset_coop_hint = preset_coop != 0;
-    } else {
-        const char* arch = props.gcnArchName;
-        const bool is_rdna3_wgp_arch =
-            arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
-            arch[3] == '1' && arch[4] == '1';
-        if (is_rdna3_wgp_arch) {
-            num_blocks *= 2;
-        }
     }
     const bool coop_requested =
         std::getenv("SUPERSONIC_QWEN4B_COOP") != nullptr || preset_coop_hint;
     constexpr int block_size = 256;
-    // LDS: reduction scratch [block_size] + input cache + FP8 LUT [256].
-    // The persistent kernel no longer caches the full MLP intermediate in LDS;
-    // down-proj streams it from global scratch. Keep enough cache for hidden
-    // vectors and attention/output-projection inputs on Qwen3.5/3.6.
-    const size_t hidden_cache = static_cast<size_t>(hidden_dim) * batch_size;
-    const size_t attention_cache = static_cast<size_t>(hidden_dim) * 2;
-    const size_t input_cache = hidden_cache > attention_cache ? hidden_cache : attention_cache;
-    const size_t fp8_lut_size = 256;  // FP8 E4M3 → F32 lookup table
-    const size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
+    const size_t fp8_lut_size =
+        (fp8_scales != nullptr || kv_fp8_descs != nullptr) ? 256u : 0u;
+    const size_t shared_bytes = (block_size + fp8_lut_size) * sizeof(float);
 
     int coop_supported = 0;
     int max_blocks_per_mp = 0;
     const void* kernel_fp = reinterpret_cast<const void*>(
         &supersonic_qwen35_persistent_decode_kernel<T>);
+    int api_occ = 0;
+    (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &api_occ, kernel_fp, block_size, shared_bytes);
+    hipFuncAttributes attr{};
+    (void)hipFuncGetAttributes(&attr, kernel_fp);
+    // gfx1100 WGP: 4 SIMDs × 1536 VGPR, wave32. Occupancy API is optimistic
+    // once scratch/spills show up; size the default grid from VGPR+LDS so
+    // the ticket barrier never launches more blocks than can be resident.
+    int vgpr = attr.numRegs > 0 ? attr.numRegs : 256;
+    int waves_simd = 1536 / vgpr;
+    if (attr.localSizeBytes > 16 && waves_simd > 1) {
+        waves_simd -= 1;
+    }
+    if (waves_simd < 1) waves_simd = 1;
+    if (waves_simd > 16) waves_simd = 16;
+    int from_vgpr = (waves_simd * 4) / (block_size / 32);
+    if (from_vgpr < 1) from_vgpr = 1;
+    int from_lds = static_cast<int>(65536 / (shared_bytes > 0 ? shared_bytes : 1));
+    if (from_lds < 1) from_lds = 1;
+    int safe_per_mp = from_vgpr < from_lds ? from_vgpr : from_lds;
+    if (!user_grid && preset_blocks <= 0) {
+        const char* arch = props.gcnArchName;
+        const bool is_rdna3_wgp_arch =
+            arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+            arch[3] == '1' && arch[4] == '1';
+        if (is_rdna3_wgp_arch) {
+            // Ticket barrier is fine at 144 on a skinny kernel, but this
+            // 253-VGPR megakernel still deadlocks at 3x (only 2 blocks
+            // actually stay resident). Keep the proven 2x default.
+            int mult = safe_per_mp;
+            if (mult > 2) mult = 2;
+            if (mult < 1) mult = 1;
+            num_blocks = props.multiProcessorCount * mult;
+        }
+    }
+    {
+        static bool dumped_occ = false;
+        if (!dumped_occ) {
+            dumped_occ = true;
+            std::fprintf(
+                stderr,
+                "[hip-occ] persistent_decode hidden=%d B=%d grid=%d CUs=%d "
+                "api_blocks/CU=%d safe_blocks/CU=%d vgpr=%d scratch=%zu "
+                "static_lds=%zu dyn_lds=%zu max_threads=%d\n",
+                hidden_dim,
+                batch_size,
+                num_blocks,
+                props.multiProcessorCount,
+                api_occ,
+                safe_per_mp,
+                attr.numRegs,
+                attr.localSizeBytes,
+                attr.sharedSizeBytes,
+                shared_bytes,
+                attr.maxThreadsPerBlock);
+        }
+    }
     if (coop_requested) {
         (void)hipDeviceGetAttribute(
             &coop_supported, hipDeviceAttributeCooperativeLaunch, device_ordinal);
@@ -6645,8 +6693,359 @@ int persistent_decode_device(
         return 261;
     }
 
-    hipError_t launch_err;
-    if (coop_requested && coop_supported && max_blocks_per_mp > 0) {
+    int io_flags = 3;
+    const bool use_gqh_split = int4_scales != nullptr
+        && hidden_dim >= 5120
+        && tap_workspace == nullptr
+        && std::getenv("SUPERSONIC_QWEN35_GQH_NOSPLIT") == nullptr
+        && !coop_requested;
+    hipError_t launch_err = hipSuccess;
+    if (use_gqh_split) {
+        const Qwen35DecodeLayerDesc* layers_base =
+            static_cast<const Qwen35DecodeLayerDesc*>(layers);
+        const Qwen35INT4ScaleDesc* int4_base =
+            static_cast<const Qwen35INT4ScaleDesc*>(int4_scales);
+        auto phase_grid = [&](int vgpr, size_t scratch, int api_occ, int cap) -> int {
+            int waves_s = 1536 / (vgpr > 0 ? vgpr : 256);
+            if (scratch > 16 && waves_s > 1) waves_s -= 1;
+            if (waves_s < 1) waves_s = 1;
+            if (waves_s > 16) waves_s = 16;
+            int from_vgpr = (waves_s * 4) / (block_size / 32);
+            if (from_vgpr < 1) from_vgpr = 1;
+            int g = from_vgpr;
+            if (api_occ > 0 && api_occ < g) g = api_occ;
+            if (g > cap) g = cap;
+            if (g < 1) g = 1;
+            return props.multiProcessorCount * g;
+        };
+        auto launch_split = [&](int split, int layer, int flags, int grid, hipStream_t stream)
+            -> hipError_t {
+            const Qwen35DecodeLayerDesc* layer_ptr = layers_base + layer;
+            const Qwen35INT4ScaleDesc* int4_ptr =
+                int4_base != nullptr ? int4_base + layer : nullptr;
+            if (split == 1) {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_persistent_decode_kernel<T, 1>),
+                    dim3(static_cast<unsigned int>(grid)),
+                    dim3(block_size),
+                    shared_bytes,
+                    stream,
+                    1,
+                    hidden_dim,
+                    intermediate_size,
+                    seqlen_offset,
+                    layer_ptr,
+                    static_cast<T*>(hidden_io),
+                    workspace,
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                    timing_slots,
+                    static_cast<const T*>(cos_table),
+                    static_cast<const T*>(sin_table),
+                    rotary_dim,
+                    proj_buf_floats,
+                    attn_scratch_floats,
+                    enable_attention_trace,
+                    static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
+                    static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
+                    batch_size,
+                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    int4_ptr,
+                    static_cast<T*>(tap_workspace),
+                    tap_layers,
+                    0,
+                    flags);
+            } else if (split == 2) {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_persistent_decode_kernel<T, 2>),
+                    dim3(static_cast<unsigned int>(grid)),
+                    dim3(block_size),
+                    shared_bytes,
+                    stream,
+                    1,
+                    hidden_dim,
+                    intermediate_size,
+                    seqlen_offset,
+                    layer_ptr,
+                    static_cast<T*>(hidden_io),
+                    workspace,
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                    timing_slots,
+                    static_cast<const T*>(cos_table),
+                    static_cast<const T*>(sin_table),
+                    rotary_dim,
+                    proj_buf_floats,
+                    attn_scratch_floats,
+                    enable_attention_trace,
+                    static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
+                    static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
+                    batch_size,
+                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    int4_ptr,
+                    static_cast<T*>(tap_workspace),
+                    tap_layers,
+                    0,
+                    flags);
+            } else if (split == 3) {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_persistent_decode_kernel<T, 3>),
+                    dim3(static_cast<unsigned int>(grid)),
+                    dim3(block_size),
+                    shared_bytes,
+                    stream,
+                    1,
+                    hidden_dim,
+                    intermediate_size,
+                    seqlen_offset,
+                    layer_ptr,
+                    static_cast<T*>(hidden_io),
+                    workspace,
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                    timing_slots,
+                    static_cast<const T*>(cos_table),
+                    static_cast<const T*>(sin_table),
+                    rotary_dim,
+                    proj_buf_floats,
+                    attn_scratch_floats,
+                    enable_attention_trace,
+                    static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
+                    static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
+                    batch_size,
+                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    int4_ptr,
+                    static_cast<T*>(tap_workspace),
+                    tap_layers,
+                    0,
+                    flags);
+            } else {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_persistent_decode_kernel<T, 4>),
+                    dim3(static_cast<unsigned int>(grid)),
+                    dim3(block_size),
+                    shared_bytes,
+                    stream,
+                    1,
+                    hidden_dim,
+                    intermediate_size,
+                    seqlen_offset,
+                    layer_ptr,
+                    static_cast<T*>(hidden_io),
+                    workspace,
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                    timing_slots,
+                    static_cast<const T*>(cos_table),
+                    static_cast<const T*>(sin_table),
+                    rotary_dim,
+                    proj_buf_floats,
+                    attn_scratch_floats,
+                    enable_attention_trace,
+                    static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
+                    static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
+                    batch_size,
+                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    int4_ptr,
+                    static_cast<T*>(tap_workspace),
+                    tap_layers,
+                    0,
+                    flags);
+            }
+            return hipGetLastError();
+        };
+        int occ1 = 0, occ2 = 0, occ3 = 0, occ4 = 0;
+        (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ1,
+            (const void*)&supersonic_qwen35_persistent_decode_kernel<T, 1>,
+            block_size,
+            shared_bytes);
+        (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ2,
+            (const void*)&supersonic_qwen35_persistent_decode_kernel<T, 2>,
+            block_size,
+            shared_bytes);
+        (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ3,
+            (const void*)&supersonic_qwen35_persistent_decode_kernel<T, 3>,
+            block_size,
+            shared_bytes);
+        (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ4,
+            (const void*)&supersonic_qwen35_persistent_decode_kernel<T, 4>,
+            block_size,
+            shared_bytes);
+        hipFuncAttributes a1{}, a2{}, a3{}, a4{};
+        (void)hipFuncGetAttributes(
+            &a1, (const void*)&supersonic_qwen35_persistent_decode_kernel<T, 1>);
+        (void)hipFuncGetAttributes(
+            &a2, (const void*)&supersonic_qwen35_persistent_decode_kernel<T, 2>);
+        (void)hipFuncGetAttributes(
+            &a3, (const void*)&supersonic_qwen35_persistent_decode_kernel<T, 3>);
+        (void)hipFuncGetAttributes(
+            &a4, (const void*)&supersonic_qwen35_persistent_decode_kernel<T, 4>);
+        static bool dumped_split = false;
+        if (!dumped_split) {
+            dumped_split = true;
+            std::fprintf(
+                stderr,
+                "[hip-occ] gqh-split in vgpr=%d occ=%d scratch=%zu  "
+                "mid vgpr=%d occ=%d scratch=%zu  out vgpr=%d occ=%d scratch=%zu  "
+                "mlp vgpr=%d occ=%d scratch=%zu\n",
+                a1.numRegs,
+                occ1,
+                a1.localSizeBytes,
+                a2.numRegs,
+                occ2,
+                a2.localSizeBytes,
+                a3.numRegs,
+                occ3,
+                a3.localSizeBytes,
+                a4.numRegs,
+                occ4,
+                a4.localSizeBytes);
+        }
+        const int grid_in = phase_grid(a1.numRegs, a1.localSizeBytes, occ1, 4);
+        const int grid_mid = phase_grid(a2.numRegs, a2.localSizeBytes, occ2, 6);
+        const int grid_out = phase_grid(a3.numRegs, a3.localSizeBytes, occ3, 3);
+        const int grid_mlp = phase_grid(a4.numRegs, a4.localSizeBytes, occ4, 4);
+        static bool dumped_grid = false;
+        if (!dumped_grid) {
+            dumped_grid = true;
+            std::fprintf(
+                stderr,
+                "[hip-occ] gqh-split grids in=%d mid=%d out=%d mlp=%d\n",
+                grid_in,
+                grid_mid,
+                grid_out,
+                grid_mlp);
+        }
+        const bool use_graph = std::getenv("SUPERSONIC_QWEN35_GQH_NOGRAPH") == nullptr;
+        struct SplitGraphCache {
+            hipGraphExec_t exec = nullptr;
+            hipGraph_t graph = nullptr;
+            hipStream_t stream = nullptr;
+            int num_layers = -1;
+            int grid_in = 0, grid_mid = 0, grid_out = 0, grid_mlp = 0;
+            const void* layers = nullptr;
+            void* hidden_io = nullptr;
+            float* workspace = nullptr;
+            unsigned int* counters = nullptr;
+            unsigned int* barrier_counter = nullptr;
+            unsigned int* barrier_flag = nullptr;
+            const void* int4 = nullptr;
+            int batch_size = 0;
+        };
+        static SplitGraphCache cache;
+        auto record_layers = [&](hipStream_t stream) -> hipError_t {
+            hipError_t err = hipSuccess;
+            for (int layer = 0; layer < num_layers; ++layer) {
+                int in_flags = (layer == 0) ? 1 : 0;
+                int mlp_flags = (layer == num_layers - 1) ? 2 : 0;
+                err = launch_split(1, layer, in_flags, grid_in, stream);
+                if (err != hipSuccess) return err;
+                err = launch_split(2, layer, 0, grid_mid, stream);
+                if (err != hipSuccess) return err;
+                err = launch_split(3, layer, 0, grid_out, stream);
+                if (err != hipSuccess) return err;
+                err = launch_split(4, layer, mlp_flags, grid_mlp, stream);
+                if (err != hipSuccess) return err;
+            }
+            return hipSuccess;
+        };
+        const int host_seqlen = seqlen_offset;
+        launch_err = hipMemcpyToSymbol(
+            HIP_SYMBOL(qwen35_split_seqlen), &host_seqlen, sizeof(host_seqlen));
+        if (launch_err != hipSuccess) {
+            // fall through to eager launches
+        } else if (use_graph) {
+            const bool reuse = cache.exec != nullptr
+                && cache.num_layers == num_layers
+                && cache.grid_in == grid_in
+                && cache.grid_mid == grid_mid
+                && cache.grid_out == grid_out
+                && cache.grid_mlp == grid_mlp
+                && cache.layers == layers
+                && cache.hidden_io == hidden_io
+                && cache.workspace == workspace
+                && cache.counters == counters
+                && cache.barrier_counter == barrier_counter
+                && cache.barrier_flag == barrier_flag
+                && cache.int4 == int4_scales
+                && cache.batch_size == batch_size;
+            if (!reuse) {
+                if (cache.exec) {
+                    (void)hipGraphExecDestroy(cache.exec);
+                    cache.exec = nullptr;
+                }
+                if (cache.graph) {
+                    (void)hipGraphDestroy(cache.graph);
+                    cache.graph = nullptr;
+                }
+                if (!cache.stream) {
+                    launch_err = hipStreamCreate(&cache.stream);
+                }
+                if (launch_err == hipSuccess) {
+                    launch_err = hipStreamBeginCapture(
+                        cache.stream, hipStreamCaptureModeGlobal);
+                }
+                if (launch_err == hipSuccess) {
+                    launch_err = record_layers(cache.stream);
+                }
+                if (launch_err == hipSuccess) {
+                    launch_err = hipStreamEndCapture(cache.stream, &cache.graph);
+                }
+                if (launch_err == hipSuccess) {
+                    launch_err = hipGraphInstantiate(
+                        &cache.exec, cache.graph, nullptr, nullptr, 0);
+                }
+                if (launch_err == hipSuccess) {
+                    cache.num_layers = num_layers;
+                    cache.grid_in = grid_in;
+                    cache.grid_mid = grid_mid;
+                    cache.grid_out = grid_out;
+                    cache.grid_mlp = grid_mlp;
+                    cache.layers = layers;
+                    cache.hidden_io = hidden_io;
+                    cache.workspace = workspace;
+                    cache.counters = counters;
+                    cache.barrier_counter = barrier_counter;
+                    cache.barrier_flag = barrier_flag;
+                    cache.int4 = int4_scales;
+                    cache.batch_size = batch_size;
+                    static bool dumped_graph = false;
+                    if (!dumped_graph) {
+                        dumped_graph = true;
+                        std::fprintf(stderr, "[hip-occ] gqh-split HIP graph captured\n");
+                    }
+                } else {
+                    if (cache.exec) {
+                        (void)hipGraphExecDestroy(cache.exec);
+                        cache.exec = nullptr;
+                    }
+                    if (cache.graph) {
+                        (void)hipGraphDestroy(cache.graph);
+                        cache.graph = nullptr;
+                    }
+                }
+            }
+            if (launch_err == hipSuccess && cache.exec != nullptr) {
+                launch_err = hipGraphLaunch(cache.exec, cache.stream);
+                if (launch_err == hipSuccess) {
+                    launch_err = hipStreamSynchronize(cache.stream);
+                }
+            } else if (launch_err != hipSuccess) {
+                // Eager fallback if capture failed.
+                launch_err = record_layers(0);
+            }
+        } else {
+            launch_err = record_layers(0);
+        }
+    } else if (coop_requested && coop_supported && max_blocks_per_mp > 0) {
         // Args for cooperative launch: void** where each entry points to
         // local storage holding one argument value. Locals must stay alive
         // through the launch — they're destroyed at function exit, and
@@ -6675,7 +7074,7 @@ int persistent_decode_device(
             &proj_buf_floats, &attn_scratch_floats, &enable_attention_trace,
             &fp8_typed, &kv_fp8_typed, &batch_size,
             &batch_descs_typed, &int4_typed,
-            &tap_ws_typed, &tap_layers, &num_taps,
+            &tap_ws_typed, &tap_layers, &num_taps, &io_flags,
         };
 
         launch_err = hipLaunchCooperativeKernel(
@@ -6716,7 +7115,8 @@ int persistent_decode_device(
             static_cast<const Qwen35INT4ScaleDesc*>(int4_scales),
             static_cast<T*>(tap_workspace),
             tap_layers,
-            num_taps);
+            num_taps,
+            io_flags);
         launch_err = hipGetLastError();
     }
 

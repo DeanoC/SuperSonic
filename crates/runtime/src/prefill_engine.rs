@@ -1924,6 +1924,10 @@ struct PrefillScratch {
     linear_gated_s_first: GpuBuffer,
     /// [linear_num_value_heads, linear_key_head_dim, linear_value_head_dim] F32
     linear_dummy_state: GpuBuffer,
+    /// Grow-only `[num_kv_heads, kv_len, head_dim]` assemble workspace so
+    /// padded KV caches are compacted without a per-layer hipMalloc.
+    kv_assemble_k: Option<GpuBuffer>,
+    kv_assemble_v: Option<GpuBuffer>,
     /// [tree_len, num_taps * hidden_dim] BF16, used by cached DDTree verify only.
     tree_tap_capture_gpu: Option<GpuBuffer>,
     tree_tap_capture_row_bytes: usize,
@@ -2100,6 +2104,8 @@ impl PrefillScratch {
                 .map_err(|e| anyhow::anyhow!("prefill linear_gated_s_first: {e}"))?,
             linear_dummy_state: GpuBuffer::alloc(ordinal, ScalarType::F32, &[nv, khd, vhd])
                 .map_err(|e| anyhow::anyhow!("prefill linear_dummy_state: {e}"))?,
+            kv_assemble_k: None,
+            kv_assemble_v: None,
             tree_tap_capture_gpu: None,
             tree_tap_capture_row_bytes: 0,
             tree_tap_capture_rows: 0,
@@ -2120,6 +2126,34 @@ fn prefill_f32_activation_carry_enabled() -> bool {
 impl PrefillScratch {
     fn has_f32_activation_carry(&self) -> bool {
         self.hidden_f32.is_some()
+    }
+
+    fn take_kv_assemble(
+        &mut self,
+        ordinal: usize,
+        num_kv_heads: usize,
+        kv_len: usize,
+        head_dim: usize,
+    ) -> Result<(GpuBuffer, GpuBuffer)> {
+        let need = num_kv_heads
+            .checked_mul(kv_len)
+            .and_then(|n| n.checked_mul(head_dim))
+            .ok_or_else(|| anyhow::anyhow!("kv assemble size overflow"))?;
+        let alloc_kv_len = kv_len.next_power_of_two().max(32);
+        let shape = [num_kv_heads, alloc_kv_len, head_dim];
+        let take_or_alloc = |slot: &mut Option<GpuBuffer>, label: &str| -> Result<GpuBuffer> {
+            if let Some(buf) = slot.take() {
+                if buf.elem_count() >= need {
+                    return Ok(buf);
+                }
+            }
+            GpuBuffer::alloc(ordinal, ScalarType::BF16, &shape)
+                .map_err(|e| anyhow::anyhow!("{label}: {e}"))
+        };
+        Ok((
+            take_or_alloc(&mut self.kv_assemble_k, "kv_assemble_k")?,
+            take_or_alloc(&mut self.kv_assemble_v, "kv_assemble_v")?,
+        ))
     }
 
     fn seed_f32_from_hidden(&mut self, ordinal: usize, elems: usize, label: &str) -> Result<()> {
@@ -5765,8 +5799,6 @@ fn prefill_full_attention_layer(
     };
 
     // 1. Q projection
-    let mut q_full = GpuBuffer::alloc(ordinal, ScalarType::BF16, &[chunk_len, q_proj_dim])
-        .map_err(|e| anyhow::anyhow!("q_full alloc: {e}"))?;
     matmul_proj(
         ordinal,
         1,
@@ -5778,7 +5810,7 @@ fn prefill_full_attention_layer(
         fw.q_proj_scale.as_ref(),
         fw.q_proj_int8_scale.as_ref(),
         weights.fp8_block_size,
-        &mut q_full,
+        &mut scratch.full_q_buf,
         fw.q_proj_int4_scale.as_ref(),
         fw.q_proj_int4_zero.as_ref(),
         fw.q_proj_awq_inv_scale.as_ref(),
@@ -5787,10 +5819,6 @@ fn prefill_full_attention_layer(
 
     // 2. Split Q into query and gate when present. Llama-style full attention
     // uses an ungated q_proj whose row count matches q_dim exactly.
-    let mut query_buf = GpuBuffer::alloc(ordinal, ScalarType::BF16, &[chunk_len, q_dim])
-        .map_err(|e| anyhow::anyhow!("query_buf alloc: {e}"))?;
-    let mut gate_buf = GpuBuffer::alloc(ordinal, ScalarType::BF16, &[chunk_len, q_dim])
-        .map_err(|e| anyhow::anyhow!("gate_buf alloc: {e}"))?;
     let q_norm_done = if has_attn_gate {
         if maybe_split_qgate_norm_bf16(
             config,
@@ -5798,10 +5826,10 @@ fn prefill_full_attention_layer(
             chunk_len,
             num_q_heads,
             head_dim,
-            &q_full,
+            &scratch.full_q_buf,
             fw.q_norm_w.as_ref(),
-            &mut query_buf,
-            &mut gate_buf,
+            &mut scratch.full_query_buf,
+            &mut scratch.full_gate_buf,
             &format!("layer {idx} fused Q split+norm"),
         )? {
             true
@@ -5812,9 +5840,9 @@ fn prefill_full_attention_layer(
                 chunk_len,
                 num_q_heads,
                 head_dim,
-                &q_full,
-                &mut query_buf,
-                &mut gate_buf,
+                &scratch.full_q_buf,
+                &mut scratch.full_query_buf,
+                &mut scratch.full_gate_buf,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} Q split: {e}"))?;
             false
@@ -5822,8 +5850,8 @@ fn prefill_full_attention_layer(
     } else {
         copy_d2d_batched(
             ordinal,
-            query_buf.as_ptr() as *mut c_void,
-            q_full.as_ptr(),
+            scratch.full_query_buf.as_ptr() as *mut c_void,
+            scratch.full_q_buf.as_ptr(),
             chunk_len * q_dim * elem_bytes,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} Q copy: {e}"))?;
@@ -5856,7 +5884,7 @@ fn prefill_full_attention_layer(
             ordinal,
             chunk_len * num_q_heads,
             head_dim,
-            &mut query_buf,
+            &mut scratch.full_query_buf,
             fw.q_norm_w.as_ref(),
             &format!("layer {idx} Q norm inplace"),
         )?
@@ -5872,14 +5900,14 @@ fn prefill_full_attention_layer(
             ordinal,
             chunk_len * num_q_heads,
             head_dim,
-            &query_buf,
+            &scratch.full_query_buf,
             fw.q_norm_w.as_ref(),
             &mut q_normed,
             &format!("layer {idx} Q norm"),
         )?;
         copy_d2d_batched(
             ordinal,
-            query_buf.as_ptr() as *mut c_void,
+            scratch.full_query_buf.as_ptr() as *mut c_void,
             q_normed.as_ptr(),
             chunk_len * q_dim * elem_bytes,
         )
@@ -5934,7 +5962,7 @@ fn prefill_full_attention_layer(
             &rotary.cos,
             &rotary.sin,
             pos_ids,
-            &mut query_buf,
+            &mut scratch.full_query_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE (indirect): {e}"))?;
     } else {
@@ -5948,7 +5976,7 @@ fn prefill_full_attention_layer(
             &rotary.cos,
             &rotary.sin,
             chunk_start,
-            &mut query_buf,
+            &mut scratch.full_query_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE: {e}"))?;
     }
@@ -5983,8 +6011,6 @@ fn prefill_full_attention_layer(
     }
 
     // 7. V projection
-    let mut v_buf = GpuBuffer::alloc(ordinal, ScalarType::BF16, &[chunk_len, kv_dim])
-        .map_err(|e| anyhow::anyhow!("v_buf alloc: {e}"))?;
     matmul_proj(
         ordinal,
         1,
@@ -5996,7 +6022,7 @@ fn prefill_full_attention_layer(
         fw.v_proj_scale.as_ref(),
         fw.v_proj_int8_scale.as_ref(),
         weights.fp8_block_size,
-        &mut v_buf,
+        &mut scratch.full_v_buf,
         fw.v_proj_int4_scale.as_ref(),
         fw.v_proj_int4_zero.as_ref(),
         fw.v_proj_awq_inv_scale.as_ref(),
@@ -6042,7 +6068,7 @@ fn prefill_full_attention_layer(
                 head_dim,
                 cap,
                 chunk_start,
-                &v_buf,
+                &scratch.full_v_buf,
                 v_cache,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} fused KV cache V write: {e}"))?;
@@ -6071,7 +6097,7 @@ fn prefill_full_attention_layer(
             chunk_len,
             num_kv_heads,
             head_dim,
-            &v_buf,
+            &scratch.full_v_buf,
             &mut scratch.attn_v,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} V transpose: {e}"))?;
@@ -6132,7 +6158,7 @@ fn prefill_full_attention_layer(
         chunk_len,
         num_q_heads,
         head_dim,
-        &query_buf,
+        &scratch.full_query_buf,
         &mut scratch.attn_q,
     )
     .map_err(|e| anyhow::anyhow!("layer {idx} Q transpose: {e}"))?;
@@ -6141,8 +6167,8 @@ fn prefill_full_attention_layer(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let ls = &mut state.layers[idx];
     let cap = ls.kv_capacity();
-    let kv_k_contig;
-    let kv_v_contig;
+    let mut assembled_k = None;
+    let mut assembled_v = None;
     let attn_k_ref: &GpuBuffer;
     let attn_v_ref: &GpuBuffer;
 
@@ -6156,12 +6182,8 @@ fn prefill_full_attention_layer(
         // Capacity > kv_len - copy each head's kv_len entries into contiguous buffers.
         // Virtual KV also uses this path because the prefill attention FFI takes
         // `GpuBuffer` wrappers, while the virtual cache is represented by raw VA.
-        kv_k_contig =
-            GpuBuffer::alloc(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                .map_err(|e| anyhow::anyhow!("kv_k_contig alloc: {e}"))?;
-        kv_v_contig =
-            GpuBuffer::alloc(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                .map_err(|e| anyhow::anyhow!("kv_v_contig alloc: {e}"))?;
+        let (kv_k_contig, kv_v_contig) =
+            scratch.take_kv_assemble(ordinal, num_kv_heads, kv_len, head_dim)?;
         let cap_stride = cap * head_dim * elem_bytes;
         let contig_stride = kv_len * head_dim * elem_bytes;
         let copy_bytes = kv_len * head_dim * elem_bytes;
@@ -6187,8 +6209,10 @@ fn prefill_full_attention_layer(
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} KV assemble V h={h}: {e}"))?;
         }
-        attn_k_ref = &kv_k_contig;
-        attn_v_ref = &kv_v_contig;
+        assembled_k = Some(kv_k_contig);
+        assembled_v = Some(kv_v_contig);
+        attn_k_ref = assembled_k.as_ref().unwrap();
+        attn_v_ref = assembled_v.as_ref().unwrap();
     }
 
     prefill_ffi::full_attention_prefill(
@@ -6208,6 +6232,11 @@ fn prefill_full_attention_layer(
         &mut scratch.attn_out_f32,
     )
     .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
+    let _ = (attn_k_ref, attn_v_ref);
+    if let (Some(k), Some(v)) = (assembled_k, assembled_v) {
+        scratch.kv_assemble_k = Some(k);
+        scratch.kv_assemble_v = Some(v);
+    }
 
     let fused_attn_gate_prep = has_attn_gate
         && gpu_hal::current_backend() == Backend::Hip
@@ -6219,7 +6248,7 @@ fn prefill_full_attention_layer(
             num_q_heads,
             head_dim,
             &scratch.attn_out_f32,
-            &gate_buf,
+            &scratch.full_gate_buf,
             &mut scratch.proj_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} fused attn gate prep: {e}"))?;
@@ -6257,7 +6286,7 @@ fn prefill_full_attention_layer(
                     ScalarType::BF16,
                     chunk_len * q_dim,
                     &mut scratch.proj_buf,
-                    &gate_buf,
+                    &scratch.full_gate_buf,
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} gate inplace: {e}"))?;
             } else {
@@ -6268,7 +6297,7 @@ fn prefill_full_attention_layer(
                     ScalarType::BF16,
                     chunk_len * q_dim,
                     &scratch.proj_buf,
-                    &gate_buf,
+                    &scratch.full_gate_buf,
                     &mut gated,
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} gate: {e}"))?;

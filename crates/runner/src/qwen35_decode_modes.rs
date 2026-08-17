@@ -86,7 +86,15 @@ pub(crate) fn report_qwen35_decode_modes(
     modes: &Qwen35DecodeModes,
     use_4b_kernel: bool,
     cuda_08b_hero_enabled: bool,
+    gqh_weights: bool,
 ) {
+    if gqh_weights && modes.kernel_single_decode_enabled {
+        if std::env::var_os("SUPERSONIC_QWEN35_GQH_COMPONENT_DECODE").is_some() {
+            eprintln!("[decode] GQH dedicated-matvec incremental path");
+        } else {
+            eprintln!("[decode] GQH persistent megakernel path");
+        }
+    }
     if modes.metal_v2_incremental {
         if modes.metal_fast_greedy_enabled {
             eprintln!("[decode] Metal v2 incremental decode (fast-greedy: fused argmax)");
