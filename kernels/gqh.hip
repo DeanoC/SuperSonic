@@ -99,9 +99,9 @@ __global__ void gqh2c_decode_kernel(
 #define GQH_WARP 32
 #define GQH_MATVEC_WARPS 8
 #define GQH_PER_LANE (GQH_SUPERBLOCK / GQH_WARP)
-// Stage the full activation vector in LDS when it fits. 5120×f32 = 20 KiB.
-// Per-superblock staging was slower: 2 syncthreads × nsb dominated the GEMV.
-#define GQH_LDS_X_MAX 5120
+// 20 KiB x-in-LDS limits occupancy to ~3 blocks/WGP. x is 5120 floats and
+// is reused across every row, so L2 should hold it. 0 disables staging.
+#define GQH_LDS_X_MAX 0
 
 extern __shared__ char gqh_dyn_smem[];
 
