@@ -56,6 +56,7 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
             true,
         )?;
         eprintln!("[chat] rendered {} chars", rendered.len());
+        eprintln!("[chat] text={rendered:?}");
         rendered
     } else {
         cli.prompt.clone()
@@ -65,6 +66,14 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
+    eprintln!(
+        "[tokenizer] ids={}",
+        prompt_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     if prompt_ids.is_empty() {
         anyhow::bail!("empty prompt after tokenization");
     }

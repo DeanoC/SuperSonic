@@ -82,6 +82,41 @@ fn gqh_state_dump_enabled() -> bool {
     env::var_os("SUPERSONIC_QWEN35_GQH_STATE_DUMP").is_some()
 }
 
+fn linear_layer_dump_dir(idx: usize) -> Option<std::path::PathBuf> {
+    let want = env::var("SUPERSONIC_QWEN35_DUMP_LINEAR_LAYER")
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    if want != idx {
+        return None;
+    }
+    env::var_os("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_DIR").map(std::path::PathBuf::from)
+}
+
+fn dump_buf_as_f32(dir: &std::path::Path, name: &str, buf: &GpuBuffer, cols: usize) -> Result<()> {
+    let bytes = buf
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("decode dump {name} D2H: {e}"))?;
+    let mut f32s = match buf.dtype() {
+        ScalarType::F32 => decode_f32_le(&bytes),
+        ScalarType::BF16 => decode_bf16_le_host(&bytes),
+        other => {
+            return Err(anyhow::anyhow!(
+                "decode dump {name}: unsupported dtype {other:?}"
+            ));
+        }
+    };
+    if f32s.len() > cols {
+        f32s.truncate(cols);
+    }
+    if f32s.len() > 3994 {
+        eprintln!("[dump] {name} n={} dim3994={:.6}", f32s.len(), f32s[3994]);
+    }
+    let out: Vec<u8> = f32s.iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(dir.join(format!("{name}.f32")), out)
+        .map_err(|e| anyhow::anyhow!("write decode {name}: {e}"))
+}
+
 fn checksum_kv_prefix_and_slot(
     buf: &GpuBuffer,
     nkv: usize,
@@ -4969,6 +5004,9 @@ impl DecodeEngine {
                     self.weights.int4_group_size,
                 )?;
             }
+            if let Some(dir) = linear_layer_dump_dir(idx) {
+                dump_buf_as_f32(&dir, "l5_q", q_full, q_proj_dim)?;
+            }
             if has_attn_gate {
                 kernel_ffi::prefill_ffi::split_qgate(
                     self.ordinal,
@@ -5126,6 +5164,10 @@ impl DecodeEngine {
                 )?;
             }
 
+            if let Some(dir) = linear_layer_dump_dir(idx) {
+                dump_buf_as_f32(&dir, "l5_k", k_buf, kv_dim)?;
+                dump_buf_as_f32(&dir, "l5_v", v_buf, kv_dim)?;
+            }
             maybe_attn_rms_norm_rows(
                 config,
                 self.ordinal,
@@ -5191,6 +5233,10 @@ impl DecodeEngine {
                 );
             }
 
+            if let Some(dir) = linear_layer_dump_dir(idx) {
+                dump_buf_as_f32(&dir, "l5_qnorm", query_buf, q_dim)?;
+                dump_buf_as_f32(&dir, "l5_knorm", k_buf, kv_dim)?;
+            }
             kernel_ffi::prefill_ffi::apply_rope_prefill(
                 self.ordinal,
                 ScalarType::BF16,
@@ -5217,6 +5263,10 @@ impl DecodeEngine {
                 k_buf,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
+            if let Some(dir) = linear_layer_dump_dir(idx) {
+                dump_buf_as_f32(&dir, "l5_qrope", query_buf, q_dim)?;
+                dump_buf_as_f32(&dir, "l5_krope", k_buf, kv_dim)?;
+            }
             if trace_output {
                 q_rope_trace = Some(
                     query_buf
@@ -9258,6 +9308,9 @@ impl DecodeEngine {
             if let Some(t) = timings.as_mut() {
                 t.persistent_full_attn_core_ms += core_start.elapsed().as_secs_f64() * 1000.0;
             }
+            if let Some(dir) = linear_layer_dump_dir(idx) {
+                dump_buf_as_f32(&dir, "l5_attn", gated, q_dim)?;
+            }
             if trace_output {
                 gated_trace = Some(
                     gated
@@ -9295,6 +9348,9 @@ impl DecodeEngine {
                     fw.o_proj_awq_inv_scale.as_ref(),
                     self.weights.int4_group_size,
                 )?;
+            }
+            if let Some(dir) = linear_layer_dump_dir(idx) {
+                dump_buf_as_f32(&dir, "l5_proj", proj_out, hidden_dim)?;
             }
             if trace_output {
                 proj_out_trace = Some(
@@ -12469,7 +12525,7 @@ impl DecodeEngine {
         // Copy out primitive config values up front so the later
         // `self.state.layers.iter_mut()` borrow doesn't fight with
         // `&self.weights.config` reads.
-        let (hidden_dim, intermediate_size, vocab_size, num_layers, rms_norm_eps) = {
+        let (hidden_dim, intermediate_size, vocab_size, num_layers, _rms_norm_eps) = {
             let c = &self.weights.config;
             (
                 c.hidden_size,
@@ -12641,17 +12697,16 @@ impl DecodeEngine {
 
         // Final RMSNorm (multirow) + tiled lm_head over all B hiddens.
         let rms_start = Instant::now();
-        kernel_ffi::rms_norm_4b_multirow(
+        rms_norm_rows_model(
+            &self.weights.config,
             self.ordinal,
-            ScalarType::BF16,
             b,
             hidden_dim,
-            rms_norm_eps,
             &cache.hidden_io,
             &self.weights.norm_weight,
             &mut cache.normed_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify final rms_norm: {e}"))?;
+            "fused verify final rms_norm",
+        )?;
         let rms_ms = rms_start.elapsed().as_secs_f64() * 1000.0;
 
         let lm_head_start = Instant::now();
@@ -13171,18 +13226,20 @@ impl DecodeEngine {
         );
 
         // 7-9. Final multi-row RMSNorm + tiled lm_head matmul, then one D2H.
+        // Use the same config-aware RMS as prefill / component decode.
+        // rms_norm_4b_multirow hardcodes Gemma weight+1, which flips the
+        // Hello 3242/30 knife-edge on Qwen (add_unit_offset=false).
         let start = Instant::now();
-        kernel_ffi::rms_norm_4b_multirow(
+        rms_norm_rows_model(
+            config,
             self.ordinal,
-            ScalarType::BF16,
             b,
             config.hidden_size,
-            config.rms_norm_eps as f32,
             &self.hidden_io,
             &self.weights.norm_weight,
             &mut self.normed_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("final rms_norm batch rows: {e}"))?;
+            "final rms_norm batch rows",
+        )?;
         timings.rms_norm_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let start = Instant::now();

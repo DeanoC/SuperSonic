@@ -1592,7 +1592,9 @@ pub(crate) fn trace_persistent_linear_layer(
             engine.scratch_debug_ptr(),
         )
     };
-    let isolated_tail_windows = {
+    let isolated_tail_windows = if !engine.weights().gqh_headers.is_empty() {
+        "skipped_gqh".to_string()
+    } else {
         let starts = [4usize, 5, 6, 7, 8];
         let mut samples = Vec::new();
         for &start_layer in &starts {

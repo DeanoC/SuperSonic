@@ -780,6 +780,50 @@ int delta_recurrent_prefill_device(
     return 0;
 }
 
+template <typename T>
+int delta_recurrent_prefill_device_stream(
+    int device_ordinal,
+    int batch_heads,
+    int seq_len,
+    int k_head_dim,
+    int v_head_dim,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    void* out,
+    hipStream_t stream
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (k_head_dim > 256) return 69;
+    constexpr int block = 256;
+    const size_t total_threads =
+        static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
+    const unsigned int grid = static_cast<unsigned int>(
+        (total_threads + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_recurrent_prefill_kernel<T>),
+        dim3(grid),
+        dim3(block),
+        0,
+        stream,
+        batch_heads,
+        seq_len,
+        k_head_dim,
+        v_head_dim,
+        static_cast<const T*>(initial_state),
+        static_cast<const T*>(query),
+        static_cast<const T*>(key),
+        static_cast<const T*>(value),
+        static_cast<const T*>(beta),
+        static_cast<const T*>(g),
+        static_cast<T*>(out),
+        static_cast<T*>(nullptr));
+    return hipGetLastError() == hipSuccess ? 0 : 67;
+}
+
 int delta_recurrent_prefill_capture_f32_k128_device(
     int device_ordinal,
     int batch_heads,
@@ -3549,6 +3593,40 @@ extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill(
     default:
         return 66;
     }
+}
+
+extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill_on_stream(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_heads,
+    size_t seq_len,
+    size_t k_head_dim,
+    size_t v_head_dim,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    void* out,
+    void* stream) {
+    if (dtype != 1) {
+        return 66;
+    }
+    return delta_recurrent_prefill_device_stream<float>(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(batch_heads),
+        static_cast<int>(seq_len),
+        static_cast<int>(k_head_dim),
+        static_cast<int>(v_head_dim),
+        initial_state,
+        query,
+        key,
+        value,
+        beta,
+        g,
+        out,
+        static_cast<hipStream_t>(stream));
 }
 
 extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill_capture(

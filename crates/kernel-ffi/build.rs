@@ -328,6 +328,12 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
         );
     }
 
+    println!("cargo:rerun-if-env-changed=GQH_ALLOW_FMA");
+    let allow_gqh_fma = env::var_os("GQH_ALLOW_FMA").is_some_and(|v| v != "0");
+    if allow_gqh_fma {
+        println!("cargo:warning=GQH_ALLOW_FMA=1: compiling GQH without fp contract(off)");
+    }
+
     let mut objects = Vec::new();
     for source in HIP_BRIDGES {
         let mut cmd = Command::new("hipcc");
@@ -343,6 +349,9 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
             .arg(kernel_dir.join(source.src_name))
             .arg("-o")
             .arg(&obj_path);
+        if allow_gqh_fma {
+            cmd.arg("-DGQH_ALLOW_FMA");
+        }
         for arch in &archs {
             cmd.arg(format!("--offload-arch={arch}"));
         }

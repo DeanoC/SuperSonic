@@ -22,6 +22,27 @@ pub(crate) fn emit_qwen35_last_logits_if_requested(cli: &Cli, logits: &[f32]) {
         return;
     }
 
+    // Hello 8192 split is 3242 ("today") vs 30 ("?"). Print the pair plus
+    // argmax so we can compare SuperSonic vs lucebox without a 248k dump.
+    if !logits.is_empty() {
+        let (argmax, max_v) = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| {
+                a.1.partial_cmp(b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.0.cmp(&a.0))
+            })
+            .map(|(i, v)| (i, *v))
+            .unwrap_or((0, 0.0));
+        let v30 = logits.get(30).copied().unwrap_or(f32::NAN);
+        let v3242 = logits.get(3242).copied().unwrap_or(f32::NAN);
+        eprintln!(
+            "[logits] argmax={argmax} v={max_v} tok30={v30} tok3242={v3242} delta_today_minus_q={}",
+            v3242 - v30
+        );
+    }
+
     use std::io::Write as _;
     print!("\nLAST_LOGITS: ");
     for (i, x) in logits.iter().enumerate() {

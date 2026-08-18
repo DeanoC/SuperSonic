@@ -38,7 +38,9 @@ static __device__ __forceinline__ float gqh_bf16_round(float x) {
     return y;
 }
 
+#ifndef GQH_ALLOW_FMA
 #pragma clang fp contract(off)
+#endif
 static __device__ __forceinline__ float gqh_subblock_scale(
     const uint8_t* __restrict__ b, int sub, float tensor_scale) {
     const uint8_t d = b[0];
@@ -48,7 +50,9 @@ static __device__ __forceinline__ float gqh_subblock_scale(
     return d_real * gqh_bits(GQH_RATIO_Q_D[ratio][0]);
 }
 
+#ifndef GQH_ALLOW_FMA
 #pragma clang fp contract(off)
+#endif
 static __device__ __forceinline__ float gqh_scale_from_planes(
     uint8_t d, const uint8_t* __restrict__ ratio8, int sub, float tensor_scale) {
     const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
@@ -234,7 +238,9 @@ static __device__ __forceinline__ void gqh_pipe_barrier() {
     asm volatile("" ::: "memory");
 }
 
+#ifndef GQH_ALLOW_FMA
 #pragma clang fp contract(off)
+#endif
 template <bool IS_GQH3>
 static __device__ __forceinline__ float gqh_sb_fma(
     float acc,

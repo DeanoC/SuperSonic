@@ -3230,6 +3230,88 @@ fn copy_bf16_row(
         .map_err(|e| anyhow::anyhow!("{label} D2H: {e}"))
 }
 
+fn decode_hidden_dump_dir_and_pos() -> Option<(std::path::PathBuf, usize)> {
+    let dir = std::env::var_os("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_DIR")?;
+    let pos = std::env::var("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_POS")
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    Some((std::path::PathBuf::from(dir), pos))
+}
+
+fn dump_decode_hidden_f32(
+    dir: &std::path::Path,
+    kind: &str,
+    layer: usize,
+    ordinal: usize,
+    source: &GpuBuffer,
+    hidden_dim: usize,
+) -> Result<()> {
+    dump_named_bf16_as_f32(
+        dir,
+        &format!("{kind}_{layer:02}"),
+        ordinal,
+        source,
+        hidden_dim,
+    )
+}
+
+fn dump_named_bf16_as_f32(
+    dir: &std::path::Path,
+    name: &str,
+    ordinal: usize,
+    source: &GpuBuffer,
+    cols: usize,
+) -> Result<()> {
+    let bytes = copy_bf16_row(
+        ordinal,
+        source,
+        0,
+        cols,
+        &format!("decode dump {name}"),
+    )?;
+    let f32s = decode_bf16_le(&bytes);
+    if f32s.len() > 3994 {
+        eprintln!("[dump] {name} n={} dim3994={:.6}", f32s.len(), f32s[3994]);
+    }
+    std::fs::write(dir.join(format!("{name}.f32")), encode_f32_le(&f32s))
+        .map_err(|e| anyhow::anyhow!("write decode {name}: {e}"))
+}
+
+fn dump_named_f32_row(
+    dir: &std::path::Path,
+    name: &str,
+    source: &GpuBuffer,
+    cols: usize,
+) -> Result<()> {
+    let bytes = source
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("decode dump {name} D2H: {e}"))?;
+    let mut f32s: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if f32s.len() > cols {
+        f32s.truncate(cols);
+    }
+    if f32s.len() > 3994 {
+        eprintln!("[dump] {name} n={} dim3994={:.6}", f32s.len(), f32s[3994]);
+    }
+    std::fs::write(dir.join(format!("{name}.f32")), encode_f32_le(&f32s))
+        .map_err(|e| anyhow::anyhow!("write decode {name}: {e}"))
+}
+
+fn linear_layer_dump_dir(idx: usize) -> Option<std::path::PathBuf> {
+    let want = std::env::var("SUPERSONIC_QWEN35_DUMP_LINEAR_LAYER")
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    if want != idx {
+        return None;
+    }
+    std::env::var_os("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_DIR").map(std::path::PathBuf::from)
+}
+
 #[allow(dead_code)]
 pub fn prefill_tail_from_hidden_with_trace_position(
     weights: &Qwen35Weights,
@@ -5527,6 +5609,10 @@ fn metal_v2_decode_step_body(
         "decode-loop embedding",
     )?;
 
+    let dump = decode_hidden_dump_dir_and_pos()
+        .filter(|(_, pos)| *pos == seqlen_offset)
+        .map(|(dir, _)| dir);
+
     for idx in 0..config.num_hidden_layers {
         scratch.scratch.rms_norm_hidden_to_normed_model(
             config,
@@ -5572,6 +5658,17 @@ fn metal_v2_decode_step_body(
             )?;
         }
 
+        if let Some(dir) = dump.as_ref() {
+            dump_decode_hidden_f32(
+                dir,
+                "attn",
+                idx,
+                ordinal,
+                &scratch.scratch.hidden,
+                hidden_dim,
+            )?;
+        }
+
         scratch.scratch.rms_norm_hidden_to_normed_model(
             config,
             ordinal,
@@ -5589,6 +5686,24 @@ fn metal_v2_decode_step_body(
             chunk_len,
             ordinal,
         )?;
+
+        if let Some(dir) = dump.as_ref() {
+            dump_decode_hidden_f32(
+                dir,
+                "hidden",
+                idx,
+                ordinal,
+                &scratch.scratch.hidden,
+                hidden_dim,
+            )?;
+        }
+    }
+    if let Some(dir) = dump.as_ref() {
+        eprintln!(
+            "[dump] component decode hiddens pos={seqlen_offset} layers={} dir={}",
+            config.num_hidden_layers,
+            dir.display()
+        );
     }
 
     Ok(())
@@ -5837,6 +5952,11 @@ fn prefill_full_attention_layer(
         fw.q_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
+    if chunk_len == 1 {
+        if let Some(dir) = linear_layer_dump_dir(idx) {
+            dump_named_bf16_as_f32(&dir, "l5_q", ordinal, &scratch.full_q_buf, q_proj_dim)?;
+        }
+    }
 
     // 2. Split Q into query and gate when present. Llama-style full attention
     // uses an ungated q_proj whose row count matches q_dim exactly.
@@ -5897,6 +6017,11 @@ fn prefill_full_attention_layer(
         fw.k_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
+    if chunk_len == 1 {
+        if let Some(dir) = linear_layer_dump_dir(idx) {
+            dump_named_bf16_as_f32(&dir, "l5_k", ordinal, &scratch.proj_buf2, kv_dim)?;
+        }
+    }
 
     // 4. Q normalization
     if !q_norm_done
@@ -6030,6 +6155,17 @@ fn prefill_full_attention_layer(
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE: {e}"))?;
     }
+    if chunk_len == 1 {
+        if let Some(dir) = linear_layer_dump_dir(idx) {
+            dump_named_bf16_as_f32(
+                &dir,
+                "l5_qrope",
+                ordinal,
+                &scratch.full_query_buf,
+                q_dim,
+            )?;
+        }
+    }
 
     // 7. V projection
     matmul_proj(
@@ -6049,6 +6185,11 @@ fn prefill_full_attention_layer(
         fw.v_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
+    if chunk_len == 1 {
+        if let Some(dir) = linear_layer_dump_dir(idx) {
+            dump_named_bf16_as_f32(&dir, "l5_v", ordinal, &scratch.full_v_buf, kv_dim)?;
+        }
+    }
 
     // 8/9. Write this chunk's K/V to KV cache BEFORE attention (so attention can read from it).
     //      The HIP fast path transposes directly into the persistent cache; fallback keeps the
@@ -6330,6 +6471,11 @@ fn prefill_full_attention_layer(
                 )
                 .map_err(|e| anyhow::anyhow!("gated copy: {e}"))?;
             }
+        }
+    }
+    if chunk_len == 1 {
+        if let Some(dir) = linear_layer_dump_dir(idx) {
+            dump_named_bf16_as_f32(&dir, "l5_attn", ordinal, &scratch.proj_buf, q_dim)?;
         }
     }
 
@@ -6987,6 +7133,10 @@ fn prefill_linear_attention_layer(
     };
     let use_fused_qkvz =
         fused_qkvz_enabled && scratch.normed.backend() == Backend::Hip && lw.qkvz_proj_w.is_some();
+    if let Some(dir) = linear_layer_dump_dir(idx) {
+        dump_named_bf16_as_f32(&dir, "l5_in", ordinal, &scratch.hidden, hidden_dim)?;
+        dump_named_bf16_as_f32(&dir, "l5_normed", ordinal, &scratch.normed, hidden_dim)?;
+    }
 
     // 1. QKV projection: normed [chunk, hidden] -> [chunk, qkv_dim].
     // Raw GGML fused [QKV; Z] avoids a second low-bit matmul, then splits
@@ -7148,6 +7298,9 @@ fn prefill_linear_attention_layer(
     }
 
     // 2. Z projection: normed [chunk, hidden] -> [chunk, z_dim]
+    if let Some(dir) = linear_layer_dump_dir(idx) {
+        dump_named_bf16_as_f32(&dir, "l5_qkv", ordinal, &scratch.proj_buf, qkv_dim)?;
+    }
     if !use_fused_qkvz {
         matmul_proj(
             ordinal,
@@ -7166,6 +7319,9 @@ fn prefill_linear_attention_layer(
             lw.z_proj_awq_inv_scale.as_ref(),
             weights.int4_group_size,
         )?;
+    }
+    if let Some(dir) = linear_layer_dump_dir(idx) {
+        dump_named_bf16_as_f32(&dir, "l5_z", ordinal, &scratch.proj_buf2, z_dim)?;
     }
     if trace_linear_debug {
         let trace = linear_debug_trace
@@ -7247,6 +7403,14 @@ fn prefill_linear_attention_layer(
                 Some(&scratch.linear_a_buf),
             )
         };
+    if let Some(dir) = linear_layer_dump_dir(idx) {
+        if let Some(b) = b_buf {
+            dump_named_bf16_as_f32(&dir, "l5_b", ordinal, b, nv)?;
+        }
+        if let Some(a) = a_buf {
+            dump_named_bf16_as_f32(&dir, "l5_a", ordinal, a, nv)?;
+        }
+    }
 
     // 5. Transpose QKV [chunk, qkv_dim] -> [qkv_dim, pad+chunk] for conv input.
     //    DFlash append blocks can prepare the previous tail, transposed rows,
@@ -7335,6 +7499,9 @@ fn prefill_linear_attention_layer(
         &mut scratch.proj_buf,
     )
     .map_err(|e| anyhow::anyhow!("layer {idx} conv: {e}"))?;
+    if let Some(dir) = linear_layer_dump_dir(idx) {
+        dump_named_bf16_as_f32(&dir, "l5_conv", ordinal, &scratch.proj_buf, qkv_dim)?;
+    }
     if trace_linear_debug {
         let trace = linear_debug_trace
             .as_mut()
@@ -7406,6 +7573,10 @@ fn prefill_linear_attention_layer(
             &mut scratch.linear_v_trans,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} fused QKV prepare: {e}"))?;
+        if let Some(dir) = linear_layer_dump_dir(idx) {
+            dump_named_f32_row(&dir, "l5_qnorm", &scratch.linear_q_trans, key_dim)?;
+            dump_named_f32_row(&dir, "l5_knorm", &scratch.linear_k_trans, key_dim)?;
+        }
     } else if gpu_hal::current_backend() == Backend::Hip {
         prefill_ffi::split_qkv_bf16_to_f32(
             ordinal,
@@ -7760,6 +7931,14 @@ fn prefill_linear_attention_layer(
         let zero_recurrent;
         let recurrent_initial = if let Some(rec_state) = state.layers[idx].recurrent_state.as_ref()
         {
+            if let Some(dir) = linear_layer_dump_dir(idx) {
+                dump_named_f32_row(
+                    &dir,
+                    "l5_rec_in",
+                    rec_state,
+                    nv * khd * vhd,
+                )?;
+            }
             rec_state
         } else {
             zero_recurrent = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
@@ -7988,6 +8167,10 @@ fn prefill_linear_attention_layer(
         trace.attn = last;
     }
 
+    if let Some(dir) = linear_layer_dump_dir(idx) {
+        dump_named_bf16_as_f32(&dir, "l5_rec", ordinal, &scratch.linear_attn_output, val_dim)?;
+    }
+
     // 14. Gated RMSNorm: out = rms_norm(attn_output) * norm_w * silu(Z)
     //     attn_output is [nv, S, vhd]; Z (proj_buf2) is [S, val_dim] = [S, nv*vhd]
     //     Need Z in [nv, S, vhd] layout
@@ -8054,6 +8237,15 @@ fn prefill_linear_attention_layer(
         let start = (chunk_len - 1) * row_bytes;
         trace.gated = bytes[start..start + row_bytes].to_vec();
     }
+    if let Some(dir) = linear_layer_dump_dir(idx) {
+        dump_named_bf16_as_f32(
+            &dir,
+            "l5_gated",
+            ordinal,
+            &scratch.linear_gated_s_first,
+            val_dim,
+        )?;
+    }
 
     // 16-17. O projection + residual:
     // [S, val_dim] × out_proj_w [hidden, val_dim]^T → hidden += [S, hidden].
@@ -8093,6 +8285,17 @@ fn prefill_linear_attention_layer(
             lw.out_proj_awq_inv_scale.as_ref(),
             weights.int4_group_size,
         )?;
+    }
+    if let Some(dir) = linear_layer_dump_dir(idx) {
+        if !fused_residual {
+            dump_named_bf16_as_f32(
+                &dir,
+                "l5_proj",
+                ordinal,
+                &scratch.proj_buf2,
+                hidden_dim,
+            )?;
+        }
     }
     if trace_linear_debug {
         let trace = linear_debug_trace
