@@ -624,3 +624,65 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
     }
     return launch_result(421, 422);
 }
+
+extern "C" int supersonic_gqh_hip_mix_matvec_stream(
+    int device_ordinal,
+    int qtype,
+    const void* wire,
+    const void* x,
+    void* y,
+    int in_dim,
+    int out_dim,
+    int ncols,
+    int acc,
+    int mode,
+    const float* lut,
+    void* stream) {
+    if (wire == nullptr || x == nullptr || y == nullptr || lut == nullptr) {
+        return 405;
+    }
+    if (in_dim <= 0 || in_dim % 32 != 0 || out_dim <= 0 || ncols <= 0) {
+        return 406;
+    }
+    if (qtype != 105 && qtype != 106) {
+        return 401;
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    const dim3 blocks(
+        static_cast<unsigned int>((out_dim + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS),
+        static_cast<unsigned int>(ncols),
+        1);
+    const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
+    float4 lut0{}, lut1{}, lut2{}, lut3{};
+    memcpy(&lut0, lut + 0, sizeof(float4));
+    memcpy(&lut1, lut + 4, sizeof(float4));
+    memcpy(&lut2, lut + 8, sizeof(float4));
+    memcpy(&lut3, lut + 12, sizeof(float4));
+    auto* packed = static_cast<const uint8_t*>(wire);
+    auto* xv = static_cast<const float*>(x);
+    auto* yv = static_cast<float*>(y);
+    hipStream_t hs = static_cast<hipStream_t>(stream);
+    const bool is_fp3 = qtype == 105;
+    if (is_fp3 && acc) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_mix_matvec_kernel<true, true>)),
+            blocks, threads, 0, hs, packed, xv, yv, in_dim, out_dim, mode,
+            lut0, lut1, lut2, lut3, (int64_t)in_dim, (int64_t)out_dim);
+    } else if (is_fp3) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_mix_matvec_kernel<true, false>)),
+            blocks, threads, 0, hs, packed, xv, yv, in_dim, out_dim, mode,
+            lut0, lut1, lut2, lut3, (int64_t)in_dim, (int64_t)out_dim);
+    } else if (acc) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_mix_matvec_kernel<false, true>)),
+            blocks, threads, 0, hs, packed, xv, yv, in_dim, out_dim, mode,
+            lut0, lut1, lut2, lut3, (int64_t)in_dim, (int64_t)out_dim);
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_mix_matvec_kernel<false, false>)),
+            blocks, threads, 0, hs, packed, xv, yv, in_dim, out_dim, mode,
+            lut0, lut1, lut2, lut3, (int64_t)in_dim, (int64_t)out_dim);
+    }
+    return launch_result(421, 422);
+}

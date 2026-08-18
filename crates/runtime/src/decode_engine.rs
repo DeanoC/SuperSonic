@@ -618,6 +618,20 @@ fn lm_head_lowbit(
         .map_err(|e| anyhow::anyhow!("{label} gqh matmul: {e}"))?;
         return Ok(true);
     }
+    if qwen35::weights::is_mix_qtype(qtype) {
+        qwen35::weights::matmul_mix(
+            ordinal,
+            m,
+            vocab_size,
+            hidden_dim,
+            lhs,
+            &*weights.lm_head,
+            qtype,
+            out,
+        )
+        .map_err(|e| anyhow::anyhow!("{label} mix matmul: {e}"))?;
+        return Ok(true);
+    }
     kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
         ordinal,
         1,
@@ -661,6 +675,13 @@ fn matmul_proj(
         }
         return qwen35::weights::matmul_gqh(ordinal, m, n, k, lhs, weight, qtype, out)
             .map_err(|e| anyhow::anyhow!("matmul_gqh: {e}"));
+    }
+    if qwen35::weights::is_mix_qtype(qtype) {
+        if batch != 1 {
+            anyhow::bail!("mix matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
+        }
+        return qwen35::weights::matmul_mix(ordinal, m, n, k, lhs, weight, qtype, out)
+            .map_err(|e| anyhow::anyhow!("matmul_mix: {e}"));
     }
     if qtype != 0 {
         let sc = int4_scale.unwrap_or(weight);

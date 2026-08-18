@@ -68,6 +68,20 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
     int grid_code,
     void* stream);
 
+extern "C" int supersonic_gqh_hip_mix_matvec_stream(
+    int device_ordinal,
+    int qtype,
+    const void* wire,
+    const void* x,
+    void* y,
+    int in_dim,
+    int out_dim,
+    int ncols,
+    int acc,
+    int mode,
+    const float* lut,
+    void* stream);
+
 extern "C" int supersonic_gqh_hip_matvec_stream_pair(
     int device_ordinal,
     int rung_a,
@@ -100,14 +114,22 @@ struct GqhProjHdr {
     int grid = 0;
     int rung = -1;
     int qtype = 0;
+    int mix_mode = 0;
+    int mix_k = 0;
+    float mix_lut[16] = {};
 };
 
 bool ggml_k_qtype(int qtype) {
     return qtype == 8 || qtype == 12 || qtype == 13 || qtype == 14;
 }
 
+bool mix_qtype(int qtype) {
+    return qtype == 105 || qtype == 106;
+}
+
 bool proj_can_gemv(const GqhProjHdr& h) {
-    return h.wire != nullptr && (h.rung >= 0 || ggml_k_qtype(h.qtype));
+    return h.wire != nullptr &&
+        (h.rung >= 0 || ggml_k_qtype(h.qtype) || mix_qtype(h.qtype));
 }
 
 struct GqhMixerLayer {
@@ -144,6 +166,25 @@ hipError_t load_gqh_proj_hdr(
     if (wire == nullptr) {
         out->rung = -1;
         out->qtype = 0;
+        return hipSuccess;
+    }
+    if (mix_qtype(out->qtype)) {
+        if (scale_ptr == nullptr) {
+            out->qtype = 0;
+            return hipSuccess;
+        }
+        struct MixSide {
+            float lut[16];
+            int mode;
+            int k;
+        } side{};
+        hipError_t err = hipMemcpy(&side, scale_ptr, sizeof(side), hipMemcpyDeviceToHost);
+        if (err != hipSuccess) {
+            return err;
+        }
+        out->mix_mode = side.mode;
+        out->mix_k = side.k;
+        memcpy(out->mix_lut, side.lut, sizeof(out->mix_lut));
         return hipSuccess;
     }
     if (out->rung < 0 || scale_ptr == nullptr) {
@@ -630,6 +671,12 @@ hipError_t launch_mixer_proj_acc(
     if (ggml_k_qtype(h.qtype)) {
         return launch_ggml_k_gemv_acc(h, x, y, in_dim, out_dim, stream);
     }
+    if (mix_qtype(h.qtype)) {
+        const int st = supersonic_gqh_hip_mix_matvec_stream(
+            ordinal, h.qtype, h.wire, x, y, in_dim, out_dim, 1, 1, h.mix_mode,
+            h.mix_lut, stream);
+        return st == 0 ? hipSuccess : hipErrorInvalidValue;
+    }
     return hipSuccess;
 }
 
@@ -650,6 +697,11 @@ hipError_t launch_mixer_proj(
         err = launch_gqh_gemv(ordinal, h, x, y, in_dim, out_dim, stream);
     } else if (ggml_k_qtype(h.qtype)) {
         err = launch_ggml_k_gemv(h, x, y, in_dim, out_dim, stream);
+    } else if (mix_qtype(h.qtype)) {
+        const int st = supersonic_gqh_hip_mix_matvec_stream(
+            ordinal, h.qtype, h.wire, x, y, in_dim, out_dim, 1, 0, h.mix_mode,
+            h.mix_lut, stream);
+        err = st == 0 ? hipSuccess : hipErrorInvalidValue;
     } else {
         return hipSuccess;
     }
@@ -7964,11 +8016,11 @@ int persistent_decode_device(
                             hidden_dim,
                             stream);
                     } else {
-                        err = launch_gqh_gemv(
+                        err = launch_mixer_proj_acc(
                             device_ordinal,
                             mlp_hdrs.down[layer],
                             ws_gate,
-                            ws_mlp,
+                            ws_hidden,
                             intermediate_size,
                             hidden_dim,
                             stream);

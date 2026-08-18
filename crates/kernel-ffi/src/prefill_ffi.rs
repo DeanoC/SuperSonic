@@ -5280,6 +5280,113 @@ pub fn matmul_rhs_transposed_gqh(
     Ok(())
 }
 
+/// Mix qtype 105/106 fused dequant-matmul. Same scratch/cast convention as GQH.
+pub fn matmul_rhs_transposed_mix(
+    ordinal: usize,
+    ncols: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    mode: i32,
+    lut: &[f32; 16],
+    qtype: i32,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16 && lhs.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "mix matmul lhs must be bf16/f32, got {:?}",
+            lhs.dtype()
+        )));
+    }
+    if out.dtype() != ScalarType::BF16 && out.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "mix matmul out must be bf16/f32, got {:?}",
+            out.dtype()
+        )));
+    }
+    if ncols == 0 || k == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "mix matmul ncols={ncols} k={k} must be positive"
+        )));
+    }
+    thread_local! {
+        static MIX_X: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };
+        static MIX_Y: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };
+    }
+    let take_scratch = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+                        elems: usize|
+     -> Result<GpuBuffer, GpuError> {
+        slot.with(|cell| {
+            let mut held = cell.borrow_mut();
+            if let Some(buf) = held.as_ref() {
+                if buf.elem_count() >= elems {
+                    return Ok(held.take().expect("scratch present"));
+                }
+            }
+            held.take();
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[elems])
+        })
+    };
+    let put_scratch = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+                       buf: GpuBuffer| {
+        slot.with(|cell| {
+            *cell.borrow_mut() = Some(buf);
+        });
+    };
+    let x_f32 = if lhs.dtype() == ScalarType::F32 {
+        None
+    } else {
+        let mut buf = take_scratch(&MIX_X, ncols * k)?;
+        cast(
+            ordinal,
+            ScalarType::BF16,
+            ScalarType::F32,
+            ncols * k,
+            lhs,
+            &mut buf,
+        )?;
+        Some(buf)
+    };
+    let x_ref = x_f32.as_ref().unwrap_or(lhs);
+    let mut y_f32 = if out.dtype() == ScalarType::F32 {
+        None
+    } else {
+        Some(take_scratch(&MIX_Y, ncols * n)?)
+    };
+    let y_ref = y_f32.as_mut().unwrap_or(out);
+    crate::gqh::mix_matvec(
+        ordinal,
+        qtype,
+        rhs,
+        x_ref,
+        y_ref,
+        k,
+        n,
+        ncols,
+        false,
+        mode,
+        lut,
+    )?;
+    if let Some(y) = y_f32.as_ref() {
+        cast(
+            ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            ncols * n,
+            y,
+            out,
+        )?;
+    }
+    if let Some(buf) = x_f32 {
+        put_scratch(&MIX_X, buf);
+    }
+    if let Some(buf) = y_f32 {
+        put_scratch(&MIX_Y, buf);
+    }
+    Ok(())
+}
+
 /// Raw GGML low-bit m16 matmul with a BF16 residual-add epilogue.
 ///
 /// Returns `Ok(false)` when the HIP kernel does not handle the shape/qtype, so

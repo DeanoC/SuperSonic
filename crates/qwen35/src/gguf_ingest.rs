@@ -13,6 +13,7 @@ use crate::config::TextConfig;
 use crate::weights::{
     ggml_k_row_bytes, FullWeights, LayerKind, LayerWeights, LinearWeights, Qwen35Weights,
     LOWBIT_GGML_Q2_K, LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K, LOWBIT_GGML_Q8_0,
+    LOWBIT_ROCMFP2_MIX, LOWBIT_ROCMFP3_MIX,
 };
 
 #[derive(Clone)]
@@ -288,6 +289,7 @@ fn upload_packed(
     name: &str,
     ordinal: usize,
     headers: &mut BTreeMap<String, GqhHeader>,
+    mix_headers: &mut BTreeMap<String, model_store::dmix2::MixHeader>,
     header_key: &str,
 ) -> Result<GpuBuffer, model_store::Error> {
     let tensor = file.tensor(name).ok_or_else(|| err(format!("missing {name}")))?;
@@ -322,12 +324,26 @@ fn upload_packed(
             12 => LOWBIT_GGML_Q4_K,
             13 => LOWBIT_GGML_Q5_K,
             14 => LOWBIT_GGML_Q6_K,
+            105 => LOWBIT_ROCMFP3_MIX,
+            106 => LOWBIT_ROCMFP2_MIX,
             other => {
                 return Err(err(format!(
                     "{name} has unsupported packed type {other}"
                 )))
             }
         };
+        if qtype == LOWBIT_ROCMFP3_MIX || qtype == LOWBIT_ROCMFP2_MIX {
+            let mix = file.mix_header(name).ok_or_else(|| {
+                err(format!("{name} is mix qtype {qtype} but has no dmix2 sidecar"))
+            })?;
+            if mix.qtype != tensor.tensor_type {
+                return Err(err(format!(
+                    "{name} dmix2 qtype {} != tensor {}",
+                    mix.qtype, tensor.tensor_type
+                )));
+            }
+            mix_headers.insert(header_key.to_string(), mix.clone());
+        }
         let row_bytes = ggml_k_row_bytes(qtype, cols).ok_or_else(|| {
             err(format!("{name} invalid packed row for type {qtype} cols={cols}"))
         })?;
@@ -344,6 +360,9 @@ fn upload_packed(
     if let Some(h) = headers.get(header_key) {
         kernel_ffi::gqh::register_header(buf.as_ptr(), h.tensor_scale, h.grid_code);
     }
+    if let Some(h) = mix_headers.get(header_key) {
+        kernel_ffi::gqh::register_mix(buf.as_ptr(), h.qtype as i32, h.mode, h.lut);
+    }
     Ok(buf)
 }
 
@@ -351,6 +370,7 @@ fn upload_packed(
 fn upload_gqh_sidecars(
     ordinal: usize,
     headers: &BTreeMap<String, GqhHeader>,
+    mix_headers: &BTreeMap<String, model_store::dmix2::MixHeader>,
 ) -> Result<BTreeMap<String, GpuBuffer>, model_store::Error> {
     let mut out = BTreeMap::new();
     for (role, header) in headers {
@@ -361,17 +381,35 @@ fn upload_gqh_sidecars(
             .map_err(model_store::Error::from)?;
         out.insert(role.clone(), buf);
     }
+    for (role, header) in mix_headers {
+        let bytes = model_store::dmix2::sidecar_bytes(header);
+        let buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[bytes.len()], &bytes)
+            .map_err(model_store::Error::from)?;
+        out.insert(role.clone(), buf);
+    }
     Ok(out)
 }
 
-fn load_q2k_embed(
+fn load_qk_embed(
     file: &GgufFile,
     ordinal: usize,
     hidden: usize,
     vocab: usize,
 ) -> Result<GpuBuffer, model_store::Error> {
+    let tensor = file
+        .tensor("token_embd.weight")
+        .ok_or_else(|| err("missing token_embd.weight"))?;
     let packed = file.tensor_bytes("token_embd.weight")?;
-    let row_bytes = model_store::q2k::row_bytes(hidden)?;
+    let (row_bytes, decode): (usize, fn(&[u8], usize, &mut [f32]) -> Result<(), model_store::Error>) =
+        match tensor.tensor_type {
+            10 => (model_store::q2k::row_bytes(hidden)?, model_store::q2k::decode_row),
+            11 => (model_store::q3k::row_bytes(hidden)?, model_store::q3k::decode_row),
+            other => {
+                return Err(err(format!(
+                    "token_embd.weight unsupported type {other} (want Q2_K or Q3_K)"
+                )))
+            }
+        };
     if packed.len() != row_bytes * vocab {
         return Err(err(format!(
             "token_embd packed {} != {}*{}",
@@ -383,7 +421,7 @@ fn load_q2k_embed(
     let mut bf = vec![0u8; vocab * hidden * 2];
     let mut row = vec![0.0f32; hidden];
     for token in 0..vocab {
-        model_store::q2k::decode_row(
+        decode(
             &packed[token * row_bytes..(token + 1) * row_bytes],
             hidden,
             &mut row,
@@ -418,8 +456,9 @@ pub fn load_weights(
     check_mapping(file, config).map_err(err)?;
     let hidden = config.hidden_size;
     let mut headers = BTreeMap::new();
+    let mut mix_headers = BTreeMap::new();
 
-    let embed_tokens = Arc::new(load_q2k_embed(
+    let embed_tokens = Arc::new(load_qk_embed(
         file,
         ordinal,
         hidden,
@@ -430,6 +469,7 @@ pub fn load_weights(
         "output.weight",
         ordinal,
         &mut headers,
+        &mut mix_headers,
         "lm_head.weight",
     )?);
     let norm_weight =
@@ -451,6 +491,7 @@ pub fn load_weights(
             &format!("{blk}.ffn_gate.weight"),
             ordinal,
             &mut headers,
+            &mut mix_headers,
             &format!("layers.{idx}.mlp.gate_proj"),
         )?;
         let up_proj_w = upload_packed(
@@ -458,6 +499,7 @@ pub fn load_weights(
             &format!("{blk}.ffn_up.weight"),
             ordinal,
             &mut headers,
+            &mut mix_headers,
             &format!("layers.{idx}.mlp.up_proj"),
         )?;
         let down_proj_w = upload_packed(
@@ -465,6 +507,7 @@ pub fn load_weights(
             &format!("{blk}.ffn_down.weight"),
             ordinal,
             &mut headers,
+            &mut mix_headers,
             &format!("layers.{idx}.mlp.down_proj"),
         )?;
 
@@ -474,6 +517,7 @@ pub fn load_weights(
                 &format!("{blk}.attn_q.weight"),
                 ordinal,
                 &mut headers,
+            &mut mix_headers,
                 &format!("layers.{idx}.self_attn.q_proj"),
             )?;
             let k_proj_w = upload_packed(
@@ -481,6 +525,7 @@ pub fn load_weights(
                 &format!("{blk}.attn_k.weight"),
                 ordinal,
                 &mut headers,
+            &mut mix_headers,
                 &format!("layers.{idx}.self_attn.k_proj"),
             )?;
             let v_proj_w = upload_packed(
@@ -488,6 +533,7 @@ pub fn load_weights(
                 &format!("{blk}.attn_v.weight"),
                 ordinal,
                 &mut headers,
+            &mut mix_headers,
                 &format!("layers.{idx}.self_attn.v_proj"),
             )?;
             let o_proj_w = upload_packed(
@@ -495,6 +541,7 @@ pub fn load_weights(
                 &format!("{blk}.attn_output.weight"),
                 ordinal,
                 &mut headers,
+            &mut mix_headers,
                 &format!("layers.{idx}.self_attn.o_proj"),
             )?;
             let q_norm_w = Some(upload_f32_as_bf16(
@@ -565,6 +612,7 @@ pub fn load_weights(
                         &format!("{blk}.attn_qkv.weight"),
                         ordinal,
                         &mut headers,
+            &mut mix_headers,
                         &format!("layers.{idx}.linear_attn.in_proj_qkv"),
                     )?,
                     z_proj_w: upload_packed(
@@ -572,6 +620,7 @@ pub fn load_weights(
                         &format!("{blk}.attn_gate.weight"),
                         ordinal,
                         &mut headers,
+            &mut mix_headers,
                         &format!("layers.{idx}.linear_attn.in_proj_z"),
                     )?,
                     qkvz_proj_w: None,
@@ -580,6 +629,7 @@ pub fn load_weights(
                         &format!("{blk}.ssm_alpha.weight"),
                         ordinal,
                         &mut headers,
+            &mut mix_headers,
                         &format!("layers.{idx}.linear_attn.in_proj_b"),
                     )?,
                     a_proj_w: upload_packed(
@@ -587,6 +637,7 @@ pub fn load_weights(
                         &format!("{blk}.ssm_beta.weight"),
                         ordinal,
                         &mut headers,
+            &mut mix_headers,
                         &format!("layers.{idx}.linear_attn.in_proj_a"),
                     )?,
                     ba_proj_w: None,
@@ -596,6 +647,7 @@ pub fn load_weights(
                         &format!("{blk}.ssm_out.weight"),
                         ordinal,
                         &mut headers,
+            &mut mix_headers,
                         &format!("layers.{idx}.linear_attn.out_proj"),
                     )?,
                     dt_bias: upload_f32_as_bf16(
@@ -658,7 +710,7 @@ pub fn load_weights(
         });
     }
 
-    let gqh_sidecars = upload_gqh_sidecars(ordinal, &headers)?;
+    let gqh_sidecars = upload_gqh_sidecars(ordinal, &headers, &mix_headers)?;
 
     Ok(Qwen35Weights {
         config: config.clone(),

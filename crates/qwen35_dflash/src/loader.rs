@@ -13,8 +13,8 @@ use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 use half::{bf16, f16};
 use memmap2::Mmap;
 use qwen35::weights::{
-    ggml_k_row_bytes, LOWBIT_GGML_Q2_K, LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K,
-    LOWBIT_GGML_Q8_0,
+    ggml_k_row_bytes, LOWBIT_GGML_Q2_K, LOWBIT_GGML_Q3_K, LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K,
+    LOWBIT_GGML_Q6_K, LOWBIT_GGML_Q8_0, LOWBIT_ROCMFP2_MIX, LOWBIT_ROCMFP3_MIX,
 };
 use safetensors::SafeTensors;
 
@@ -196,10 +196,13 @@ const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q2_K: u32 = 10;
+const GGML_TYPE_Q3_K: u32 = 11;
 const GGML_TYPE_Q4_K: u32 = 12;
 const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
 const GGML_TYPE_BF16: u32 = 30;
+const GGML_TYPE_ROCMFP3_MIX: u32 = 105;
+const GGML_TYPE_ROCMFP2_MIX: u32 = 106;
 const GGML_TYPE_GQH3: u32 = 108;
 const GGML_TYPE_GQH2_H: u32 = 109;
 const GGML_TYPE_GQH2_C: u32 = 110;
@@ -444,7 +447,8 @@ impl GgufWeightLoader {
                     row_bytes,
                 })
             }
-            GGML_TYPE_Q8_0 | GGML_TYPE_Q2_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K => {
+            GGML_TYPE_Q8_0 | GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K
+            | GGML_TYPE_Q6_K | GGML_TYPE_ROCMFP3_MIX | GGML_TYPE_ROCMFP2_MIX => {
                 let quant_type = gguf_linear_quant_type(tensor.tensor_type).ok_or_else(|| {
                     LoadError::UnsupportedDtype(format!(
                         "GGUF linear tensor {name} has unsupported ggml type {}",
@@ -628,7 +632,8 @@ fn gguf_tensor_nbytes(dims: &[usize], tensor_type: u32) -> Result<usize, LoadErr
         GGML_TYPE_F16 | GGML_TYPE_BF16 => elems
             .checked_mul(2)
             .ok_or_else(|| LoadError::InvalidGguf("16-bit tensor byte size overflows".into())),
-        GGML_TYPE_Q8_0 | GGML_TYPE_Q2_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K => {
+        GGML_TYPE_Q8_0 | GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K
+        | GGML_TYPE_Q6_K | GGML_TYPE_ROCMFP3_MIX | GGML_TYPE_ROCMFP2_MIX => {
             if dims.len() != 2 {
                 return Err(LoadError::UnexpectedTensor(format!(
                     "quantized GGUF tensor must be rank-2, got {dims:?}"
@@ -671,9 +676,12 @@ fn gguf_linear_quant_type(tensor_type: u32) -> Option<i32> {
     match tensor_type {
         GGML_TYPE_Q8_0 => Some(LOWBIT_GGML_Q8_0),
         GGML_TYPE_Q2_K => Some(LOWBIT_GGML_Q2_K),
+        GGML_TYPE_Q3_K => Some(LOWBIT_GGML_Q3_K),
         GGML_TYPE_Q4_K => Some(LOWBIT_GGML_Q4_K),
         GGML_TYPE_Q5_K => Some(LOWBIT_GGML_Q5_K),
         GGML_TYPE_Q6_K => Some(LOWBIT_GGML_Q6_K),
+        GGML_TYPE_ROCMFP3_MIX => Some(LOWBIT_ROCMFP3_MIX),
+        GGML_TYPE_ROCMFP2_MIX => Some(LOWBIT_ROCMFP2_MIX),
         _ => None,
     }
 }

@@ -159,9 +159,12 @@ pub const LOWBIT_QUIP_E8: i32 = 21;
 pub const LOWBIT_QTIP_TRELLIS2: i32 = 22;
 pub const LOWBIT_GGML_Q8_0: i32 = 8;
 pub const LOWBIT_GGML_Q2_K: i32 = 10;
+pub const LOWBIT_GGML_Q3_K: i32 = 11;
 pub const LOWBIT_GGML_Q4_K: i32 = 12;
 pub const LOWBIT_GGML_Q5_K: i32 = 13;
 pub const LOWBIT_GGML_Q6_K: i32 = 14;
+pub const LOWBIT_ROCMFP3_MIX: i32 = 105;
+pub const LOWBIT_ROCMFP2_MIX: i32 = 106;
 pub const LOWBIT_GQH3: i32 = 108;
 pub const LOWBIT_GQH2_H: i32 = 109;
 pub const LOWBIT_GQH2_C: i32 = 110;
@@ -179,6 +182,16 @@ pub fn ggml_k_row_bytes(qtype: i32, cols: usize) -> Option<usize> {
         LOWBIT_GGML_Q4_K => Some(blocks * 144),
         LOWBIT_GGML_Q5_K => Some(blocks * 176),
         LOWBIT_GGML_Q6_K => Some(blocks * 210),
+        LOWBIT_ROCMFP3_MIX => model_store::dmix2::row_bytes(
+            model_store::dmix2::GGML_TYPE_Q3_1_ROCMFP3_MIX,
+            cols,
+        )
+        .ok(),
+        LOWBIT_ROCMFP2_MIX => model_store::dmix2::row_bytes(
+            model_store::dmix2::GGML_TYPE_Q2_1_ROCMFP2_MIX,
+            cols,
+        )
+        .ok(),
         LOWBIT_GQH3 => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh3, cols),
         LOWBIT_GQH2_H => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh2H, cols),
         LOWBIT_GQH2_C => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh2C, cols),
@@ -200,6 +213,8 @@ pub fn infer_lowbit_type(weight: &GpuBuffer, logical_cols: usize, native_int4: b
         LOWBIT_GGML_Q4_K,
         LOWBIT_GGML_Q5_K,
         LOWBIT_GGML_Q6_K,
+        LOWBIT_ROCMFP3_MIX,
+        LOWBIT_ROCMFP2_MIX,
         LOWBIT_GQH3,
         LOWBIT_GQH2_H,
         LOWBIT_GQH2_C,
@@ -213,6 +228,10 @@ pub fn infer_lowbit_type(weight: &GpuBuffer, logical_cols: usize, native_int4: b
 
 pub fn is_gqh_qtype(qtype: i32) -> bool {
     kernel_ffi::gqh::rung_from_ggml_type(qtype as u32).is_some()
+}
+
+pub fn is_mix_qtype(qtype: i32) -> bool {
+    qtype == LOWBIT_ROCMFP3_MIX || qtype == LOWBIT_ROCMFP2_MIX
 }
 
 /// GQH fused dequant-matmul using the header registered against `weight`.
@@ -249,6 +268,34 @@ pub fn matmul_gqh(
         tensor_scale,
         grid_code,
         rung,
+        out,
+    )
+}
+
+/// Mix (105/106) fused dequant-matmul. Same f32 activation convention as GQH.
+pub fn matmul_mix(
+    ordinal: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    weight: &GpuBuffer,
+    qtype: i32,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let mix = kernel_ffi::gqh::lookup_mix(weight.as_ptr()).ok_or_else(|| {
+        GpuError::InvalidArg("mix sidecar not registered for weight buffer".into())
+    })?;
+    kernel_ffi::prefill_ffi::matmul_rhs_transposed_mix(
+        ordinal,
+        m,
+        n,
+        k,
+        lhs,
+        weight,
+        mix.mode,
+        &mix.lut,
+        qtype,
         out,
     )
 }

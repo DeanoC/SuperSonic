@@ -9,6 +9,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
+use crate::dmix2::{self, MixHeader};
 use crate::gqh::{self, GqhHeader, GqhRung};
 use crate::Error;
 
@@ -16,6 +17,7 @@ const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q2_K: u32 = 10;
+const GGML_TYPE_Q3_K: u32 = 11;
 const GGML_TYPE_Q4_K: u32 = 12;
 const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
@@ -35,6 +37,7 @@ pub struct GgufFile {
     data_offset: usize,
     kv: BTreeMap<String, String>,
     gqh_headers: BTreeMap<String, GqhHeader>,
+    mix_headers: BTreeMap<String, MixHeader>,
 }
 
 impl GgufFile {
@@ -59,6 +62,7 @@ impl GgufFile {
         let mut alignment = 32usize;
         let mut kv = BTreeMap::new();
         let mut gqh_headers = BTreeMap::new();
+        let mut mix_headers = BTreeMap::new();
         for _ in 0..metadata_count {
             let key = cursor.read_string()?;
             let value_type = cursor.read_u32()?;
@@ -69,6 +73,7 @@ impl GgufFile {
                 &mut alignment,
                 &mut kv,
                 &mut gqh_headers,
+                &mut mix_headers,
             )?;
         }
         if alignment == 0 {
@@ -123,6 +128,7 @@ impl GgufFile {
             data_offset,
             kv,
             gqh_headers,
+            mix_headers,
         })
     }
 
@@ -162,6 +168,10 @@ impl GgufFile {
     pub fn gqh_header_count(&self) -> usize {
         self.gqh_headers.len()
     }
+
+    pub fn mix_header(&self, name: &str) -> Option<&MixHeader> {
+        self.mix_headers.get(name)
+    }
 }
 
 pub fn tensor_nbytes(dims: &[usize], tensor_type: u32) -> Result<usize, Error> {
@@ -178,7 +188,20 @@ pub fn tensor_nbytes(dims: &[usize], tensor_type: u32) -> Result<usize, Error> {
             .ok_or_else(|| Error::Other("16-bit tensor byte size overflows".into())),
         GGML_TYPE_Q8_0 => kquant_nbytes(dims, 32, 34, "Q8_0"),
         GGML_TYPE_Q2_K => kquant_nbytes(dims, 256, 84, "Q2_K"),
+        GGML_TYPE_Q3_K => kquant_nbytes(dims, 256, 110, "Q3_K"),
         GGML_TYPE_Q4_K => kquant_nbytes(dims, 256, 144, "Q4_K"),
+        t if dmix2::block_bytes(t).is_some() => {
+            if dims.len() != 2 {
+                return Err(Error::Other(format!(
+                    "mix tensor must be rank-2, got {dims:?}"
+                )));
+            }
+            dmix2::row_bytes(t, dims[0]).and_then(|row| {
+                dims[1]
+                    .checked_mul(row)
+                    .ok_or_else(|| Error::Other("mix tensor byte size overflows".into()))
+            })
+        }
         GGML_TYPE_Q5_K => kquant_nbytes(dims, 256, 176, "Q5_K"),
         GGML_TYPE_Q6_K => kquant_nbytes(dims, 256, 210, "Q6_K"),
         t if GqhRung::from_ggml_type(t).is_some() => {
@@ -290,6 +313,7 @@ fn read_metadata(
     alignment: &mut usize,
     kv: &mut BTreeMap<String, String>,
     gqh_headers: &mut BTreeMap<String, GqhHeader>,
+    mix_headers: &mut BTreeMap<String, MixHeader>,
 ) -> Result<(), Error> {
     match value_type {
         0 | 1 => {
@@ -330,9 +354,20 @@ fn read_metadata(
                 for (name, header) in gqh::parse_gqh_headers_kv(&blob)? {
                     gqh_headers.insert(name, header);
                 }
+            } else if key == dmix2::DMIX2_KV && elem_type == 0 {
+                let blob = cursor.take(len)?.to_vec();
+                *mix_headers = dmix2::parse_dmix2_kv(&blob)?;
             } else {
                 for _ in 0..len {
-                    read_metadata(cursor, elem_type, "", alignment, kv, gqh_headers)?;
+                    read_metadata(
+                        cursor,
+                        elem_type,
+                        "",
+                        alignment,
+                        kv,
+                        gqh_headers,
+                        mix_headers,
+                    )?;
                 }
             }
         }

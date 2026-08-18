@@ -434,6 +434,13 @@ fn matmul_proj(
         return qwen35::weights::matmul_gqh(ordinal, m, n, k, lhs, weight, qtype, out)
             .map_err(|e| anyhow::anyhow!("matmul_gqh: {e}"));
     }
+    if qwen35::weights::is_mix_qtype(qtype) {
+        if batch != 1 {
+            anyhow::bail!("mix matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
+        }
+        return qwen35::weights::matmul_mix(ordinal, m, n, k, lhs, weight, qtype, out)
+            .map_err(|e| anyhow::anyhow!("matmul_mix: {e}"));
+    }
     if qtype != 0 {
         let sc = int4_scale.unwrap_or(weight);
         let zr = int4_zero.unwrap_or(weight);
@@ -503,6 +510,20 @@ fn prefill_lm_head_lowbit(
             out,
         )
         .map_err(|e| anyhow::anyhow!("{label} gqh: {e}"))?;
+        return Ok(true);
+    }
+    if qwen35::weights::is_mix_qtype(qtype) {
+        qwen35::weights::matmul_mix(
+            ordinal,
+            count,
+            vocab_size,
+            hidden_dim,
+            lhs,
+            &*weights.lm_head,
+            qtype,
+            out,
+        )
+        .map_err(|e| anyhow::anyhow!("{label} mix: {e}"))?;
         return Ok(true);
     }
     if !maybe_matmul_q6_k_mmq_lm_head(

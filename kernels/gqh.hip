@@ -527,3 +527,126 @@ __global__ void gqh2c_matvec_kernel(
         y[(int64_t)col * y_col_stride + row] = acc;
     }
 }
+
+// Dense ROCmFPX mix (qtype 105/106). One warp per row, lanes stride 32-weight
+// blocks. Decode matches lucebox rocmfp{2,3}_mix: mode 0 uses fixed levels,
+// mode 1 uses the 2-book sidecar LUT. Product is s * w * x folded into acc.
+#define MIX_QK 32
+#define MIX_FP3_QS 12
+#define MIX_FP3_BYTES 14
+#define MIX_FP2_QS 8
+#define MIX_FP2_BYTES 10
+
+static __device__ __forceinline__ float mix_ue4m3(uint8_t e) {
+    if (e > 0x7e) {
+        return 0.0f;
+    }
+    const int exp = e >> 3;
+    const int mant = e & 7;
+    if (exp == 0) {
+        return (float)mant * 0.0009765625f;
+    }
+    return ldexpf((float)(8 + mant), exp - 11);
+}
+
+static __device__ __forceinline__ uint32_t mix_fp3_code(const uint8_t* qs, int i) {
+    const int bit = i * 3;
+    const int byte = bit >> 3;
+    const int shift = bit & 7;
+    uint32_t v = qs[byte];
+    if (byte + 1 < MIX_FP3_QS) {
+        v |= (uint32_t)qs[byte + 1] << 8;
+    }
+    if (byte + 2 < MIX_FP3_QS) {
+        v |= (uint32_t)qs[byte + 2] << 16;
+    }
+    return (v >> shift) & 7u;
+}
+
+static __device__ __forceinline__ float mix_fp3_fixed(uint32_t code) {
+    const uint32_t m = code & 3u;
+    const int mag = (m == 3u) ? 4 : (int)m;
+    return (code & 4u) ? -(float)mag : (float)mag;
+}
+
+static __device__ __forceinline__ uint32_t mix_fp2_code(const uint8_t* qs, int i) {
+    return (uint32_t)(qs[i >> 2] >> (2 * (i & 3))) & 3u;
+}
+
+static __device__ __forceinline__ float mix_fp2_fixed(uint32_t code) {
+    return (float)((int)code - 1);
+}
+
+template <bool IS_FP3, bool kAcc>
+__global__ void gqh_mix_matvec_kernel(
+    const uint8_t* __restrict__ data,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int in,
+    int out,
+    int mode,
+    float4 lut0,
+    float4 lut1,
+    float4 lut2,
+    float4 lut3,
+    int64_t x_col_stride,
+    int64_t y_col_stride) {
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int row = blockIdx.x * warps_per_block + (threadIdx.x / GQH_WARP);
+    const int lane = threadIdx.x % GQH_WARP;
+    const int col = blockIdx.y;
+    if (row >= out) {
+        return;
+    }
+    const int blk_bytes = IS_FP3 ? MIX_FP3_BYTES : MIX_FP2_BYTES;
+    const int nsb = in / MIX_QK;
+    const uint8_t* __restrict__ rowbase = data + (int64_t)row * nsb * blk_bytes;
+    const float* __restrict__ xc = x + (int64_t)col * x_col_stride;
+    const int klev = IS_FP3 ? 8 : 4;
+    float lut[16] = {
+        lut0.x, lut0.y, lut0.z, lut0.w, lut1.x, lut1.y, lut1.z, lut1.w,
+        lut2.x, lut2.y, lut2.z, lut2.w, lut3.x, lut3.y, lut3.z, lut3.w};
+    float acc = 0.0f;
+    for (int b = lane; b < nsb; b += GQH_WARP) {
+        const uint8_t* __restrict__ blk = rowbase + (int64_t)b * blk_bytes;
+        const uint8_t m0 = blk[IS_FP3 ? MIX_FP3_QS : MIX_FP2_QS];
+        const uint8_t m1 = blk[(IS_FP3 ? MIX_FP3_QS : MIX_FP2_QS) + 1];
+        const float* xs = xc + b * MIX_QK;
+        if (mode == 0) {
+            const float s0 = mix_ue4m3(m0);
+            const float s1 = mix_ue4m3(m1);
+#pragma unroll
+            for (int j = 0; j < MIX_QK; ++j) {
+                const float s = (j < MIX_QK / 2) ? s0 : s1;
+                const float w = IS_FP3 ? mix_fp3_fixed(mix_fp3_code(blk, j))
+                                       : mix_fp2_fixed(mix_fp2_code(blk, j));
+                acc += (s * w) * xs[j];
+            }
+        } else {
+            const float s0 = mix_ue4m3(m0 & 0x7f);
+            const float s1 = mix_ue4m3(m1 & 0x7f);
+            const float* bk0 = lut + ((m0 >> 7) * klev);
+            const float* bk1 = lut + ((m1 >> 7) * klev);
+#pragma unroll
+            for (int j = 0; j < MIX_QK; ++j) {
+                const float s = (j < MIX_QK / 2) ? s0 : s1;
+                const float* bk = (j < MIX_QK / 2) ? bk0 : bk1;
+                const int code = IS_FP3 ? (int)mix_fp3_code(blk, j)
+                                        : (int)mix_fp2_code(blk, j);
+                acc += (s * bk[code]) * xs[j];
+            }
+        }
+    }
+#pragma unroll
+    for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
+        acc += gqh_warp_shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        const int64_t yi = (int64_t)col * y_col_stride + row;
+        if constexpr (kAcc) {
+            y[yi] = gqh_bf16_round(y[yi] + gqh_bf16_round(acc));
+        } else {
+            y[yi] = acc;
+        }
+    }
+}

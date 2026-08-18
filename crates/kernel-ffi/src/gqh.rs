@@ -24,6 +24,39 @@ fn header_map() -> &'static Mutex<HashMap<usize, RegisteredHeader>> {
 }
 
 /// Record the GQH header for a packed device buffer. Keyed by `GpuBuffer::as_ptr()`.
+#[derive(Clone, Copy, Debug)]
+pub struct RegisteredMix {
+    pub qtype: i32,
+    pub mode: i32,
+    pub lut: [f32; 16],
+}
+
+fn mix_map() -> &'static Mutex<HashMap<usize, RegisteredMix>> {
+    static MAP: OnceLock<Mutex<HashMap<usize, RegisteredMix>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn register_mix(ptr: *const c_void, qtype: i32, mode: i32, lut: [f32; 16]) {
+    if ptr.is_null() {
+        return;
+    }
+    mix_map()
+        .lock()
+        .expect("mix registry")
+        .insert(ptr as usize, RegisteredMix { qtype, mode, lut });
+}
+
+pub fn lookup_mix(ptr: *const c_void) -> Option<RegisteredMix> {
+    if ptr.is_null() {
+        return None;
+    }
+    mix_map()
+        .lock()
+        .expect("mix registry")
+        .get(&(ptr as usize))
+        .copied()
+}
+
 pub fn register_header(ptr: *const c_void, tensor_scale: f32, grid_code: u8) {
     if ptr.is_null() {
         return;
@@ -68,6 +101,21 @@ unsafe extern "C" {
         dst: *mut c_void,
         rows: c_int,
         cols: c_int,
+    ) -> c_int;
+
+    fn supersonic_gqh_hip_mix_matvec_stream(
+        device_ordinal: c_int,
+        qtype: c_int,
+        wire: *const c_void,
+        x: *const c_void,
+        y: *mut c_void,
+        in_dim: c_int,
+        out_dim: c_int,
+        ncols: c_int,
+        acc: c_int,
+        mode: c_int,
+        lut: *const f32,
+        stream: *mut c_void,
     ) -> c_int;
 
     fn supersonic_gqh_hip_matvec(
@@ -230,6 +278,69 @@ pub fn matvec(
     };
     if status != 0 {
         return Err(backend_error(backend, "gqh matvec", status));
+    }
+    Ok(())
+}
+
+/// Fused mix (105/106) matvec. `lut` is 16 f32 levels (unused slots ignored).
+pub fn mix_matvec(
+    ordinal: usize,
+    qtype: i32,
+    wire: &GpuBuffer,
+    x: &GpuBuffer,
+    y: &mut GpuBuffer,
+    in_dim: usize,
+    out_dim: usize,
+    ncols: usize,
+    acc: bool,
+    mode: i32,
+    lut: &[f32; 16],
+) -> Result<(), GpuError> {
+    if in_dim == 0 || in_dim % 32 != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "mix matvec in_dim {in_dim} is not a multiple of 32"
+        )));
+    }
+    if x.dtype() != ScalarType::F32 || y.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "mix matvec x/y must be f32, got {:?}/{:?}",
+            x.dtype(),
+            y.dtype()
+        )));
+    }
+    let backend = y.backend();
+    let status = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                supersonic_gqh_hip_mix_matvec_stream(
+                    ordinal as c_int,
+                    qtype as c_int,
+                    wire.as_ptr(),
+                    x.as_ptr(),
+                    y.as_mut_ptr(),
+                    in_dim as c_int,
+                    out_dim as c_int,
+                    ncols as c_int,
+                    if acc { 1 } else { 0 },
+                    mode as c_int,
+                    lut.as_ptr(),
+                    std::ptr::null_mut(),
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
+            }
+        }
+        other => {
+            return Err(GpuError::Unsupported(format!(
+                "mix matvec is HIP-only, got {other:?}"
+            )));
+        }
+    };
+    if status != 0 {
+        return Err(backend_error(backend, "mix matvec", status));
     }
     Ok(())
 }

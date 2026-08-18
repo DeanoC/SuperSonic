@@ -1,9 +1,11 @@
 pub mod baker;
+pub mod dmix2;
 pub mod fetch;
 pub mod flm;
 pub mod gguf;
 pub mod gqh;
 pub mod q2k;
+pub mod q3k;
 pub mod manifest;
 pub mod store;
 pub mod transforms;
