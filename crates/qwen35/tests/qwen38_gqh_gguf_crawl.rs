@@ -726,3 +726,129 @@ fn rung10_linear_layer0_norm_projs_mlp() {
     );
 }
 
+fn gguf_8192_path() -> Option<PathBuf> {
+    let path = PathBuf::from("/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf");
+    path.is_file().then_some(path)
+}
+
+#[test]
+fn mix105_onehot_matches_cpu_decode() {
+    let Some(path) = gguf_8192_path() else {
+        return;
+    };
+    let Some(ordinal) = require_hip() else {
+        return;
+    };
+    let file = GgufFile::open(&path).expect("open 8192");
+    let name = "blk.21.ssm_out.weight";
+    let t = file.tensor(name).expect("ssm_out");
+    assert_eq!(t.tensor_type, 105);
+    let cols = t.dims[0];
+    let rows = 4usize;
+    let header = file.mix_header(name).expect("dmix2").clone();
+    assert_eq!(header.mode, 1);
+    let packed_all = file.tensor_bytes(name).expect("bytes");
+    let row_b = model_store::dmix2::row_bytes(105, cols).expect("row");
+    let packed = &packed_all[..row_b * rows];
+    let mut want = vec![0.0f32; rows];
+    let mut x = vec![0.0f32; cols];
+    x[0] = 1.0;
+    x[17] = 1.0;
+    x[100] = 1.0;
+    for r in 0..rows {
+        let mut wrow = vec![0.0f32; cols];
+        model_store::dmix2::decode_row(
+            105,
+            &packed[r * row_b..(r + 1) * row_b],
+            cols,
+            &header,
+            &mut wrow,
+        )
+        .expect("cpu decode");
+        want[r] = wrow[0] + wrow[17] + wrow[100];
+    }
+    let x_buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[cols], &{
+        x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()
+    })
+    .expect("x");
+    let w_buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_b], packed)
+        .expect("w");
+    kernel_ffi::gqh::register_mix(w_buf.as_ptr(), 105, header.mode, header.lut);
+    let mut y = GpuBuffer::zeros(ordinal, ScalarType::F32, &[rows]).expect("y");
+    kernel_ffi::gqh::mix_matvec(
+        ordinal,
+        105,
+        &w_buf,
+        &x_buf,
+        &mut y,
+        cols,
+        rows,
+        1,
+        false,
+        header.mode,
+        &header.lut,
+    )
+    .expect("hip mix");
+    let got_bytes = y.to_host_bytes().expect("d2h");
+    let got: Vec<f32> = got_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        let den = w.abs().max(1e-6);
+        assert!(
+            (g - w).abs() / den < 1e-5,
+            "mix105 [{i}] got {g} want {w}"
+        );
+    }
+
+    // Full-row ones vector: stresses the warp-tree vs sequential fold.
+    let x1 = vec![1.0f32; cols];
+    let mut want1 = vec![0.0f32; rows];
+    for r in 0..rows {
+        let mut wrow = vec![0.0f32; cols];
+        model_store::dmix2::decode_row(
+            105,
+            &packed[r * row_b..(r + 1) * row_b],
+            cols,
+            &header,
+            &mut wrow,
+        )
+        .expect("cpu decode ones");
+        want1[r] = wrow.iter().sum();
+    }
+    let x1_buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[cols], &{
+        x1.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()
+    })
+    .expect("x1");
+    let mut y1 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[rows]).expect("y1");
+    kernel_ffi::gqh::mix_matvec(
+        ordinal,
+        105,
+        &w_buf,
+        &x1_buf,
+        &mut y1,
+        cols,
+        rows,
+        1,
+        false,
+        header.mode,
+        &header.lut,
+    )
+    .expect("hip mix ones");
+    let got1: Vec<f32> = y1
+        .to_host_bytes()
+        .expect("d2h ones")
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (g, w)) in got1.iter().zip(&want1).enumerate() {
+        let den = w.abs().max(1.0);
+        assert!(
+            (g - w).abs() / den < 1e-4,
+            "mix105 ones [{i}] got {g} want {w} rel {}",
+            (g - w).abs() / den
+        );
+    }
+}
+

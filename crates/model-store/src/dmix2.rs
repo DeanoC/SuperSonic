@@ -66,6 +66,105 @@ pub fn sidecar_bytes(h: &MixHeader) -> [u8; 72] {
     out
 }
 
+fn mix_ue4m3(e: u8) -> f32 {
+    if e > 0x7e {
+        return 0.0;
+    }
+    let exp = e >> 3;
+    let mant = e & 7;
+    if exp == 0 {
+        return f32::from(mant) * 0.0009765625;
+    }
+    f32::from(8 + mant) * 2f32.powi(i32::from(exp) - 11)
+}
+
+fn mix_fp3_code(qs: &[u8], i: usize) -> u32 {
+    let bit = i * 3;
+    let byte = bit >> 3;
+    let shift = bit & 7;
+    let mut v = u32::from(qs[byte]);
+    if byte + 1 < MIX_FP3_BLOCK_BYTES - 2 {
+        v |= u32::from(qs[byte + 1]) << 8;
+    }
+    if byte + 2 < MIX_FP3_BLOCK_BYTES - 2 {
+        v |= u32::from(qs[byte + 2]) << 16;
+    }
+    (v >> shift) & 7
+}
+
+fn mix_fp3_fixed(code: u32) -> f32 {
+    let m = code & 3;
+    let mag = if m == 3 { 4 } else { m as i32 };
+    if code & 4 != 0 {
+        -(mag as f32)
+    } else {
+        mag as f32
+    }
+}
+
+fn mix_fp2_code(qs: &[u8], i: usize) -> u32 {
+    u32::from(qs[i >> 2] >> (2 * (i & 3))) & 3
+}
+
+fn mix_fp2_fixed(code: u32) -> f32 {
+    (code as i32 - 1) as f32
+}
+
+/// Dequantize one output row of a dense 105/106 tensor.
+pub fn decode_row(
+    qtype: u32,
+    packed: &[u8],
+    cols: usize,
+    header: &MixHeader,
+    out: &mut [f32],
+) -> Result<(), Error> {
+    let row = row_bytes(qtype, cols)?;
+    if packed.len() != row {
+        return Err(Error::Other(format!(
+            "mix packed row is {} B, expected {row} B",
+            packed.len()
+        )));
+    }
+    if out.len() != cols {
+        return Err(Error::Other(format!(
+            "mix decode out len {} != cols {cols}",
+            out.len()
+        )));
+    }
+    let blk = block_bytes(qtype).unwrap();
+    let qs_len = blk - 2;
+    let klev = header.k as usize;
+    let nsb = cols / MIX_QK;
+    for sb in 0..nsb {
+        let b = &packed[sb * blk..(sb + 1) * blk];
+        let m0 = b[qs_len];
+        let m1 = b[qs_len + 1];
+        for j in 0..MIX_QK {
+            let meta = if j < MIX_QK / 2 { m0 } else { m1 };
+            let code = if qtype == GGML_TYPE_Q3_1_ROCMFP3_MIX {
+                mix_fp3_code(b, j)
+            } else {
+                mix_fp2_code(b, j)
+            };
+            let w = if header.mode == 0 {
+                let s = mix_ue4m3(meta);
+                let lvl = if qtype == GGML_TYPE_Q3_1_ROCMFP3_MIX {
+                    mix_fp3_fixed(code)
+                } else {
+                    mix_fp2_fixed(code)
+                };
+                s * lvl
+            } else {
+                let s = mix_ue4m3(meta & 0x7f);
+                let bk = (meta >> 7) as usize;
+                s * header.lut[bk * klev + code as usize]
+            };
+            out[sb * MIX_QK + j] = w;
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_dmix2_kv(blob: &[u8]) -> Result<BTreeMap<String, MixHeader>, Error> {
     if blob.len() < 16 {
         return Err(Error::Other(format!(

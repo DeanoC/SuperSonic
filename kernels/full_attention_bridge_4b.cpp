@@ -314,6 +314,27 @@ bool load_gqh_mlp_hdrs(
                 ++lin_gqh;
             } else if (ggml_k_qtype(m.lin_out.qtype)) {
                 ++lin_ggml;
+            } else if (mix_qtype(m.lin_out.qtype)) {
+                std::fprintf(
+                    stderr,
+                    "[gqh-gemv] mix lin L%d qt=%d mode=%d k=%d lut0=%.6g lut7=%.6g\n",
+                    li,
+                    m.lin_out.qtype,
+                    m.lin_out.mix_mode,
+                    m.lin_out.mix_k,
+                    m.lin_out.mix_lut[0],
+                    m.lin_out.mix_lut[7]);
+            }
+            if (mix_qtype(cache->down[li].qtype)) {
+                std::fprintf(
+                    stderr,
+                    "[gqh-gemv] mix down L%d qt=%d mode=%d k=%d lut0=%.6g lut3=%.6g\n",
+                    li,
+                    cache->down[li].qtype,
+                    cache->down[li].mix_mode,
+                    cache->down[li].mix_k,
+                    cache->down[li].mix_lut[0],
+                    cache->down[li].mix_lut[3]);
             }
             if (proj_can_gemv(m.a) && proj_can_gemv(m.b)) {
                 ++lin_ab;
