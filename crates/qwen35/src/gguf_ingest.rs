@@ -123,15 +123,18 @@ pub fn expected_gguf_names(config: &TextConfig) -> Vec<MappedTensor> {
                 LayerKind::Linear,
                 Some(idx),
             ));
+            // llama.cpp / GGUF: ssm_beta = sigmoid forget (HF in_proj_b),
+            // ssm_alpha = softplus decay (HF in_proj_a). SuperSonic names
+            // follow the HF roles.
             out.push(map(
                 &format!("layers.{idx}.linear_attn.in_proj_b"),
-                &format!("{prefix}.ssm_alpha.weight"),
+                &format!("{prefix}.ssm_beta.weight"),
                 LayerKind::Linear,
                 Some(idx),
             ));
             out.push(map(
                 &format!("layers.{idx}.linear_attn.in_proj_a"),
-                &format!("{prefix}.ssm_beta.weight"),
+                &format!("{prefix}.ssm_alpha.weight"),
                 LayerKind::Linear,
                 Some(idx),
             ));
@@ -441,7 +444,11 @@ fn load_a_log_exp(file: &GgufFile, name: &str, ordinal: usize) -> Result<GpuBuff
     }
     let mut bf = Vec::with_capacity(data.len() / 2);
     for chunk in data.chunks_exact(4) {
-        let v = f32::from_le_bytes(chunk.try_into().unwrap()).exp();
+        // GGUF / llama.cpp store ssm_a as -exp(A_log). SuperSonic's
+        // compute_beta_g does g = -softplus(A+dt) * a_log_exp, so the
+        // device slot must be +exp(A_log) = -ssm_a. Do not exp() here:
+        // that would treat the already-transformed value as raw A_log.
+        let v = -f32::from_le_bytes(chunk.try_into().unwrap());
         bf.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
     }
     GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[bf.len() / 2], &bf).map_err(Into::into)
@@ -626,7 +633,7 @@ pub fn load_weights(
                     qkvz_proj_w: None,
                     b_proj_w: upload_packed(
                         file,
-                        &format!("{blk}.ssm_alpha.weight"),
+                        &format!("{blk}.ssm_beta.weight"),
                         ordinal,
                         &mut headers,
             &mut mix_headers,
@@ -634,7 +641,7 @@ pub fn load_weights(
                     )?,
                     a_proj_w: upload_packed(
                         file,
-                        &format!("{blk}.ssm_beta.weight"),
+                        &format!("{blk}.ssm_alpha.weight"),
                         ordinal,
                         &mut headers,
             &mut mix_headers,
