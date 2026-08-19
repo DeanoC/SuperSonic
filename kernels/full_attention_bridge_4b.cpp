@@ -208,7 +208,10 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
     int grid_a,
     int grid_b,
     int fuse_swiglu,
-    void* stream);
+    void* stream,
+    int ncols,
+    int64_t x_col_stride,
+    int64_t y_col_stride);
 
 namespace {
 
@@ -271,6 +274,8 @@ struct GqhMixerLayer {
     int kv_max_t = 0;
     int attn_head_dim = 0;
     int attn_kv_heads = 0;
+    const void* q_norm_w = nullptr;
+    const void* k_norm_w = nullptr;
     void* conv_state = nullptr;
     const void* conv1d_w = nullptr;
     int conv_kernel_size = 0;
@@ -397,6 +402,8 @@ bool load_gqh_mlp_hdrs(
         m.kv_max_t = L.kv_max_t;
         m.attn_head_dim = L.attn_head_dim;
         m.attn_kv_heads = L.attn_num_kv_heads;
+        m.q_norm_w = L.q_norm_w;
+        m.k_norm_w = L.k_norm_w;
         m.conv_state = L.conv_state;
         m.conv1d_w = L.conv1d_w;
         m.conv_kernel_size = L.conv_kernel_size;
@@ -618,7 +625,19 @@ hipError_t launch_gqh_gemv(
     float* y,
     int in_dim,
     int out_dim,
-    hipStream_t stream) {
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t x_col_stride = 0,
+    int64_t y_col_stride = 0) {
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    if (x_col_stride <= 0) {
+        x_col_stride = in_dim;
+    }
+    if (y_col_stride <= 0) {
+        y_col_stride = out_dim;
+    }
     const int st = supersonic_gqh_hip_matvec_stream(
         ordinal,
         h.rung,
@@ -627,9 +646,9 @@ hipError_t launch_gqh_gemv(
         y,
         in_dim,
         out_dim,
-        1,
-        in_dim,
-        out_dim,
+        ncols,
+        x_col_stride,
+        y_col_stride,
         h.scale,
         h.grid,
         stream);
@@ -647,9 +666,21 @@ hipError_t launch_gqh_gemv_pair(
     int out_a,
     int out_b,
     hipStream_t stream,
-    bool fuse_swiglu = false) {
+    bool fuse_swiglu = false,
+    int ncols = 1,
+    int64_t x_col_stride = 0,
+    int64_t y_col_stride = 0) {
     if (a.rung < 0 || b.rung < 0 || a.wire == nullptr || b.wire == nullptr) {
         return hipErrorInvalidValue;
+    }
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    if (x_col_stride <= 0) {
+        x_col_stride = in_dim;
+    }
+    if (y_col_stride <= 0) {
+        y_col_stride = out_a > 0 ? out_a : in_dim;
     }
     const int st = supersonic_gqh_hip_matvec_stream_pair(
         ordinal,
@@ -668,7 +699,10 @@ hipError_t launch_gqh_gemv_pair(
         a.grid,
         b.grid,
         fuse_swiglu ? 1 : 0,
-        stream);
+        stream,
+        ncols,
+        x_col_stride,
+        y_col_stride);
     return st == 0 ? hipSuccess : hipErrorInvalidValue;
 }
 
@@ -713,7 +747,19 @@ hipError_t launch_gqh_gemv_acc(
     float* y,
     int in_dim,
     int out_dim,
-    hipStream_t stream) {
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t x_col_stride = 0,
+    int64_t y_col_stride = 0) {
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    if (x_col_stride <= 0) {
+        x_col_stride = in_dim;
+    }
+    if (y_col_stride <= 0) {
+        y_col_stride = out_dim;
+    }
     const int st = supersonic_gqh_hip_matvec_stream_acc(
         ordinal,
         h.rung,
@@ -722,26 +768,51 @@ hipError_t launch_gqh_gemv_acc(
         y,
         in_dim,
         out_dim,
-        1,
-        in_dim,
-        out_dim,
+        ncols,
+        x_col_stride,
+        y_col_stride,
         h.scale,
         h.grid,
         stream);
     return st == 0 ? hipSuccess : hipErrorInvalidValue;
 }
 
-void launch_round_f32(float* y, int n, hipStream_t stream) {
+void launch_round_f32(
+    float* y,
+    int n,
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t col_stride = 0) {
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    const int64_t stride = col_stride > 0 ? col_stride : static_cast<int64_t>(n);
+    if (ncols == 1 || stride == static_cast<int64_t>(n)) {
+        const int total = n * ncols;
+        const int bs = 256;
+        const int gs = (total + bs - 1) / bs;
+        hipLaunchKernelGGL(
+            supersonic_qwen35_bf16_round_f32_kernel,
+            dim3(static_cast<unsigned int>(gs)),
+            dim3(bs),
+            0,
+            stream,
+            y,
+            total);
+        return;
+    }
     const int bs = 256;
     const int gs = (n + bs - 1) / bs;
-    hipLaunchKernelGGL(
-        supersonic_qwen35_bf16_round_f32_kernel,
-        dim3(static_cast<unsigned int>(gs)),
-        dim3(bs),
-        0,
-        stream,
-        y,
-        n);
+    for (int c = 0; c < ncols; ++c) {
+        hipLaunchKernelGGL(
+            supersonic_qwen35_bf16_round_f32_kernel,
+            dim3(static_cast<unsigned int>(gs)),
+            dim3(bs),
+            0,
+            stream,
+            y + static_cast<int64_t>(c) * stride,
+            n);
+    }
 }
 
 void launch_add_round_f32(float* dst, const float* add, int n, hipStream_t stream) {
@@ -770,6 +841,130 @@ struct DecodeRecScratch {
 DecodeRecScratch& decode_rec_scratch() {
     static DecodeRecScratch s;
     return s;
+}
+
+// Per-token linear (conv+rec) snapshots for fused B>1 MTP verify. After a
+// partial accept we restore prefix `commit_len` instead of replaying the
+// trunk sequentially. Rec is copied after each token in the layer B-loop;
+// conv is written inside the rec-prep kernel after each col.
+struct MtpPrefixSnap {
+    static constexpr int kMaxB = 8;
+    static constexpr int kMaxLayers = 80;
+    float* rec[kMaxB][kMaxLayers]{};
+    hip_bfloat16* conv[kMaxB][kMaxLayers]{};
+    void* rec_live[kMaxLayers]{};
+    void* conv_live[kMaxLayers]{};
+    size_t rec_bytes[kMaxLayers]{};
+    size_t conv_bytes[kMaxLayers]{};
+    int n_layers = 0;
+    int n_b = 0;
+    bool ready = false;
+    float* rec_slab = nullptr;
+    hip_bfloat16* conv_slab = nullptr;
+    size_t rec_slab_bytes = 0;
+    size_t conv_slab_bytes = 0;
+};
+
+MtpPrefixSnap& mtp_prefix_snap() {
+    static MtpPrefixSnap s;
+    return s;
+}
+
+hipError_t ensure_mtp_prefix_snap(
+    const GqhMlpHdrs& hdrs, int n_layers, int n_b) {
+    MtpPrefixSnap& s = mtp_prefix_snap();
+    if (n_layers <= 0 || n_layers > MtpPrefixSnap::kMaxLayers || n_b < 2 ||
+        n_b > MtpPrefixSnap::kMaxB) {
+        s.ready = false;
+        return hipErrorInvalidValue;
+    }
+    size_t rec_need = 0;
+    size_t conv_need = 0;
+    size_t rec_bytes[MtpPrefixSnap::kMaxLayers]{};
+    size_t conv_bytes[MtpPrefixSnap::kMaxLayers]{};
+    for (int layer = 0; layer < n_layers; ++layer) {
+        const GqhMixerLayer& mx = hdrs.mix[layer];
+        if (mx.layer_type != 0 || mx.recurrent_state == nullptr ||
+            mx.conv_state == nullptr || mx.nv <= 0 || mx.hkd <= 0 ||
+            mx.hvd <= 0 || mx.qkv_out <= 0) {
+            continue;
+        }
+        rec_bytes[layer] = static_cast<size_t>(mx.nv) *
+            static_cast<size_t>(mx.hkd) * static_cast<size_t>(mx.hvd) *
+            sizeof(float);
+        conv_bytes[layer] = static_cast<size_t>(mx.qkv_out) * 3 *
+            sizeof(hip_bfloat16);
+        rec_need += rec_bytes[layer];
+        conv_need += conv_bytes[layer];
+    }
+    rec_need *= static_cast<size_t>(n_b);
+    conv_need *= static_cast<size_t>(n_b);
+    if (rec_need == 0 || conv_need == 0) {
+        s.ready = false;
+        return hipSuccess;
+    }
+    if (s.rec_slab == nullptr || s.rec_slab_bytes < rec_need) {
+        if (s.rec_slab != nullptr) {
+            (void)hipFree(s.rec_slab);
+            s.rec_slab = nullptr;
+            s.rec_slab_bytes = 0;
+        }
+        float* p = nullptr;
+        hipError_t err = hipMalloc(&p, rec_need);
+        if (err != hipSuccess) {
+            s.ready = false;
+            return err;
+        }
+        s.rec_slab = p;
+        s.rec_slab_bytes = rec_need;
+    }
+    if (s.conv_slab == nullptr || s.conv_slab_bytes < conv_need) {
+        if (s.conv_slab != nullptr) {
+            (void)hipFree(s.conv_slab);
+            s.conv_slab = nullptr;
+            s.conv_slab_bytes = 0;
+        }
+        hip_bfloat16* p = nullptr;
+        hipError_t err = hipMalloc(&p, conv_need);
+        if (err != hipSuccess) {
+            s.ready = false;
+            return err;
+        }
+        s.conv_slab = p;
+        s.conv_slab_bytes = conv_need;
+    }
+    for (int layer = 0; layer < MtpPrefixSnap::kMaxLayers; ++layer) {
+        for (int b = 0; b < MtpPrefixSnap::kMaxB; ++b) {
+            s.rec[b][layer] = nullptr;
+            s.conv[b][layer] = nullptr;
+        }
+        s.rec_live[layer] = nullptr;
+        s.conv_live[layer] = nullptr;
+        s.rec_bytes[layer] = 0;
+        s.conv_bytes[layer] = 0;
+    }
+    char* rec_cur = reinterpret_cast<char*>(s.rec_slab);
+    char* conv_cur = reinterpret_cast<char*>(s.conv_slab);
+    for (int layer = 0; layer < n_layers; ++layer) {
+        const GqhMixerLayer& mx = hdrs.mix[layer];
+        s.rec_live[layer] = mx.recurrent_state;
+        s.conv_live[layer] = mx.conv_state;
+        s.rec_bytes[layer] = rec_bytes[layer];
+        s.conv_bytes[layer] = conv_bytes[layer];
+        if (rec_bytes[layer] == 0) {
+            continue;
+        }
+        for (int b = 0; b < n_b; ++b) {
+            s.rec[b][layer] = reinterpret_cast<float*>(rec_cur);
+            rec_cur += rec_bytes[layer];
+            s.conv[b][layer] = reinterpret_cast<hip_bfloat16*>(conv_cur);
+            conv_cur += conv_bytes[layer];
+        }
+    }
+    s.n_layers = n_layers;
+    s.n_b = n_b;
+    s.ready = true;
+    return hipSuccess;
 }
 
 hipError_t ensure_decode_rec_scratch(int nv, int khd, int vhd) {
@@ -850,15 +1045,28 @@ void launch_q8_0_wmma_gemv(
     float* y,
     int k,
     int n,
-    hipStream_t stream) {
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t x_col_stride = 0,
+    int64_t y_col_stride = 0) {
     if (w == nullptr || n <= 0 || k <= 0) {
         return;
     }
-    const unsigned int blocks =
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    if (x_col_stride <= 0) {
+        x_col_stride = k;
+    }
+    if (y_col_stride <= 0) {
+        y_col_stride = n;
+    }
+    const unsigned int blocks_x =
         static_cast<unsigned int>((n + 15) / 16);
     hipLaunchKernelGGL(
         supersonic_qwen35_q8_0_wmma_gemv_f32_kernel,
-        dim3(blocks == 0 ? 1u : blocks),
+        dim3(blocks_x == 0 ? 1u : blocks_x,
+             static_cast<unsigned int>(ncols)),
         dim3(32),
         0,
         stream,
@@ -866,7 +1074,62 @@ void launch_q8_0_wmma_gemv(
         x,
         y,
         k,
-        n);
+        n,
+        ncols,
+        x_col_stride,
+        y_col_stride);
+}
+
+hipError_t launch_decode_full_prep(
+    const GqhMixerLayer& mx,
+    float* ws_proj,
+    float* ws_attn,
+    const void* cos_table,
+    const void* sin_table,
+    int seq_off,
+    int batch_size,
+    int proj_buf_floats,
+    int attn_scratch_floats,
+    hipStream_t stream) {
+    const int nh = mx.attn_heads;
+    const int nkv = mx.attn_kv_heads;
+    const int hd = mx.attn_head_dim;
+    if (nh <= 0 || nkv <= 0 || hd <= 0 || mx.kv_cache_k == nullptr ||
+        mx.kv_cache_v == nullptr || mx.q_norm_w == nullptr ||
+        mx.k_norm_w == nullptr) {
+        return hipErrorInvalidValue;
+    }
+    if (batch_size <= 0) {
+        batch_size = 1;
+    }
+    const int rot_dim = hd / 4;
+    hipLaunchKernelGGL(
+        supersonic_qwen35_decode_full_prep_kernel,
+        dim3(static_cast<unsigned int>(nh),
+             static_cast<unsigned int>(batch_size)),
+        dim3(static_cast<unsigned int>(hd)),
+        256 * sizeof(float),
+        stream,
+        ws_proj,
+        ws_attn,
+        static_cast<hip_bfloat16*>(mx.kv_cache_k),
+        static_cast<hip_bfloat16*>(mx.kv_cache_v),
+        static_cast<const hip_bfloat16*>(mx.q_norm_w),
+        static_cast<const hip_bfloat16*>(mx.k_norm_w),
+        static_cast<const hip_bfloat16*>(cos_table),
+        static_cast<const hip_bfloat16*>(sin_table),
+        nh,
+        nkv,
+        hd,
+        mx.q_out,
+        mx.k_out,
+        rot_dim,
+        mx.kv_max_t,
+        seq_off,
+        proj_buf_floats,
+        attn_scratch_floats,
+        mx.rms_unit_offset ? 1.0f : 0.0f);
+    return hipGetLastError();
 }
 
 void launch_decode_rec_prep(
@@ -877,7 +1140,21 @@ void launch_decode_rec_prep(
     hip_bfloat16* conv_state,
     const hip_bfloat16* conv_w,
     float* conv_out,
-    hipStream_t stream) {
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t qkv_col_stride = 0,
+    int64_t out_col_stride = 0,
+    hip_bfloat16* conv_snaps = nullptr,
+    int64_t snap_col_stride = 0) {
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    if (qkv_col_stride <= 0) {
+        qkv_col_stride = conv_dim;
+    }
+    if (out_col_stride <= 0) {
+        out_col_stride = conv_dim;
+    }
     const int key_dim = nk * hkd;
     const unsigned int conv_blocks =
         static_cast<unsigned int>((conv_dim + 255) / 256);
@@ -891,10 +1168,16 @@ void launch_decode_rec_prep(
         qkv_f32,
         conv_state,
         conv_w,
-        conv_out);
+        conv_out,
+        ncols,
+        qkv_col_stride,
+        out_col_stride,
+        conv_snaps,
+        snap_col_stride);
     hipLaunchKernelGGL(
         supersonic_qwen35_decode_rec_qk_rms_kernel,
-        dim3(static_cast<unsigned int>(2 * nk)),
+        dim3(static_cast<unsigned int>(2 * nk),
+             static_cast<unsigned int>(ncols)),
         dim3(static_cast<unsigned int>(hkd)),
         0,
         stream,
@@ -902,7 +1185,8 @@ void launch_decode_rec_prep(
         hkd,
         key_dim,
         conv_dim,
-        conv_out);
+        conv_out,
+        out_col_stride);
 }
 
 hipError_t launch_delta_recurrent_prefill_f32(
@@ -1030,15 +1314,22 @@ hipError_t launch_host_full_attn(
     float* ws_proj,
     float* saved_gate,
     int seq_off,
-    hipStream_t stream) {
+    hipStream_t stream,
+    int batch_size = 1,
+    int proj_buf_floats = 0,
+    int attn_scratch_floats = 0) {
+    (void)ordinal;
     const int nh = mx.attn_heads;
     const int nkv = mx.attn_kv_heads;
     const int hd = mx.attn_head_dim;
     const int max_t = mx.kv_max_t;
-    const int kv_len = seq_off + 1;
+    if (batch_size <= 0) {
+        batch_size = 1;
+    }
+    const int kv_len0 = seq_off + batch_size;
     if (nh <= 0 || nkv <= 0 || hd <= 0 || max_t <= 0 ||
         mx.kv_cache_k == nullptr || mx.kv_cache_v == nullptr ||
-        kv_len <= 0 || kv_len > max_t) {
+        seq_off < 0 || kv_len0 <= 0 || kv_len0 > max_t) {
         return hipErrorInvalidValue;
     }
     hipError_t err = ensure_decode_full_attn_scratch(nh, nkv, hd, max_t);
@@ -1048,114 +1339,137 @@ hipError_t launch_host_full_attn(
     DecodeFullAttnScratch& sc = decode_full_attn_scratch();
     const int q_n = nh * hd;
     const int bs = 256;
-    hipLaunchKernelGGL(
-        supersonic_qwen35_pack_full_q_interleaved_kernel,
-        dim3(static_cast<unsigned int>((q_n + bs - 1) / bs)),
-        dim3(bs),
-        0,
-        stream,
-        ws_proj,
-        sc.q,
-        nh,
-        hd);
-    const int groups = nh / nkv;
-    const float scale = 1.0f / sqrtf(static_cast<float>(hd));
-    const int n_splits = sc.n_splits > 0 ? sc.n_splits : 32;
-    if (groups == 6 && hd == 256 && (nh % 3) == 0) {
+    const int64_t proj_stride =
+        proj_buf_floats > 0 ? static_cast<int64_t>(proj_buf_floats) : 0;
+    const int64_t gate_stride =
+        attn_scratch_floats > 0 ? static_cast<int64_t>(attn_scratch_floats) : 0;
+    for (int b = 0; b < batch_size; ++b) {
+        float* proj_b = ws_proj + static_cast<int64_t>(b) * proj_stride;
+        float* gate_b = saved_gate + static_cast<int64_t>(b) * gate_stride;
+        // Negative kv_len: kernel reads qwen35_split_seqlen + (-kv_len)
+        // so HIP graph replay can pick up the current position.
+        const int kv_len = -(b + 1);
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(
-                (supersonic_qwen35_full_attention_decode_split_gqa_kernel<
-                    hip_bfloat16,
-                    3>)),
-            dim3(static_cast<unsigned int>(nh / 3),
-                 static_cast<unsigned int>(n_splits)),
+            supersonic_qwen35_pack_full_q_interleaved_kernel,
+            dim3(static_cast<unsigned int>((q_n + bs - 1) / bs)),
+            dim3(bs),
+            0,
+            stream,
+            proj_b,
+            sc.q,
+            nh,
+            hd);
+        const int groups = nh / nkv;
+        const float scale = 1.0f / sqrtf(static_cast<float>(hd));
+        const int n_splits = sc.n_splits > 0 ? sc.n_splits : 32;
+        if (groups == 6 && hd == 256 && (nh % 3) == 0) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(
+                    (supersonic_qwen35_full_attention_decode_split_gqa_kernel<
+                        hip_bfloat16,
+                        3>)),
+                dim3(static_cast<unsigned int>(nh / 3),
+                     static_cast<unsigned int>(n_splits)),
+                dim3(32),
+                0,
+                stream,
+                kv_len,
+                max_t,
+                hd,
+                groups,
+                n_splits,
+                scale,
+                sc.q,
+                static_cast<const hip_bfloat16*>(mx.kv_cache_k),
+                static_cast<const hip_bfloat16*>(mx.kv_cache_v),
+                sc.part_m,
+                sc.part_l,
+                sc.part_acc);
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(
+                    supersonic_qwen35_full_attention_decode_split_kernel<hip_bfloat16>),
+                dim3(static_cast<unsigned int>(nh), static_cast<unsigned int>(n_splits)),
+                dim3(32),
+                0,
+                stream,
+                kv_len,
+                max_t,
+                hd,
+                groups,
+                n_splits,
+                scale,
+                sc.q,
+                static_cast<const hip_bfloat16*>(mx.kv_cache_k),
+                static_cast<const hip_bfloat16*>(mx.kv_cache_v),
+                sc.part_m,
+                sc.part_l,
+                sc.part_acc);
+        }
+        err = hipGetLastError();
+        if (err != hipSuccess) {
+            return err;
+        }
+        hipLaunchKernelGGL(
+            supersonic_qwen35_full_attention_decode_merge_kernel,
+            dim3(static_cast<unsigned int>(nh)),
             dim3(32),
             0,
             stream,
-            -1,
-            max_t,
-            hd,
-            groups,
             n_splits,
-            scale,
-            sc.q,
-            static_cast<const hip_bfloat16*>(mx.kv_cache_k),
-            static_cast<const hip_bfloat16*>(mx.kv_cache_v),
+            hd,
             sc.part_m,
             sc.part_l,
-            sc.part_acc);
-    } else {
+            sc.part_acc,
+            sc.attn);
+        err = hipGetLastError();
+        if (err != hipSuccess) {
+            return err;
+        }
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(
-                supersonic_qwen35_full_attention_decode_split_kernel<hip_bfloat16>),
-            dim3(static_cast<unsigned int>(nh), static_cast<unsigned int>(n_splits)),
-            dim3(32),
+            supersonic_qwen35_full_attn_gate_f32_kernel,
+            dim3(static_cast<unsigned int>((q_n + bs - 1) / bs)),
+            dim3(bs),
             0,
             stream,
-            -1,
-            max_t,
-            hd,
-            groups,
-            n_splits,
-            scale,
-            sc.q,
-            static_cast<const hip_bfloat16*>(mx.kv_cache_k),
-            static_cast<const hip_bfloat16*>(mx.kv_cache_v),
-            sc.part_m,
-            sc.part_l,
-            sc.part_acc);
+            sc.attn,
+            gate_b,
+            proj_b,
+            q_n);
     }
-    err = hipGetLastError();
-    if (err != hipSuccess) {
-        return err;
-    }
-    hipLaunchKernelGGL(
-        supersonic_qwen35_full_attention_decode_merge_kernel,
-        dim3(static_cast<unsigned int>(nh)),
-        dim3(32),
-        0,
-        stream,
-        n_splits,
-        hd,
-        sc.part_m,
-        sc.part_l,
-        sc.part_acc,
-        sc.attn);
-    err = hipGetLastError();
-    if (err != hipSuccess) {
-        return err;
-    }
-    hipLaunchKernelGGL(
-        supersonic_qwen35_full_attn_gate_f32_kernel,
-        dim3(static_cast<unsigned int>((q_n + bs - 1) / bs)),
-        dim3(bs),
-        0,
-        stream,
-        sc.attn,
-        saved_gate,
-        ws_proj,
-        q_n);
     return hipGetLastError();
 }
 
-void launch_swiglu_f32(float* gate, const float* up, int n, hipStream_t stream) {
+void launch_swiglu_f32(
+    float* gate,
+    const float* up,
+    int n,
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t col_stride = 0) {
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    const int64_t stride = col_stride > 0 ? col_stride : static_cast<int64_t>(n);
     const int bs = 256;
     const int gs = (n + bs - 1) / bs;
-    hipLaunchKernelGGL(
-        supersonic_qwen35_swiglu_f32_kernel,
-        dim3(static_cast<unsigned int>(gs)),
-        dim3(bs),
-        0,
-        stream,
-        gate,
-        up,
-        n);
+    for (int c = 0; c < ncols; ++c) {
+        hipLaunchKernelGGL(
+            supersonic_qwen35_swiglu_f32_kernel,
+            dim3(static_cast<unsigned int>(gs)),
+            dim3(bs),
+            0,
+            stream,
+            gate + static_cast<int64_t>(c) * stride,
+            up + static_cast<int64_t>(c) * stride,
+            n);
+    }
 }
 
 float* decode_rms_partials() {
     static float* p = nullptr;
     if (p == nullptr) {
-        if (hipMalloc(&p, 32 * sizeof(float)) != hipSuccess) {
+        if (hipMalloc(&p, 256 * sizeof(float)) != hipSuccess) {
             p = nullptr;
         }
     }
@@ -1175,11 +1489,15 @@ hipError_t launch_decode_rms(
     hipStream_t stream) {
     constexpr int kBs = 256;
     float* partials = decode_rms_partials();
-    if (partials != nullptr && hidden_dim == 5120 && batch_size <= 1) {
+    if (partials != nullptr && hidden_dim == 5120) {
         const int npartials = (hidden_dim + kBs - 1) / kBs;
+        const int B = batch_size > 0 ? batch_size : 1;
+        const dim3 pgrid(
+            static_cast<unsigned int>(npartials),
+            static_cast<unsigned int>(B));
         hipLaunchKernelGGL(
             supersonic_qwen35_decode_rms_partial_kernel,
-            dim3(static_cast<unsigned int>(npartials)),
+            pgrid,
             dim3(kBs),
             kBs * sizeof(float),
             stream,
@@ -1191,7 +1509,7 @@ hipError_t launch_decode_rms(
             flags);
         hipLaunchKernelGGL(
             supersonic_qwen35_decode_rms_scale_kernel,
-            dim3(static_cast<unsigned int>(npartials)),
+            pgrid,
             dim3(kBs),
             0,
             stream,
@@ -1205,9 +1523,11 @@ hipError_t launch_decode_rms(
             unit_offset);
         return hipGetLastError();
     }
+    const unsigned int rms_grid =
+        static_cast<unsigned int>(batch_size > 1 ? batch_size : 1);
     hipLaunchKernelGGL(
         supersonic_qwen35_decode_rms_kernel,
-        dim3(1),
+        dim3(rms_grid),
         dim3(kBs),
         kBs * sizeof(float),
         stream,
@@ -1286,7 +1606,10 @@ hipError_t launch_ggml_k_gemv_impl(
     float* y,
     int in_dim,
     int out_dim,
-    hipStream_t stream) {
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t x_col_stride = 0,
+    int64_t y_col_stride = 0) {
     if (out_dim <= 0 || in_dim <= 0 || h.wire == nullptr || x == nullptr ||
         y == nullptr) {
         return hipErrorInvalidValue;
@@ -1296,6 +1619,15 @@ hipError_t launch_ggml_k_gemv_impl(
     }
     if (h.qtype != 8 && (in_dim % 256) != 0) {
         return hipErrorInvalidValue;
+    }
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    if (x_col_stride <= 0) {
+        x_col_stride = in_dim;
+    }
+    if (y_col_stride <= 0) {
+        y_col_stride = out_dim;
     }
     // Same fused F32 walker as the residual-add path. Dual-row when the
     // output is a multiple of 8 so both rows stay in-bounds.
@@ -1307,45 +1639,78 @@ hipError_t launch_ggml_k_gemv_impl(
         (out_dim + rows_per_block - 1) / rows_per_block));
     const dim3 threads(kThreads);
     auto* packed = static_cast<const uint8_t*>(h.wire);
+    const bool skinny = ncols > 1 && ncols <= 4;
+    const int kC = skinny ? (ncols <= 3 ? 3 : 4) : 1;
     auto launch = [&](auto kernel) {
         hipLaunchKernelGGL(
-            kernel, blocks, threads, 0, stream, packed, x, y, in_dim, out_dim);
+            kernel, blocks, threads, 0, stream, packed, x, y, in_dim, out_dim,
+            ncols, x_col_stride, y_col_stride);
     };
     switch (h.qtype) {
         case 8:
-            if (dual) {
+            if (skinny && dual && kC == 3) {
                 launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2>)));
+                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 3>)));
+            } else if (skinny && dual) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 4>)));
+            } else if (skinny && kC == 3) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1, 3>)));
+            } else if (skinny) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1, 4>)));
+            } else if (dual) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 1>)));
             } else {
                 launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1>)));
+                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1, 1>)));
             }
             break;
         case 12:
-            if (dual) {
+            if (skinny && dual) {
                 launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 2>)));
+                    (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 2, 4>)));
+            } else if (skinny) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 1, 4>)));
+            } else if (dual) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 2, 1>)));
             } else {
                 launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 1>)));
+                    (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 1, 1>)));
             }
             break;
         case 13:
-            if (dual) {
+            if (skinny && dual) {
                 launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 2>)));
+                    (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 2, 4>)));
+            } else if (skinny) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 1, 4>)));
+            } else if (dual) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 2, 1>)));
             } else {
                 launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 1>)));
+                    (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 1, 1>)));
             }
             break;
         case 14:
-            if (dual) {
+            if (skinny && dual) {
                 launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 2>)));
+                    (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 2, 4>)));
+            } else if (skinny) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 1, 4>)));
+            } else if (dual) {
+                launch(HIP_KERNEL_NAME(
+                    (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 2, 1>)));
             } else {
                 launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 1>)));
+                    (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 1, 1>)));
             }
             break;
         default:
@@ -1360,8 +1725,12 @@ hipError_t launch_ggml_k_gemv(
     float* y,
     int in_dim,
     int out_dim,
-    hipStream_t stream) {
-    return launch_ggml_k_gemv_impl<false>(h, x, y, in_dim, out_dim, stream);
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t x_col_stride = 0,
+    int64_t y_col_stride = 0) {
+    return launch_ggml_k_gemv_impl<false>(
+        h, x, y, in_dim, out_dim, stream, ncols, x_col_stride, y_col_stride);
 }
 
 hipError_t launch_ggml_k_gemv_acc(
@@ -1370,8 +1739,12 @@ hipError_t launch_ggml_k_gemv_acc(
     float* y,
     int in_dim,
     int out_dim,
-    hipStream_t stream) {
-    return launch_ggml_k_gemv_impl<true>(h, x, y, in_dim, out_dim, stream);
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t x_col_stride = 0,
+    int64_t y_col_stride = 0) {
+    return launch_ggml_k_gemv_impl<true>(
+        h, x, y, in_dim, out_dim, stream, ncols, x_col_stride, y_col_stride);
 }
 
 hipError_t launch_mixer_proj_acc(
@@ -1381,21 +1754,52 @@ hipError_t launch_mixer_proj_acc(
     float* y,
     int in_dim,
     int out_dim,
-    hipStream_t stream) {
+    hipStream_t stream,
+    int ncols = 1,
+    int64_t x_col_stride = 0,
+    int64_t y_col_stride = 0) {
     if (out_dim <= 0 || h.wire == nullptr) {
         return hipSuccess;
     }
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    if (x_col_stride <= 0) {
+        x_col_stride = in_dim;
+    }
+    if (y_col_stride <= 0) {
+        y_col_stride = out_dim;
+    }
     if (h.rung >= 0) {
-        return launch_gqh_gemv_acc(ordinal, h, x, y, in_dim, out_dim, stream);
+        return launch_gqh_gemv_acc(
+            ordinal, h, x, y, in_dim, out_dim, stream, ncols, x_col_stride,
+            y_col_stride);
     }
     if (ggml_k_qtype(h.qtype)) {
-        return launch_ggml_k_gemv_acc(h, x, y, in_dim, out_dim, stream);
+        return launch_ggml_k_gemv_acc(
+            h, x, y, in_dim, out_dim, stream, ncols, x_col_stride,
+            y_col_stride);
     }
     if (mix_qtype(h.qtype)) {
-        const int st = supersonic_gqh_hip_mix_matvec_stream(
-            ordinal, h.qtype, h.wire, x, y, in_dim, out_dim, 1, 1, h.mix_mode,
-            h.mix_lut, stream);
-        return st == 0 ? hipSuccess : hipErrorInvalidValue;
+        for (int c = 0; c < ncols; ++c) {
+            const int st = supersonic_gqh_hip_mix_matvec_stream(
+                ordinal,
+                h.qtype,
+                h.wire,
+                x + static_cast<int64_t>(c) * x_col_stride,
+                y + static_cast<int64_t>(c) * y_col_stride,
+                in_dim,
+                out_dim,
+                1,
+                1,
+                h.mix_mode,
+                h.mix_lut,
+                stream);
+            if (st != 0) {
+                return hipErrorInvalidValue;
+            }
+        }
+        return hipSuccess;
     }
     return hipSuccess;
 }
@@ -1408,20 +1812,50 @@ hipError_t launch_mixer_proj(
     int in_dim,
     int out_dim,
     hipStream_t stream,
-    bool do_round = true) {
+    bool do_round = true,
+    int ncols = 1,
+    int64_t x_col_stride = 0,
+    int64_t y_col_stride = 0) {
     if (out_dim <= 0 || h.wire == nullptr) {
         return hipSuccess;
     }
+    if (ncols <= 0) {
+        ncols = 1;
+    }
+    if (x_col_stride <= 0) {
+        x_col_stride = in_dim;
+    }
+    if (y_col_stride <= 0) {
+        y_col_stride = out_dim;
+    }
     hipError_t err = hipSuccess;
     if (h.rung >= 0) {
-        err = launch_gqh_gemv(ordinal, h, x, y, in_dim, out_dim, stream);
+        err = launch_gqh_gemv(
+            ordinal, h, x, y, in_dim, out_dim, stream, ncols, x_col_stride,
+            y_col_stride);
     } else if (ggml_k_qtype(h.qtype)) {
-        err = launch_ggml_k_gemv(h, x, y, in_dim, out_dim, stream);
+        err = launch_ggml_k_gemv(
+            h, x, y, in_dim, out_dim, stream, ncols, x_col_stride,
+            y_col_stride);
     } else if (mix_qtype(h.qtype)) {
-        const int st = supersonic_gqh_hip_mix_matvec_stream(
-            ordinal, h.qtype, h.wire, x, y, in_dim, out_dim, 1, 0, h.mix_mode,
-            h.mix_lut, stream);
-        err = st == 0 ? hipSuccess : hipErrorInvalidValue;
+        for (int c = 0; c < ncols; ++c) {
+            const int st = supersonic_gqh_hip_mix_matvec_stream(
+                ordinal,
+                h.qtype,
+                h.wire,
+                x + static_cast<int64_t>(c) * x_col_stride,
+                y + static_cast<int64_t>(c) * y_col_stride,
+                in_dim,
+                out_dim,
+                1,
+                0,
+                h.mix_mode,
+                h.mix_lut,
+                stream);
+            if (st != 0) {
+                return hipErrorInvalidValue;
+            }
+        }
     } else {
         return hipSuccess;
     }
@@ -1429,7 +1863,7 @@ hipError_t launch_mixer_proj(
         return err;
     }
     if (do_round) {
-        launch_round_f32(y, out_dim, stream);
+        launch_round_f32(y, out_dim, stream, ncols, y_col_stride);
     }
     return hipSuccess;
 }
@@ -8351,6 +8785,13 @@ int persistent_decode_device(
             const Qwen35DecodeLayerDesc* layer_ptr = layers_base + layer;
             const Qwen35INT4ScaleDesc* int4_ptr =
                 int4_base != nullptr ? int4_base + layer : nullptr;
+            // Split launches pass num_layers=1, so the kernel's
+            // batch_descs[0] must be this layer's row, not layer 0.
+            const BatchSeqDesc* batch_ptr =
+                static_cast<const BatchSeqDesc*>(batch_descs);
+            if (batch_ptr != nullptr) {
+                batch_ptr += layer;
+            }
             if (split == 1) {
                 hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(supersonic_qwen35_persistent_decode_kernel<T, 1>),
@@ -8378,7 +8819,7 @@ int persistent_decode_device(
                     static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
                     static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
                     batch_size,
-                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    batch_ptr,
                     int4_ptr,
                     static_cast<T*>(tap_workspace),
                     tap_layers,
@@ -8411,7 +8852,7 @@ int persistent_decode_device(
                     static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
                     static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
                     batch_size,
-                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    batch_ptr,
                     int4_ptr,
                     static_cast<T*>(tap_workspace),
                     tap_layers,
@@ -8444,7 +8885,7 @@ int persistent_decode_device(
                     static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
                     static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
                     batch_size,
-                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    batch_ptr,
                     int4_ptr,
                     static_cast<T*>(tap_workspace),
                     tap_layers,
@@ -8477,7 +8918,7 @@ int persistent_decode_device(
                     static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
                     static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
                     batch_size,
-                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    batch_ptr,
                     int4_ptr,
                     static_cast<T*>(tap_workspace),
                     tap_layers,
@@ -8510,7 +8951,7 @@ int persistent_decode_device(
                     static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
                     static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
                     batch_size,
-                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    batch_ptr,
                     int4_ptr,
                     static_cast<T*>(tap_workspace),
                     tap_layers,
@@ -8543,7 +8984,7 @@ int persistent_decode_device(
                     static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
                     static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
                     batch_size,
-                    static_cast<const BatchSeqDesc*>(batch_descs),
+                    batch_ptr,
                     int4_ptr,
                     static_cast<T*>(tap_workspace),
                     tap_layers,
@@ -8742,11 +9183,13 @@ int persistent_decode_device(
         hipDeviceProp_t hip_prop{};
         (void)hipGetDeviceProperties(&hip_prop, 0);
         // gfx12: Global+side fails; ThreadLocal+side replay was 105 ms/tok
-        // vs 61 eager; single-stream capture was a wash. Keep eager.
+        // vs 61 eager. B>1 single-stream capture on gfx12 was a wash
+        // (70 vs 71 ms verify). Keep eager unless gfx11 or opt-in.
         const bool use_graph =
-            hip_prop.major < 12 &&
             std::getenv("SUPERSONIC_DISABLE_HIP_GRAPH") == nullptr &&
-            std::getenv("SUPERSONIC_DECODE_PROF") == nullptr;
+            std::getenv("SUPERSONIC_DECODE_PROF") == nullptr &&
+            (hip_prop.major < 12 ||
+             std::getenv("SUPERSONIC_HIP_GRAPH") != nullptr);
         struct SplitGraphCache {
             hipGraphExec_t exec = nullptr;
             hipGraph_t graph = nullptr;
@@ -8811,6 +9254,16 @@ int persistent_decode_device(
         float* ws_token = ws_mlp + batch_size * hidden_dim;
         float* ws_proj = ws_token + batch_size * hidden_dim;
         float* ws_attn = ws_proj + batch_size * proj_buf_floats;
+        const int gemv_ncols = batch_size > 0 ? batch_size : 1;
+        if (gemv_ncols > 1) {
+            (void)ensure_mtp_prefix_snap(mlp_hdrs, num_layers, gemv_ncols);
+        } else {
+            mtp_prefix_snap().ready = false;
+        }
+        const int64_t hidden_stride = hidden_dim;
+        const int64_t proj_stride = proj_buf_floats;
+        const int64_t mlp_stride = static_cast<int64_t>(intermediate_size) * 2;
+        const int64_t attn_stride = attn_scratch_floats;
         const char* out_mode_env = std::getenv("SUPERSONIC_QWEN35_GQH_GEMV_OUT");
         int host_out_mask = 0;
         if (use_gqh_gemv) {
@@ -8835,7 +9288,7 @@ int persistent_decode_device(
                 return e != nullptr && e[0] != '\0' && e[0] != '0';
             }();
             double ms_attn = 0, ms_inproj = 0, ms_rec = 0, ms_out = 0, ms_mlp = 0;
-            double ms_pair = 0, ms_down = 0;
+            double ms_pair = 0, ms_down = 0, ms_rms = 0, ms_prep = 0;
             auto now_ms = []() {
                 return std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now().time_since_epoch())
@@ -8879,6 +9332,7 @@ int persistent_decode_device(
                         rms_flags |= 1;
                         io = static_cast<const hip_bfloat16*>(hidden_io);
                     }
+                    const double t_rms0 = dec_prof ? (sync_now(), now_ms()) : 0;
                     err = launch_decode_rms(
                         ws_hidden,
                         ws_normed,
@@ -8890,6 +9344,10 @@ int persistent_decode_device(
                         mx_rms.rms_unit_offset ? 1.0f : 0.0f,
                         rms_flags,
                         stream);
+                    if (dec_prof) {
+                        sync_now();
+                        ms_rms += now_ms() - t_rms0;
+                    }
                 } else {
                     err = launch_split(1, layer, in_flags, grid_in, stream);
                 }
@@ -8915,32 +9373,37 @@ int persistent_decode_device(
                     const double t_in0 = dec_prof ? (sync_now(), now_ms()) : 0;
                     if (mx.layer_type == 1) {
                         hipStream_t kv_stream = stream;
-                        hipStream_t side = decode_side_stream();
+                        hipStream_t side =
+                            stream != nullptr ? nullptr : decode_side_stream();
                         if (side != nullptr && mx.k.wire != nullptr) {
                             decode_fork_side(stream, side);
                             kv_stream = side;
                         }
                         err = launch_mixer_proj(
                             device_ordinal, mx.q, ws_normed, ws_proj,
-                            hidden_dim, mx.q_out, stream, false);
+                            hidden_dim, mx.q_out, stream, false, gemv_ncols,
+                            hidden_stride, proj_stride);
                         if (err == hipSuccess) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.k, ws_normed,
                                 ws_proj + mx.q_out,
-                                hidden_dim, mx.k_out, kv_stream, false);
+                                hidden_dim, mx.k_out, kv_stream, false,
+                                gemv_ncols, hidden_stride, proj_stride);
                         }
                         if (err == hipSuccess) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.v, ws_normed,
                                 ws_proj + mx.q_out + mx.k_out,
-                                hidden_dim, mx.k_out, kv_stream, false);
+                                hidden_dim, mx.k_out, kv_stream, false,
+                                gemv_ncols, hidden_stride, proj_stride);
                         }
                         if (kv_stream != stream) {
                             decode_join_side(stream, kv_stream);
                         }
                     } else {
                         hipStream_t z_stream = stream;
-                        hipStream_t side = decode_side_stream();
+                        hipStream_t side =
+                            stream != nullptr ? nullptr : decode_side_stream();
                         if (side != nullptr && mx.z.wire != nullptr &&
                             mx.z_out > 0) {
                             decode_fork_side(stream, side);
@@ -8948,12 +9411,14 @@ int persistent_decode_device(
                         }
                         err = launch_mixer_proj(
                             device_ordinal, mx.qkv, ws_normed, ws_proj,
-                            hidden_dim, mx.qkv_out, stream, false);
+                            hidden_dim, mx.qkv_out, stream, false, gemv_ncols,
+                            hidden_stride, proj_stride);
                         if (err == hipSuccess) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.z, ws_normed,
                                 ws_proj + mx.qkv_out,
-                                hidden_dim, mx.z_out, z_stream, false);
+                                hidden_dim, mx.z_out, z_stream, false,
+                                gemv_ncols, hidden_stride, proj_stride);
                         }
                         // Join z after rec-prep: rec-prep only reads qkv, so
                         // it can overlap the z GEMV. Rec fused still needs z.
@@ -8964,13 +9429,15 @@ int persistent_decode_device(
                             err = launch_mixer_proj(
                                 device_ordinal, mx.b, ws_normed,
                                 ws_proj + mx.qkv_out + mx.z_out,
-                                hidden_dim, mx.nv, stream, false);
+                                hidden_dim, mx.nv, stream, false, gemv_ncols,
+                                hidden_stride, proj_stride);
                         }
                         if (err == hipSuccess && mx.a.qtype != 8) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.a, ws_normed,
                                 ws_proj + mx.qkv_out + mx.z_out + mx.nv,
-                                hidden_dim, mx.nv, stream, false);
+                                hidden_dim, mx.nv, stream, false, gemv_ncols,
+                                hidden_stride, proj_stride);
                         }
                     }
 
@@ -9019,7 +9486,9 @@ int persistent_decode_device(
                         const int nh = mx.attn_heads > 0 ? mx.attn_heads : 1;
                         // 24-block mid wins once KV is long; at Hello-length
                         // the grid_barrier tax is larger than the head parallel.
-                        mid_g = (seqlen_offset < 24) ? 1 : nh;
+                        // Batched verify (B>1) has enough QK-norm/RoPE/KV
+                        // work to keep the 24-wide grid busy.
+                        mid_g = (seqlen_offset < 24 && gemv_ncols <= 1) ? 1 : nh;
                         if (mx.kv_cache_k != nullptr && mx.attn_head_dim > 0 &&
                             mx.attn_kv_heads > 0) {
                             mid_flags |= 256;
@@ -9059,46 +9528,90 @@ int persistent_decode_device(
                     }
                 }
                 if (rec_prep) {
+                    const double t_p0 = dec_prof ? (sync_now(), now_ms()) : 0;
                     const GqhMixerLayer& mxp = mlp_hdrs.mix[layer];
                     const int nk_p =
                         (mxp.qkv_out - mxp.nv * mxp.hvd) / (2 * mxp.hkd);
+                    // ggml-K matvec (12×128) has far more occupancy than
+                    // WMMA m=1 tile16 (3×32) on nv=48. B=1 Hello tokens
+                    // must stay 9419…3242; revert if they move.
                     if ((mid_flags & 8) != 0) {
-                        launch_q8_0_wmma_gemv(
-                            mxp.b.wire,
+                        (void)launch_ggml_k_gemv(
+                            mxp.b,
                             ws_normed,
                             ws_proj + mxp.qkv_out + mxp.z_out,
                             hidden_dim,
                             mxp.nv,
-                            stream);
+                            stream,
+                            gemv_ncols,
+                            hidden_stride,
+                            proj_stride);
                     }
                     if ((mid_flags & 16) != 0) {
-                        launch_q8_0_wmma_gemv(
-                            mxp.a.wire,
+                        (void)launch_ggml_k_gemv(
+                            mxp.a,
                             ws_normed,
                             ws_proj + mxp.qkv_out + mxp.z_out + mxp.nv,
                             hidden_dim,
                             mxp.nv,
-                            stream);
+                            stream,
+                            gemv_ncols,
+                            hidden_stride,
+                            proj_stride);
                     }
-                    launch_decode_rec_prep(
-                        mxp.qkv_out,
-                        nk_p,
-                        mxp.hkd,
-                        ws_proj,
-                        static_cast<hip_bfloat16*>(mxp.conv_state),
-                        static_cast<const hip_bfloat16*>(mxp.conv1d_w),
-                        ws_gate,
-                        stream);
+                    {
+                        MtpPrefixSnap& psnap = mtp_prefix_snap();
+                        hip_bfloat16* conv_snaps = nullptr;
+                        int64_t snap_stride = 0;
+                        if (psnap.ready && psnap.conv[0][layer] != nullptr &&
+                            psnap.conv_bytes[layer] > 0) {
+                            conv_snaps = psnap.conv[0][layer];
+                            snap_stride = static_cast<int64_t>(
+                                psnap.conv_bytes[layer] / sizeof(hip_bfloat16));
+                        }
+                        launch_decode_rec_prep(
+                            mxp.qkv_out,
+                            nk_p,
+                            mxp.hkd,
+                            ws_proj,
+                            static_cast<hip_bfloat16*>(mxp.conv_state),
+                            static_cast<const hip_bfloat16*>(mxp.conv1d_w),
+                            ws_gate,
+                            stream,
+                            gemv_ncols,
+                            proj_stride,
+                            mlp_stride,
+                            conv_snaps,
+                            snap_stride);
+                    }
                     if (z_pending != nullptr) {
                         decode_join_side(stream, z_pending);
                         z_pending = nullptr;
+                    }
+                    if (dec_prof) {
+                        sync_now();
+                        ms_prep += now_ms() - t_p0;
                     }
                 } else {
                     if (z_pending != nullptr) {
                         decode_join_side(stream, z_pending);
                         z_pending = nullptr;
                     }
-                    err = launch_split(2, layer, mid_flags, mid_g, stream);
+                    if ((mid_flags & 256) != 0) {
+                        err = launch_decode_full_prep(
+                            mlp_hdrs.mix[layer],
+                            ws_proj,
+                            ws_attn,
+                            cos_table,
+                            sin_table,
+                            seqlen_offset,
+                            gemv_ncols,
+                            proj_buf_floats,
+                            attn_scratch_floats,
+                            stream);
+                    } else {
+                        err = launch_split(2, layer, mid_flags, mid_g, stream);
+                    }
                     if (err != hipSuccess) return err;
                 }
                 if ((mid_flags & 256) != 0) {
@@ -9112,7 +9625,10 @@ int persistent_decode_device(
                         ws_proj,
                         saved_gate,
                         seqlen_offset,
-                        stream);
+                        stream,
+                        gemv_ncols,
+                        proj_buf_floats,
+                        attn_scratch_floats);
                     if (dec_prof) {
                         sync_now();
                         ms_attn += now_ms() - t_a0;
@@ -9128,79 +9644,103 @@ int persistent_decode_device(
                         (mxr.qkv_out - nv * hvd) / (2 * hkd);
                     const int key_dim = nk * hkd;
                     DecodeRecScratch& sc = decode_rec_scratch();
-                    const float* q_u = ws_gate + mxr.qkv_out;
-                    const float* k_u = ws_gate + mxr.qkv_out + key_dim;
-                    const float* v_ptr = ws_gate + 2 * key_dim;
-                    const float* b_ptr =
-                        ws_proj + mxr.qkv_out + mxr.z_out;
-                    const float* a_ptr = b_ptr + nv;
-                    const float* z_ptr = ws_proj + mxr.qkv_out;
                     const double t_r0 = dec_prof ? (sync_now(), now_ms()) : 0;
-                    if (hkd == 128 && hvd == 128) {
-                        const int st = supersonic_qwen35_hip_decode_rec_k128_fused(
-                            device_ordinal,
-                            nv,
-                            nk,
-                            static_cast<float*>(mxr.recurrent_state),
-                            q_u,
-                            k_u,
-                            v_ptr,
-                            b_ptr,
-                            a_ptr,
-                            static_cast<const hip_bfloat16*>(mxr.dt_bias_w),
-                            static_cast<const hip_bfloat16*>(mxr.a_log_exp_w),
-                            sc.out,
-                            stream);
-                        err = st == 0 ? hipSuccess : hipErrorInvalidValue;
-                    } else {
-                        launch_decode_pack_rec_inputs(
-                            nv,
-                            nk,
-                            hkd,
-                            q_u,
-                            k_u,
-                            b_ptr,
-                            a_ptr,
-                            static_cast<const hip_bfloat16*>(mxr.dt_bias_w),
-                            static_cast<const hip_bfloat16*>(mxr.a_log_exp_w),
-                            sc.q,
-                            sc.k,
-                            sc.beta,
-                            sc.g,
-                            stream);
-                        err = launch_delta_recurrent_prefill_f32(
-                            device_ordinal,
+                    for (int b = 0; b < gemv_ncols; ++b) {
+                        float* conv_b =
+                            ws_gate + static_cast<int64_t>(b) * mlp_stride;
+                        float* proj_b =
+                            ws_proj + static_cast<int64_t>(b) * proj_stride;
+                        float* attn_b =
+                            ws_attn + static_cast<int64_t>(b) * attn_stride;
+                        const float* q_u = conv_b + mxr.qkv_out;
+                        const float* k_u = conv_b + mxr.qkv_out + key_dim;
+                        const float* v_ptr = conv_b + 2 * key_dim;
+                        const float* b_ptr =
+                            proj_b + mxr.qkv_out + mxr.z_out;
+                        const float* a_ptr = b_ptr + nv;
+                        const float* z_ptr = proj_b + mxr.qkv_out;
+                        if (hkd == 128 && hvd == 128) {
+                            const int st =
+                                supersonic_qwen35_hip_decode_rec_k128_fused(
+                                    device_ordinal,
+                                    nv,
+                                    nk,
+                                    static_cast<float*>(mxr.recurrent_state),
+                                    q_u,
+                                    k_u,
+                                    v_ptr,
+                                    b_ptr,
+                                    a_ptr,
+                                    static_cast<const hip_bfloat16*>(
+                                        mxr.dt_bias_w),
+                                    static_cast<const hip_bfloat16*>(
+                                        mxr.a_log_exp_w),
+                                    sc.out,
+                                    stream);
+                            err = st == 0 ? hipSuccess : hipErrorInvalidValue;
+                        } else {
+                            launch_decode_pack_rec_inputs(
+                                nv,
+                                nk,
+                                hkd,
+                                q_u,
+                                k_u,
+                                b_ptr,
+                                a_ptr,
+                                static_cast<const hip_bfloat16*>(mxr.dt_bias_w),
+                                static_cast<const hip_bfloat16*>(
+                                    mxr.a_log_exp_w),
+                                sc.q,
+                                sc.k,
+                                sc.beta,
+                                sc.g,
+                                stream);
+                            err = launch_delta_recurrent_prefill_f32(
+                                device_ordinal,
+                                nv,
+                                hkd,
+                                hvd,
+                                static_cast<const float*>(mxr.recurrent_state),
+                                sc.q,
+                                sc.k,
+                                v_ptr,
+                                sc.beta,
+                                sc.g,
+                                sc.out,
+                                stream);
+                        }
+                        if (err != hipSuccess) return err;
+                        launch_decode_extract_rec_gated(
                             nv,
                             hkd,
                             hvd,
-                            static_cast<const float*>(mxr.recurrent_state),
-                            sc.q,
-                            sc.k,
-                            v_ptr,
-                            sc.beta,
-                            sc.g,
+                            mxr.linear_norm_eps,
                             sc.out,
-                            stream);
+                            z_ptr,
+                            static_cast<const float*>(mxr.linear_norm_w),
+                            (hkd == 128 && hvd == 128)
+                                ? nullptr
+                                : static_cast<float*>(mxr.recurrent_state),
+                            attn_b,
+                            stream,
+                            (hkd == 128 && hvd == 128) ? 1 : 0);
+                        MtpPrefixSnap& psnap = mtp_prefix_snap();
+                        if (psnap.ready && b < gemv_ncols &&
+                            psnap.rec[b][layer] != nullptr &&
+                            psnap.rec_bytes[layer] > 0 &&
+                            mxr.recurrent_state != nullptr) {
+                            (void)hipMemcpyAsync(
+                                psnap.rec[b][layer],
+                                mxr.recurrent_state,
+                                psnap.rec_bytes[layer],
+                                hipMemcpyDeviceToDevice,
+                                stream);
+                        }
                     }
                     if (dec_prof) {
                         sync_now();
                         ms_rec += now_ms() - t_r0;
                     }
-                    if (err != hipSuccess) return err;
-                    launch_decode_extract_rec_gated(
-                        nv,
-                        hkd,
-                        hvd,
-                        mxr.linear_norm_eps,
-                        sc.out,
-                        z_ptr,
-                        static_cast<const float*>(mxr.linear_norm_w),
-                        (hkd == 128 && hvd == 128)
-                            ? nullptr
-                            : static_cast<float*>(mxr.recurrent_state),
-                        ws_attn,
-                        stream,
-                        (hkd == 128 && hvd == 128) ? 1 : 0);
                     static bool dumped_host_rec = false;
                     if (!dumped_host_rec) {
                         dumped_host_rec = true;
@@ -9315,7 +9855,8 @@ int persistent_decode_device(
                     if (do_full) {
                         err = launch_mixer_proj_acc(
                             device_ordinal, mx.o, ws_proj, ws_hidden,
-                            mx.attn_size, hidden_dim, stream);
+                            mx.attn_size, hidden_dim, stream, gemv_ncols,
+                            proj_stride, hidden_stride);
                     } else if (do_lin) {
                         // extract_rec_gated already BF16-rounds attn_out,
                         // so a second round_f32 is a no-op. Acc GEMV is
@@ -9323,7 +9864,8 @@ int persistent_decode_device(
                         // after the extra y-round collapses.
                         err = launch_mixer_proj_acc(
                             device_ordinal, mx.lin_out, ws_attn, ws_hidden,
-                            mx.val_dim, hidden_dim, stream);
+                            mx.val_dim, hidden_dim, stream, gemv_ncols,
+                            attn_stride, hidden_stride);
                     }
                     if (dec_prof) {
                         sync_now();
@@ -9442,6 +9984,7 @@ int persistent_decode_device(
                 }
                 if (use_gqh_gemv) {
                     const GqhMixerLayer& mx_rms = mlp_hdrs.mix[layer];
+                    const double t_rms1 = dec_prof ? (sync_now(), now_ms()) : 0;
                     err = launch_decode_rms(
                         ws_hidden,
                         ws_normed,
@@ -9453,6 +9996,10 @@ int persistent_decode_device(
                         mx_rms.rms_unit_offset ? 1.0f : 0.0f,
                         0,
                         stream);
+                    if (dec_prof) {
+                        sync_now();
+                        ms_rms += now_ms() - t_rms1;
+                    }
                 } else {
                     err = launch_split(4, layer, 0, grid_gate, stream);
                 }
@@ -9474,7 +10021,10 @@ int persistent_decode_device(
                             intermediate_size,
                             intermediate_size,
                             stream,
-                            true);
+                            true,
+                            gemv_ncols,
+                            hidden_stride,
+                            mlp_stride);
                     } else {
                         err = hipErrorInvalidValue;
                     }
@@ -9486,7 +10036,10 @@ int persistent_decode_device(
                             ws_gate,
                             hidden_dim,
                             intermediate_size,
-                            stream);
+                            stream,
+                            gemv_ncols,
+                            hidden_stride,
+                            mlp_stride);
                         if (err == hipSuccess) {
                             err = launch_gqh_gemv(
                                 device_ordinal,
@@ -9495,11 +10048,15 @@ int persistent_decode_device(
                                 ws_up,
                                 hidden_dim,
                                 intermediate_size,
-                                stream);
+                                stream,
+                                gemv_ncols,
+                                hidden_stride,
+                                mlp_stride);
                         }
                         if (err == hipSuccess) {
                             launch_swiglu_f32(
-                                ws_gate, ws_up, intermediate_size, stream);
+                                ws_gate, ws_up, intermediate_size, stream,
+                                gemv_ncols, mlp_stride);
                         }
                     }
                     if (err != hipSuccess) {
@@ -9522,7 +10079,10 @@ int persistent_decode_device(
                             ws_hidden,
                             intermediate_size,
                             hidden_dim,
-                            stream);
+                            stream,
+                            gemv_ncols,
+                            mlp_stride,
+                            hidden_stride);
                     } else {
                         err = launch_mixer_proj_acc(
                             device_ordinal,
@@ -9531,7 +10091,10 @@ int persistent_decode_device(
                             ws_hidden,
                             intermediate_size,
                             hidden_dim,
-                            stream);
+                            stream,
+                            gemv_ncols,
+                            mlp_stride,
+                            hidden_stride);
                     }
                     if (err != hipSuccess) {
                         std::fprintf(
@@ -9582,7 +10145,7 @@ int persistent_decode_device(
                 std::fprintf(
                     stderr,
                     "[decode-prof] step=%d seq=%d attn=%.1f inproj=%.1f rec=%.1f "
-                    "out=%.1f mlp=%.1f pair=%.1f down=%.1f ms\n",
+                    "out=%.1f mlp=%.1f pair=%.1f down=%.1f rms=%.1f prep=%.1f ms\n",
                     dec_prof_step,
                     static_cast<int>(seqlen_offset),
                     ms_attn,
@@ -9591,7 +10154,9 @@ int persistent_decode_device(
                     ms_out,
                     ms_mlp,
                     ms_pair,
-                    ms_down);
+                    ms_down,
+                    ms_rms,
+                    ms_prep);
                 ++dec_prof_step;
             }
             return hipSuccess;
@@ -9645,7 +10210,6 @@ int persistent_decode_device(
                 }
                 hipError_t rec_err = hipSuccess;
                 if (capturing) {
-                    decode_fork_side(cache.stream, decode_side_stream());
                     rec_err = record_layers(cache.stream);
                     launch_err = hipStreamEndCapture(cache.stream, &cache.graph);
                     if (rec_err != hipSuccess && launch_err == hipSuccess) {
@@ -9825,6 +10389,52 @@ int persistent_decode_device(
 //   tap_workspace = nullptr, tap_layers = nullptr, num_taps = 0 disables; the kernel body
 //   must short-circuit when tap_workspace is nullptr so existing decode callers see no
 //   change in observable behavior or runtime (gfx1150 codegen-sensitivity guard).
+// Restore conv+rec after fused B>1 verify to the prefix of `commit_len`
+// tokens (1-based). Returns 0 if live linear state matches that prefix
+// (including commit_len==B, already live). Returns 1 if no snapshot is
+// available and the caller must sequential-replay.
+extern "C" int supersonic_qwen35_hip_mtp_restore_linear_prefix(int commit_len) {
+    MtpPrefixSnap& s = mtp_prefix_snap();
+    if (commit_len <= 0) {
+        return 1;
+    }
+    if (!s.ready || s.n_b < 2 || s.n_layers <= 0) {
+        return 1;
+    }
+    if (commit_len == s.n_b) {
+        return 0;
+    }
+    if (commit_len > s.n_b) {
+        return 1;
+    }
+    const int b = commit_len - 1;
+    for (int layer = 0; layer < s.n_layers; ++layer) {
+        if (s.rec_live[layer] != nullptr && s.rec[b][layer] != nullptr &&
+            s.rec_bytes[layer] > 0) {
+            hipError_t err = hipMemcpy(
+                s.rec_live[layer],
+                s.rec[b][layer],
+                s.rec_bytes[layer],
+                hipMemcpyDeviceToDevice);
+            if (err != hipSuccess) {
+                return static_cast<int>(err);
+            }
+        }
+        if (s.conv_live[layer] != nullptr && s.conv[b][layer] != nullptr &&
+            s.conv_bytes[layer] > 0) {
+            hipError_t err = hipMemcpy(
+                s.conv_live[layer],
+                s.conv[b][layer],
+                s.conv_bytes[layer],
+                hipMemcpyDeviceToDevice);
+            if (err != hipSuccess) {
+                return static_cast<int>(err);
+            }
+        }
+    }
+    return 0;
+}
+
 extern "C" int supersonic_qwen35_4b_hip_persistent_decode(
     int dtype,
     size_t device_ordinal,

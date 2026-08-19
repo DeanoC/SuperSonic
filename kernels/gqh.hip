@@ -332,6 +332,49 @@ static __device__ __forceinline__ void gqh_acc_tight_lane(
     }
 }
 
+// Skinny B>1: dequant once (w[t] = lvl * s_b), then fmaf per column. Same
+// product as gqh_acc_fma so verify stays bit-identical to kCols=1. llama.cpp
+// gqh_matvec_kernel does this reuse; we previously re-dequantized per column.
+template <bool IS_GQH3>
+static __device__ __forceinline__ void gqh_lane_weights(
+    float w[GQH_PER_LANE], const gqh_tight_lane& p, const float4& mag) {
+#pragma unroll
+    for (int t = 0; t < GQH_PER_LANE; ++t) {
+        const int lo = (p.lo2 >> (2 * t)) & 0x03;
+        const int code = IS_GQH3 ? (lo | (((p.hi1 >> t) & 1) << 2)) : lo;
+        w[t] = gqh_level<IS_GQH3>(code, mag) * p.s_b;
+    }
+}
+
+static __device__ __forceinline__ void gqh_fma_weights(
+    float& acc, const float w[GQH_PER_LANE], const float xs[GQH_PER_LANE]) {
+#pragma unroll
+    for (int t = 0; t < GQH_PER_LANE; ++t) {
+        acc = fmaf(w[t], xs[t], acc);
+    }
+}
+
+static __device__ __forceinline__ void gqh_load_lane_xs(
+    float xs[GQH_PER_LANE],
+    const float* __restrict__ x,
+    int64_t col,
+    int64_t x_col_stride,
+    int sb,
+    int j0) {
+    const float* __restrict__ xc =
+        x + col * x_col_stride + sb * GQH_SUPERBLOCK + j0;
+    const float4 x0 = *reinterpret_cast<const float4*>(xc);
+    const float4 x1 = *reinterpret_cast<const float4*>(xc + 4);
+    xs[0] = x0.x;
+    xs[1] = x0.y;
+    xs[2] = x0.z;
+    xs[3] = x0.w;
+    xs[4] = x1.x;
+    xs[5] = x1.y;
+    xs[6] = x1.z;
+    xs[7] = x1.w;
+}
+
 // One output row, same product order as gqh_matvec_tight_kernel kRows=1.
 template <bool IS_GQH3>
 static __device__ __forceinline__ float gqh_tight_row_dot(
@@ -914,14 +957,16 @@ __global__ void gqh_planar_to_tight_ileave2_kernel(
 // kernel; each superblock is 105/73 contiguous bytes like llama.cpp.
 // kRows=2: one warp does two consecutive rows and shares the x load.
 // Launch only when out is a multiple of warps*2 so both rows are valid.
-template <bool IS_GQH3, bool kAcc, int kRows = 1, bool kPad = false, int kNsb = 0>
+template <bool IS_GQH3, bool kAcc, int kRows = 1, bool kPad = false, int kNsb = 0,
+          int kCols = 1>
 __global__ void gqh_matvec_tight_kernel(
     const uint8_t* __restrict__ data, const float* __restrict__ x, float* __restrict__ y,
     int in, int out, float tensor_scale, float4 mag, int64_t x_col_stride,
-    int64_t y_col_stride, int ileave, int row_off) {
+    int64_t y_col_stride, int ileave, int row_off, int ncols) {
     const int warps_per_block = blockDim.x / GQH_WARP;
     const int lane = threadIdx.x % GQH_WARP;
-    const int col = blockIdx.y;
+    const int col0 = (kCols == 1) ? (int)blockIdx.y : 0;
+    const int ncol = (kCols == 1) ? 1 : (ncols < kCols ? ncols : kCols);
     const int warp = threadIdx.x / GQH_WARP;
     const int row0 = (blockIdx.x * warps_per_block + warp) * kRows + row_off;
 
@@ -952,63 +997,101 @@ __global__ void gqh_matvec_tight_kernel(
     const uint8_t* __restrict__ rowbase1 = (kRows == 2)
         ? (data + (int64_t)(row0 + 1) * row_pitch)
         : rowbase0;
-    const float* __restrict__ xc = x + (int64_t)col * x_col_stride;
     const int j0 = lane * GQH_PER_LANE;
     const int sub = j0 >> 4;
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    // llama.cpp gqh_matvec_kernel: simple SB loop, 4 waves/block.
-    // The old software-pipe path was never taken at 4 waves but still
-    // compiled into this kernel and inflated VGPR on gfx1100.
-    for (int sb = 0; sb < nsb; ++sb) {
-        const float4 x0 =
-            *reinterpret_cast<const float4*>(xc + sb * GQH_SUPERBLOCK + j0);
-        const float4 x1 =
-            *reinterpret_cast<const float4*>(xc + sb * GQH_SUPERBLOCK + j0 + 4);
-        const float xs[GQH_PER_LANE] = {
-            x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-        gqh_tight_lane p0;
+    float acc0[kCols];
+    float acc1[kCols];
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+        acc0[c] = 0.0f;
+        if constexpr (kRows == 2) {
+            acc1[c] = 0.0f;
+        }
+    }
+    auto load_p0 = [&](int sb) {
         if constexpr (kPad) {
-            p0 = gqh_load_padded_lane<IS_GQH3>(
+            return gqh_load_padded_lane<IS_GQH3>(
                 rowbase0, sb, sb_pitch, lane, sub, tensor_scale, s_ratio);
         } else {
-            p0 = gqh_load_tight_lane<IS_GQH3>(
+            return gqh_load_tight_lane<IS_GQH3>(
                 rowbase0, sb, sb_pitch, lane, sub, tensor_scale, s_ratio);
         }
-        gqh_acc_tight_lane<IS_GQH3>(acc0, p0, mag, xs);
-        if constexpr (kRows == 2) {
-            gqh_tight_lane p1;
-            if constexpr (kPad) {
-                p1 = gqh_load_padded_lane<IS_GQH3>(
-                    rowbase1, sb, sb_pitch, lane, sub, tensor_scale, s_ratio);
-            } else {
-                p1 = gqh_load_tight_lane<IS_GQH3>(
-                    rowbase1, sb, sb_pitch, lane, sub, tensor_scale, s_ratio);
+    };
+    auto load_p1 = [&](int sb) {
+        if constexpr (kPad) {
+            return gqh_load_padded_lane<IS_GQH3>(
+                rowbase1, sb, sb_pitch, lane, sub, tensor_scale, s_ratio);
+        } else {
+            return gqh_load_tight_lane<IS_GQH3>(
+                rowbase1, sb, sb_pitch, lane, sub, tensor_scale, s_ratio);
+        }
+    };
+    if constexpr (kCols == 1) {
+#pragma unroll 4
+        for (int sb = 0; sb < nsb; ++sb) {
+            const gqh_tight_lane p0 = load_p0(sb);
+            float xs[GQH_PER_LANE];
+            gqh_load_lane_xs(xs, x, col0, x_col_stride, sb, j0);
+            gqh_acc_tight_lane<IS_GQH3>(acc0[0], p0, mag, xs);
+            if constexpr (kRows == 2) {
+                const gqh_tight_lane p1 = load_p1(sb);
+                gqh_acc_tight_lane<IS_GQH3>(acc1[0], p1, mag, xs);
             }
-            gqh_acc_tight_lane<IS_GQH3>(acc1, p1, mag, xs);
+        }
+    } else {
+        for (int sb = 0; sb < nsb; ++sb) {
+            const gqh_tight_lane p0 = load_p0(sb);
+            float w0[GQH_PER_LANE];
+            gqh_lane_weights<IS_GQH3>(w0, p0, mag);
+            float w1[GQH_PER_LANE];
+            if constexpr (kRows == 2) {
+                const gqh_tight_lane p1 = load_p1(sb);
+                gqh_lane_weights<IS_GQH3>(w1, p1, mag);
+            }
+#pragma unroll
+            for (int c = 0; c < kCols; ++c) {
+                if (c >= ncol) {
+                    break;
+                }
+                float xs[GQH_PER_LANE];
+                gqh_load_lane_xs(xs, x, col0 + c, x_col_stride, sb, j0);
+                gqh_fma_weights(acc0[c], w0, xs);
+                if constexpr (kRows == 2) {
+                    gqh_fma_weights(acc1[c], w1, xs);
+                }
+            }
         }
     }
 #pragma unroll
     for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
-        acc0 += gqh_warp_shfl_down(acc0, off);
-        if constexpr (kRows == 2) {
-            acc1 += gqh_warp_shfl_down(acc1, off);
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            acc0[c] += gqh_warp_shfl_down(acc0[c], off);
+            if constexpr (kRows == 2) {
+                acc1[c] += gqh_warp_shfl_down(acc1[c], off);
+            }
         }
     }
     if (lane == 0) {
-        const int64_t yi0 = (int64_t)col * y_col_stride + row0;
-        if constexpr (kAcc) {
-            y[yi0] = gqh_bf16_round(y[yi0] + gqh_bf16_round(acc0));
-        } else {
-            y[yi0] = acc0;
-        }
-        if constexpr (kRows == 2) {
-            const int64_t yi1 = yi0 + 1;
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (c >= ncol) {
+                break;
+            }
+            const int64_t yi0 = (int64_t)(col0 + c) * y_col_stride + row0;
             if constexpr (kAcc) {
-                y[yi1] = gqh_bf16_round(y[yi1] + gqh_bf16_round(acc1));
+                y[yi0] = gqh_bf16_round(y[yi0] + gqh_bf16_round(acc0[c]));
             } else {
-                y[yi1] = acc1;
+                y[yi0] = acc0[c];
+            }
+            if constexpr (kRows == 2) {
+                const int64_t yi1 = yi0 + 1;
+                if constexpr (kAcc) {
+                    y[yi1] = gqh_bf16_round(y[yi1] + gqh_bf16_round(acc1[c]));
+                } else {
+                    y[yi1] = acc1[c];
+                }
             }
         }
     }
@@ -1165,7 +1248,7 @@ __global__ void gqh_matvec_pair_tight_kernel(
 // SwiGLU pair: no ileave, no dual-row, fuse always on. Same product order
 // as gqh_matvec_pair_tight_kernel<1> with fuse_swiglu=1. Fewer runtime
 // branches so gfx1100 occupancy can match llama's 4-wave singles.
-template <bool A_IS_GQH3, bool B_IS_GQH3, int kNsb = 0>
+template <bool A_IS_GQH3, bool B_IS_GQH3, int kNsb = 0, int kCols = 1>
 __global__ void gqh_matvec_pair_swiglu_kernel(
     const uint8_t* __restrict__ data_a,
     const uint8_t* __restrict__ data_b,
@@ -1176,10 +1259,15 @@ __global__ void gqh_matvec_pair_swiglu_kernel(
     float scale_a,
     float scale_b,
     float4 mag_a,
-    float4 mag_b) {
+    float4 mag_b,
+    int64_t x_col_stride,
+    int64_t y_col_stride,
+    int ncols) {
     const int warps_per_block = blockDim.x / GQH_WARP;
     const int lane = threadIdx.x % GQH_WARP;
     const int warp = threadIdx.x / GQH_WARP;
+    const int col0 = (kCols == 1) ? (int)blockIdx.y : 0;
+    const int ncol = (kCols == 1) ? 1 : (ncols < kCols ? ncols : kCols);
     const int row = blockIdx.x * warps_per_block + warp;
 
     __shared__ float s_ratio[16];
@@ -1209,10 +1297,14 @@ __global__ void gqh_matvec_pair_swiglu_kernel(
     const int j0 = lane * GQH_PER_LANE;
     const int sub = j0 >> 4;
 
-    float acc_a = 0.0f;
-    float acc_b = 0.0f;
-#pragma unroll 2
-    for (int sb = 0; sb < nsb; ++sb) {
+    float acc_a[kCols];
+    float acc_b[kCols];
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+        acc_a[c] = 0.0f;
+        acc_b[c] = 0.0f;
+    }
+    auto pair_sb = [&](int sb) {
         const uint8_t* __restrict__ ba = row_a + (int64_t)sb * sb_a;
         const uint8_t* __restrict__ bb = row_b + (int64_t)sb * sb_b;
         const uint8_t da = gqh_ld_nt_u8(ba);
@@ -1227,52 +1319,97 @@ __global__ void gqh_matvec_pair_swiglu_kernel(
             d_real_a * s_ratio[(sub & 1) ? (rba >> 4) : (rba & 0x0f)];
         const float s_bb =
             d_real_b * s_ratio[(sub & 1) ? (rbb >> 4) : (rbb & 0x0f)];
-        const float4 x0 =
-            *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0);
-        const float4 x1 =
-            *reinterpret_cast<const float4*>(x + sb * GQH_SUPERBLOCK + j0 + 4);
-        const float xs[GQH_PER_LANE] = {
-            x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
         uint16_t lo2a, lo2b;
         memcpy(&lo2a, ba + 9 + lane * 2, sizeof(lo2a));
         memcpy(&lo2b, bb + 9 + lane * 2, sizeof(lo2b));
         const uint8_t hi1a = A_IS_GQH3 ? gqh_ld_nt_u8(ba + 73 + lane) : 0;
         const uint8_t hi1b = B_IS_GQH3 ? gqh_ld_nt_u8(bb + 73 + lane) : 0;
+        if constexpr (kCols == 1) {
+            float xs[GQH_PER_LANE];
+            gqh_load_lane_xs(xs, x, col0, x_col_stride, sb, j0);
 #pragma unroll
-        for (int t = 0; t < GQH_PER_LANE; ++t) {
-            const int loa = (lo2a >> (2 * t)) & 0x03;
-            const int lob = (lo2b >> (2 * t)) & 0x03;
-            const int ca =
-                A_IS_GQH3 ? (loa | (((hi1a >> t) & 1) << 2)) : loa;
-            const int cb =
-                B_IS_GQH3 ? (lob | (((hi1b >> t) & 1) << 2)) : lob;
-            acc_a = gqh_acc_fma(
-                acc_a, gqh_level<A_IS_GQH3>(ca, mag_a), s_ba, xs[t]);
-            acc_b = gqh_acc_fma(
-                acc_b, gqh_level<B_IS_GQH3>(cb, mag_b), s_bb, xs[t]);
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                const int loa = (lo2a >> (2 * t)) & 0x03;
+                const int lob = (lo2b >> (2 * t)) & 0x03;
+                const int ca =
+                    A_IS_GQH3 ? (loa | (((hi1a >> t) & 1) << 2)) : loa;
+                const int cb =
+                    B_IS_GQH3 ? (lob | (((hi1b >> t) & 1) << 2)) : lob;
+                acc_a[0] = gqh_acc_fma(
+                    acc_a[0], gqh_level<A_IS_GQH3>(ca, mag_a), s_ba, xs[t]);
+                acc_b[0] = gqh_acc_fma(
+                    acc_b[0], gqh_level<B_IS_GQH3>(cb, mag_b), s_bb, xs[t]);
+            }
+        } else {
+            float wa[GQH_PER_LANE];
+            float wb[GQH_PER_LANE];
+#pragma unroll
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                const int loa = (lo2a >> (2 * t)) & 0x03;
+                const int lob = (lo2b >> (2 * t)) & 0x03;
+                const int ca =
+                    A_IS_GQH3 ? (loa | (((hi1a >> t) & 1) << 2)) : loa;
+                const int cb =
+                    B_IS_GQH3 ? (lob | (((hi1b >> t) & 1) << 2)) : lob;
+                wa[t] = gqh_level<A_IS_GQH3>(ca, mag_a) * s_ba;
+                wb[t] = gqh_level<B_IS_GQH3>(cb, mag_b) * s_bb;
+            }
+#pragma unroll
+            for (int c = 0; c < kCols; ++c) {
+                if (c >= ncol) {
+                    break;
+                }
+                float xs[GQH_PER_LANE];
+                gqh_load_lane_xs(xs, x, col0 + c, x_col_stride, sb, j0);
+                gqh_fma_weights(acc_a[c], wa, xs);
+                gqh_fma_weights(acc_b[c], wb, xs);
+            }
+        }
+    };
+    if constexpr (kCols == 1) {
+#pragma unroll 4
+        for (int sb = 0; sb < nsb; ++sb) {
+            pair_sb(sb);
+        }
+    } else {
+        for (int sb = 0; sb < nsb; ++sb) {
+            pair_sb(sb);
         }
     }
 #pragma unroll
     for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
-        acc_a += gqh_warp_shfl_down(acc_a, off);
-        acc_b += gqh_warp_shfl_down(acc_b, off);
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            acc_a[c] += gqh_warp_shfl_down(acc_a[c], off);
+            acc_b[c] += gqh_warp_shfl_down(acc_b[c], off);
+        }
     }
     if (lane == 0) {
-        const float g = gqh_bf16_round(acc_a);
-        const float u = gqh_bf16_round(acc_b);
-        y[row] = gqh_bf16_round((g / (1.0f + expf(-g))) * u);
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (c >= ncol) {
+                break;
+            }
+            const int64_t yi = (int64_t)(col0 + c) * y_col_stride + row;
+            const float g = gqh_bf16_round(acc_a[c]);
+            const float u = gqh_bf16_round(acc_b[c]);
+            y[yi] = gqh_bf16_round((g / (1.0f + expf(-g))) * u);
+        }
     }
 }
 
 // Compact llama-style GQH4 GEMV. Pitch is nsb*137, not the planar stride.
-template <bool kAcc, int kRows = 1, int kNsb = 0>
+// kCols=1 is decode GEMV (grid.y is the token). kCols>1 is skinny GEMM:
+// one weight load, kCols activation columns (blockIdx.y unused).
+template <bool kAcc, int kRows = 1, int kNsb = 0, int kCols = 1>
 __global__ void gqh4_matvec_tight_kernel(
     const uint8_t* __restrict__ data, const float* __restrict__ x, float* __restrict__ y,
     int in, int out, float tensor_scale, gqh_grid16 grid, int64_t x_col_stride,
-    int64_t y_col_stride, int row_off) {
+    int64_t y_col_stride, int row_off, int ncols) {
     const int warps_per_block = blockDim.x / GQH_WARP;
     const int lane = threadIdx.x % GQH_WARP;
-    const int col = blockIdx.y;
+    const int col0 = (kCols == 1) ? (int)blockIdx.y : 0;
+    const int ncol = (kCols == 1) ? 1 : (ncols < kCols ? ncols : kCols);
     const int warp = threadIdx.x / GQH_WARP;
     const int row0 = (blockIdx.x * warps_per_block + warp) * kRows + row_off;
 
@@ -1294,22 +1431,21 @@ __global__ void gqh4_matvec_tight_kernel(
     const uint8_t* __restrict__ rowbase1 = (kRows == 2)
         ? (data + (int64_t)(row0 + 1) * row_pitch)
         : rowbase0;
-    const float* __restrict__ xc = x + (int64_t)col * x_col_stride;
     const int j0 = lane * GQH_PER_LANE;
     const int sub = j0 >> 4;
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    // kNsb=68 (down): compile-time trip count, unroll 4. Full unroll
-    // blows VGPRs. LDS tiling of x was 66 ms/tok vs 61 eager.
-#pragma unroll 4
+    float acc0[kCols];
+    float acc1[kCols];
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+        acc0[c] = 0.0f;
+        if constexpr (kRows == 2) {
+            acc1[c] = 0.0f;
+        }
+    }
+    // kNsb=68 (down): no SB unroll. Unroll 4 on skinny B>1 spilled;
+    // llama.cpp gqh_matvec_kernel uses a plain loop. Full unroll blows VGPRs.
     for (int sb = 0; sb < nsb; ++sb) {
-        const float4 x0 =
-            *reinterpret_cast<const float4*>(xc + sb * GQH_SUPERBLOCK + j0);
-        const float4 x1 =
-            *reinterpret_cast<const float4*>(xc + sb * GQH_SUPERBLOCK + j0 + 4);
-        const float xs[GQH_PER_LANE] = {
-            x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
         const uint8_t* __restrict__ b0 = rowbase0 + (int64_t)sb * sb_bytes;
         const uint8_t d0 = gqh_ld_nt_u8(b0);
         const float d_real0 = gqh_bits(GQH_E4M3_D[d0 >> 3][d0 & 7]) * tensor_scale;
@@ -1317,53 +1453,97 @@ __global__ void gqh4_matvec_tight_kernel(
         const float s_b0 = d_real0 * s_ratio[(sub & 1) ? (rb0 >> 4) : (rb0 & 0x0f)];
         uint32_t codes0;
         memcpy(&codes0, b0 + 9 + lane * 4, sizeof(codes0));
-#pragma unroll
-        for (int t = 0; t < GQH_PER_LANE; ++t) {
-            acc0 = gqh_acc_fma(
-                acc0, s_grid[(codes0 >> (4 * t)) & 0x0f], s_b0, xs[t]);
-        }
+        uint32_t codes1 = 0;
+        float s_b1 = 0.0f;
         if constexpr (kRows == 2) {
             const uint8_t* __restrict__ b1 = rowbase1 + (int64_t)sb * sb_bytes;
             const uint8_t d1 = gqh_ld_nt_u8(b1);
-            const float d_real1 = gqh_bits(GQH_E4M3_D[d1 >> 3][d1 & 7]) * tensor_scale;
+            const float d_real1 =
+                gqh_bits(GQH_E4M3_D[d1 >> 3][d1 & 7]) * tensor_scale;
             const uint8_t rb1 = gqh_ld_nt_u8(b1 + 1 + (sub >> 1));
-            const float s_b1 = d_real1 * s_ratio[(sub & 1) ? (rb1 >> 4) : (rb1 & 0x0f)];
-            uint32_t codes1;
+            s_b1 = d_real1 * s_ratio[(sub & 1) ? (rb1 >> 4) : (rb1 & 0x0f)];
             memcpy(&codes1, b1 + 9 + lane * 4, sizeof(codes1));
+        }
+        if constexpr (kCols == 1) {
+            float xs[GQH_PER_LANE];
+            gqh_load_lane_xs(xs, x, col0, x_col_stride, sb, j0);
 #pragma unroll
             for (int t = 0; t < GQH_PER_LANE; ++t) {
-                acc1 = gqh_acc_fma(
-                    acc1, s_grid[(codes1 >> (4 * t)) & 0x0f], s_b1, xs[t]);
+                acc0[0] = gqh_acc_fma(
+                    acc0[0], s_grid[(codes0 >> (4 * t)) & 0x0f], s_b0, xs[t]);
+            }
+            if constexpr (kRows == 2) {
+#pragma unroll
+                for (int t = 0; t < GQH_PER_LANE; ++t) {
+                    acc1[0] = gqh_acc_fma(
+                        acc1[0],
+                        s_grid[(codes1 >> (4 * t)) & 0x0f],
+                        s_b1,
+                        xs[t]);
+                }
+            }
+        } else {
+            float w0[GQH_PER_LANE];
+            float w1[GQH_PER_LANE];
+#pragma unroll
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                w0[t] = s_grid[(codes0 >> (4 * t)) & 0x0f] * s_b0;
+                if constexpr (kRows == 2) {
+                    w1[t] = s_grid[(codes1 >> (4 * t)) & 0x0f] * s_b1;
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < kCols; ++c) {
+                if (c >= ncol) {
+                    break;
+                }
+                float xs[GQH_PER_LANE];
+                gqh_load_lane_xs(xs, x, col0 + c, x_col_stride, sb, j0);
+                gqh_fma_weights(acc0[c], w0, xs);
+                if constexpr (kRows == 2) {
+                    gqh_fma_weights(acc1[c], w1, xs);
+                }
             }
         }
     }
 #pragma unroll
     for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
-        acc0 += gqh_warp_shfl_down(acc0, off);
-        if constexpr (kRows == 2) {
-            acc1 += gqh_warp_shfl_down(acc1, off);
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            acc0[c] += gqh_warp_shfl_down(acc0[c], off);
+            if constexpr (kRows == 2) {
+                acc1[c] += gqh_warp_shfl_down(acc1[c], off);
+            }
         }
     }
     if (lane == 0) {
-        const int64_t yi0 = (int64_t)col * y_col_stride + row0;
-        if constexpr (kAcc) {
-            y[yi0] = gqh_bf16_round(y[yi0] + gqh_bf16_round(acc0));
-        } else {
-            y[yi0] = acc0;
-        }
-        if constexpr (kRows == 2) {
-            const int64_t yi1 = yi0 + 1;
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (c >= ncol) {
+                break;
+            }
+            const int64_t yi0 = (int64_t)(col0 + c) * y_col_stride + row0;
             if constexpr (kAcc) {
-                y[yi1] = gqh_bf16_round(y[yi1] + gqh_bf16_round(acc1));
+                y[yi0] = gqh_bf16_round(y[yi0] + gqh_bf16_round(acc0[c]));
             } else {
-                y[yi1] = acc1;
+                y[yi0] = acc0[c];
+            }
+            if constexpr (kRows == 2) {
+                const int64_t yi1 = yi0 + 1;
+                if constexpr (kAcc) {
+                    y[yi1] = gqh_bf16_round(y[yi1] + gqh_bf16_round(acc1[c]));
+                } else {
+                    y[yi1] = acc1[c];
+                }
             }
         }
     }
 }
 
 
-template <int kNsb = 0, int kRows = 1>
+// kCols=1: grid.y is the token (batched GEMVs). kCols>1: one weight
+// load, kCols activation columns (blockIdx.y unused).
+template <int kNsb = 0, int kRows = 1, int kCols = 1>
 __global__ void gqh4_matvec_pair_swiglu_kernel(
     const uint8_t* __restrict__ data_a,
     const uint8_t* __restrict__ data_b,
@@ -1374,10 +1554,15 @@ __global__ void gqh4_matvec_pair_swiglu_kernel(
     float scale_a,
     float scale_b,
     gqh_grid16 grid_a,
-    gqh_grid16 grid_b) {
+    gqh_grid16 grid_b,
+    int64_t x_col_stride,
+    int64_t y_col_stride,
+    int ncols) {
     const int warps_per_block = blockDim.x / GQH_WARP;
     const int lane = threadIdx.x % GQH_WARP;
     const int warp = threadIdx.x / GQH_WARP;
+    const int col0 = (kCols == 1) ? (int)blockIdx.y : 0;
+    const int ncol = (kCols == 1) ? 1 : (ncols < kCols ? ncols : kCols);
     const int row = (blockIdx.x * warps_per_block + warp) * kRows;
 
     __shared__ float s_ratio[16];
@@ -1405,62 +1590,114 @@ __global__ void gqh4_matvec_pair_swiglu_kernel(
     const int j0 = lane * GQH_PER_LANE;
     const int sub = j0 >> 4;
 
-    float acc_a0 = 0.0f;
-    float acc_b0 = 0.0f;
-    float acc_a1 = 0.0f;
-    float acc_b1 = 0.0f;
-    auto acc_row = [&](const uint8_t* ra, const uint8_t* rb, float& aa, float& ab,
-                       int sbi, const float xs[GQH_PER_LANE]) {
-        const uint8_t* __restrict__ ba = ra + (int64_t)sbi * sb;
-        const uint8_t* __restrict__ bb = rb + (int64_t)sbi * sb;
-        const uint8_t da = gqh_ld_nt_u8(ba);
-        const uint8_t db = gqh_ld_nt_u8(bb);
-        const float d_real_a = gqh_bits(GQH_E4M3_D[da >> 3][da & 7]) * scale_a;
-        const float d_real_b = gqh_bits(GQH_E4M3_D[db >> 3][db & 7]) * scale_b;
-        const uint8_t rba = gqh_ld_nt_u8(ba + 1 + (sub >> 1));
-        const uint8_t rbb = gqh_ld_nt_u8(bb + 1 + (sub >> 1));
-        const float s_ba = d_real_a * s_ratio[(sub & 1) ? (rba >> 4) : (rba & 0x0f)];
-        const float s_bb = d_real_b * s_ratio[(sub & 1) ? (rbb >> 4) : (rbb & 0x0f)];
-        uint32_t ca, cb;
-        memcpy(&ca, ba + 9 + lane * 4, sizeof(ca));
-        memcpy(&cb, bb + 9 + lane * 4, sizeof(cb));
+    float acc_a0[kCols];
+    float acc_b0[kCols];
+    float acc_a1[kCols];
+    float acc_b1[kCols];
 #pragma unroll
-        for (int t = 0; t < GQH_PER_LANE; ++t) {
-            aa = gqh_acc_fma(aa, s_ga[(ca >> (4 * t)) & 0x0f], s_ba, xs[t]);
-            ab = gqh_acc_fma(ab, s_gb[(cb >> (4 * t)) & 0x0f], s_bb, xs[t]);
+    for (int c = 0; c < kCols; ++c) {
+        acc_a0[c] = 0.0f;
+        acc_b0[c] = 0.0f;
+        if constexpr (kRows == 2) {
+            acc_a1[c] = 0.0f;
+            acc_b1[c] = 0.0f;
         }
+    }
+    auto load_sb = [&](const uint8_t* ra, int sbi, float scale, uint32_t& codes,
+                       float& s_b) {
+        const uint8_t* __restrict__ bw = ra + (int64_t)sbi * sb;
+        const uint8_t d = gqh_ld_nt_u8(bw);
+        const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * scale;
+        const uint8_t rbv = gqh_ld_nt_u8(bw + 1 + (sub >> 1));
+        s_b = d_real * s_ratio[(sub & 1) ? (rbv >> 4) : (rbv & 0x0f)];
+        memcpy(&codes, bw + 9 + lane * 4, sizeof(codes));
     };
     const int nloop = kNsb > 0 ? kNsb : nsb;
-#pragma unroll 4
     for (int sbi = 0; sbi < nloop; ++sbi) {
-        const float4 x0 =
-            *reinterpret_cast<const float4*>(x + sbi * GQH_SUPERBLOCK + j0);
-        const float4 x1v =
-            *reinterpret_cast<const float4*>(x + sbi * GQH_SUPERBLOCK + j0 + 4);
-        const float xs[GQH_PER_LANE] = {
-            x0.x, x0.y, x0.z, x0.w, x1v.x, x1v.y, x1v.z, x1v.w};
-        acc_row(row_a0, row_b0, acc_a0, acc_b0, sbi, xs);
+        uint32_t ca0 = 0, cb0 = 0, ca1 = 0, cb1 = 0;
+        float s_a0 = 0.0f, s_b0 = 0.0f, s_a1 = 0.0f, s_b1 = 0.0f;
+        load_sb(row_a0, sbi, scale_a, ca0, s_a0);
+        load_sb(row_b0, sbi, scale_b, cb0, s_b0);
         if constexpr (kRows == 2) {
-            acc_row(row_a1, row_b1, acc_a1, acc_b1, sbi, xs);
+            load_sb(row_a1, sbi, scale_a, ca1, s_a1);
+            load_sb(row_b1, sbi, scale_b, cb1, s_b1);
+        }
+        if constexpr (kCols == 1) {
+            float xs[GQH_PER_LANE];
+            gqh_load_lane_xs(xs, x, col0, x_col_stride, sbi, j0);
+#pragma unroll
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                acc_a0[0] = gqh_acc_fma(
+                    acc_a0[0], s_ga[(ca0 >> (4 * t)) & 0x0f], s_a0, xs[t]);
+                acc_b0[0] = gqh_acc_fma(
+                    acc_b0[0], s_gb[(cb0 >> (4 * t)) & 0x0f], s_b0, xs[t]);
+            }
+            if constexpr (kRows == 2) {
+#pragma unroll
+                for (int t = 0; t < GQH_PER_LANE; ++t) {
+                    acc_a1[0] = gqh_acc_fma(
+                        acc_a1[0], s_ga[(ca1 >> (4 * t)) & 0x0f], s_a1, xs[t]);
+                    acc_b1[0] = gqh_acc_fma(
+                        acc_b1[0], s_gb[(cb1 >> (4 * t)) & 0x0f], s_b1, xs[t]);
+                }
+            }
+        } else {
+            float wa0[GQH_PER_LANE];
+            float wb0[GQH_PER_LANE];
+            float wa1[GQH_PER_LANE];
+            float wb1[GQH_PER_LANE];
+#pragma unroll
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                wa0[t] = s_ga[(ca0 >> (4 * t)) & 0x0f] * s_a0;
+                wb0[t] = s_gb[(cb0 >> (4 * t)) & 0x0f] * s_b0;
+                if constexpr (kRows == 2) {
+                    wa1[t] = s_ga[(ca1 >> (4 * t)) & 0x0f] * s_a1;
+                    wb1[t] = s_gb[(cb1 >> (4 * t)) & 0x0f] * s_b1;
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < kCols; ++c) {
+                if (c >= ncol) {
+                    break;
+                }
+                float xs[GQH_PER_LANE];
+                gqh_load_lane_xs(xs, x, col0 + c, x_col_stride, sbi, j0);
+                gqh_fma_weights(acc_a0[c], wa0, xs);
+                gqh_fma_weights(acc_b0[c], wb0, xs);
+                if constexpr (kRows == 2) {
+                    gqh_fma_weights(acc_a1[c], wa1, xs);
+                    gqh_fma_weights(acc_b1[c], wb1, xs);
+                }
+            }
         }
     }
 #pragma unroll
     for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
-        acc_a0 += gqh_warp_shfl_down(acc_a0, off);
-        acc_b0 += gqh_warp_shfl_down(acc_b0, off);
-        if constexpr (kRows == 2) {
-            acc_a1 += gqh_warp_shfl_down(acc_a1, off);
-            acc_b1 += gqh_warp_shfl_down(acc_b1, off);
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            acc_a0[c] += gqh_warp_shfl_down(acc_a0[c], off);
+            acc_b0[c] += gqh_warp_shfl_down(acc_b0[c], off);
+            if constexpr (kRows == 2) {
+                acc_a1[c] += gqh_warp_shfl_down(acc_a1[c], off);
+                acc_b1[c] += gqh_warp_shfl_down(acc_b1[c], off);
+            }
         }
     }
     if (lane == 0) {
-        const float g = gqh_bf16_round(acc_a0);
-        const float u = gqh_bf16_round(acc_b0);
-        y[row] = gqh_bf16_round((g / (1.0f + expf(-g))) * u);
-        if constexpr (kRows == 2) {
-            const float g1 = gqh_bf16_round(acc_a1);
-            const float u1 = gqh_bf16_round(acc_b1);
-            y[row + 1] = gqh_bf16_round((g1 / (1.0f + expf(-g1))) * u1);
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (c >= ncol) {
+                break;
+            }
+            const int64_t yi = (int64_t)(col0 + c) * y_col_stride + row;
+            const float g = gqh_bf16_round(acc_a0[c]);
+            const float u = gqh_bf16_round(acc_b0[c]);
+            y[yi] = gqh_bf16_round((g / (1.0f + expf(-g))) * u);
+            if constexpr (kRows == 2) {
+                const float g1 = gqh_bf16_round(acc_a1[c]);
+                const float u1 = gqh_bf16_round(acc_b1[c]);
+                y[yi + 1] = gqh_bf16_round((g1 / (1.0f + expf(-g1))) * u1);
+            }
         }
     }
 }

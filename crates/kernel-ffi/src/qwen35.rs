@@ -435,6 +435,7 @@ pub fn persistent_decode_qwen08_sm86_specialized(
 #[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
     fn supersonic_qwen35_4b_hip_set_gqh_prepare_only(on: c_int);
+    fn supersonic_qwen35_hip_mtp_restore_linear_prefix(commit_len: c_int) -> c_int;
 }
 
 pub fn set_hip_gqh_prepare_only(on: bool) {
@@ -444,6 +445,32 @@ pub fn set_hip_gqh_prepare_only(on: bool) {
     }
     #[cfg(not(supersonic_backend_hip))]
     let _ = on;
+}
+
+/// Restore linear conv+rec after fused B>1 MTP verify to a committed prefix.
+/// `Ok(true)` if live state matches `commit_len` tokens; `Ok(false)` if the
+/// caller must sequential-replay.
+pub fn mtp_restore_linear_prefix(commit_len: usize) -> Result<bool, GpuError> {
+    #[cfg(supersonic_backend_hip)]
+    {
+        let status = unsafe {
+            supersonic_qwen35_hip_mtp_restore_linear_prefix(commit_len as c_int)
+        };
+        if status == 0 {
+            return Ok(true);
+        }
+        if status == 1 {
+            return Ok(false);
+        }
+        return Err(GpuError::InvalidArg(format!(
+            "mtp_restore_linear_prefix failed: {status}"
+        )));
+    }
+    #[cfg(not(supersonic_backend_hip))]
+    {
+        let _ = commit_len;
+        Ok(false)
+    }
 }
 
 pub fn persistent_decode_4b(

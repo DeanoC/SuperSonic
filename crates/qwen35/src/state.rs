@@ -1548,6 +1548,54 @@ impl ModelState {
     /// `snap` via D2D copies into the existing buffers. Shapes/dtypes must
     /// match what `snapshot_linear` captured — this is a tight invariant
     /// because the sidecar originated from the same `ModelState::new`.
+    /// Copy live linear state into an existing sidecar, allocating on first
+    /// use or if layer layout changed. Avoids per-round `hipMalloc`.
+    pub fn snapshot_linear_into(
+        &self,
+        snap: &mut LinearStateSnapshot,
+        ordinal: usize,
+    ) -> Result<(), GpuError> {
+        if snap.per_layer.len() != self.layers.len() {
+            *snap = self.snapshot_linear()?;
+            return Ok(());
+        }
+        for (i, ls) in self.layers.iter().enumerate() {
+            match (
+                ls.kind,
+                ls.conv_state.as_ref(),
+                ls.recurrent_state.as_ref(),
+                snap.per_layer[i].as_mut(),
+            ) {
+                (LayerKind::Linear, Some(conv), Some(rec), Some((conv_dst, rec_dst))) => {
+                    if conv_dst.len_bytes() != conv.len_bytes()
+                        || rec_dst.len_bytes() != rec.len_bytes()
+                    {
+                        *snap = self.snapshot_linear()?;
+                        return Ok(());
+                    }
+                    gpu_hal::copy_d2d(
+                        ordinal,
+                        conv_dst.as_mut_ptr(),
+                        conv.as_ptr(),
+                        conv.len_bytes(),
+                    )?;
+                    gpu_hal::copy_d2d(
+                        ordinal,
+                        rec_dst.as_mut_ptr(),
+                        rec.as_ptr(),
+                        rec.len_bytes(),
+                    )?;
+                }
+                (LayerKind::Full, _, _, None) => {}
+                _ => {
+                    *snap = self.snapshot_linear()?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn restore_linear(
         &mut self,
         snap: &LinearStateSnapshot,

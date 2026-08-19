@@ -5540,6 +5540,10 @@ pub struct MetalV2DecodeScratch {
     scratch: PrefillScratch,
     chunk_conv_tail: Vec<Option<GpuBuffer>>,
     token_id_buf: GpuBuffer,
+    mtp_residual: GpuBuffer,
+    mtp_logits: GpuBuffer,
+    mtp_argmax: GpuBuffer,
+    mtp_counter: GpuBuffer,
 }
 
 impl MetalV2DecodeScratch {
@@ -5563,11 +5567,31 @@ impl MetalV2DecodeScratch {
 
         let token_id_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("metal v2 token id buf: {e}"))?;
+        let mtp_residual = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[1, config.hidden_size],
+        )
+        .map_err(|e| anyhow::anyhow!("mtp residual scratch: {e}"))?;
+        let mtp_logits = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[1, config.vocab_size],
+        )
+        .map_err(|e| anyhow::anyhow!("mtp logits scratch: {e}"))?;
+        let mtp_argmax = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+            .map_err(|e| anyhow::anyhow!("mtp argmax scratch: {e}"))?;
+        let mtp_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+            .map_err(|e| anyhow::anyhow!("mtp counter scratch: {e}"))?;
 
         Ok(Self {
             scratch,
             chunk_conv_tail,
             token_id_buf,
+            mtp_residual,
+            mtp_logits,
+            mtp_argmax,
+            mtp_counter,
         })
     }
 
@@ -9499,11 +9523,9 @@ pub fn qwen35_mtp_forward(
         scratch.scratch.mlp_buf.shape()
     );
 
-    let mut residual = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
-        .map_err(|e| anyhow::anyhow!("mtp residual alloc: {e}"))?;
     copy_d2d_batched(
         ordinal,
-        residual.as_mut_ptr(),
+        scratch.mtp_residual.as_mut_ptr(),
         h.as_ptr(),
         hidden_dim * elem,
     )
@@ -9512,7 +9534,7 @@ pub fn qwen35_mtp_forward(
         copy_d2d_batched(
             ordinal,
             scratch.scratch.proj_buf2.as_mut_ptr(),
-            residual.as_ptr(),
+            scratch.mtp_residual.as_ptr(),
             hidden_dim * elem,
         )
         .map_err(|e| anyhow::anyhow!("mtp h_nextn copy: {e}"))?;
@@ -9522,7 +9544,7 @@ pub fn qwen35_mtp_forward(
             ordinal,
             1,
             hidden_dim,
-            &residual,
+            &scratch.mtp_residual,
             &weights.norm_weight,
             &mut scratch.scratch.proj_buf2,
             "mtp output_norm / h_nextn",
@@ -9565,7 +9587,7 @@ pub fn qwen35_mtp_forward(
         hidden_dim,
         &scratch.scratch.proj_buf2,
         &mtp.hnorm_w,
-        &mut residual,
+        &mut scratch.mtp_residual,
         "mtp hnorm",
     )?;
     copy_d2d_batched(
@@ -9578,7 +9600,7 @@ pub fn qwen35_mtp_forward(
     copy_d2d_batched(
         ordinal,
         scratch.scratch.mlp_buf.offset_ptr(hidden_dim * elem) as *mut c_void,
-        residual.as_ptr(),
+        scratch.mtp_residual.as_ptr(),
         hidden_dim * elem,
     )
     .map_err(|e| anyhow::anyhow!("mtp concat h: {e}"))?;
@@ -9655,8 +9677,6 @@ pub fn qwen35_mtp_forward(
         "mtp shared_head_norm",
     )?;
     let vocab_size = config.vocab_size;
-    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, vocab_size])
-        .map_err(|e| anyhow::anyhow!("mtp logits alloc: {e}"))?;
     if !prefill_lm_head_lowbit(
         ordinal,
         1,
@@ -9664,47 +9684,52 @@ pub fn qwen35_mtp_forward(
         hidden_dim,
         out_h,
         weights,
-        &mut logits_buf,
+        &mut scratch.mtp_logits,
         "mtp lm_head",
     )? {
-        let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-            .map_err(|e| anyhow::anyhow!("mtp lm_head counter: {e}"))?;
         kernel_ffi::standalone_matvec(
             ordinal,
             ScalarType::BF16,
-            &mut logits_buf,
+            &mut scratch.mtp_logits,
             out_h,
             &*weights.lm_head,
             hidden_dim,
             vocab_size,
-            &mut counter,
+            &mut scratch.mtp_counter,
         )
         .map_err(|e| anyhow::anyhow!("mtp lm_head matvec: {e}"))?;
     }
-    let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-        .map_err(|e| anyhow::anyhow!("mtp argmax alloc: {e}"))?;
-    match logits_buf.backend() {
+    match scratch.mtp_logits.backend() {
         Backend::Hip => prefill_ffi::argmax_bf16_rows(
             ordinal,
             1,
             vocab_size,
-            &logits_buf,
-            &mut out_index,
+            &scratch.mtp_logits,
+            &mut scratch.mtp_argmax,
         )
         .map_err(|e| anyhow::anyhow!("mtp argmax: {e}"))?,
         Backend::Cuda => kernel_ffi::cuda_argmax_bf16(
             ordinal,
-            &logits_buf,
-            &mut out_index,
+            &scratch.mtp_logits,
+            &mut scratch.mtp_argmax,
             vocab_size,
         )
         .map_err(|e| anyhow::anyhow!("mtp argmax: {e}"))?,
-        Backend::Metal => kernel_ffi::metal_argmax_bf16_into(&logits_buf, &mut out_index, vocab_size)
-            .map_err(|e| anyhow::anyhow!("mtp argmax: {e}"))?,
+        Backend::Metal => kernel_ffi::metal_argmax_bf16_into(
+            &scratch.mtp_logits,
+            &mut scratch.mtp_argmax,
+            vocab_size,
+        )
+        .map_err(|e| anyhow::anyhow!("mtp argmax: {e}"))?,
     }
     let mut id = [0u8; 4];
-    gpu_hal::copy_d2h(ordinal, id.as_mut_ptr() as *mut c_void, out_index.as_ptr(), 4)
-        .map_err(|e| anyhow::anyhow!("mtp argmax d2h: {e}"))?;
+    gpu_hal::copy_d2h(
+        ordinal,
+        id.as_mut_ptr() as *mut c_void,
+        scratch.mtp_argmax.as_ptr(),
+        4,
+    )
+    .map_err(|e| anyhow::anyhow!("mtp argmax d2h: {e}"))?;
     Ok(u32::from_le_bytes(id))
 }
 

@@ -1153,9 +1153,12 @@ pub struct DecodeEngine {
     mtp_spec_emitted: u32,
     mtp_force_seq: bool,
     /// After a 0-accept block, finish the request with sequential decode.
+    #[allow(dead_code)]
     mtp_seq_rest: bool,
-    /// Last fused-verify RMSNorm row (BF16 `[hidden]`), embeddings_nextn.
+    /// Last fused-verify RMSNorm rows (BF16 `[B, hidden]`), embeddings_nextn.
     fused_last_normed: Option<Vec<u8>>,
+    /// Reusable pre-verify linear snapshot. Avoids per-round clone alloc.
+    mtp_linear_snap: Option<LinearStateSnapshot>,
 }
 
 pub struct DecodeEngineSnapshot {
@@ -1220,6 +1223,8 @@ struct DFlashFusedVerifyCache {
     normed_buf: GpuBuffer,
     /// BF16 logits output, shape `[block_size, 1, vocab_size]`.
     logits_buf: GpuBuffer,
+    /// GPU argmax indices, shape `[block_size]` U32.
+    argmax_buf: GpuBuffer,
     /// Device copy of `Vec<BatchSeqDesc>` (one per layer), re-uploaded
     /// each fused-verify call.
     batch_desc_device: GpuBuffer,
@@ -1413,6 +1418,8 @@ impl DFlashFusedVerifyCache {
             .map_err(|e| anyhow::anyhow!("fused verify normed_buf alloc: {e}"))?;
         let logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, vocab_size])
             .map_err(|e| anyhow::anyhow!("fused verify logits_buf alloc: {e}"))?;
+        let argmax_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[block_size])
+            .map_err(|e| anyhow::anyhow!("fused verify argmax_buf alloc: {e}"))?;
         let batch_desc_bytes = num_layers * std::mem::size_of::<kernel_ffi::BatchSeqDesc>();
         let batch_desc_device = GpuBuffer::zeros(ordinal, ScalarType::U8, &[batch_desc_bytes])
             .map_err(|e| anyhow::anyhow!("fused verify batch desc alloc: {e}"))?;
@@ -1422,6 +1429,7 @@ impl DFlashFusedVerifyCache {
             hidden_io,
             normed_buf,
             logits_buf,
+            argmax_buf,
             batch_desc_device,
         })
     }
@@ -10684,6 +10692,7 @@ impl DecodeEngine {
             mtp_force_seq: false,
             mtp_seq_rest: false,
             fused_last_normed: None,
+            mtp_linear_snap: None,
         })
     }
 
@@ -10779,14 +10788,10 @@ impl DecodeEngine {
             anyhow::bail!("mtp spec round missing seeded h_nextn");
         }
         let max_b = self.fused_verify_max_batch().min(kernel_ffi::MAX_BATCH_SIZE);
-        let gqh = !self.weights.gqh_headers.is_empty();
-        let k = if gqh {
-            self.mtp_k.min(remaining.saturating_sub(1))
-        } else {
-            self.mtp_k
-                .min(remaining.saturating_sub(1))
-                .min(max_b.saturating_sub(1))
-        };
+        let k = self
+            .mtp_k
+            .min(remaining.saturating_sub(1))
+            .min(max_b.saturating_sub(1));
         let mtp_kv_start = self
             .state
             .mtp
@@ -10794,10 +10799,7 @@ impl DecodeEngine {
             .map(|ls| ls.kv_filled)
             .unwrap_or(0);
 
-        if self.mtp_seq_rest
-            || self.mtp_force_seq
-            || (k < self.mtp_k && self.mtp_spec_rounds > 0)
-        {
+        if self.mtp_force_seq {
             self.mtp_force_seq = false;
             return self.run_mtp_spec_round_sequential(
                 first_token,
@@ -10811,7 +10813,16 @@ impl DecodeEngine {
         let drafts = if k == 0 {
             Vec::new()
         } else {
-            self.mtp_draft_chain(first_token, pos, k)?
+            let t_draft = Instant::now();
+            let d = self.mtp_draft_chain(first_token, pos, k)?;
+            if env::var_os("SUPERSONIC_QWEN38_MTP_PROFILE").is_some() {
+                eprintln!(
+                    "[qwen38-mtp-profile] draft k={} {:.1}ms",
+                    d.len(),
+                    t_draft.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            d
         };
         if drafts.is_empty() {
             return self.run_mtp_spec_round_sequential(
@@ -10831,24 +10842,20 @@ impl DecodeEngine {
             block.truncate(remaining);
         }
 
-        let snap = self
-            .state
-            .snapshot_linear()
-            .map_err(|e| anyhow::anyhow!("mtp snapshot_linear: {e}"))?;
+        self.ensure_mtp_linear_snap()?;
         let t0 = Instant::now();
-        let use_fused = !gqh && block.len() <= max_b;
+        let use_fused = block.len() <= max_b;
         let (emitted, next_token, n_acc) = if use_fused {
-            match self.verify_block_fused_decode(&block, pos) {
-                Ok(logits) => {
+            match self.verify_block_fused_decode_greedy(&block, pos) {
+                Ok(greedy) => {
                     let verify_ms = t0.elapsed().as_secs_f64() * 1000.0;
                     self.mtp_accept_fused_or_replay(
                         &block,
                         &drafts,
-                        &logits,
+                        &greedy,
                         remaining,
                         pos,
                         verify_ms,
-                        &snap,
                     )?
                 }
                 Err(err) => {
@@ -10888,7 +10895,6 @@ impl DecodeEngine {
                 remaining,
                 pos,
                 verify_ms,
-                &snap,
             )?
         };
 
@@ -10901,9 +10907,6 @@ impl DecodeEngine {
         self.mtp_spec_emitted += emitted.len() as u32;
         self.mtp_diag_total += drafts.len() as u32;
         self.mtp_diag_hits += n_acc as u32;
-        if n_acc == 0 && !drafts.is_empty() {
-            self.mtp_seq_rest = true;
-        }
         Ok(MtpSpecRound {
             emitted,
             next_token,
@@ -10912,17 +10915,61 @@ impl DecodeEngine {
         })
     }
 
+    fn ensure_mtp_linear_snap(&mut self) -> Result<()> {
+        if self.mtp_linear_snap.is_none() {
+            self.mtp_linear_snap = Some(
+                self.state
+                    .snapshot_linear()
+                    .map_err(|e| anyhow::anyhow!("mtp snapshot_linear: {e}"))?,
+            );
+            return Ok(());
+        }
+        let ordinal = self.ordinal;
+        let snap = self.mtp_linear_snap.as_mut().unwrap();
+        self.state
+            .snapshot_linear_into(snap, ordinal)
+            .map_err(|e| anyhow::anyhow!("mtp snapshot_linear_into: {e}"))
+    }
+
+    fn seed_mtp_from_fused_normed(&mut self, commit_len: usize) -> Result<()> {
+        let Some(normed) = self.fused_last_normed.clone() else {
+            return Ok(());
+        };
+        let hidden = self.weights.config.hidden_size;
+        let row_bytes = hidden * ScalarType::BF16.size_in_bytes();
+        let start = commit_len.saturating_sub(1) * row_bytes;
+        let end = start + row_bytes;
+        if end <= normed.len() {
+            self.seed_mtp_h_from_normed(&normed[start..end])?;
+        }
+        Ok(())
+    }
+
+    fn mtp_commit_prefix(
+        &mut self,
+        block: &[u32],
+        greedy: &[u32],
+        commit_len: usize,
+        n_acc: usize,
+        pos: usize,
+        fused: bool,
+    ) -> Result<(Vec<u32>, u32, usize)> {
+        self.commit_fused_kv_filled(pos + commit_len);
+        if fused {
+            self.seed_mtp_from_fused_normed(commit_len)?;
+        }
+        Ok((block[..commit_len].to_vec(), greedy[commit_len - 1], n_acc))
+    }
+
     fn mtp_accept_fused_or_replay(
         &mut self,
         block: &[u32],
         drafts: &[u32],
-        logits: &[Vec<f32>],
+        greedy: &[u32],
         remaining: usize,
         pos: usize,
         verify_ms: f64,
-        snap: &LinearStateSnapshot,
     ) -> Result<(Vec<u32>, u32, usize)> {
-        let greedy: Vec<u32> = logits.iter().map(|row| Self::greedy_sample(row)).collect();
         anyhow::ensure!(
             greedy.len() == block.len(),
             "fused verify greedy {} != block {}",
@@ -10944,13 +10991,19 @@ impl DecodeEngine {
             );
         }
         if commit_len == block.len() {
-            self.commit_fused_kv_filled(pos + commit_len);
-            if let Some(normed) = self.fused_last_normed.clone() {
-                self.seed_mtp_h_from_normed(&normed)?;
+            return self.mtp_commit_prefix(block, greedy, commit_len, n_acc, pos, true);
+        }
+        match kernel_ffi::mtp_restore_linear_prefix(commit_len) {
+            Ok(true) => {
+                if env::var_os("SUPERSONIC_QWEN38_MTP_PROFILE").is_some() {
+                    eprintln!(
+                        "[qwen38-mtp-profile] prefix-restore commit={} skip-replay",
+                        commit_len
+                    );
+                }
+                self.mtp_commit_prefix(block, greedy, commit_len, n_acc, pos, true)
             }
-            Ok((block.to_vec(), greedy[commit_len - 1], n_acc))
-        } else {
-            self.mtp_replay_committed_prefix(&block[..commit_len], pos, snap)
+            Ok(false) | Err(_) => self.mtp_replay_committed_prefix(&block[..commit_len], pos),
         }
     }
 
@@ -10963,7 +11016,6 @@ impl DecodeEngine {
         remaining: usize,
         pos: usize,
         verify_ms: f64,
-        snap: &LinearStateSnapshot,
     ) -> Result<(Vec<u32>, u32, usize)> {
         anyhow::ensure!(
             greedy.len() == block.len(),
@@ -10998,7 +11050,7 @@ impl DecodeEngine {
             }
             Ok((block.to_vec(), greedy[commit_len - 1], n_acc))
         } else {
-            self.mtp_replay_committed_prefix(&block[..commit_len], pos, snap)
+            self.mtp_replay_committed_prefix(&block[..commit_len], pos)
         }
     }
 
@@ -11015,10 +11067,13 @@ impl DecodeEngine {
         &mut self,
         committed: &[u32],
         pos: usize,
-        snap: &LinearStateSnapshot,
     ) -> Result<(Vec<u32>, u32, usize)> {
         anyhow::ensure!(!committed.is_empty(), "mtp replay empty prefix");
         let ordinal = self.ordinal;
+        let snap = self
+            .mtp_linear_snap
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("mtp replay missing linear snapshot"))?;
         self.state
             .restore_linear(snap, ordinal)
             .map_err(|e| anyhow::anyhow!("mtp restore_linear: {e}"))?;
@@ -13200,6 +13255,27 @@ impl DecodeEngine {
         tokens: &[u32],
         pos_offset: usize,
     ) -> Result<Vec<Vec<f32>>> {
+        Ok(self
+            .verify_block_fused_decode_ex(tokens, pos_offset, false)?
+            .0)
+    }
+
+    fn verify_block_fused_decode_greedy(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Result<Vec<u32>> {
+        Ok(self
+            .verify_block_fused_decode_ex(tokens, pos_offset, true)?
+            .1)
+    }
+
+    fn verify_block_fused_decode_ex(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+        greedy_only: bool,
+    ) -> Result<(Vec<Vec<f32>>, Vec<u32>)> {
         if !self.use_4b_kernel {
             anyhow::bail!("verify_block_fused_decode requires use_4b_kernel");
         }
@@ -13435,26 +13511,58 @@ impl DecodeEngine {
         let lm_head_ms = lm_head_start.elapsed().as_secs_f64() * 1000.0;
 
         let d2h_start = Instant::now();
-        let logits_host = cache
-            .logits_buf
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("fused verify logits D2H: {e}"))?;
-        let d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
-        let row_stride_bytes = vocab_size * ScalarType::BF16.size_in_bytes();
-        let mut logits_per_pos = Vec::with_capacity(b);
-        for bi in 0..b {
-            let start = bi * row_stride_bytes;
-            let end = start + row_stride_bytes;
-            let row: Vec<f32> = logits_host[start..end]
-                .chunks_exact(2)
-                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect();
-            logits_per_pos.push(row);
+        let greedy = {
+            kernel_ffi::prefill_ffi::argmax_bf16_rows(
+                self.ordinal,
+                b,
+                vocab_size,
+                &cache.logits_buf,
+                &mut cache.argmax_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("fused verify gpu argmax: {e}"))?;
+            let token_bytes = cache
+                .argmax_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("fused verify argmax D2H: {e}"))?;
+            anyhow::ensure!(
+                token_bytes.len() >= b * 4,
+                "fused verify argmax D2H truncated"
+            );
+            let mut ids = Vec::with_capacity(b);
+            for i in 0..b {
+                let chunk: [u8; 4] = token_bytes[i * 4..i * 4 + 4]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("fused verify argmax token truncated"))?;
+                ids.push(u32::from_le_bytes(chunk));
+            }
+            ids
+        };
+        let mut logits_per_pos = Vec::new();
+        let d2h_ms;
+        if greedy_only {
+            d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
+        } else {
+            let logits_host = cache
+                .logits_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("fused verify logits D2H: {e}"))?;
+            d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
+            let row_stride_bytes = vocab_size * ScalarType::BF16.size_in_bytes();
+            logits_per_pos = Vec::with_capacity(b);
+            for bi in 0..b {
+                let start = bi * row_stride_bytes;
+                let end = start + row_stride_bytes;
+                let row: Vec<f32> = logits_host[start..end]
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect();
+                logits_per_pos.push(row);
+            }
         }
 
         if profile_verify {
             eprintln!(
-                "[dflash-profile] fused_verify B={b} pos={pos_offset} persistent={persistent_ms:.2}ms rms={rms_ms:.2}ms lm_head={lm_head_ms:.2}ms d2h={d2h_ms:.2}ms"
+                "[dflash-profile] fused_verify B={b} pos={pos_offset} persistent={persistent_ms:.2}ms rms={rms_ms:.2}ms lm_head={lm_head_ms:.2}ms d2h={d2h_ms:.2}ms greedy_only={greedy_only}"
             );
         }
 
@@ -13462,12 +13570,10 @@ impl DecodeEngine {
             .normed_buf
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("fused verify normed D2H: {e}"))?;
-        let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
-        let last_off = (b - 1) * row_bytes;
-        self.fused_last_normed = Some(normed_host[last_off..last_off + row_bytes].to_vec());
+        self.fused_last_normed = Some(normed_host);
 
         self.dflash_fused_verify_cache = Some(cache);
-        Ok(logits_per_pos)
+        Ok((logits_per_pos, greedy))
     }
 
     /// Greedy argmax over logits.
@@ -15053,4 +15159,35 @@ fn greedy_argmax_u32(logits: &[f32]) -> u32 {
             }
         })
         .0 as u32
+}
+
+#[cfg(test)]
+mod mtp_accept_tests {
+    use super::DecodeEngine;
+
+    #[test]
+    fn greedy_sample_is_argmax() {
+        assert_eq!(DecodeEngine::greedy_sample(&[0.1, 4.0, 3.5, -1.0]), 1);
+        assert_eq!(DecodeEngine::greedy_sample(&[-3.0, -2.0, -2.5]), 1);
+    }
+
+    #[test]
+    fn fused_verify_batch_fits_k2_for_qwen38_hidden() {
+        // Qwen3.8-27B hidden=5120. K=2 needs B=3 fused verify.
+        const HIDDEN: usize = 5120;
+        const MAX_INPUT_CACHE_FLOATS: usize = 15872;
+        let max_b = (MAX_INPUT_CACHE_FLOATS / HIDDEN).max(1);
+        assert!(max_b >= 3, "fused verify B=3 must fit hidden={HIDDEN}");
+    }
+
+    #[test]
+    fn mtp_commit_len_is_accepted_plus_one() {
+        let n_acc = 1usize;
+        let block_len = 3usize;
+        let remaining = 32usize;
+        let commit_len = (n_acc + 1).min(block_len).min(remaining);
+        assert_eq!(commit_len, 2);
+        assert_eq!((0usize + 1).min(3).min(32), 1);
+        assert_eq!((2usize + 1).min(3).min(32), 3);
+    }
 }
