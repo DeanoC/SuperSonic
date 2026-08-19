@@ -31,6 +31,9 @@ static __constant__ uint32_t GQH_RATIO_Q_D[16][1] = GQH_RATIO_Q_INIT;
 static __constant__ uint32_t GQH2C_CB_D[256][8] = GQH2C_CODEBOOK_INIT;
 static __constant__ uint8_t GQH2C_SIGN_D[128] = GQH2C_SIGN_MASK_INIT;
 
+struct gqh_grid16 {
+    float v[16];
+};
 struct gqh_grid8 {
     float v[8];
 };
@@ -163,6 +166,26 @@ __global__ void gqh2c_decode_kernel(
     const float raw = gqh_bits(GQH2C_CB_D[p[grp]][e]);
     const float mag = ((mask >> e) & 1) ? -raw : raw;
     dst[sb * GQH_SUPERBLOCK + j] = gqh_store_val<T>(mag * s_blk);
+}
+
+// Tight 137 B superblock: [0] E4M3 d, [1:9] ratios, [9:137] uint4 codes.
+// 16-level grid in LDS -- same reason as llama.cpp: divergent code indexes.
+template <typename T>
+__global__ void gqh4_decode_kernel(
+    const uint8_t* __restrict__ wire, float tensor_scale, gqh_grid16 grid,
+    T* __restrict__ dst) {
+    const int64_t sb = blockIdx.x;
+    const int j = threadIdx.x;
+    const uint8_t* __restrict__ b = wire + sb * GQH4_SB_BYTES;
+    __shared__ float s_grid[16];
+    if (j < 16) {
+        s_grid[j] = grid.v[j];
+    }
+    __syncthreads();
+    const float s_b = gqh_subblock_scale(b, j >> 4, tensor_scale);
+    const uint8_t cb = b[9 + (j >> 1)];
+    const int code = (j & 1) ? (cb >> 4) : (cb & 0x0f);
+    dst[sb * GQH_SUPERBLOCK + j] = gqh_store_val<T>(s_grid[code] * s_b);
 }
 
 #define GQH_WARP 32
@@ -1238,6 +1261,207 @@ __global__ void gqh_matvec_pair_swiglu_kernel(
         const float g = gqh_bf16_round(acc_a);
         const float u = gqh_bf16_round(acc_b);
         y[row] = gqh_bf16_round((g / (1.0f + expf(-g))) * u);
+    }
+}
+
+// Compact llama-style GQH4 GEMV. Pitch is nsb*137, not the planar stride.
+template <bool kAcc, int kRows = 1, int kNsb = 0>
+__global__ void gqh4_matvec_tight_kernel(
+    const uint8_t* __restrict__ data, const float* __restrict__ x, float* __restrict__ y,
+    int in, int out, float tensor_scale, gqh_grid16 grid, int64_t x_col_stride,
+    int64_t y_col_stride, int row_off) {
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int lane = threadIdx.x % GQH_WARP;
+    const int col = blockIdx.y;
+    const int warp = threadIdx.x / GQH_WARP;
+    const int row0 = (blockIdx.x * warps_per_block + warp) * kRows + row_off;
+
+    __shared__ float s_ratio[16];
+    __shared__ float s_grid[16];
+    if (threadIdx.x < 16) {
+        s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+        s_grid[threadIdx.x] = grid.v[threadIdx.x];
+    }
+    __syncthreads();
+    if (row0 >= row_off + out) {
+        return;
+    }
+
+    const int nsb = kNsb > 0 ? kNsb : (in / GQH_SUPERBLOCK);
+    constexpr int sb_bytes = GQH4_SB_BYTES;
+    const int row_pitch = nsb * sb_bytes;
+    const uint8_t* __restrict__ rowbase0 = data + (int64_t)row0 * row_pitch;
+    const uint8_t* __restrict__ rowbase1 = (kRows == 2)
+        ? (data + (int64_t)(row0 + 1) * row_pitch)
+        : rowbase0;
+    const float* __restrict__ xc = x + (int64_t)col * x_col_stride;
+    const int j0 = lane * GQH_PER_LANE;
+    const int sub = j0 >> 4;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    // kNsb=68 (down): compile-time trip count, unroll 4. Full unroll
+    // blows VGPRs. LDS tiling of x was 66 ms/tok vs 61 eager.
+#pragma unroll 4
+    for (int sb = 0; sb < nsb; ++sb) {
+        const float4 x0 =
+            *reinterpret_cast<const float4*>(xc + sb * GQH_SUPERBLOCK + j0);
+        const float4 x1 =
+            *reinterpret_cast<const float4*>(xc + sb * GQH_SUPERBLOCK + j0 + 4);
+        const float xs[GQH_PER_LANE] = {
+            x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        const uint8_t* __restrict__ b0 = rowbase0 + (int64_t)sb * sb_bytes;
+        const uint8_t d0 = gqh_ld_nt_u8(b0);
+        const float d_real0 = gqh_bits(GQH_E4M3_D[d0 >> 3][d0 & 7]) * tensor_scale;
+        const uint8_t rb0 = gqh_ld_nt_u8(b0 + 1 + (sub >> 1));
+        const float s_b0 = d_real0 * s_ratio[(sub & 1) ? (rb0 >> 4) : (rb0 & 0x0f)];
+        uint32_t codes0;
+        memcpy(&codes0, b0 + 9 + lane * 4, sizeof(codes0));
+#pragma unroll
+        for (int t = 0; t < GQH_PER_LANE; ++t) {
+            acc0 = gqh_acc_fma(
+                acc0, s_grid[(codes0 >> (4 * t)) & 0x0f], s_b0, xs[t]);
+        }
+        if constexpr (kRows == 2) {
+            const uint8_t* __restrict__ b1 = rowbase1 + (int64_t)sb * sb_bytes;
+            const uint8_t d1 = gqh_ld_nt_u8(b1);
+            const float d_real1 = gqh_bits(GQH_E4M3_D[d1 >> 3][d1 & 7]) * tensor_scale;
+            const uint8_t rb1 = gqh_ld_nt_u8(b1 + 1 + (sub >> 1));
+            const float s_b1 = d_real1 * s_ratio[(sub & 1) ? (rb1 >> 4) : (rb1 & 0x0f)];
+            uint32_t codes1;
+            memcpy(&codes1, b1 + 9 + lane * 4, sizeof(codes1));
+#pragma unroll
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                acc1 = gqh_acc_fma(
+                    acc1, s_grid[(codes1 >> (4 * t)) & 0x0f], s_b1, xs[t]);
+            }
+        }
+    }
+#pragma unroll
+    for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
+        acc0 += gqh_warp_shfl_down(acc0, off);
+        if constexpr (kRows == 2) {
+            acc1 += gqh_warp_shfl_down(acc1, off);
+        }
+    }
+    if (lane == 0) {
+        const int64_t yi0 = (int64_t)col * y_col_stride + row0;
+        if constexpr (kAcc) {
+            y[yi0] = gqh_bf16_round(y[yi0] + gqh_bf16_round(acc0));
+        } else {
+            y[yi0] = acc0;
+        }
+        if constexpr (kRows == 2) {
+            const int64_t yi1 = yi0 + 1;
+            if constexpr (kAcc) {
+                y[yi1] = gqh_bf16_round(y[yi1] + gqh_bf16_round(acc1));
+            } else {
+                y[yi1] = acc1;
+            }
+        }
+    }
+}
+
+
+template <int kNsb = 0, int kRows = 1>
+__global__ void gqh4_matvec_pair_swiglu_kernel(
+    const uint8_t* __restrict__ data_a,
+    const uint8_t* __restrict__ data_b,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int in,
+    int out,
+    float scale_a,
+    float scale_b,
+    gqh_grid16 grid_a,
+    gqh_grid16 grid_b) {
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int lane = threadIdx.x % GQH_WARP;
+    const int warp = threadIdx.x / GQH_WARP;
+    const int row = (blockIdx.x * warps_per_block + warp) * kRows;
+
+    __shared__ float s_ratio[16];
+    __shared__ float s_ga[16];
+    __shared__ float s_gb[16];
+    if (threadIdx.x < 16) {
+        s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+        s_ga[threadIdx.x] = grid_a.v[threadIdx.x];
+        s_gb[threadIdx.x] = grid_b.v[threadIdx.x];
+    }
+    __syncthreads();
+    if (row >= out) {
+        return;
+    }
+
+    const int nsb = kNsb > 0 ? kNsb : (in / GQH_SUPERBLOCK);
+    constexpr int sb = GQH4_SB_BYTES;
+    const int pitch = nsb * sb;
+    const uint8_t* __restrict__ row_a0 = data_a + (int64_t)row * pitch;
+    const uint8_t* __restrict__ row_b0 = data_b + (int64_t)row * pitch;
+    const uint8_t* __restrict__ row_a1 =
+        (kRows == 2) ? row_a0 + pitch : row_a0;
+    const uint8_t* __restrict__ row_b1 =
+        (kRows == 2) ? row_b0 + pitch : row_b0;
+    const int j0 = lane * GQH_PER_LANE;
+    const int sub = j0 >> 4;
+
+    float acc_a0 = 0.0f;
+    float acc_b0 = 0.0f;
+    float acc_a1 = 0.0f;
+    float acc_b1 = 0.0f;
+    auto acc_row = [&](const uint8_t* ra, const uint8_t* rb, float& aa, float& ab,
+                       int sbi, const float xs[GQH_PER_LANE]) {
+        const uint8_t* __restrict__ ba = ra + (int64_t)sbi * sb;
+        const uint8_t* __restrict__ bb = rb + (int64_t)sbi * sb;
+        const uint8_t da = gqh_ld_nt_u8(ba);
+        const uint8_t db = gqh_ld_nt_u8(bb);
+        const float d_real_a = gqh_bits(GQH_E4M3_D[da >> 3][da & 7]) * scale_a;
+        const float d_real_b = gqh_bits(GQH_E4M3_D[db >> 3][db & 7]) * scale_b;
+        const uint8_t rba = gqh_ld_nt_u8(ba + 1 + (sub >> 1));
+        const uint8_t rbb = gqh_ld_nt_u8(bb + 1 + (sub >> 1));
+        const float s_ba = d_real_a * s_ratio[(sub & 1) ? (rba >> 4) : (rba & 0x0f)];
+        const float s_bb = d_real_b * s_ratio[(sub & 1) ? (rbb >> 4) : (rbb & 0x0f)];
+        uint32_t ca, cb;
+        memcpy(&ca, ba + 9 + lane * 4, sizeof(ca));
+        memcpy(&cb, bb + 9 + lane * 4, sizeof(cb));
+#pragma unroll
+        for (int t = 0; t < GQH_PER_LANE; ++t) {
+            aa = gqh_acc_fma(aa, s_ga[(ca >> (4 * t)) & 0x0f], s_ba, xs[t]);
+            ab = gqh_acc_fma(ab, s_gb[(cb >> (4 * t)) & 0x0f], s_bb, xs[t]);
+        }
+    };
+    const int nloop = kNsb > 0 ? kNsb : nsb;
+#pragma unroll 4
+    for (int sbi = 0; sbi < nloop; ++sbi) {
+        const float4 x0 =
+            *reinterpret_cast<const float4*>(x + sbi * GQH_SUPERBLOCK + j0);
+        const float4 x1v =
+            *reinterpret_cast<const float4*>(x + sbi * GQH_SUPERBLOCK + j0 + 4);
+        const float xs[GQH_PER_LANE] = {
+            x0.x, x0.y, x0.z, x0.w, x1v.x, x1v.y, x1v.z, x1v.w};
+        acc_row(row_a0, row_b0, acc_a0, acc_b0, sbi, xs);
+        if constexpr (kRows == 2) {
+            acc_row(row_a1, row_b1, acc_a1, acc_b1, sbi, xs);
+        }
+    }
+#pragma unroll
+    for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
+        acc_a0 += gqh_warp_shfl_down(acc_a0, off);
+        acc_b0 += gqh_warp_shfl_down(acc_b0, off);
+        if constexpr (kRows == 2) {
+            acc_a1 += gqh_warp_shfl_down(acc_a1, off);
+            acc_b1 += gqh_warp_shfl_down(acc_b1, off);
+        }
+    }
+    if (lane == 0) {
+        const float g = gqh_bf16_round(acc_a0);
+        const float u = gqh_bf16_round(acc_b0);
+        y[row] = gqh_bf16_round((g / (1.0f + expf(-g))) * u);
+        if constexpr (kRows == 2) {
+            const float g1 = gqh_bf16_round(acc_a1);
+            const float u1 = gqh_bf16_round(acc_b1);
+            y[row + 1] = gqh_bf16_round((g1 / (1.0f + expf(-g1))) * u1);
+        }
     }
 }
 

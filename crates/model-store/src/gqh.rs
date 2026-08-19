@@ -1,4 +1,4 @@
-//! GQH (Geo-Quant Hierarchical) codecs 13–15 / GGUF qtypes 108–110.
+//! GQH (Geo-Quant Hierarchical) codecs 13–15 / GGUF qtypes 108–111.
 //!
 //! Decode is bit-exact against the geo-lucebox CPU reference and the
 //! `tests/gqh-vectors` wires. Do not reassociate the float products.
@@ -12,6 +12,7 @@ use crate::Error;
 pub const GGML_TYPE_GQH3: u32 = 108;
 pub const GGML_TYPE_GQH2_H: u32 = 109;
 pub const GGML_TYPE_GQH2_C: u32 = 110;
+pub const GGML_TYPE_GQH4: u32 = 111;
 
 pub const GQH_HEADERS_KV: &str = "geoquant.gqh.headers";
 const GQH_MAGIC: &[u8; 8] = b"GQHh1\0\0\0";
@@ -21,6 +22,7 @@ pub enum GqhRung {
     Gqh3,
     Gqh2H,
     Gqh2C,
+    Gqh4,
 }
 
 impl GqhRung {
@@ -29,6 +31,7 @@ impl GqhRung {
             GGML_TYPE_GQH3 => Some(Self::Gqh3),
             GGML_TYPE_GQH2_H => Some(Self::Gqh2H),
             GGML_TYPE_GQH2_C => Some(Self::Gqh2C),
+            GGML_TYPE_GQH4 => Some(Self::Gqh4),
             _ => None,
         }
     }
@@ -38,6 +41,7 @@ impl GqhRung {
             crate::flm::CODEC_GQH3 => Some(Self::Gqh3),
             crate::flm::CODEC_GQH2_H => Some(Self::Gqh2H),
             crate::flm::CODEC_GQH2_C => Some(Self::Gqh2C),
+            crate::flm::CODEC_GQH4 => Some(Self::Gqh4),
             _ => None,
         }
     }
@@ -47,6 +51,7 @@ impl GqhRung {
             Self::Gqh3 => GGML_TYPE_GQH3,
             Self::Gqh2H => GGML_TYPE_GQH2_H,
             Self::Gqh2C => GGML_TYPE_GQH2_C,
+            Self::Gqh4 => GGML_TYPE_GQH4,
         }
     }
 
@@ -55,6 +60,7 @@ impl GqhRung {
             Self::Gqh3 => crate::flm::CODEC_GQH3,
             Self::Gqh2H => crate::flm::CODEC_GQH2_H,
             Self::Gqh2C => crate::flm::CODEC_GQH2_C,
+            Self::Gqh4 => crate::flm::CODEC_GQH4,
         }
     }
 
@@ -63,6 +69,7 @@ impl GqhRung {
             Self::Gqh3 => tables::GQH3_SB_BYTES,
             Self::Gqh2H => tables::GQH2H_SB_BYTES,
             Self::Gqh2C => tables::GQH2C_SB_BYTES,
+            Self::Gqh4 => tables::GQH4_SB_BYTES,
         }
     }
 
@@ -138,8 +145,8 @@ pub fn device_row_bytes(rung: GqhRung, cols: usize) -> Option<usize> {
     if cols == 0 || cols % tables::SUPERBLOCK != 0 {
         return None;
     }
-    if matches!(rung, GqhRung::Gqh2C) {
-        return Some((cols / tables::SUPERBLOCK) * tables::GQH2C_SB_BYTES);
+    if matches!(rung, GqhRung::Gqh2C | GqhRung::Gqh4) {
+        return Some((cols / tables::SUPERBLOCK) * rung.superblock_bytes());
     }
     Some(plane_layout(cols / tables::SUPERBLOCK, matches!(rung, GqhRung::Gqh3)).stride)
 }
@@ -164,7 +171,7 @@ pub fn planarize(rung: GqhRung, rows: usize, cols: usize, tight: &[u8]) -> Resul
             tight.len()
         )));
     }
-    if matches!(rung, GqhRung::Gqh2C) {
+    if matches!(rung, GqhRung::Gqh2C | GqhRung::Gqh4) {
         return Ok(tight.to_vec());
     }
     let nsb = cols / tables::SUPERBLOCK;
@@ -228,6 +235,10 @@ pub fn decode_row(
             decode_gqh2_h(packed, nsb, h.tensor_scale, h.grid_code, out)?;
         }
         GqhRung::Gqh2C => decode_gqh2_c(packed, nsb, out)?,
+        GqhRung::Gqh4 => {
+            let h = header.ok_or_else(|| Error::Other("GQH4 requires a per-tensor header".into()))?;
+            decode_gqh4(packed, nsb, h.tensor_scale, h.grid_code, out)?;
+        }
     }
     Ok(())
 }
@@ -254,6 +265,33 @@ fn decode_gqh3(
                 let hi = (b[73 + (j >> 3)] >> (j & 7)) & 0x01;
                 out[sb * tables::SUPERBLOCK + j] =
                     bits_f32(grid[(lo | (hi << 2)) as usize]) * s_b;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_gqh4(
+    packed: &[u8],
+    nsb: usize,
+    tensor_scale: f32,
+    grid_code: u8,
+    out: &mut [f32],
+) -> Result<(), Error> {
+    if grid_code as usize >= tables::GRID_CODES {
+        return Err(Error::Other(format!("GQH4 grid_code {grid_code} >= 12")));
+    }
+    let grid = tables::GQH4_GRID[grid_code as usize];
+    let sb_bytes = tables::GQH4_SB_BYTES;
+    for sb in 0..nsb {
+        let b = &packed[sb * sb_bytes..(sb + 1) * sb_bytes];
+        for sub in 0..tables::N_SUB {
+            let s_b = subblock_scale(b, sub, tensor_scale);
+            for t in 0..tables::SUBBLOCK {
+                let j = sub * tables::SUBBLOCK + t;
+                let cb = b[9 + (j >> 1)];
+                let code = if j & 1 == 1 { cb >> 4 } else { cb & 0x0f };
+                out[sb * tables::SUPERBLOCK + j] = bits_f32(grid[code as usize]) * s_b;
             }
         }
     }
@@ -359,9 +397,9 @@ pub fn parse_gqh_headers_kv(blob: &[u8]) -> Result<Vec<(String, GqhHeader)>, Err
             return Err(Error::Other(format!("GQH header KV '{name}' padding is not zero")));
         }
         off += 12;
-        if qtype != GGML_TYPE_GQH3 && qtype != GGML_TYPE_GQH2_H {
+        if qtype != GGML_TYPE_GQH3 && qtype != GGML_TYPE_GQH2_H && qtype != GGML_TYPE_GQH4 {
             return Err(Error::Other(format!(
-                "GQH header KV '{name}' qtype {qtype} is not 108/109"
+                "GQH header KV '{name}' qtype {qtype} is not 108/109/111"
             )));
         }
         if grid_code as usize >= tables::GRID_CODES {
@@ -515,10 +553,52 @@ mod tests {
     }
 
     #[test]
+    fn gqh4_nibble_decode_row_uses_grid_and_subblock_scale() {
+        let nsb = 1usize;
+        let cols = 256usize;
+        let mut packed = vec![0u8; tables::GQH4_SB_BYTES];
+        packed[0] = 0x38; // e4m3 1.0
+        for i in 0..8 {
+            packed[1 + i] = 0xff; // ratio 15/15
+        }
+        for j in 0..256 {
+            let byte = 9 + (j >> 1);
+            let nibble = (j & 15) as u8;
+            if j & 1 == 1 {
+                packed[byte] |= nibble << 4;
+            } else {
+                packed[byte] |= nibble;
+            }
+        }
+        let header = GqhHeader {
+            qtype: GGML_TYPE_GQH4,
+            tensor_scale: 2.0,
+            grid_code: 0,
+        };
+        let mut out = vec![0.0f32; cols];
+        decode_row(GqhRung::Gqh4, &packed, cols, Some(header), &mut out).unwrap();
+        let d_real = f32::from_bits(tables::E4M3_LUT[(0x38 >> 3) as usize][(0x38 & 7) as usize]) * 2.0;
+        let s_b = d_real * f32::from_bits(tables::RATIO_Q[15]);
+        for j in 0..256 {
+            let code = j & 15;
+            let want = f32::from_bits(tables::GQH4_GRID[0][code]) * s_b;
+            assert_eq!(
+                out[j].to_bits(),
+                want.to_bits(),
+                "j={j} got {} want {}",
+                out[j],
+                want
+            );
+        }
+        let _ = nsb;
+    }
+
+    #[test]
     fn maps_gguf_qtypes_onto_flm_codecs() {
         assert_eq!(GqhRung::from_ggml_type(108).unwrap().flm_codec(), 13);
         assert_eq!(GqhRung::from_ggml_type(109).unwrap().flm_codec(), 14);
         assert_eq!(GqhRung::from_ggml_type(110).unwrap().flm_codec(), 15);
+        assert_eq!(GqhRung::from_ggml_type(111).unwrap().flm_codec(), 16);
         assert_eq!(GqhRung::from_flm_codec(13).unwrap().ggml_type(), 108);
         assert!(GqhRung::from_ggml_type(107).is_none());
     }

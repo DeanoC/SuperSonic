@@ -206,6 +206,7 @@ const GGML_TYPE_ROCMFP2_MIX: u32 = 106;
 const GGML_TYPE_GQH3: u32 = 108;
 const GGML_TYPE_GQH2_H: u32 = 109;
 const GGML_TYPE_GQH2_C: u32 = 110;
+const GGML_TYPE_GQH4: u32 = 111;
 
 #[derive(Debug, Clone)]
 struct GgufTensor {
@@ -416,7 +417,7 @@ impl GgufWeightLoader {
         let logical_cols = tensor.dims[0];
         let logical_rows = tensor.dims[1];
         match tensor.tensor_type {
-            GGML_TYPE_GQH3 | GGML_TYPE_GQH2_H | GGML_TYPE_GQH2_C => {
+            GGML_TYPE_GQH3 | GGML_TYPE_GQH2_H | GGML_TYPE_GQH2_C | GGML_TYPE_GQH4 => {
                 let rung = model_store::gqh::GqhRung::from_ggml_type(tensor.tensor_type)
                     .ok_or_else(|| {
                         LoadError::UnsupportedDtype(format!(

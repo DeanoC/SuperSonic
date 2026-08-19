@@ -216,6 +216,7 @@ int gqh_rung_from_qtype(int qtype) {
     if (qtype == 108) return 0;
     if (qtype == 109) return 1;
     if (qtype == 110) return 2;
+    if (qtype == 111) return 3;
     return -1;
 }
 
@@ -8738,7 +8739,12 @@ int persistent_decode_device(
         const bool dump_this = dump_dir != nullptr
             && dump_pos_env != nullptr
             && std::atoi(dump_pos_env) == static_cast<int>(seqlen_offset);
+        hipDeviceProp_t hip_prop{};
+        (void)hipGetDeviceProperties(&hip_prop, 0);
+        // gfx12: Global+side fails; ThreadLocal+side replay was 105 ms/tok
+        // vs 61 eager; single-stream capture was a wash. Keep eager.
         const bool use_graph =
+            hip_prop.major < 12 &&
             std::getenv("SUPERSONIC_DISABLE_HIP_GRAPH") == nullptr &&
             std::getenv("SUPERSONIC_DECODE_PROF") == nullptr;
         struct SplitGraphCache {
@@ -8887,7 +8893,14 @@ int persistent_decode_device(
                 } else {
                     err = launch_split(1, layer, in_flags, grid_in, stream);
                 }
-                if (err != hipSuccess) return err;
+                if (err != hipSuccess) {
+                    std::fprintf(
+                        stderr,
+                        "[decode] fail after in-rms layer=%d: %s\n",
+                        layer,
+                        hipGetErrorString(err));
+                    return err;
+                }
                 if (layer == dump_lin) {
                     if (stream) {
                         (void)hipStreamSynchronize(stream);
@@ -8965,7 +8978,14 @@ int persistent_decode_device(
                         sync_now();
                         ms_inproj += now_ms() - t_in0;
                     }
-                    if (err != hipSuccess) return err;
+                    if (err != hipSuccess) {
+                        std::fprintf(
+                            stderr,
+                            "[decode] fail after inproj layer=%d: %s\n",
+                            layer,
+                            hipGetErrorString(err));
+                        return err;
+                    }
                     if (layer == dump_lin) {
                         if (z_pending != nullptr) {
                             decode_join_side(stream, z_pending);
@@ -9441,7 +9461,8 @@ int persistent_decode_device(
                     const double t_m0 = dec_prof ? (sync_now(), now_ms()) : 0;
                     const GqhProjHdr& gate_h = mlp_hdrs.gate[layer];
                     const GqhProjHdr& up_h = mlp_hdrs.up[layer];
-                    if (gate_h.rung >= 0 && up_h.rung >= 0) {
+                    if (gate_h.rung >= 0 && up_h.rung >= 0 &&
+                        gate_h.rung == up_h.rung) {
                         err = launch_gqh_gemv_pair(
                             device_ordinal,
                             gate_h,
@@ -9455,6 +9476,9 @@ int persistent_decode_device(
                             stream,
                             true);
                     } else {
+                        err = hipErrorInvalidValue;
+                    }
+                    if (err != hipSuccess) {
                         err = launch_gqh_gemv(
                             device_ordinal,
                             gate_h,
@@ -9478,7 +9502,14 @@ int persistent_decode_device(
                                 ws_gate, ws_up, intermediate_size, stream);
                         }
                     }
-                    if (err != hipSuccess) return err;
+                    if (err != hipSuccess) {
+                        std::fprintf(
+                            stderr,
+                            "[decode] fail after pair layer=%d: %s\n",
+                            layer,
+                            hipGetErrorString(err));
+                        return err;
+                    }
                     const double t_d0 = dec_prof ? (sync_now(), now_ms()) : 0;
                     if (dec_prof) {
                         ms_pair += t_d0 - t_m0;
@@ -9502,7 +9533,14 @@ int persistent_decode_device(
                             hidden_dim,
                             stream);
                     }
-                    if (err != hipSuccess) return err;
+                    if (err != hipSuccess) {
+                        std::fprintf(
+                            stderr,
+                            "[decode] fail after down layer=%d: %s\n",
+                            layer,
+                            hipGetErrorString(err));
+                        return err;
+                    }
                     if (dec_prof) {
                         sync_now();
                         const double t_m1 = now_ms();
@@ -9660,13 +9698,13 @@ int persistent_decode_device(
             }
             if (g_hip_gqh_prepare_only) {
                 g_hip_gqh_prepare_only = false;
-                if (launch_err == hipSuccess) {
-                    (void)hipDeviceSynchronize();
-                    std::fprintf(
-                        stderr,
-                        "[decode] GQH tight convert + HIP graph prepared\n");
-                    return 0;
-                }
+                (void)hipGetLastError();
+                (void)hipDeviceSynchronize();
+                std::fprintf(
+                    stderr,
+                    "[decode] GQH tight convert prepared%s\n",
+                    launch_err == hipSuccess ? " + HIP graph" : " (eager decode)");
+                return 0;
             }
             if (launch_err == hipSuccess && cache.exec != nullptr) {
                 launch_err = hipGraphLaunch(cache.exec, cache.stream);
@@ -9678,6 +9716,14 @@ int persistent_decode_device(
                 launch_err = record_layers(0);
             }
         } else {
+            if (g_hip_gqh_prepare_only) {
+                g_hip_gqh_prepare_only = false;
+                (void)hipDeviceSynchronize();
+                std::fprintf(
+                    stderr,
+                    "[decode] GQH tight convert prepared (eager decode)\n");
+                return 0;
+            }
             launch_err = record_layers(0);
         }
     } else if (coop_requested && coop_supported && max_blocks_per_mp > 0) {
@@ -9756,8 +9802,22 @@ int persistent_decode_device(
     }
 
     hipError_t sync_err = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) {
+        std::fprintf(
+            stderr,
+            "[decode] launch_err=%s (%d)\n",
+            hipGetErrorString(launch_err),
+            static_cast<int>(launch_err));
+        return 254;
+    }
+    if (sync_err != hipSuccess) {
+        std::fprintf(
+            stderr,
+            "[decode] sync_err=%s (%d)\n",
+            hipGetErrorString(sync_err),
+            static_cast<int>(sync_err));
+        return 255;
+    }
     return 0;
 }
 
@@ -9856,8 +9916,22 @@ extern "C" int supersonic_qwen35_4b_hip_quantize_kv_to_fp8(
     }
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) {
+        std::fprintf(
+            stderr,
+            "[decode] launch_err=%s (%d)\n",
+            hipGetErrorString(launch_err),
+            static_cast<int>(launch_err));
+        return 254;
+    }
+    if (sync_err != hipSuccess) {
+        std::fprintf(
+            stderr,
+            "[decode] sync_err=%s (%d)\n",
+            hipGetErrorString(sync_err),
+            static_cast<int>(sync_err));
+        return 255;
+    }
     return 0;
 }
 

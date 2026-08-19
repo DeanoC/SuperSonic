@@ -376,11 +376,13 @@ static constexpr int QWEN35_LOWBIT_GGML_Q6_K = 14;
 static constexpr int QWEN35_LOWBIT_GQH3 = 108;
 static constexpr int QWEN35_LOWBIT_GQH2_H = 109;
 static constexpr int QWEN35_LOWBIT_GQH2_C = 110;
+static constexpr int QWEN35_LOWBIT_GQH4 = 111;
 
 static __constant__ uint32_t QWEN35_GQH_E4M3[32][8] = GQH_E4M3_LUT_INIT;
 static __constant__ uint32_t QWEN35_GQH_RATIO_Q[16][1] = GQH_RATIO_Q_INIT;
 static __constant__ uint32_t QWEN35_GQH3_GRID[12][8] = GQH3_GRID_INIT;
 static __constant__ uint32_t QWEN35_GQH2H_GRID[12][4] = GQH2H_GRID_INIT;
+static __constant__ uint32_t QWEN35_GQH4_GRID[12][16] = GQH4_GRID_INIT;
 
 __device__ inline bool qwen35_lowbit_native_int4(int qtype) {
     return qtype == QWEN35_LOWBIT_NATIVE_INT4;
@@ -396,7 +398,8 @@ __device__ inline bool qwen35_lowbit_ggml_k(int qtype) {
 __device__ inline bool qwen35_lowbit_gqh(int qtype) {
     return qtype == QWEN35_LOWBIT_GQH3 ||
            qtype == QWEN35_LOWBIT_GQH2_H ||
-           qtype == QWEN35_LOWBIT_GQH2_C;
+           qtype == QWEN35_LOWBIT_GQH2_C ||
+           qtype == QWEN35_LOWBIT_GQH4;
 }
 
 __device__ inline bool qwen35_lowbit_supported(int qtype) {
@@ -428,6 +431,7 @@ __device__ inline int qwen35_gqh_row_bytes(int qtype, int cols) {
     if (qtype == QWEN35_LOWBIT_GQH3) return gqh_plane_row_bytes(nsb, 1);
     if (qtype == QWEN35_LOWBIT_GQH2_H) return gqh_plane_row_bytes(nsb, 0);
     if (qtype == QWEN35_LOWBIT_GQH2_C) return nsb * GQH2C_SB_BYTES;
+    if (qtype == QWEN35_LOWBIT_GQH4) return nsb * GQH4_SB_BYTES;
     return 0;
 }
 
@@ -465,6 +469,15 @@ __device__ inline float qwen35_gqh_dequant_scalar(
         const int code = (lo_p[j >> 2] >> (2 * (j & 3))) & 0x03;
         return qwen35_gqh_bits(QWEN35_GQH2H_GRID[grid_code][code]) * s_b;
     }
+    if (qtype == QWEN35_LOWBIT_GQH4) {
+        const uint8_t* b = static_cast<const uint8_t*>(w_ptr) +
+            static_cast<size_t>(row) * static_cast<size_t>(nsb * GQH4_SB_BYTES) +
+            static_cast<size_t>(sb) * GQH4_SB_BYTES;
+        const float s4 = qwen35_gqh_subblock_scale(b, j >> 4, tensor_scale);
+        const uint8_t cb = b[9 + (j >> 1)];
+        const int code = (j & 1) ? (cb >> 4) : (cb & 0x0f);
+        return qwen35_gqh_bits(QWEN35_GQH4_GRID[grid_code][code]) * s4;
+    }
     return 0.0f;
 }
 
@@ -472,6 +485,20 @@ __device__ inline void qwen35_gqh_dequant_8(
     const void* w_ptr, int qtype, int row, int col, int cols,
     float tensor_scale, int grid_code, float out[8]) {
     const int nsb = cols / GQH_SUPERBLOCK;
+    if (qtype == QWEN35_LOWBIT_GQH4) {
+        const uint8_t* b = static_cast<const uint8_t*>(w_ptr) +
+            static_cast<size_t>(row) * static_cast<size_t>(nsb * GQH4_SB_BYTES) +
+            static_cast<size_t>(col / GQH_SUPERBLOCK) * GQH4_SB_BYTES;
+        const int j0 = col % GQH_SUPERBLOCK;
+        const float s4 = qwen35_gqh_subblock_scale(b, j0 >> 4, tensor_scale);
+        for (int i = 0; i < 8; ++i) {
+            const int j = j0 + i;
+            const uint8_t cb = b[9 + (j >> 1)];
+            const int code = (j & 1) ? (cb >> 4) : (cb & 0x0f);
+            out[i] = qwen35_gqh_bits(QWEN35_GQH4_GRID[grid_code][code]) * s4;
+        }
+        return;
+    }
     const int is3 = qtype == QWEN35_LOWBIT_GQH3;
     int off_r, off_lo, off_hi, stride;
     gqh_plane_offsets(nsb, is3, &off_r, &off_lo, &off_hi, &stride);
@@ -8330,6 +8357,71 @@ __global__ __launch_bounds__(256, 4) void supersonic_qwen35_decode_rms_scale_ker
     }
     __syncthreads();
     const int c = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + threadIdx.x;
+    if (c < hidden_dim) {
+        const float y =
+            hidden_f32[c] * s_inv * (static_cast<float>(norm_w[c]) + unit_offset);
+        normed[c] = static_cast<float>(hip_bfloat16(y));
+    }
+}
+
+// Same two-phase math as partial+scale, one cooperative launch (grid.sync).
+// Cuts 128 scale launches/token on decode.
+#if defined(__HIPCC__)
+#include <hip/hip_cooperative_groups.h>
+#endif
+__global__ __launch_bounds__(256, 4) void supersonic_qwen35_decode_rms_coop_kernel(
+    float* __restrict__ hidden_f32,
+    float* __restrict__ normed,
+    const hip_bfloat16* __restrict__ hidden_io,
+    const hip_bfloat16* __restrict__ norm_w,
+    float* __restrict__ partials,
+    int hidden_dim,
+    int npartials,
+    float eps,
+    float unit_offset,
+    int flags
+) {
+    extern __shared__ float lds[];
+    const int tid = threadIdx.x;
+    const int c = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
+    float x = 0.0f;
+    if (c < hidden_dim) {
+        if ((flags & 1) != 0 && hidden_io != nullptr) {
+            x = static_cast<float>(hidden_io[c]);
+        } else {
+            x = hidden_f32[c];
+        }
+        if ((flags & 2) != 0) {
+            x = bf16_round_rne_f32_finite(x);
+        }
+        hidden_f32[c] = x;
+    }
+    float partial_sq = x * x;
+    lds[tid] = partial_sq;
+    __syncthreads();
+    for (int s = static_cast<int>(blockDim.x) / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            lds[tid] += lds[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partials[blockIdx.x] = lds[0];
+    }
+#if defined(__HIPCC__)
+    cooperative_groups::this_grid().sync();
+#else
+    __syncthreads();
+#endif
+    __shared__ float s_inv;
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int i = 0; i < npartials; ++i) {
+            tot += partials[i];
+        }
+        s_inv = rsqrtf(tot / static_cast<float>(hidden_dim) + eps);
+    }
+    __syncthreads();
     if (c < hidden_dim) {
         const float y =
             hidden_f32[c] * s_inv * (static_cast<float>(norm_w[c]) + unit_offset);

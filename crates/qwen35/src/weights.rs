@@ -168,6 +168,7 @@ pub const LOWBIT_ROCMFP2_MIX: i32 = 106;
 pub const LOWBIT_GQH3: i32 = 108;
 pub const LOWBIT_GQH2_H: i32 = 109;
 pub const LOWBIT_GQH2_C: i32 = 110;
+pub const LOWBIT_GQH4: i32 = 111;
 
 pub fn ggml_k_row_bytes(qtype: i32, cols: usize) -> Option<usize> {
     if qtype == LOWBIT_GGML_Q8_0 {
@@ -195,6 +196,7 @@ pub fn ggml_k_row_bytes(qtype: i32, cols: usize) -> Option<usize> {
         LOWBIT_GQH3 => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh3, cols),
         LOWBIT_GQH2_H => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh2H, cols),
         LOWBIT_GQH2_C => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh2C, cols),
+        LOWBIT_GQH4 => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh4, cols),
         _ => None,
     }
 }
@@ -218,6 +220,7 @@ pub fn infer_lowbit_type(weight: &GpuBuffer, logical_cols: usize, native_int4: b
         LOWBIT_GQH3,
         LOWBIT_GQH2_H,
         LOWBIT_GQH2_C,
+        LOWBIT_GQH4,
     ] {
         if ggml_k_row_bytes(qtype, logical_cols) == Some(row_bytes) {
             return qtype;

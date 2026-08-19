@@ -76,7 +76,12 @@ enum GqhRung : int {
     GQH_RUNG_GQH3 = 0,
     GQH_RUNG_GQH2_H = 1,
     GQH_RUNG_GQH2_C = 2,
+    GQH_RUNG_GQH4 = 3,
 };
+
+int gqh4_tight_warps() {
+    return 4;
+}
 
 int packed_row_bytes(int rung) {
     switch (rung) {
@@ -86,6 +91,8 @@ int packed_row_bytes(int rung) {
             return GQH2H_SB_BYTES;
         case GQH_RUNG_GQH2_C:
             return GQH2C_SB_BYTES;
+        case GQH_RUNG_GQH4:
+            return GQH4_SB_BYTES;
         default:
             return -1;
     }
@@ -113,6 +120,12 @@ gqh_grid8 load_gqh3_grid(int grid_code) {
 gqh_grid4 load_gqh2h_grid(int grid_code) {
     gqh_grid4 grid{};
     memcpy(grid.v, GQH2H_GRID[grid_code], sizeof(grid.v));
+    return grid;
+}
+
+gqh_grid16 load_gqh4_grid(int grid_code) {
+    gqh_grid16 grid{};
+    memcpy(grid.v, GQH4_GRID[grid_code], sizeof(grid.v));
     return grid;
 }
 
@@ -296,6 +309,79 @@ void launch_gqh12_matvec(
     int grid_code,
     int64_t x_col_stride,
     int64_t y_col_stride) {
+    if (rung == GQH_RUNG_GQH4) {
+        const int nsb = in_dim / GQH_SUPERBLOCK;
+        // gfx12: 8 waves/block. 4-wave GQH4 pair+down left decode at 61 ms/tok.
+        const int kTightWarps = gqh4_tight_warps();
+        const bool dual =
+            out_dim > 5120 && (out_dim % (kTightWarps * 2)) == 0;
+        dim3 tblocks = blocks;
+        tblocks.x = static_cast<unsigned int>(
+            (out_dim + (dual ? kTightWarps * 2 : kTightWarps) - 1) /
+            (dual ? kTightWarps * 2 : kTightWarps));
+        if (tblocks.x == 0) {
+            tblocks.x = 1;
+        }
+        const dim3 tthreads(GQH_WARP * kTightWarps, 1, 1);
+        const gqh_grid16 grid4 = load_gqh4_grid(grid_code);
+        if (nsb == 68) {
+            // Fat-K down: 17408/256. Dual-row at out=5120 shares x.
+            // LDS tiling of x was 66 ms/tok vs 61 eager.
+            const bool down_dual = (out_dim % (kTightWarps * 2)) == 0;
+            dim3 dblocks = tblocks;
+            dblocks.x = static_cast<unsigned int>(
+                (out_dim + (down_dual ? kTightWarps * 2 : kTightWarps) - 1) /
+                (down_dual ? kTightWarps * 2 : kTightWarps));
+            if (dblocks.x == 0) {
+                dblocks.x = 1;
+            }
+            static bool dumped_down = false;
+            if (!dumped_down) {
+                dumped_down = true;
+                std::fprintf(
+                    stderr,
+                    "[gqh-gemv] gqh4 down nsb=68 warps=%d dual=%d in=%d out=%d\n",
+                    kTightWarps,
+                    down_dual ? 1 : 0,
+                    in_dim,
+                    out_dim);
+            }
+            if (down_dual) {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME((gqh4_matvec_tight_kernel<kAcc, 2, 68>)),
+                    dblocks, tthreads, 0, stream, packed, xv, yv, in_dim,
+                    out_dim, tensor_scale, grid4, x_col_stride, y_col_stride,
+                    g_gqh_row_off);
+            } else {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME((gqh4_matvec_tight_kernel<kAcc, 1, 68>)),
+                    dblocks, tthreads, 0, stream, packed, xv, yv, in_dim,
+                    out_dim, tensor_scale, grid4, x_col_stride, y_col_stride,
+                    g_gqh_row_off);
+            }
+        } else if (dual && nsb == 20) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh4_matvec_tight_kernel<kAcc, 2, 20>)),
+                tblocks, tthreads, 0, stream, packed, xv, yv, in_dim, out_dim,
+                tensor_scale, grid4, x_col_stride, y_col_stride, g_gqh_row_off);
+        } else if (dual) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh4_matvec_tight_kernel<kAcc, 2, 0>)),
+                tblocks, tthreads, 0, stream, packed, xv, yv, in_dim, out_dim,
+                tensor_scale, grid4, x_col_stride, y_col_stride, g_gqh_row_off);
+        } else if (nsb == 20) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh4_matvec_tight_kernel<kAcc, 1, 20>)),
+                tblocks, tthreads, 0, stream, packed, xv, yv, in_dim, out_dim,
+                tensor_scale, grid4, x_col_stride, y_col_stride, g_gqh_row_off);
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh4_matvec_tight_kernel<kAcc, 1, 0>)),
+                tblocks, tthreads, 0, stream, packed, xv, yv, in_dim, out_dim,
+                tensor_scale, grid4, x_col_stride, y_col_stride, g_gqh_row_off);
+        }
+        return;
+    }
     gqh_ensure_tight(const_cast<uint8_t*>(packed), in_dim, out_dim, rung, stream);
     if (gqh_is_tight(packed)) {
         const bool pad = gqh_is_padded(packed);
@@ -657,6 +743,18 @@ extern "C" int supersonic_gqh_hip_decode(
                     packed,
                     out);
                 break;
+            case GQH_RUNG_GQH4:
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gqh4_decode_kernel<hip_bfloat16>),
+                    grid,
+                    block,
+                    0,
+                    st,
+                    packed,
+                    tensor_scale,
+                    load_gqh4_grid(grid_code),
+                    out);
+                break;
             default:
                 return 401;
         }
@@ -697,6 +795,18 @@ extern "C" int supersonic_gqh_hip_decode(
                     0,
                     st,
                     packed,
+                    out);
+                break;
+            case GQH_RUNG_GQH4:
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gqh4_decode_kernel<float>),
+                    grid,
+                    block,
+                    0,
+                    st,
+                    packed,
+                    tensor_scale,
+                    load_gqh4_grid(grid_code),
                     out);
                 break;
             default:
@@ -748,6 +858,7 @@ extern "C" int supersonic_gqh_hip_matvec(
     switch (rung) {
         case GQH_RUNG_GQH3:
         case GQH_RUNG_GQH2_H:
+        case GQH_RUNG_GQH4:
             launch_gqh12_matvec<false>(
                 rung,
                 blocks,
@@ -828,6 +939,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
     switch (rung) {
         case GQH_RUNG_GQH3:
         case GQH_RUNG_GQH2_H:
+        case GQH_RUNG_GQH4:
             launch_gqh12_matvec<false>(
                 rung,
                 blocks,
@@ -908,6 +1020,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
     switch (rung) {
         case GQH_RUNG_GQH3:
         case GQH_RUNG_GQH2_H:
+        case GQH_RUNG_GQH4:
             launch_gqh12_matvec<true>(
                 rung,
                 blocks,
@@ -948,10 +1061,11 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
     int grid_b,
     int fuse_swiglu,
     void* stream) {
-    if (rung_a != GQH_RUNG_GQH3 && rung_a != GQH_RUNG_GQH2_H) {
-        return 401;
-    }
-    if (rung_b != GQH_RUNG_GQH3 && rung_b != GQH_RUNG_GQH2_H) {
+    const bool a_ok = rung_a == GQH_RUNG_GQH3 || rung_a == GQH_RUNG_GQH2_H ||
+        rung_a == GQH_RUNG_GQH4;
+    const bool b_ok = rung_b == GQH_RUNG_GQH3 || rung_b == GQH_RUNG_GQH2_H ||
+        rung_b == GQH_RUNG_GQH4;
+    if (!a_ok || !b_ok) {
         return 401;
     }
     const int out_b_eff = out_b > 0 ? out_b : out_dim;
@@ -984,6 +1098,38 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
     auto* ya = static_cast<float*>(y_a);
     auto* yb = static_cast<float*>(y_b);
     hipStream_t hs = static_cast<hipStream_t>(stream);
+    if (rung_a == GQH_RUNG_GQH4 || rung_b == GQH_RUNG_GQH4) {
+        if (rung_a != GQH_RUNG_GQH4 || rung_b != GQH_RUNG_GQH4 || !fuse_swiglu ||
+            out_dim != out_b_eff) {
+            return 401;
+        }
+        // 4-wave 1-row + nsb=20 unroll-4 was the best pair (3421 ms).
+        // 2-wave dual-row was 3429; 4-wave dual-row was 3429.
+        const int kSwigluWarps = 4;
+        dim3 sblocks(
+            static_cast<unsigned int>(
+                (out_dim + kSwigluWarps - 1) / kSwigluWarps),
+            1,
+            1);
+        if (sblocks.x == 0) {
+            sblocks.x = 1;
+        }
+        const dim3 sthreads(GQH_WARP * kSwigluWarps, 1, 1);
+        const gqh_grid16 ga = load_gqh4_grid(grid_a);
+        const gqh_grid16 gb = load_gqh4_grid(grid_b);
+        if (in_dim == 5120) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh4_matvec_pair_swiglu_kernel<20, 1>)),
+                sblocks, sthreads, 0, hs, pa, pb, xv, ya, in_dim, out_dim,
+                scale_a, scale_b, ga, gb);
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME((gqh4_matvec_pair_swiglu_kernel<0, 1>)),
+                sblocks, sthreads, 0, hs, pa, pb, xv, ya, in_dim, out_dim,
+                scale_a, scale_b, ga, gb);
+        }
+        return launch_result(421, 422);
+    }
     gqh_ensure_tight(const_cast<uint8_t*>(pa), in_dim, out_dim, rung_a, hs);
     gqh_ensure_tight(const_cast<uint8_t*>(pb), in_dim, out_b_eff, rung_b, hs);
     const bool tight = gqh_is_tight(pa) && gqh_is_tight(pb);
@@ -1252,10 +1398,9 @@ extern "C" int supersonic_gqh_hip_matvec_stream_ab(
     int grid_a,
     int grid_b,
     void* stream) {
-    if (rung_a != GQH_RUNG_GQH3 && rung_a != GQH_RUNG_GQH2_H) {
-        return 401;
-    }
-    if (rung_b != GQH_RUNG_GQH3 && rung_b != GQH_RUNG_GQH2_H) {
+    const bool a_ok = rung_a == GQH_RUNG_GQH3 || rung_a == GQH_RUNG_GQH2_H;
+    const bool b_ok = rung_b == GQH_RUNG_GQH3 || rung_b == GQH_RUNG_GQH2_H;
+    if (!a_ok || !b_ok) {
         return 401;
     }
     const int shape_a = validate_shape(rung_a, out_a, in_dim, grid_a);

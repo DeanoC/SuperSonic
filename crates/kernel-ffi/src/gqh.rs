@@ -87,6 +87,7 @@ pub fn lookup_header(ptr: *const c_void) -> Option<RegisteredHeader> {
 pub const RUNG_GQH3: i32 = 0;
 pub const RUNG_GQH2_H: i32 = 1;
 pub const RUNG_GQH2_C: i32 = 2;
+pub const RUNG_GQH4: i32 = 3;
 
 pub const SUPERBLOCK: usize = 256;
 
@@ -169,6 +170,7 @@ pub fn rung_from_ggml_type(ty: u32) -> Option<i32> {
         108 => Some(RUNG_GQH3),
         109 => Some(RUNG_GQH2_H),
         110 => Some(RUNG_GQH2_C),
+        111 => Some(RUNG_GQH4),
         _ => None,
     }
 }
@@ -178,6 +180,7 @@ pub fn rung_from_flm_codec(semantic_id: u16) -> Option<i32> {
         13 => Some(RUNG_GQH3),
         14 => Some(RUNG_GQH2_H),
         15 => Some(RUNG_GQH2_C),
+        16 => Some(RUNG_GQH4),
         _ => None,
     }
 }
@@ -606,6 +609,7 @@ mod tests {
         assert_eq!(rung_from_ggml_type(108), Some(RUNG_GQH3));
         assert_eq!(rung_from_ggml_type(109), Some(RUNG_GQH2_H));
         assert_eq!(rung_from_ggml_type(110), Some(RUNG_GQH2_C));
+        assert_eq!(rung_from_ggml_type(111), Some(RUNG_GQH4));
         assert_eq!(rung_from_flm_codec(13), Some(RUNG_GQH3));
         assert_eq!(rung_from_flm_codec(14), Some(RUNG_GQH2_H));
         assert_eq!(rung_from_flm_codec(15), Some(RUNG_GQH2_C));
@@ -826,6 +830,7 @@ mod tests {
                     GqhRung::Gqh3 => RUNG_GQH3,
                     GqhRung::Gqh2H => RUNG_GQH2_H,
                     GqhRung::Gqh2C => RUNG_GQH2_C,
+                    GqhRung::Gqh4 => RUNG_GQH4,
                 },
                 &packed_buf,
                 scale,
