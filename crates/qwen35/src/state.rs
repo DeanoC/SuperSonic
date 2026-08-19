@@ -1311,6 +1311,8 @@ fn dtype_name(dtype: ScalarType) -> &'static str {
 /// All mutable state for the model.
 pub struct ModelState {
     pub layers: Vec<LayerState>,
+    /// KV cache for the optional NextN/MTP full-attention block.
+    pub mtp: Option<LayerState>,
 }
 
 impl ModelState {
@@ -1323,12 +1325,22 @@ impl ModelState {
                 layers.push(LayerState::new_linear(ordinal, config)?);
             }
         }
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            mtp: if config.mtp_num_hidden_layers > 0 {
+                Some(LayerState::new_full(ordinal))
+            } else {
+                None
+            },
+        })
     }
 
     /// Prepare existing buffers for a from-scratch prefill replay without
     /// reallocating caches that can safely be overwritten in place.
     pub fn reset_for_prefill_reuse(&mut self) {
+        if let Some(ls) = self.mtp.as_mut() {
+            ls.kv_filled = 0;
+        }
         for ls in &mut self.layers {
             ls.kv_filled = 0;
             ls.kv_shadow_start = usize::MAX;
@@ -1443,13 +1455,20 @@ impl ModelState {
         for ls in &self.layers {
             layers.push(ls.clone_gpu()?);
         }
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            mtp: match &self.mtp {
+                Some(ls) => Some(ls.clone_gpu()?),
+                None => None,
+            },
+        })
     }
 
     pub fn resident_gpu_bytes(&self) -> usize {
         self.layers
             .iter()
             .map(LayerState::resident_gpu_bytes)
+            .chain(self.mtp.iter().map(LayerState::resident_gpu_bytes))
             .fold(0usize, usize::saturating_add)
     }
 
@@ -1494,7 +1513,14 @@ impl ModelState {
                 ordinal,
             )?);
         }
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            mtp: if config.mtp_num_hidden_layers > 0 {
+                Some(LayerState::new_full(ordinal))
+            } else {
+                None
+            },
+        })
     }
 
     /// Capture `(conv_state, recurrent_state)` for every linear-attention
@@ -1623,6 +1649,8 @@ mod tests {
             linear_num_key_heads: 2,
             linear_num_value_heads: 4,
             layer_types: vec![],
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
             rope_parameters: None,
         }
         .normalized()

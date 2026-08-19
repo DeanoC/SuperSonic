@@ -95,6 +95,12 @@ pub struct TextConfig {
     pub layer_types: Vec<String>,
     #[serde(default)]
     pub rope_parameters: Option<RopeParameters>,
+    /// DeepSeek-style NextN/MTP heads after the trunk. Qwen3.8 GGUF is 1.
+    #[serde(default)]
+    pub mtp_num_hidden_layers: usize,
+    /// When true the MTP block owns embed/lm_head. Qwen3.8 GGUF shares both.
+    #[serde(default)]
+    pub mtp_use_dedicated_embeddings: bool,
 }
 
 impl TextConfig {
@@ -279,6 +285,8 @@ impl Config {
                 linear_num_key_heads: flm.linear_num_key_heads,
                 linear_num_value_heads: flm.linear_num_value_heads,
                 layer_types,
+                mtp_num_hidden_layers: 0,
+                mtp_use_dedicated_embeddings: false,
                 rope_parameters: Some(RopeParameters {
                     rope_type: "default".to_string(),
                     rope_theta: flm.rope_theta,

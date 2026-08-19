@@ -97,14 +97,15 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "0.0")]
     pub(crate) progress_heartbeat_seconds: f64,
 
-    /// Enable Qwen3.6-MoE self-speculative decode.
+    /// Enable self-speculative decode.
     ///
-    /// When set, the engine loads the multi-token-prediction (MTP) head
-    /// from the bake and runs draft generation plus base-model verification.
-    /// When unset (default), MTP weights are not loaded and self-spec decode
-    /// is unavailable, leaving the extra VRAM for KV cache and scratch.
+    /// Qwen3.6-MoE: load the MTP head and run draft generation plus
+    /// base-model verification.
     ///
-    /// Currently HIP/qwen3.6-MoE only; ignored for other model families.
+    /// Qwen3.8-27B GQH: run the built-in NextN (`blk.64`) head as a K-token
+    /// draft, then short-block trunk verify. Greedy output is unchanged.
+    /// `SUPERSONIC_QWEN38_MTP_K` sets draft length (default 2).
+    /// `SUPERSONIC_QWEN38_MTP=1` is diagnostic-only.
     #[arg(long)]
     pub(crate) speculative_decode: bool,
 

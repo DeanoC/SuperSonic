@@ -1795,6 +1795,9 @@ pub struct PrefillAppendVerifyResult {
     pub target_next: Option<Vec<u32>>,
     pub tap_hiddens_all: Option<Vec<Vec<u8>>>,
     pub rollback: Option<PrefillAppendRollback>,
+    /// BF16 `[chunk_len, hidden]` after final RMSNorm (embeddings_nextn).
+    /// Filled on the greedy-only path used by Qwen3.8 NextN verify.
+    pub normed_rows: Option<Vec<u8>>,
 }
 
 pub struct PrefillAppendGpuTapSink<'a> {
@@ -3427,7 +3430,8 @@ pub fn prefill_tail_from_hidden_with_trace_position(
         if config.is_full_attention(idx) {
             prefill_full_attention_layer(
                 weights,
-                state,
+                weights.layers[idx].full.as_ref().expect("full attn weights"),
+                &mut state.layers[idx],
                 rotary,
                 &mut scratch,
                 config,
@@ -3487,7 +3491,7 @@ pub fn prefill_tail_from_hidden_with_trace_position(
             )?);
         }
 
-        prefill_mlp_layer(weights, &mut scratch, config, idx, seq_len, ordinal)?;
+        prefill_mlp_layer(weights, &weights.layers[idx], &mut scratch, config, idx, seq_len, ordinal)?;
 
         if let Some(trace) = layer_mlp_swiglu_trace.as_mut() {
             trace.push(copy_bf16_row(
@@ -3862,7 +3866,8 @@ fn prefill_inner(
             if config.is_full_attention(idx) {
                 prefill_full_attention_layer(
                     weights,
-                    state,
+                    weights.layers[idx].full.as_ref().expect("full attn weights"),
+                    &mut state.layers[idx],
                     rotary,
                     &mut scratch,
                     config,
@@ -3952,7 +3957,7 @@ fn prefill_inner(
             }
 
             // MLP
-            prefill_mlp_layer(weights, &mut scratch, config, idx, chunk_len, ordinal)?;
+            prefill_mlp_layer(weights, &weights.layers[idx], &mut scratch, config, idx, chunk_len, ordinal)?;
 
             if is_last_chunk {
                 if let Some(trace) = layer_mlp_swiglu_trace.as_mut() {
@@ -4530,7 +4535,12 @@ fn prefill_append_verify_impl(
         }
     };
     if !cache.matches(chunk_len, ordinal) {
-        *cache = PrefillAppendVerifyCache::new(config, chunk_len, ordinal)?;
+        let can_reuse_larger = !capture_rollback
+            && cache.ordinal == ordinal
+            && cache.chunk_len >= chunk_len;
+        if !can_reuse_larger {
+            *cache = PrefillAppendVerifyCache::new(config, chunk_len, ordinal)?;
+        }
     }
     let mut rollback: Option<PrefillAppendRollback> = if capture_rollback {
         Some(cache.take_rollback(config, pos_offset, ordinal)?)
@@ -4632,7 +4642,8 @@ fn prefill_append_verify_impl(
             let t_full = std::time::Instant::now();
             prefill_full_attention_layer(
                 weights,
-                state,
+                weights.layers[idx].full.as_ref().expect("full attn weights"),
+                &mut state.layers[idx],
                 rotary,
                 scratch,
                 config,
@@ -4701,7 +4712,7 @@ fn prefill_append_verify_impl(
         }
 
         let t_mlp = std::time::Instant::now();
-        prefill_mlp_layer(weights, scratch, config, idx, chunk_len, ordinal)?;
+        prefill_mlp_layer(weights, &weights.layers[idx], scratch, config, idx, chunk_len, ordinal)?;
         if profile {
             ms_mlp += t_mlp.elapsed().as_secs_f64() * 1000.0;
         }
@@ -4734,6 +4745,7 @@ fn prefill_append_verify_impl(
     }
 
     let t_logits = std::time::Instant::now();
+    let mut normed_rows = None;
     let (logits_per_pos, target_next) = if greedy_only {
         let ids = if let Some(compare_tokens) = greedy_compare_tokens {
             compute_greedy_for_acceptance(
@@ -4746,7 +4758,7 @@ fn prefill_append_verify_impl(
                 ordinal,
             )?
         } else {
-            let (ids, _normed) = compute_greedy_for_range(
+            let (ids, normed) = compute_greedy_for_range(
                 &scratch.hidden,
                 weights,
                 config,
@@ -4755,6 +4767,11 @@ fn prefill_append_verify_impl(
                 use_4b_kernel,
                 ordinal,
             )?;
+            normed_rows = Some(
+                normed
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("append greedy normed D2H: {e}"))?,
+            );
             ids
         };
         (Vec::new(), Some(ids))
@@ -4803,6 +4820,7 @@ fn prefill_append_verify_impl(
         target_next,
         tap_hiddens_all,
         rollback,
+        normed_rows,
     })
 }
 
@@ -5106,7 +5124,7 @@ fn prefill_tree_verify_impl(
         }
 
         let t_mlp = std::time::Instant::now();
-        prefill_mlp_layer(weights, &mut *scratch, config, idx, tree_len, ordinal)?;
+        prefill_mlp_layer(weights, &weights.layers[idx], &mut *scratch, config, idx, tree_len, ordinal)?;
         if profile {
             ms_mlp += t_mlp.elapsed().as_secs_f64() * 1000.0;
         }
@@ -5552,6 +5570,18 @@ impl MetalV2DecodeScratch {
             token_id_buf,
         })
     }
+
+    /// Last-layer residual after a metal-v2 decode body (`[1, hidden]` BF16).
+    pub fn copy_last_residual_to(&self, ordinal: usize, dst: &mut GpuBuffer) -> Result<()> {
+        let bytes = self.scratch.hidden.len_bytes().min(dst.len_bytes());
+        gpu_hal::copy_d2d(
+            ordinal,
+            dst.as_mut_ptr(),
+            self.scratch.hidden.as_ptr(),
+            bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("copy last residual: {e}"))
+    }
 }
 
 /// Per-token forward pass body shared by `metal_v2_decode_step` (full-logits)
@@ -5641,7 +5671,8 @@ fn metal_v2_decode_step_body(
         if config.is_full_attention(idx) {
             prefill_full_attention_layer(
                 weights,
-                state,
+                weights.layers[idx].full.as_ref().expect("full attn weights"),
+                &mut state.layers[idx],
                 rotary,
                 &mut scratch.scratch,
                 config,
@@ -5695,6 +5726,7 @@ fn metal_v2_decode_step_body(
 
         prefill_mlp_layer(
             weights,
+            &weights.layers[idx],
             &mut scratch.scratch,
             config,
             idx,
@@ -5888,7 +5920,8 @@ pub fn metal_v2_decode_step_greedy(
 /// prefill passes `true`.
 fn prefill_full_attention_layer(
     weights: &Qwen35Weights,
-    state: &mut ModelState,
+    fw: &qwen35::weights::FullWeights,
+    ls: &mut qwen35::state::LayerState,
     rotary: &RotaryTables,
     scratch: &mut PrefillScratch,
     config: &TextConfig,
@@ -5900,10 +5933,6 @@ fn prefill_full_attention_layer(
     commit_kv_filled: bool,
     kept_positions_chunk: Option<&[u32]>, // NEW
 ) -> Result<()> {
-    let fw = weights.layers[idx]
-        .full
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("layer {idx}: expected full attention weights"))?;
 
     let hidden_dim = config.hidden_size;
     let num_q_heads = config.num_attention_heads;
@@ -6213,7 +6242,6 @@ fn prefill_full_attention_layer(
     let kv_cache_written = if gpu_hal::current_backend() == Backend::Hip
         && env::var_os("SUPERSONIC_DFLASH_DISABLE_FUSED_KV_CACHE_WRITE").is_none()
     {
-        let ls = &mut state.layers[idx];
         ls.ensure_kv_capacity(kv_len - 1, ordinal, config, kv_chunk_size, false)
             .map_err(|e| anyhow::anyhow!("layer {idx} KV alloc: {e}"))?;
         kv_capacity_prepared = true;
@@ -6279,7 +6307,6 @@ fn prefill_full_attention_layer(
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} V transpose: {e}"))?;
 
-        let ls = &mut state.layers[idx];
         if !kv_capacity_prepared {
             ls.ensure_kv_capacity(kv_len - 1, ordinal, config, kv_chunk_size, false)
                 .map_err(|e| anyhow::anyhow!("layer {idx} KV alloc: {e}"))?;
@@ -6325,7 +6352,7 @@ fn prefill_full_attention_layer(
         }
     }
     if commit_kv_filled {
-        state.layers[idx].set_kv_filled(kv_len);
+        ls.set_kv_filled(kv_len);
     }
 
     // 10. Transpose Q to [H, chunk_len, D]
@@ -6342,7 +6369,6 @@ fn prefill_full_attention_layer(
 
     // 11. Causal attention — Q: [q_heads, chunk_len, hd], K/V: [kv_heads, kv_len, hd]
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let ls = &mut state.layers[idx];
     let cap = ls.kv_capacity();
     let mut assembled_k = None;
     let mut assembled_v = None;
@@ -9199,13 +9225,13 @@ fn prefill_tree_linear_attention_layer(
 
 fn prefill_mlp_layer(
     weights: &Qwen35Weights,
+    lw: &qwen35::weights::LayerWeights,
     scratch: &mut PrefillScratch,
     config: &TextConfig,
     idx: usize,
     seq_len: usize,
     ordinal: usize,
 ) -> Result<()> {
-    let lw = &weights.layers[idx];
     let hidden_dim = config.hidden_size;
     let intermediate = config.intermediate_size;
 
@@ -9429,4 +9455,285 @@ fn prefill_mlp_layer(
     }
 
     Ok(())
+}
+
+/// One NextN/MTP draft step. Matches llama.cpp `graph_mtp`.
+///
+/// `h` is either a trunk last-layer residual (`h_is_nextn=false`, RMS with
+/// `output_norm` first) or an embeddings_nextn / previous MTP `t_h_nextn`
+/// row (`h_is_nextn=true`). Compact MTP KV is written at `ls.kv_filled`;
+/// RoPE uses `abs_pos`. Writes shared-head hidden into `out_h`.
+pub fn qwen35_mtp_forward(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    scratch: &mut MetalV2DecodeScratch,
+    h: &GpuBuffer,
+    h_is_nextn: bool,
+    token_id: u32,
+    abs_pos: usize,
+    out_h: &mut GpuBuffer,
+    ordinal: usize,
+    kv_chunk_size: usize,
+) -> Result<u32> {
+    let mtp = weights
+        .mtp
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("qwen35 MTP: blk.64 weights were not loaded"))?;
+    let ls = state
+        .mtp
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("qwen35 MTP: missing MTP KV state"))?;
+    let fw = mtp
+        .layer
+        .full
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("qwen35 MTP: expected a full-attention block"))?;
+    let config = &weights.config;
+    let hidden_dim = config.hidden_size;
+    let elem = ScalarType::BF16.size_in_bytes();
+    anyhow::ensure!(
+        scratch.scratch.mlp_buf.shape().get(1).copied().unwrap_or(0) >= hidden_dim * 2,
+        "mtp concat needs mlp_buf cols >= {}, got {:?}",
+        hidden_dim * 2,
+        scratch.scratch.mlp_buf.shape()
+    );
+
+    let mut residual = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("mtp residual alloc: {e}"))?;
+    copy_d2d_batched(
+        ordinal,
+        residual.as_mut_ptr(),
+        h.as_ptr(),
+        hidden_dim * elem,
+    )
+    .map_err(|e| anyhow::anyhow!("mtp residual copy: {e}"))?;
+    if h_is_nextn {
+        copy_d2d_batched(
+            ordinal,
+            scratch.scratch.proj_buf2.as_mut_ptr(),
+            residual.as_ptr(),
+            hidden_dim * elem,
+        )
+        .map_err(|e| anyhow::anyhow!("mtp h_nextn copy: {e}"))?;
+    } else {
+        rms_norm_rows_model(
+            config,
+            ordinal,
+            1,
+            hidden_dim,
+            &residual,
+            &weights.norm_weight,
+            &mut scratch.scratch.proj_buf2,
+            "mtp output_norm / h_nextn",
+        )?;
+    }
+
+    let id_bytes = token_id.to_le_bytes();
+    copy_h2d(
+        ordinal,
+        scratch.token_id_buf.as_ptr() as *mut c_void,
+        id_bytes.as_ptr() as *const c_void,
+        4,
+    )
+    .map_err(|e| anyhow::anyhow!("mtp token id upload: {e}"))?;
+    prefill_ffi::embedding_lookup(
+        ordinal,
+        ScalarType::BF16,
+        1,
+        config.vocab_size,
+        hidden_dim,
+        &weights.embed_tokens,
+        &scratch.token_id_buf,
+        &mut scratch.scratch.hidden,
+    )?;
+
+    rms_norm_rows_model(
+        config,
+        ordinal,
+        1,
+        hidden_dim,
+        &scratch.scratch.hidden,
+        &mtp.enorm_w,
+        &mut scratch.scratch.proj_buf,
+        "mtp enorm",
+    )?;
+    rms_norm_rows_model(
+        config,
+        ordinal,
+        1,
+        hidden_dim,
+        &scratch.scratch.proj_buf2,
+        &mtp.hnorm_w,
+        &mut residual,
+        "mtp hnorm",
+    )?;
+    copy_d2d_batched(
+        ordinal,
+        scratch.scratch.mlp_buf.as_mut_ptr(),
+        scratch.scratch.proj_buf.as_ptr(),
+        hidden_dim * elem,
+    )
+    .map_err(|e| anyhow::anyhow!("mtp concat e: {e}"))?;
+    copy_d2d_batched(
+        ordinal,
+        scratch.scratch.mlp_buf.offset_ptr(hidden_dim * elem) as *mut c_void,
+        residual.as_ptr(),
+        hidden_dim * elem,
+    )
+    .map_err(|e| anyhow::anyhow!("mtp concat h: {e}"))?;
+
+    matmul_proj(
+        ordinal,
+        1,
+        1,
+        hidden_dim,
+        hidden_dim * 2,
+        &scratch.scratch.mlp_buf,
+        &mtp.eh_proj_w,
+        None,
+        None,
+        0,
+        &mut scratch.scratch.hidden,
+        None,
+        None,
+        None,
+        0,
+    )?;
+
+    scratch.scratch.rms_norm_hidden_to_normed_model(
+        config,
+        ordinal,
+        1,
+        hidden_dim,
+        &mtp.layer.input_norm_w,
+        "mtp attn norm",
+    )?;
+    let compact = ls.kv_filled;
+    let abs = [abs_pos as u32];
+    prefill_full_attention_layer(
+        weights,
+        fw,
+        ls,
+        rotary,
+        &mut scratch.scratch,
+        config,
+        64,
+        1,
+        compact,
+        ordinal,
+        kv_chunk_size,
+        /* commit_kv_filled */ true,
+        Some(&abs),
+    )?;
+    scratch.scratch.rms_norm_hidden_to_normed_model(
+        config,
+        ordinal,
+        1,
+        hidden_dim,
+        &mtp.layer.post_attn_norm_w,
+        "mtp post-attn norm",
+    )?;
+    prefill_mlp_layer(
+        weights,
+        &mtp.layer,
+        &mut scratch.scratch,
+        config,
+        64,
+        1,
+        ordinal,
+    )?;
+
+    rms_norm_rows_model(
+        config,
+        ordinal,
+        1,
+        hidden_dim,
+        &scratch.scratch.hidden,
+        &mtp.shared_head_norm_w,
+        out_h,
+        "mtp shared_head_norm",
+    )?;
+    let vocab_size = config.vocab_size;
+    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, vocab_size])
+        .map_err(|e| anyhow::anyhow!("mtp logits alloc: {e}"))?;
+    if !prefill_lm_head_lowbit(
+        ordinal,
+        1,
+        vocab_size,
+        hidden_dim,
+        out_h,
+        weights,
+        &mut logits_buf,
+        "mtp lm_head",
+    )? {
+        let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+            .map_err(|e| anyhow::anyhow!("mtp lm_head counter: {e}"))?;
+        kernel_ffi::standalone_matvec(
+            ordinal,
+            ScalarType::BF16,
+            &mut logits_buf,
+            out_h,
+            &*weights.lm_head,
+            hidden_dim,
+            vocab_size,
+            &mut counter,
+        )
+        .map_err(|e| anyhow::anyhow!("mtp lm_head matvec: {e}"))?;
+    }
+    let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+        .map_err(|e| anyhow::anyhow!("mtp argmax alloc: {e}"))?;
+    match logits_buf.backend() {
+        Backend::Hip => prefill_ffi::argmax_bf16_rows(
+            ordinal,
+            1,
+            vocab_size,
+            &logits_buf,
+            &mut out_index,
+        )
+        .map_err(|e| anyhow::anyhow!("mtp argmax: {e}"))?,
+        Backend::Cuda => kernel_ffi::cuda_argmax_bf16(
+            ordinal,
+            &logits_buf,
+            &mut out_index,
+            vocab_size,
+        )
+        .map_err(|e| anyhow::anyhow!("mtp argmax: {e}"))?,
+        Backend::Metal => kernel_ffi::metal_argmax_bf16_into(&logits_buf, &mut out_index, vocab_size)
+            .map_err(|e| anyhow::anyhow!("mtp argmax: {e}"))?,
+    }
+    let mut id = [0u8; 4];
+    gpu_hal::copy_d2h(ordinal, id.as_mut_ptr() as *mut c_void, out_index.as_ptr(), 4)
+        .map_err(|e| anyhow::anyhow!("mtp argmax d2h: {e}"))?;
+    Ok(u32::from_le_bytes(id))
+}
+
+/// Diagnostic wrapper: trunk residual in, greedy draft token out.
+pub fn qwen35_mtp_draft_greedy(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    scratch: &mut MetalV2DecodeScratch,
+    h: &GpuBuffer,
+    token_id: u32,
+    seqlen_offset: usize,
+    ordinal: usize,
+    kv_chunk_size: usize,
+) -> Result<u32> {
+    let hidden_dim = weights.config.hidden_size;
+    let mut out_h = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("mtp draft out_h alloc: {e}"))?;
+    qwen35_mtp_forward(
+        weights,
+        state,
+        rotary,
+        scratch,
+        h,
+        false,
+        token_id,
+        seqlen_offset,
+        &mut out_h,
+        ordinal,
+        kv_chunk_size,
+    )
 }

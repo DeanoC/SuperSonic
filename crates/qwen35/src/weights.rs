@@ -339,6 +339,18 @@ pub struct Qwen35Weights {
     /// Device 8-byte `{tensor_scale, grid_code}` sidecars for the megakernel.
     /// Kept alive so `INT4ScaleDesc` pointers stay valid.
     pub gqh_sidecars: BTreeMap<String, GpuBuffer>,
+    /// Optional NextN/MTP block (`blk.64` on Qwen3.8 GGUF).
+    pub mtp: Option<MtpWeights>,
+}
+
+/// DeepSeek-style NextN head: enorm/hnorm + eh_proj + one full-attn decoder
+/// block. Shares `embed_tokens` / `lm_head` when dedicated tensors are absent.
+pub struct MtpWeights {
+    pub enorm_w: GpuBuffer,
+    pub hnorm_w: GpuBuffer,
+    pub eh_proj_w: GpuBuffer,
+    pub shared_head_norm_w: GpuBuffer,
+    pub layer: LayerWeights,
 }
 
 impl Qwen35Weights {
@@ -672,6 +684,7 @@ impl Qwen35Weights {
             int8_outlier_threshold: 0.0,
             gqh_headers: BTreeMap::new(),
             gqh_sidecars: BTreeMap::new(),
+            mtp: None,
         })
     }
 
@@ -962,6 +975,7 @@ impl Qwen35Weights {
             int8_outlier_threshold: 0.0,
             gqh_headers: BTreeMap::new(),
             gqh_sidecars: BTreeMap::new(),
+            mtp: None,
         })
     }
 }

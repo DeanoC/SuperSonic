@@ -193,6 +193,9 @@ pub(crate) fn run_qwen35(
             }
         }
     }
+    let prefill_normed = native_prefill_trace
+        .as_ref()
+        .and_then(|(norm, ..)| norm.clone());
     let decode_output = run_qwen35_decode_loop(Qwen35DecodeLoop {
         cli,
         engine: &mut engine,
@@ -209,6 +212,7 @@ pub(crate) fn run_qwen35(
         ordinal,
         kv_chunk_size: params.kv_chunk_size,
         use_4b_kernel,
+        prefill_normed,
     })?;
 
     emit_qwen35_decode_report(Qwen35DecodeReport {

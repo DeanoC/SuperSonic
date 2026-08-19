@@ -1,4 +1,5 @@
-//! Qwen3.8 GGUF → SuperSonic role map and packed weight load. MTP `blk.64` is ignored.
+//! Qwen3.8 GGUF → SuperSonic role map and packed weight load.
+//! NextN/MTP `blk.64` is loaded into [`Qwen35Weights::mtp`] when present.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,7 +12,7 @@ use model_store::gqh::{self, GqhHeader, GqhRung};
 
 use crate::config::TextConfig;
 use crate::weights::{
-    ggml_k_row_bytes, FullWeights, LayerKind, LayerWeights, LinearWeights, Qwen35Weights,
+    ggml_k_row_bytes, FullWeights, LayerKind, LayerWeights, LinearWeights, MtpWeights, Qwen35Weights,
     LOWBIT_GGML_Q2_K, LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K, LOWBIT_GGML_Q8_0,
     LOWBIT_ROCMFP2_MIX, LOWBIT_ROCMFP3_MIX,
 };
@@ -34,7 +35,7 @@ pub fn is_gqh_gguf(path: &Path) -> Result<bool, model_store::Error> {
     Ok(file.gqh_header_count() > 0)
 }
 
-/// Expected GGUF tensor names for the 64 language layers (no MTP).
+/// Expected GGUF tensor names for the 64 language layers (MTP is optional).
 pub fn expected_gguf_names(config: &TextConfig) -> Vec<MappedTensor> {
     let mut out = vec![
         map("token_embd.weight", "token_embd.weight", LayerKind::Full, None),
@@ -454,7 +455,7 @@ fn load_a_log_exp(file: &GgufFile, name: &str, ordinal: usize) -> Result<GpuBuff
     GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[bf.len() / 2], &bf).map_err(Into::into)
 }
 
-/// Load packed Qwen3.8 GQH GGUF weights. Skips MTP `blk.64`.
+/// Load packed Qwen3.8 GQH GGUF weights, including NextN `blk.64` when present.
 pub fn load_weights(
     file: &GgufFile,
     config: &TextConfig,
@@ -717,10 +718,16 @@ pub fn load_weights(
         });
     }
 
+    let mtp = load_mtp_block(file, config, ordinal, &mut headers, &mut mix_headers)?;
     let gqh_sidecars = upload_gqh_sidecars(ordinal, &headers, &mix_headers)?;
+    let mut config = config.clone();
+    if mtp.is_some() {
+        config.mtp_num_hidden_layers = config.mtp_num_hidden_layers.max(1);
+        eprintln!("[qwen38-mtp] loaded NextN blk.64 (shared embed/lm_head)");
+    }
 
     Ok(Qwen35Weights {
-        config: config.clone(),
+        config,
         weight_prefix: "gguf".to_string(),
         embed_tokens,
         lm_head,
@@ -739,5 +746,175 @@ pub fn load_weights(
         is_int8: false,
         int8_baked_store: None,
         int8_outlier_threshold: 0.0,
+        mtp,
     })
+}
+
+fn load_mtp_block(
+    file: &GgufFile,
+    config: &TextConfig,
+    ordinal: usize,
+    headers: &mut BTreeMap<String, GqhHeader>,
+    mix_headers: &mut BTreeMap<String, model_store::dmix2::MixHeader>,
+) -> Result<Option<MtpWeights>, model_store::Error> {
+    if file.tensor("blk.64.nextn.eh_proj.weight").is_none() {
+        return Ok(None);
+    }
+    let hidden = config.hidden_size;
+    let q_out = config.num_attention_heads * config.head_dim;
+    let kv_out = config.num_key_value_heads * config.head_dim;
+    let enorm_w = upload_f32_as_bf16(file, "blk.64.nextn.enorm.weight", ordinal, &[hidden])?;
+    let hnorm_w = upload_f32_as_bf16(file, "blk.64.nextn.hnorm.weight", ordinal, &[hidden])?;
+    let shared_head_norm_w =
+        upload_f32_as_bf16(file, "blk.64.nextn.shared_head_norm.weight", ordinal, &[hidden])?;
+    let eh_proj_w = upload_packed(
+        file,
+        "blk.64.nextn.eh_proj.weight",
+        ordinal,
+        headers,
+        mix_headers,
+        "mtp.eh_proj",
+    )?;
+    let input_norm_w = upload_f32_as_bf16(file, "blk.64.attn_norm.weight", ordinal, &[hidden])?;
+    let post_attn_norm_w =
+        upload_f32_as_bf16(file, "blk.64.post_attention_norm.weight", ordinal, &[hidden])?;
+    let gate_proj_w = upload_packed(
+        file,
+        "blk.64.ffn_gate.weight",
+        ordinal,
+        headers,
+        mix_headers,
+        "mtp.mlp.gate_proj",
+    )?;
+    let up_proj_w = upload_packed(
+        file,
+        "blk.64.ffn_up.weight",
+        ordinal,
+        headers,
+        mix_headers,
+        "mtp.mlp.up_proj",
+    )?;
+    let down_proj_w = upload_packed(
+        file,
+        "blk.64.ffn_down.weight",
+        ordinal,
+        headers,
+        mix_headers,
+        "mtp.mlp.down_proj",
+    )?;
+    let q_proj_w = upload_packed(
+        file,
+        "blk.64.attn_q.weight",
+        ordinal,
+        headers,
+        mix_headers,
+        "mtp.self_attn.q_proj",
+    )?;
+    let k_proj_w = upload_packed(
+        file,
+        "blk.64.attn_k.weight",
+        ordinal,
+        headers,
+        mix_headers,
+        "mtp.self_attn.k_proj",
+    )?;
+    let v_proj_w = upload_packed(
+        file,
+        "blk.64.attn_v.weight",
+        ordinal,
+        headers,
+        mix_headers,
+        "mtp.self_attn.v_proj",
+    )?;
+    let o_proj_w = upload_packed(
+        file,
+        "blk.64.attn_output.weight",
+        ordinal,
+        headers,
+        mix_headers,
+        "mtp.self_attn.o_proj",
+    )?;
+    let q_norm_w = Some(upload_f32_as_bf16(
+        file,
+        "blk.64.attn_q_norm.weight",
+        ordinal,
+        &[config.head_dim],
+    )?);
+    let k_norm_w = Some(upload_f32_as_bf16(
+        file,
+        "blk.64.attn_k_norm.weight",
+        ordinal,
+        &[config.head_dim],
+    )?);
+    if q_proj_w.shape()[0] != q_out * 2 {
+        return Err(err(format!(
+            "blk.64.attn_q.weight rows {} != {} (Q||gate)",
+            q_proj_w.shape()[0],
+            q_out * 2
+        )));
+    }
+    if k_proj_w.shape()[0] != kv_out {
+        return Err(err(format!(
+            "blk.64.attn_k.weight rows {} != {kv_out}",
+            k_proj_w.shape()[0]
+        )));
+    }
+    Ok(Some(MtpWeights {
+        enorm_w,
+        hnorm_w,
+        eh_proj_w,
+        shared_head_norm_w,
+        layer: LayerWeights {
+            kind: LayerKind::Full,
+            input_norm_w,
+            post_attn_norm_w,
+            gate_proj_w,
+            up_proj_w,
+            down_proj_w,
+            gate_proj_scale: None,
+            up_proj_scale: None,
+            down_proj_scale: None,
+            gate_proj_int8_scale: None,
+            up_proj_int8_scale: None,
+            down_proj_int8_scale: None,
+            gate_proj_int4_scale: None,
+            gate_proj_int4_zero: None,
+            gate_proj_awq_inv_scale: None,
+            up_proj_int4_scale: None,
+            up_proj_int4_zero: None,
+            up_proj_awq_inv_scale: None,
+            down_proj_int4_scale: None,
+            down_proj_int4_zero: None,
+            down_proj_awq_inv_scale: None,
+            linear: None,
+            full: Some(FullWeights {
+                q_proj_w,
+                k_proj_w,
+                v_proj_w,
+                o_proj_w,
+                q_norm_w,
+                k_norm_w,
+                q_proj_scale: None,
+                k_proj_scale: None,
+                v_proj_scale: None,
+                o_proj_scale: None,
+                q_proj_int8_scale: None,
+                k_proj_int8_scale: None,
+                v_proj_int8_scale: None,
+                o_proj_int8_scale: None,
+                q_proj_int4_scale: None,
+                q_proj_int4_zero: None,
+                q_proj_awq_inv_scale: None,
+                k_proj_int4_scale: None,
+                k_proj_int4_zero: None,
+                k_proj_awq_inv_scale: None,
+                v_proj_int4_scale: None,
+                v_proj_int4_zero: None,
+                v_proj_awq_inv_scale: None,
+                o_proj_int4_scale: None,
+                o_proj_int4_zero: None,
+                o_proj_awq_inv_scale: None,
+            }),
+        },
+    }))
 }

@@ -29,6 +29,7 @@ pub(crate) struct Qwen35DecodeLoop<'a> {
     pub(crate) ordinal: usize,
     pub(crate) kv_chunk_size: usize,
     pub(crate) use_4b_kernel: bool,
+    pub(crate) prefill_normed: Option<Vec<u8>>,
 }
 
 pub(crate) struct Qwen35DecodeLoopOutput {
@@ -53,7 +54,65 @@ pub(crate) fn run_qwen35_decode_loop(
     let mut batch_next_tokens: Vec<u32> = vec![next_token; decode.cli.batch_size];
 
     decode.engine.prepare_hip_gqh_decode()?;
+    if decode.engine.mtp_spec_enabled() {
+        if let Some(normed) = decode.prefill_normed.as_deref() {
+            decode.engine.seed_mtp_h_from_normed(normed)?;
+        } else {
+            anyhow::bail!("qwen3.8 MTP spec needs prefill final-norm hidden");
+        }
+    }
     let decode_start = Instant::now();
+    if decode.engine.mtp_spec_enabled() && decode.cli.batch_size == 1 {
+        let mut seqlen_offset = seqlen_start;
+        while generated_ids.len() < decode.cli.max_new_tokens {
+            if !decode.cli.ignore_eos && decode.eos_ids.contains(&next_token) {
+                break;
+            }
+            let remaining = decode.cli.max_new_tokens - generated_ids.len();
+            let round = decode
+                .engine
+                .run_mtp_spec_round(next_token, seqlen_offset, remaining)?;
+            eprintln!(
+                "[qwen38-mtp] pos={} drafted={} accepted={} emitted={}",
+                seqlen_offset,
+                round.n_drafted,
+                round.n_accepted,
+                round.emitted.len()
+            );
+            for &tok in &round.emitted {
+                generated_ids.push(tok);
+                seqlen_offset += 1;
+                if !decode.cli.ignore_eos && decode.eos_ids.contains(&tok) {
+                    break;
+                }
+            }
+            next_token = round.next_token;
+            if generated_ids
+                .last()
+                .is_some_and(|t| !decode.cli.ignore_eos && decode.eos_ids.contains(t))
+            {
+                break;
+            }
+        }
+        if let Some((hits, total, rounds, emitted)) = decode.engine.mtp_spec_summary() {
+            eprintln!(
+                "[qwen38-mtp] accept {hits}/{total} ({:.0}%) over {rounds} rounds, emitted {emitted}",
+                if total == 0 {
+                    0.0
+                } else {
+                    100.0 * hits as f32 / total as f32
+                }
+            );
+        }
+        return Ok(Qwen35DecodeLoopOutput {
+            generated_ids,
+            decode_ms: decode_start.elapsed().as_secs_f64() * 1000.0,
+            max_delta,
+            gpu_max_delta,
+            native_decode_timings,
+            native_decode_timing_steps,
+        });
+    }
     for step in 0..decode.cli.max_new_tokens {
         if !decode.cli.ignore_eos && decode.eos_ids.contains(&next_token) {
             break;
@@ -114,6 +173,15 @@ pub(crate) fn run_qwen35_decode_loop(
                 },
             )?;
         }
+    }
+
+    if let Some((hits, total)) = decode.engine.mtp_diag_summary() {
+        eprintln!(
+            "[qwen38-mtp] accept {}/{} ({:.0}%) — diagnostic only, trunk still ran every step",
+            hits,
+            total,
+            100.0 * hits as f32 / total as f32
+        );
     }
 
     Ok(Qwen35DecodeLoopOutput {

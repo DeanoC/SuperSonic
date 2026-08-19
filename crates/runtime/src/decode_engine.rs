@@ -19,8 +19,8 @@ use qwen35::scratch::{
     PersistentDecodeScratch, PERSISTENT_4B_TIMING_SLOTS_PER_LAYER, PERSISTENT_SYNC_COUNTER_BYTES,
 };
 use qwen35::state::{
-    kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState,
-    ModelStateDiskSnapshot,
+    kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, LinearStateSnapshot,
+    ModelState, ModelStateDiskSnapshot,
 };
 use qwen35::weights::{LayerKind, Qwen35Weights};
 use serde::{Deserialize, Serialize};
@@ -1061,6 +1061,13 @@ fn qwen35_4b_cuda_split_windows(total_layers: usize) -> Vec<(usize, usize)> {
     }
 }
 
+pub struct MtpSpecRound {
+    pub emitted: Vec<u32>,
+    pub next_token: u32,
+    pub n_drafted: usize,
+    pub n_accepted: usize,
+}
+
 pub struct DecodeEngine {
     weights: Qwen35Weights,
     state: ModelState,
@@ -1131,6 +1138,24 @@ pub struct DecodeEngine {
     /// the first Metal decode step; carries the BF16 inter-chunk linear-attention
     /// buffers across decode steps.
     metal_v2_scratch: Option<prefill_engine::MetalV2DecodeScratch>,
+    /// When true, run the Qwen3.8 NextN head after each greedy token and log
+    /// draft vs next greedy. Does not change the emitted token stream.
+    mtp_diag: bool,
+    /// When true, consume NextN drafts via prefill-append verify (usable spec).
+    mtp_spec: bool,
+    mtp_k: usize,
+    mtp_h: Option<GpuBuffer>,
+    mtp_h_tmp: Option<GpuBuffer>,
+    mtp_pending_draft: Option<u32>,
+    mtp_diag_hits: u32,
+    mtp_diag_total: u32,
+    mtp_spec_rounds: u32,
+    mtp_spec_emitted: u32,
+    mtp_force_seq: bool,
+    /// After a 0-accept block, finish the request with sequential decode.
+    mtp_seq_rest: bool,
+    /// Last fused-verify RMSNorm row (BF16 `[hidden]`), embeddings_nextn.
+    fused_last_normed: Option<Vec<u8>>,
 }
 
 pub struct DecodeEngineSnapshot {
@@ -4490,10 +4515,55 @@ impl DecodeEngine {
             self.decode_step_batch_impl(&[token_id], seqlen_offset, false, true)?;
         if let Some(row) = all_logits.first() {
             if row.len() == 1 {
-                return Ok((row[0].to_bits(), timings));
+                let sampled = row[0].to_bits();
+                self.maybe_qwen38_mtp_diag(sampled, seqlen_offset)?;
+                return Ok((sampled, timings));
             }
         }
         anyhow::bail!("hip fast greedy missing token")
+    }
+
+    fn maybe_qwen38_mtp_diag(&mut self, sampled: u32, seqlen_offset: usize) -> Result<()> {
+        if self.mtp_spec || !self.mtp_diag || self.weights.mtp.is_none() {
+            return Ok(());
+        }
+        if let Some(pending) = self.mtp_pending_draft {
+            self.mtp_diag_total += 1;
+            let hit = pending == sampled;
+            if hit {
+                self.mtp_diag_hits += 1;
+            }
+            eprintln!(
+                "[qwen38-mtp] pos={} greedy={} draft={} accept={} running={}/{}",
+                seqlen_offset,
+                sampled,
+                pending,
+                u8::from(hit),
+                self.mtp_diag_hits,
+                self.mtp_diag_total
+            );
+        }
+        let mut scratch = match self.metal_v2_scratch.take() {
+            Some(scratch) => scratch,
+            None => prefill_engine::MetalV2DecodeScratch::new(
+                &self.weights.config,
+                self.ordinal,
+            )?,
+        };
+        let draft = prefill_engine::qwen35_mtp_draft_greedy(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            &mut scratch,
+            &self.hidden_io,
+            sampled,
+            seqlen_offset + 1,
+            self.ordinal,
+            self.kv_chunk_size,
+        );
+        self.metal_v2_scratch = Some(scratch);
+        self.mtp_pending_draft = Some(draft?);
+        Ok(())
     }
 
     fn component_decode_step_4b(
@@ -10597,11 +10667,504 @@ impl DecodeEngine {
             component_full_attn_scratch,
             component_mlp_scratch,
             metal_v2_scratch: None,
+            mtp_diag: env::var_os("SUPERSONIC_QWEN38_MTP").is_some(),
+            mtp_spec: false,
+            mtp_k: env::var("SUPERSONIC_QWEN38_MTP_K")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&k| k > 0)
+                .unwrap_or(2),
+            mtp_h: None,
+            mtp_h_tmp: None,
+            mtp_pending_draft: None,
+            mtp_diag_hits: 0,
+            mtp_diag_total: 0,
+            mtp_spec_rounds: 0,
+            mtp_spec_emitted: 0,
+            mtp_force_seq: false,
+            mtp_seq_rest: false,
+            fused_last_normed: None,
         })
     }
 
     pub fn weights(&self) -> &Qwen35Weights {
         &self.weights
+    }
+
+    pub fn set_mtp_diag(&mut self, on: bool) {
+        self.mtp_diag = on;
+    }
+
+    pub fn set_mtp_spec(&mut self, on: bool) {
+        self.mtp_spec = on;
+        if on {
+            self.mtp_diag = false;
+        }
+    }
+
+    pub fn mtp_spec_enabled(&self) -> bool {
+        self.mtp_spec && self.weights.mtp.is_some()
+    }
+
+    pub fn mtp_diag_summary(&self) -> Option<(u32, u32)> {
+        if (self.mtp_diag || self.mtp_spec) && self.mtp_diag_total > 0 {
+            Some((self.mtp_diag_hits, self.mtp_diag_total))
+        } else {
+            None
+        }
+    }
+
+    pub fn mtp_spec_summary(&self) -> Option<(u32, u32, u32, u32)> {
+        if self.mtp_spec && self.mtp_spec_rounds > 0 {
+            Some((
+                self.mtp_diag_hits,
+                self.mtp_diag_total,
+                self.mtp_spec_rounds,
+                self.mtp_spec_emitted,
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub fn seed_mtp_h_from_normed(&mut self, bytes: &[u8]) -> Result<()> {
+        let hidden = self.weights.config.hidden_size;
+        let need = hidden * ScalarType::BF16.size_in_bytes();
+        anyhow::ensure!(
+            bytes.len() == need,
+            "mtp h seed {} bytes, expected {need}",
+            bytes.len()
+        );
+        if self.mtp_h.is_none() {
+            self.mtp_h = Some(
+                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden])
+                    .map_err(|e| anyhow::anyhow!("mtp_h alloc: {e}"))?,
+            );
+        }
+        if self.mtp_h_tmp.is_none() {
+            self.mtp_h_tmp = Some(
+                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden])
+                    .map_err(|e| anyhow::anyhow!("mtp_h_tmp alloc: {e}"))?,
+            );
+        }
+        let dst = self.mtp_h.as_mut().unwrap();
+        gpu_hal::copy_h2d(
+            self.ordinal,
+            dst.as_mut_ptr(),
+            bytes.as_ptr() as *const std::ffi::c_void,
+            need,
+        )
+        .map_err(|e| anyhow::anyhow!("mtp h seed h2d: {e}"))?;
+        Ok(())
+    }
+
+    fn fused_verify_max_batch(&self) -> usize {
+        const MAX_INPUT_CACHE_FLOATS: usize = 15872;
+        (MAX_INPUT_CACHE_FLOATS / self.weights.config.hidden_size.max(1)).max(1)
+    }
+
+    /// One NextN speculative round: draft up to K tokens (capped so the
+    /// verify block fits fused-decode LDS), then one B-token fused trunk
+    /// verify. Full accept keeps the fused linear/KV writes; partial
+    /// restore + sequential replay of the committed prefix.
+    pub fn run_mtp_spec_round(
+        &mut self,
+        first_token: u32,
+        pos: usize,
+        remaining: usize,
+    ) -> Result<MtpSpecRound> {
+        anyhow::ensure!(self.mtp_spec_enabled(), "MTP spec is not enabled");
+        anyhow::ensure!(remaining > 0, "mtp spec round with remaining=0");
+        if self.mtp_h.is_none() {
+            anyhow::bail!("mtp spec round missing seeded h_nextn");
+        }
+        let max_b = self.fused_verify_max_batch().min(kernel_ffi::MAX_BATCH_SIZE);
+        let gqh = !self.weights.gqh_headers.is_empty();
+        let k = if gqh {
+            self.mtp_k.min(remaining.saturating_sub(1))
+        } else {
+            self.mtp_k
+                .min(remaining.saturating_sub(1))
+                .min(max_b.saturating_sub(1))
+        };
+        let mtp_kv_start = self
+            .state
+            .mtp
+            .as_ref()
+            .map(|ls| ls.kv_filled)
+            .unwrap_or(0);
+
+        if self.mtp_seq_rest
+            || self.mtp_force_seq
+            || (k < self.mtp_k && self.mtp_spec_rounds > 0)
+        {
+            self.mtp_force_seq = false;
+            return self.run_mtp_spec_round_sequential(
+                first_token,
+                pos,
+                remaining,
+                Vec::new(),
+                mtp_kv_start,
+                0,
+            );
+        }
+        let drafts = if k == 0 {
+            Vec::new()
+        } else {
+            self.mtp_draft_chain(first_token, pos, k)?
+        };
+        if drafts.is_empty() {
+            return self.run_mtp_spec_round_sequential(
+                first_token,
+                pos,
+                remaining,
+                drafts,
+                mtp_kv_start,
+                k,
+            );
+        }
+
+        let mut block = Vec::with_capacity(drafts.len() + 1);
+        block.push(first_token);
+        block.extend_from_slice(&drafts);
+        if block.len() > remaining {
+            block.truncate(remaining);
+        }
+
+        let snap = self
+            .state
+            .snapshot_linear()
+            .map_err(|e| anyhow::anyhow!("mtp snapshot_linear: {e}"))?;
+        let t0 = Instant::now();
+        let use_fused = !gqh && block.len() <= max_b;
+        let (emitted, next_token, n_acc) = if use_fused {
+            match self.verify_block_fused_decode(&block, pos) {
+                Ok(logits) => {
+                    let verify_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    self.mtp_accept_fused_or_replay(
+                        &block,
+                        &drafts,
+                        &logits,
+                        remaining,
+                        pos,
+                        verify_ms,
+                        &snap,
+                    )?
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("shared-memory budget exceeded") {
+                        return self.run_mtp_spec_round_sequential(
+                            first_token,
+                            pos,
+                            remaining,
+                            drafts,
+                            mtp_kv_start,
+                            k,
+                        );
+                    }
+                    return Err(err);
+                }
+            }
+        } else {
+            let result = self.verify_block_prefill_append_impl(
+                &block,
+                pos,
+                None,
+                false,
+                true,
+                None,
+                None,
+            )?;
+            let verify_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let greedy = result.target_next.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("mtp append verify missing greedy target_next")
+            })?;
+            self.mtp_accept_append_or_replay(
+                &block,
+                &drafts,
+                greedy,
+                result.normed_rows.as_deref(),
+                remaining,
+                pos,
+                verify_ms,
+                &snap,
+            )?
+        };
+
+        if k > 0 {
+            if let Some(ls) = self.state.mtp.as_mut() {
+                ls.set_kv_filled(mtp_kv_start + emitted.len().min(k));
+            }
+        }
+        self.mtp_spec_rounds += 1;
+        self.mtp_spec_emitted += emitted.len() as u32;
+        self.mtp_diag_total += drafts.len() as u32;
+        self.mtp_diag_hits += n_acc as u32;
+        if n_acc == 0 && !drafts.is_empty() {
+            self.mtp_seq_rest = true;
+        }
+        Ok(MtpSpecRound {
+            emitted,
+            next_token,
+            n_drafted: drafts.len(),
+            n_accepted: n_acc,
+        })
+    }
+
+    fn mtp_accept_fused_or_replay(
+        &mut self,
+        block: &[u32],
+        drafts: &[u32],
+        logits: &[Vec<f32>],
+        remaining: usize,
+        pos: usize,
+        verify_ms: f64,
+        snap: &LinearStateSnapshot,
+    ) -> Result<(Vec<u32>, u32, usize)> {
+        let greedy: Vec<u32> = logits.iter().map(|row| Self::greedy_sample(row)).collect();
+        anyhow::ensure!(
+            greedy.len() == block.len(),
+            "fused verify greedy {} != block {}",
+            greedy.len(),
+            block.len()
+        );
+        let mut n_acc = 0usize;
+        while n_acc < drafts.len() && n_acc + 1 < greedy.len() && greedy[n_acc] == drafts[n_acc] {
+            n_acc += 1;
+        }
+        let commit_len = (n_acc + 1).min(block.len()).min(remaining);
+        if env::var_os("SUPERSONIC_QWEN38_MTP_PROFILE").is_some() {
+            eprintln!(
+                "[qwen38-mtp-profile] fused B={} verify={:.1}ms commit={} n_acc={}",
+                block.len(),
+                verify_ms,
+                commit_len,
+                n_acc
+            );
+        }
+        if commit_len == block.len() {
+            self.commit_fused_kv_filled(pos + commit_len);
+            if let Some(normed) = self.fused_last_normed.clone() {
+                self.seed_mtp_h_from_normed(&normed)?;
+            }
+            Ok((block.to_vec(), greedy[commit_len - 1], n_acc))
+        } else {
+            self.mtp_replay_committed_prefix(&block[..commit_len], pos, snap)
+        }
+    }
+
+    fn mtp_accept_append_or_replay(
+        &mut self,
+        block: &[u32],
+        drafts: &[u32],
+        greedy: &[u32],
+        normed_rows: Option<&[u8]>,
+        remaining: usize,
+        pos: usize,
+        verify_ms: f64,
+        snap: &LinearStateSnapshot,
+    ) -> Result<(Vec<u32>, u32, usize)> {
+        anyhow::ensure!(
+            greedy.len() == block.len(),
+            "append verify greedy {} != block {}",
+            greedy.len(),
+            block.len()
+        );
+        let mut n_acc = 0usize;
+        while n_acc < drafts.len() && n_acc + 1 < greedy.len() && greedy[n_acc] == drafts[n_acc] {
+            n_acc += 1;
+        }
+        let commit_len = (n_acc + 1).min(block.len()).min(remaining);
+        if env::var_os("SUPERSONIC_QWEN38_MTP_PROFILE").is_some() {
+            eprintln!(
+                "[qwen38-mtp-profile] append B={} verify={:.1}ms commit={} n_acc={}",
+                block.len(),
+                verify_ms,
+                commit_len,
+                n_acc
+            );
+        }
+        if commit_len == block.len() {
+            self.commit_fused_kv_filled(pos + commit_len);
+            if let Some(normed) = normed_rows {
+                let hidden = self.weights.config.hidden_size;
+                let row_bytes = hidden * ScalarType::BF16.size_in_bytes();
+                let start = (commit_len - 1) * row_bytes;
+                let end = start + row_bytes;
+                if end <= normed.len() {
+                    self.seed_mtp_h_from_normed(&normed[start..end])?;
+                }
+            }
+            Ok((block.to_vec(), greedy[commit_len - 1], n_acc))
+        } else {
+            self.mtp_replay_committed_prefix(&block[..commit_len], pos, snap)
+        }
+    }
+
+    fn commit_fused_kv_filled(&mut self, new_len: usize) {
+        let config = &self.weights.config;
+        for (i, ls) in self.state.layers.iter_mut().enumerate() {
+            if config.is_full_attention(i) {
+                ls.set_kv_filled(new_len);
+            }
+        }
+    }
+
+    fn mtp_replay_committed_prefix(
+        &mut self,
+        committed: &[u32],
+        pos: usize,
+        snap: &LinearStateSnapshot,
+    ) -> Result<(Vec<u32>, u32, usize)> {
+        anyhow::ensure!(!committed.is_empty(), "mtp replay empty prefix");
+        let ordinal = self.ordinal;
+        self.state
+            .restore_linear(snap, ordinal)
+            .map_err(|e| anyhow::anyhow!("mtp restore_linear: {e}"))?;
+        self.rewind_full_kv_filled(pos);
+
+        let mut next_token = committed[0];
+        for (i, &token) in committed.iter().enumerate() {
+            let (sampled, _) = self.decode_step_hip_fast_greedy(token, pos + i)?;
+            next_token = sampled;
+        }
+        self.store_mtp_h_from_residual()?;
+        let n_acc = committed.len().saturating_sub(1);
+        Ok((committed.to_vec(), next_token, n_acc))
+    }
+
+    fn run_mtp_spec_round_sequential(
+        &mut self,
+        first_token: u32,
+        mut pos: usize,
+        remaining: usize,
+        drafts: Vec<u32>,
+        mtp_kv_start: usize,
+        k: usize,
+    ) -> Result<MtpSpecRound> {
+        let mut emitted = Vec::with_capacity(drafts.len() + 1);
+        let mut token = first_token;
+        let mut n_acc = 0usize;
+        let mut next_token = first_token;
+        let verify_steps = drafts.len() + 1;
+        for i in 0..verify_steps {
+            if emitted.len() >= remaining {
+                break;
+            }
+            let (sampled, _) = self.decode_step_hip_fast_greedy(token, pos)?;
+            emitted.push(token);
+            self.store_mtp_h_from_residual()?;
+            pos += 1;
+            next_token = sampled;
+            if i == drafts.len() {
+                break;
+            }
+            if sampled == drafts[i] {
+                n_acc += 1;
+                token = sampled;
+            } else {
+                break;
+            }
+        }
+        if k > 0 {
+            if let Some(ls) = self.state.mtp.as_mut() {
+                ls.set_kv_filled(mtp_kv_start + emitted.len().min(k));
+            }
+        }
+        self.mtp_spec_rounds += 1;
+        self.mtp_spec_emitted += emitted.len() as u32;
+        self.mtp_diag_total += drafts.len() as u32;
+        self.mtp_diag_hits += n_acc as u32;
+        Ok(MtpSpecRound {
+            emitted,
+            next_token,
+            n_drafted: drafts.len(),
+            n_accepted: n_acc,
+        })
+    }
+
+    fn store_mtp_h_from_residual(&mut self) -> Result<()> {
+        let hidden = self.weights.config.hidden_size;
+        if self.mtp_h.is_none() {
+            self.mtp_h = Some(
+                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden])
+                    .map_err(|e| anyhow::anyhow!("mtp_h alloc: {e}"))?,
+            );
+        }
+        let mtp_h = self.mtp_h.as_mut().unwrap();
+        rms_norm_rows_model(
+            &self.weights.config,
+            self.ordinal,
+            1,
+            hidden,
+            &self.hidden_io,
+            &self.weights.norm_weight,
+            mtp_h,
+            "mtp spec output_norm",
+        )
+    }
+
+    fn mtp_draft_chain(
+        &mut self,
+        mut token: u32,
+        abs_pos: usize,
+        k: usize,
+    ) -> Result<Vec<u32>> {
+        let mut scratch = match self.metal_v2_scratch.take() {
+            Some(scratch) => scratch,
+            None => prefill_engine::MetalV2DecodeScratch::new(
+                &self.weights.config,
+                self.ordinal,
+            )?,
+        };
+        let mut src = self
+            .mtp_h
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("mtp chain missing h"))?;
+        let mut dst = match self.mtp_h_tmp.take() {
+            Some(buf) => buf,
+            None => GpuBuffer::zeros(
+                self.ordinal,
+                ScalarType::BF16,
+                &[1, self.weights.config.hidden_size],
+            )
+            .map_err(|e| anyhow::anyhow!("mtp_h_tmp alloc: {e}"))?,
+        };
+        let mut drafts = Vec::with_capacity(k);
+        let mut err = None;
+        for i in 0..k {
+            match prefill_engine::qwen35_mtp_forward(
+                &self.weights,
+                &mut self.state,
+                &self.rotary,
+                &mut scratch,
+                &src,
+                true,
+                token,
+                abs_pos + i,
+                &mut dst,
+                self.ordinal,
+                self.kv_chunk_size,
+            ) {
+                Ok(d) => {
+                    drafts.push(d);
+                    token = d;
+                    std::mem::swap(&mut src, &mut dst);
+                }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        self.mtp_h = Some(src);
+        self.mtp_h_tmp = Some(dst);
+        self.metal_v2_scratch = Some(scratch);
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(drafts)
     }
 
     pub fn set_decode_context_limit(&mut self, context_tokens: usize) {
@@ -11553,7 +12116,9 @@ impl DecodeEngine {
             self.ordinal,
             self.kv_chunk_size,
         );
+        let copy = scratch.copy_last_residual_to(self.ordinal, &mut self.hidden_io);
         self.metal_v2_scratch = Some(scratch);
+        copy?;
         let logits = result?;
         maybe_dump_gqh_decode_state(
             &self.state,
@@ -12892,6 +13457,14 @@ impl DecodeEngine {
                 "[dflash-profile] fused_verify B={b} pos={pos_offset} persistent={persistent_ms:.2}ms rms={rms_ms:.2}ms lm_head={lm_head_ms:.2}ms d2h={d2h_ms:.2}ms"
             );
         }
+
+        let normed_host = cache
+            .normed_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("fused verify normed D2H: {e}"))?;
+        let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+        let last_off = (b - 1) * row_bytes;
+        self.fused_last_normed = Some(normed_host[last_off..last_off + row_bytes].to_vec());
 
         self.dflash_fused_verify_cache = Some(cache);
         Ok(logits_per_pos)

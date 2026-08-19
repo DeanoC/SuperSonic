@@ -130,6 +130,23 @@ pub(crate) fn load_qwen35_engine(
         cli.batch_size,
     )?;
     engine.set_decode_context_limit(context_tokens);
+    if *model_variant == ModelVariant::Qwen3_8_27B {
+        if cli.speculative_decode {
+            if engine.weights().mtp.is_none() {
+                anyhow::bail!(
+                    "--speculative-decode on qwen3.8-27b needs NextN blk.64 in the GGUF"
+                );
+            }
+            engine.set_mtp_spec(true);
+            eprintln!(
+                "[qwen38-mtp] NextN spec on (K-draft + short-block verify; greedy-identical)"
+            );
+        } else if engine.weights().mtp.is_some() {
+            eprintln!(
+                "[qwen38-mtp] loaded blk.64 (pass --speculative-decode or SUPERSONIC_QWEN38_MTP=1 for draft telemetry)"
+            );
+        }
+    }
     let allow_host_lm_head_rescore = cli.no_bake
         && !engine.weights().is_fp8
         && !engine.weights().is_int4

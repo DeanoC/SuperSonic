@@ -216,6 +216,8 @@ mod tests {
             linear_value_head_dim: 64,
             linear_num_key_heads: 8,
             linear_num_value_heads: 8,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
             layer_types: vec![
                 "linear_attention".to_string(),
                 "linear_attention".to_string(),
