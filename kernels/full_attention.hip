@@ -662,6 +662,7 @@ __global__ void supersonic_qwen35_full_attention_prefill_tiled_kernel(
     float* out
 ) {
     constexpr int ACC_MAX = 8;   // head_dim <= 8 * warpSize asserted in launcher
+    constexpr int QPW = 1;
 
     const int qr_base = blockIdx.x * BM;
     const int qh      = blockIdx.y;
@@ -670,6 +671,7 @@ __global__ void supersonic_qwen35_full_attention_prefill_tiled_kernel(
     const int warp_y  = threadIdx.y;        // 0..BM-1
     const int lane    = threadIdx.x;        // 0..warpSize-1
     const int qr      = qr_base + warp_y;
+    const int qr1     = qr_base + BM + warp_y;
     if (lane >= warpSize) return;
     if (batch >= batch_size || qh >= q_heads) return;
 
@@ -678,30 +680,58 @@ __global__ void supersonic_qwen35_full_attention_prefill_tiled_kernel(
     T* v_tile = k_tile + BK * head_dim;
 
     const bool active = (qr < q_len);
+    const bool active1 = (QPW == 2) && (qr1 < q_len);
     const int causal_limit = active ? min(kv_len, seqlen_offset + qr + 1) : 0;
+    const int causal_limit1 = active1 ? min(kv_len, seqlen_offset + qr1 + 1) : 0;
 
     const T* q_row = active ? (query + (((batch * q_heads + qh) * q_len + qr) * head_dim)) : nullptr;
+    const T* q_row1 = active1 ? (query + (((batch * q_heads + qh) * q_len + qr1) * head_dim)) : nullptr;
     const T* k_head_ptr = key   + ((batch * kv_heads + kv_h) * kv_len * head_dim);
     const T* v_head_ptr = value + ((batch * kv_heads + kv_h) * kv_len * head_dim);
     float*   out_row = active ? (out + (((batch * q_heads + qh) * q_len + qr) * head_dim)) : nullptr;
+    float*   out_row1 = active1 ? (out + (((batch * q_heads + qh) * q_len + qr1) * head_dim)) : nullptr;
 
     // Per-lane output accumulators (in registers). Each lane owns the dims
     // d = lane, lane + warpSize, lane + 2*warpSize, ... (up to ACC_MAX of them).
     float acc[ACC_MAX];
+    float acc1[ACC_MAX];
+    float q_reg[ACC_MAX];
+    float q_reg1[ACC_MAX];
     int   acc_dim[ACC_MAX];
     int   acc_count = 0;
     #pragma unroll
-    for (int i = 0; i < ACC_MAX; ++i) acc[i] = 0.0f;
+    for (int i = 0; i < ACC_MAX; ++i) {
+        acc[i] = 0.0f;
+        acc1[i] = 0.0f;
+        q_reg[i] = 0.0f;
+        q_reg1[i] = 0.0f;
+        acc_dim[i] = -1;
+    }
     for (int d = lane; d < head_dim && acc_count < ACC_MAX; d += warpSize) {
         acc_dim[acc_count++] = d;
+    }
+    if (active) {
+        for (int i = 0; i < acc_count; ++i) {
+            q_reg[i] = supersonic_qwen35_to_float(q_row[acc_dim[i]]);
+        }
+    }
+    if (active1) {
+        for (int i = 0; i < acc_count; ++i) {
+            q_reg1[i] = supersonic_qwen35_to_float(q_row1[acc_dim[i]]);
+        }
     }
 
     float m_i = -INFINITY;
     float l_i = 0.0f;
+    float m1 = -INFINITY;
+    float l1 = 0.0f;
 
     // Iterate K tiles. Even inactive warps must participate in cooperative
     // loads and __syncthreads() — they just won't write output.
-    const int causal_for_block = active ? causal_limit : 0;
+    const int causal_for_block = active
+        ? (active1 ? ((causal_limit1 > causal_limit) ? causal_limit1 : causal_limit)
+                   : causal_limit)
+        : (active1 ? causal_limit1 : 0);
     // For the cooperative load we need an upper bound on K positions any
     // warp in this block will need. Different warps can have different
     // causal_limit values (qr varies). Use the maximum across the block.
@@ -720,41 +750,138 @@ __global__ void supersonic_qwen35_full_attention_prefill_tiled_kernel(
         const int load_total = tile_len * head_dim;
         const int total_threads = BM * warpSize;
         const int linear_tid = warp_y * warpSize + lane;
-        for (int i = linear_tid; i < load_total; i += total_threads) {
-            const int row = i / head_dim;
-            const int col = i - row * head_dim;
-            const int gk_pos = tile_base + row;
-            const size_t off = (size_t)gk_pos * head_dim + (size_t)col;
-            k_tile[i] = k_head_ptr[off];
-            v_tile[i] = v_head_ptr[off];
+        if (sizeof(T) == 2 && (head_dim % 2) == 0) {
+            const int vec_total = load_total >> 1;
+            for (int vi = linear_tid; vi < vec_total; vi += total_threads) {
+                const int elem = vi << 1;
+                const int row = elem / head_dim;
+                const int col = elem - row * head_dim;
+                const size_t off =
+                    (size_t)(tile_base + row) * (size_t)head_dim + (size_t)col;
+                *reinterpret_cast<uint32_t*>(&k_tile[elem]) =
+                    *reinterpret_cast<const uint32_t*>(k_head_ptr + off);
+                *reinterpret_cast<uint32_t*>(&v_tile[elem]) =
+                    *reinterpret_cast<const uint32_t*>(v_head_ptr + off);
+            }
+        } else {
+            for (int i = linear_tid; i < load_total; i += total_threads) {
+                const int row = i / head_dim;
+                const int col = i - row * head_dim;
+                const int gk_pos = tile_base + row;
+                const size_t off = (size_t)gk_pos * head_dim + (size_t)col;
+                k_tile[i] = k_head_ptr[off];
+                v_tile[i] = v_head_ptr[off];
+            }
         }
         __syncthreads();
 
         // Walk this tile, applying the online softmax recurrence per query row.
         if (active) {
             const int j_max = min(tile_len, causal_limit - tile_base);
-            for (int j = 0; j < j_max; ++j) {
+            int j = 0;
+            for (; j + 3 < j_max; j += 4) {
+                float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+                const T* k0 = k_tile + j * head_dim;
+                const T* k1 = k0 + head_dim;
+                const T* k2 = k1 + head_dim;
+                const T* k3 = k2 + head_dim;
+                #pragma unroll
+                for (int i = 0; i < ACC_MAX; ++i) {
+                    if (i < acc_count) {
+                        const float qv = q_reg[i];
+                        const int d = acc_dim[i];
+                        p0 += qv * supersonic_qwen35_to_float(k0[d]);
+                        p1 += qv * supersonic_qwen35_to_float(k1[d]);
+                        p2 += qv * supersonic_qwen35_to_float(k2[d]);
+                        p3 += qv * supersonic_qwen35_to_float(k3[d]);
+                    }
+                }
+                const float s0 = __shfl(supersonic_qwen35_wave_sum(p0), 0) * scale;
+                const float s1 = __shfl(supersonic_qwen35_wave_sum(p1), 0) * scale;
+                const float s2 = __shfl(supersonic_qwen35_wave_sum(p2), 0) * scale;
+                const float s3 = __shfl(supersonic_qwen35_wave_sum(p3), 0) * scale;
+                const T* v0 = v_tile + j * head_dim;
+                const T* vs[4] = {v0, v0 + head_dim, v0 + 2 * head_dim, v0 + 3 * head_dim};
+                const float scores[4] = {s0, s1, s2, s3};
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const float m_old = m_i;
+                    const float m_new = scores[u] > m_old ? scores[u] : m_old;
+                    const float alpha = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+                    const float weight = __expf(scores[u] - m_new);
+                    l_i = l_i * alpha + weight;
+                    m_i = m_new;
+                    for (int i = 0; i < acc_count; ++i) {
+                        acc[i] = acc[i] * alpha +
+                            weight * supersonic_qwen35_to_float(vs[u][acc_dim[i]]);
+                    }
+                    if (active1 && (tile_base + j + u) < causal_limit1) {
+                        float p1q = 0.0f;
+                        #pragma unroll
+                        for (int i = 0; i < ACC_MAX; ++i) {
+                            if (i < acc_count) {
+                                p1q += q_reg1[i] * supersonic_qwen35_to_float(
+                                    (u == 0 ? k0 : u == 1 ? k1 : u == 2 ? k2 : k3)[acc_dim[i]]);
+                            }
+                        }
+                        const float sc1 =
+                            __shfl(supersonic_qwen35_wave_sum(p1q), 0) * scale;
+                        const float m_old1 = m1;
+                        const float m_new1 = sc1 > m_old1 ? sc1 : m_old1;
+                        const float al1 = (m_old1 == -INFINITY) ? 0.0f : __expf(m_old1 - m_new1);
+                        const float w1 = __expf(sc1 - m_new1);
+                        l1 = l1 * al1 + w1;
+                        m1 = m_new1;
+                        for (int i = 0; i < acc_count; ++i) {
+                            acc1[i] = acc1[i] * al1 +
+                                w1 * supersonic_qwen35_to_float(vs[u][acc_dim[i]]);
+                        }
+                    }
+                }
+            }
+            for (; j < j_max; ++j) {
                 const T* k_row = k_tile + j * head_dim;
                 const T* v_row = v_tile + j * head_dim;
 
                 float partial = 0.0f;
-                for (int d = lane; d < head_dim; d += warpSize) {
-                    partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
+                #pragma unroll
+                for (int i = 0; i < ACC_MAX; ++i) {
+                    if (i < acc_count) {
+                        partial += q_reg[i] * supersonic_qwen35_to_float(k_row[acc_dim[i]]);
+                    }
                 }
-                // wave_sum is a __shfl_down butterfly that leaves the sum
-                // only in lane 0; broadcast it so every lane sees the same
-                // score (each lane runs its own per-output-dim recurrence).
                 float score = __shfl(supersonic_qwen35_wave_sum(partial), 0) * scale;
 
                 const float m_old = m_i;
                 const float m_new = score > m_old ? score : m_old;
-                const float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
-                const float weight = expf(score - m_new);
+                const float alpha = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+                const float weight = __expf(score - m_new);
                 l_i = l_i * alpha + weight;
                 m_i = m_new;
 
                 for (int i = 0; i < acc_count; ++i) {
                     acc[i] = acc[i] * alpha + weight * supersonic_qwen35_to_float(v_row[acc_dim[i]]);
+                }
+                if (active1 && (tile_base + j) < causal_limit1) {
+                    float p1q = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < ACC_MAX; ++i) {
+                        if (i < acc_count) {
+                            p1q += q_reg1[i] * supersonic_qwen35_to_float(k_row[acc_dim[i]]);
+                        }
+                    }
+                    const float sc1 =
+                        __shfl(supersonic_qwen35_wave_sum(p1q), 0) * scale;
+                    const float m_old1 = m1;
+                    const float m_new1 = sc1 > m_old1 ? sc1 : m_old1;
+                    const float al1 = (m_old1 == -INFINITY) ? 0.0f : __expf(m_old1 - m_new1);
+                    const float w1 = __expf(sc1 - m_new1);
+                    l1 = l1 * al1 + w1;
+                    m1 = m_new1;
+                    for (int i = 0; i < acc_count; ++i) {
+                        acc1[i] = acc1[i] * al1 +
+                            w1 * supersonic_qwen35_to_float(v_row[acc_dim[i]]);
+                    }
                 }
             }
         }
@@ -766,6 +893,165 @@ __global__ void supersonic_qwen35_full_attention_prefill_tiled_kernel(
         for (int i = 0; i < acc_count; ++i) {
             out_row[acc_dim[i]] = acc[i] * inv;
         }
+    }
+    if (active1) {
+        const float inv1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
+        for (int i = 0; i < acc_count; ++i) {
+            out_row1[acc_dim[i]] = acc1[i] * inv1;
+        }
+    }
+}
+
+// Causal softmax over scores[n_rows, kv_len], one block per row.
+// GQA packs stack Q heads, so qi = row % q_len (same mask per query
+// position across the heads that share a KV head).
+// Applies `scale` and masks j >= seqlen_offset+qi+1.
+__global__ void supersonic_qwen35_causal_softmax_rows(
+    float* scores,
+    int n_rows,
+    int q_len,
+    int kv_len,
+    int seqlen_offset,
+    float scale
+) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (row < 0 || row >= n_rows || q_len <= 0) {
+        return;
+    }
+    const int qi = row % q_len;
+    int limit = seqlen_offset + qi + 1;
+    if (limit > kv_len) {
+        limit = kv_len;
+    }
+    if (limit < 0) {
+        limit = 0;
+    }
+    float* srow = scores + static_cast<size_t>(row) * kv_len;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int bs = static_cast<int>(blockDim.x);
+
+    float local_max = -INFINITY;
+    for (int j = tid; j < kv_len; j += bs) {
+        float s = srow[j] * scale;
+        if (j >= limit) {
+            s = -INFINITY;
+        }
+        srow[j] = s;
+        if (s > local_max) {
+            local_max = s;
+        }
+    }
+    __shared__ float red[256];
+    red[tid] = local_max;
+    __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] = fmaxf(red[tid], red[tid + s]);
+        }
+        __syncthreads();
+    }
+    const float m = red[0];
+    float local_sum = 0.0f;
+    for (int j = tid; j < limit; j += bs) {
+        const float e = expf(srow[j] - m);
+        srow[j] = e;
+        local_sum += e;
+    }
+    for (int j = limit + tid; j < kv_len; j += bs) {
+        srow[j] = 0.0f;
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        __syncthreads();
+    }
+    const float inv = (red[0] > 0.0f) ? (1.0f / red[0]) : 0.0f;
+    for (int j = tid; j < limit; j += bs) {
+        srow[j] *= inv;
+    }
+}
+
+// Same causal softmax, BF16 scores in and out. Accumulates in F32.
+__global__ void supersonic_qwen35_causal_softmax_rows_bf16(
+    hip_bfloat16* scores,
+    int n_rows,
+    int q_len,
+    int kv_len,
+    int seqlen_offset,
+    float scale
+) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (row < 0 || row >= n_rows || q_len <= 0) {
+        return;
+    }
+    const int qi = row % q_len;
+    int limit = seqlen_offset + qi + 1;
+    if (limit > kv_len) {
+        limit = kv_len;
+    }
+    if (limit < 0) {
+        limit = 0;
+    }
+    hip_bfloat16* srow = scores + static_cast<size_t>(row) * kv_len;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int bs = static_cast<int>(blockDim.x);
+
+    float local_max = -INFINITY;
+    for (int j = tid; j < kv_len; j += bs) {
+        float s = static_cast<float>(srow[j]) * scale;
+        if (j >= limit) {
+            s = -INFINITY;
+        }
+        srow[j] = static_cast<hip_bfloat16>(s);
+        if (s > local_max) {
+            local_max = s;
+        }
+    }
+    __shared__ float red[256];
+    red[tid] = local_max;
+    __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] = fmaxf(red[tid], red[tid + s]);
+        }
+        __syncthreads();
+    }
+    const float m = red[0];
+    float local_sum = 0.0f;
+    for (int j = tid; j < limit; j += bs) {
+        const float e = expf(static_cast<float>(srow[j]) - m);
+        srow[j] = static_cast<hip_bfloat16>(e);
+        local_sum += e;
+    }
+    for (int j = limit + tid; j < kv_len; j += bs) {
+        srow[j] = static_cast<hip_bfloat16>(0.0f);
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        __syncthreads();
+    }
+    const float inv = (red[0] > 0.0f) ? (1.0f / red[0]) : 0.0f;
+    for (int j = tid; j < limit; j += bs) {
+        srow[j] = static_cast<hip_bfloat16>(static_cast<float>(srow[j]) * inv);
+    }
+}
+
+// BF16 V -> F32 for the AV GEMM.
+__global__ void supersonic_qwen35_cast_bf16_to_f32(
+    const hip_bfloat16* __restrict__ src,
+    float* __restrict__ dst,
+    int n
+) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        dst[i] = supersonic_qwen35_to_float(src[i]);
     }
 }
 
@@ -1480,6 +1766,431 @@ __global__ void supersonic_qwen35_delta_recurrent_prefill_kernel(
         state_trace,
         tid
     );
+}
+
+// Specialized k=v=128 rec. Same product order as the generic warp
+// kernel (scale, kv_mem, delta, state+=, out) but k-per-lane is a
+// compile-time 4, so the 8070-token loop has no nk branches and no
+// block-wide LDS sync. Launch: 4 warps × 32, bounds 128/2.
+template <typename T>
+__global__ __launch_bounds__(128, 2)
+void supersonic_qwen35_delta_recurrent_prefill_warp_k128_kernel(
+    int batch_heads,
+    int seq_len,
+    const T* __restrict__ initial_state,
+    const T* __restrict__ query,
+    const T* __restrict__ key,
+    const T* __restrict__ value,
+    const T* __restrict__ beta,
+    const T* __restrict__ g,
+    T* __restrict__ out
+) {
+    constexpr int K = 128;
+    constexpr int V = 128;
+    constexpr int R = 4;
+    constexpr int V_PER_WARP = 4;
+    const int lane = static_cast<int>(threadIdx.x);
+    const int warp_id = static_cast<int>(blockIdx.x * blockDim.y + threadIdx.y);
+    const int total = batch_heads * (V / V_PER_WARP);
+    if (lane >= 32 || warp_id >= total) {
+        return;
+    }
+    const int groups_per_head = V / V_PER_WARP;
+    const int bh = warp_id / groups_per_head;
+    const int v0 = (warp_id - bh * groups_per_head) * V_PER_WARP;
+    const int v1 = v0 + 1;
+    const int v2 = v0 + 2;
+    const int v3 = v0 + 3;
+    const int state_stride = K * V;
+    const int token_stride_k = seq_len * K;
+    const int token_stride_v = seq_len * V;
+    const int out_base = bh * (seq_len + K) * V;
+
+    float state0[R];
+    float state1[R];
+    float state2[R];
+    float state3[R];
+    int k_ids[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        k_ids[r] = lane + r * 32;
+        const int ks = bh * state_stride + k_ids[r] * V;
+        state0[r] = supersonic_qwen35_to_float(initial_state[ks + v0]);
+        state1[r] = supersonic_qwen35_to_float(initial_state[ks + v1]);
+        state2[r] = supersonic_qwen35_to_float(initial_state[ks + v2]);
+        state3[r] = supersonic_qwen35_to_float(initial_state[ks + v3]);
+    }
+
+    float g_cur = 0.0f;
+    float ds_cur = 0.0f;
+    float v0_cur = 0.0f;
+    float v1_cur = 0.0f;
+    float v2_cur = 0.0f;
+    float v3_cur = 0.0f;
+    float k_cur[R];
+    float q_cur[R];
+    if (seq_len > 0) {
+        g_cur = __expf(supersonic_qwen35_to_float(g[bh * seq_len]));
+        ds_cur = supersonic_qwen35_to_float(beta[bh * seq_len]);
+        v0_cur = supersonic_qwen35_to_float(value[bh * token_stride_v + v0]);
+        v1_cur = supersonic_qwen35_to_float(value[bh * token_stride_v + v1]);
+        v2_cur = supersonic_qwen35_to_float(value[bh * token_stride_v + v2]);
+        v3_cur = supersonic_qwen35_to_float(value[bh * token_stride_v + v3]);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            k_cur[r] = supersonic_qwen35_to_float(key[bh * token_stride_k + k_ids[r]]);
+            q_cur[r] = supersonic_qwen35_to_float(query[bh * token_stride_k + k_ids[r]]);
+        }
+    }
+    for (int t = 0; t < seq_len; ++t) {
+        float g_n = 0.0f;
+        float ds_n = 0.0f;
+        float v0_n = 0.0f;
+        float v1_n = 0.0f;
+        float v2_n = 0.0f;
+        float v3_n = 0.0f;
+        float k_n[R];
+        float q_n[R];
+        if (t + 1 < seq_len) {
+            const int tn = t + 1;
+            g_n = __expf(supersonic_qwen35_to_float(g[bh * seq_len + tn]));
+            ds_n = supersonic_qwen35_to_float(beta[bh * seq_len + tn]);
+            const int val_row_n = bh * token_stride_v + tn * V;
+            v0_n = supersonic_qwen35_to_float(value[val_row_n + v0]);
+            v1_n = supersonic_qwen35_to_float(value[val_row_n + v1]);
+            v2_n = supersonic_qwen35_to_float(value[val_row_n + v2]);
+            v3_n = supersonic_qwen35_to_float(value[val_row_n + v3]);
+            const int key_row_n = bh * token_stride_k + tn * K;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                k_n[r] = supersonic_qwen35_to_float(key[key_row_n + k_ids[r]]);
+                q_n[r] = supersonic_qwen35_to_float(query[key_row_n + k_ids[r]]);
+            }
+        }
+        asm volatile("" ::: "memory");
+
+        float kv0 = 0.0f;
+        float kv1 = 0.0f;
+        float kv2 = 0.0f;
+        float kv3 = 0.0f;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            state0[r] *= g_cur;
+            state1[r] *= g_cur;
+            state2[r] *= g_cur;
+            state3[r] *= g_cur;
+            kv0 += state0[r] * k_cur[r];
+            kv1 += state1[r] * k_cur[r];
+            kv2 += state2[r] * k_cur[r];
+            kv3 += state3[r] * k_cur[r];
+        }
+        kv0 = __shfl(supersonic_qwen35_wave_sum(kv0), 0);
+        kv1 = __shfl(supersonic_qwen35_wave_sum(kv1), 0);
+        kv2 = __shfl(supersonic_qwen35_wave_sum(kv2), 0);
+        kv3 = __shfl(supersonic_qwen35_wave_sum(kv3), 0);
+        const float d0 = (v0_cur - kv0) * ds_cur;
+        const float d1 = (v1_cur - kv1) * ds_cur;
+        const float d2 = (v2_cur - kv2) * ds_cur;
+        const float d3 = (v3_cur - kv3) * ds_cur;
+
+        float o0 = 0.0f;
+        float o1 = 0.0f;
+        float o2 = 0.0f;
+        float o3 = 0.0f;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            state0[r] += k_cur[r] * d0;
+            state1[r] += k_cur[r] * d1;
+            state2[r] += k_cur[r] * d2;
+            state3[r] += k_cur[r] * d3;
+            o0 += state0[r] * q_cur[r];
+            o1 += state1[r] * q_cur[r];
+            o2 += state2[r] * q_cur[r];
+            o3 += state3[r] * q_cur[r];
+        }
+        o0 = __shfl(supersonic_qwen35_wave_sum(o0), 0);
+        o1 = __shfl(supersonic_qwen35_wave_sum(o1), 0);
+        o2 = __shfl(supersonic_qwen35_wave_sum(o2), 0);
+        o3 = __shfl(supersonic_qwen35_wave_sum(o3), 0);
+        if (lane == 0) {
+            out[out_base + t * V + v0] = supersonic_qwen35_from_float<T>(o0);
+            out[out_base + t * V + v1] = supersonic_qwen35_from_float<T>(o1);
+            out[out_base + t * V + v2] = supersonic_qwen35_from_float<T>(o2);
+            out[out_base + t * V + v3] = supersonic_qwen35_from_float<T>(o3);
+        }
+
+        g_cur = g_n;
+        ds_cur = ds_n;
+        v0_cur = v0_n;
+        v1_cur = v1_n;
+        v2_cur = v2_n;
+        v3_cur = v3_n;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            k_cur[r] = k_n[r];
+            q_cur[r] = q_n[r];
+        }
+    }
+
+    const int state_out = out_base + seq_len * V;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int so = state_out + k_ids[r] * V;
+        out[so + v0] = supersonic_qwen35_from_float<T>(state0[r]);
+        out[so + v1] = supersonic_qwen35_from_float<T>(state1[r]);
+        out[so + v2] = supersonic_qwen35_from_float<T>(state2[r]);
+        out[so + v3] = supersonic_qwen35_from_float<T>(state3[r]);
+    }
+}
+
+// Decode seq=1 k128 rec that reads unique q/k (repeat via h%nk) and
+// packs beta/g in-register. Same rec product order as the prefill
+// k128 kernel; same beta/g math as decode_pack_rec_inputs.
+__global__ __launch_bounds__(128, 2)
+void supersonic_qwen35_decode_rec_k128_fused_kernel(
+    int nv,
+    int nk,
+    float* __restrict__ rec_state,
+    const float* __restrict__ q_unique,
+    const float* __restrict__ k_unique,
+    const float* __restrict__ value,
+    const float* __restrict__ b,
+    const float* __restrict__ a,
+    const hip_bfloat16* __restrict__ dt_bias,
+    const hip_bfloat16* __restrict__ a_log_exp,
+    float* __restrict__ out) {
+    constexpr int K = 128;
+    constexpr int V = 128;
+    constexpr int R = 4;
+    constexpr int V_PER_WARP = 4;
+    const int lane = static_cast<int>(threadIdx.x);
+    const int warp_id = static_cast<int>(blockIdx.x * blockDim.y + threadIdx.y);
+    const int total = nv * (V / V_PER_WARP);
+    if (lane >= 32 || warp_id >= total) {
+        return;
+    }
+    const int groups_per_head = V / V_PER_WARP;
+    const int bh = warp_id / groups_per_head;
+    const int v0 = (warp_id - bh * groups_per_head) * V_PER_WARP;
+    const int v1 = v0 + 1;
+    const int v2 = v0 + 2;
+    const int v3 = v0 + 3;
+    const int state_stride = K * V;
+    const int src_h = bh % nk;
+    const int out_base = bh * V;
+
+    int k_ids[R];
+    float state0[R], state1[R], state2[R], state3[R];
+    float k_cur[R], q_cur[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        k_ids[r] = lane + r * 32;
+        const int ks = bh * state_stride + k_ids[r] * V;
+        state0[r] = rec_state[ks + v0];
+        state1[r] = rec_state[ks + v1];
+        state2[r] = rec_state[ks + v2];
+        state3[r] = rec_state[ks + v3];
+        q_cur[r] = q_unique[src_h * K + k_ids[r]];
+        k_cur[r] = k_unique[src_h * K + k_ids[r]];
+    }
+
+    const float beta = 1.0f / (1.0f + expf(-b[bh]));
+    float g_cur = 0.0f;
+    if (dt_bias != nullptr && a_log_exp != nullptr) {
+        const float dt = supersonic_qwen35_to_float(dt_bias[bh]);
+        const float ale = supersonic_qwen35_to_float(a_log_exp[bh]);
+        const float sp = logf(1.0f + expf(a[bh] + dt));
+        g_cur = __expf(-sp * ale);
+    } else {
+        g_cur = 1.0f;
+    }
+    const float v0_cur = value[bh * V + v0];
+    const float v1_cur = value[bh * V + v1];
+    const float v2_cur = value[bh * V + v2];
+    const float v3_cur = value[bh * V + v3];
+
+    float kv0 = 0.0f, kv1 = 0.0f, kv2 = 0.0f, kv3 = 0.0f;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        state0[r] *= g_cur;
+        state1[r] *= g_cur;
+        state2[r] *= g_cur;
+        state3[r] *= g_cur;
+        kv0 += state0[r] * k_cur[r];
+        kv1 += state1[r] * k_cur[r];
+        kv2 += state2[r] * k_cur[r];
+        kv3 += state3[r] * k_cur[r];
+    }
+    kv0 = __shfl(supersonic_qwen35_wave_sum(kv0), 0);
+    kv1 = __shfl(supersonic_qwen35_wave_sum(kv1), 0);
+    kv2 = __shfl(supersonic_qwen35_wave_sum(kv2), 0);
+    kv3 = __shfl(supersonic_qwen35_wave_sum(kv3), 0);
+    const float d0 = (v0_cur - kv0) * beta;
+    const float d1 = (v1_cur - kv1) * beta;
+    const float d2 = (v2_cur - kv2) * beta;
+    const float d3 = (v3_cur - kv3) * beta;
+
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        state0[r] += k_cur[r] * d0;
+        state1[r] += k_cur[r] * d1;
+        state2[r] += k_cur[r] * d2;
+        state3[r] += k_cur[r] * d3;
+        o0 += state0[r] * q_cur[r];
+        o1 += state1[r] * q_cur[r];
+        o2 += state2[r] * q_cur[r];
+        o3 += state3[r] * q_cur[r];
+    }
+    o0 = __shfl(supersonic_qwen35_wave_sum(o0), 0);
+    o1 = __shfl(supersonic_qwen35_wave_sum(o1), 0);
+    o2 = __shfl(supersonic_qwen35_wave_sum(o2), 0);
+    o3 = __shfl(supersonic_qwen35_wave_sum(o3), 0);
+    if (lane == 0) {
+        out[out_base + v0] = o0;
+        out[out_base + v1] = o1;
+        out[out_base + v2] = o2;
+        out[out_base + v3] = o3;
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int so = bh * state_stride + k_ids[r] * V;
+        rec_state[so + v0] = state0[r];
+        rec_state[so + v1] = state1[r];
+        rec_state[so + v2] = state2[r];
+        rec_state[so + v3] = state3[r];
+    }
+}
+
+// Warp-split rec: one warp per (head, v_idx). Each lane holds
+// k = lane, lane+32, ... so state is 4–8 floats instead of 128.
+// The one-thread-per-v path spills `float state[128]` to scratch and
+// serializes 8k timesteps at ~356 ms/layer on gfx1100.
+template <typename T, int MAX_K_PER_LANE = 8>
+__global__ void supersonic_qwen35_delta_recurrent_prefill_warp_kernel(
+    int batch_heads,
+    int seq_len,
+    int k_head_dim,
+    int v_head_dim,
+    const T* initial_state,
+    const T* query,
+    const T* key,
+    const T* value,
+    const T* beta,
+    const T* g,
+    T* out
+) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int warp_id = static_cast<int>(blockIdx.x * blockDim.y + threadIdx.y);
+    const int total = batch_heads * v_head_dim;
+    const bool valid = lane < 32 && warp_id < total &&
+        k_head_dim <= MAX_K_PER_LANE * 32;
+    // Consecutive warps in a block share a head, so they share k/q rows.
+    // Do not early-return: the token loop uses block-wide LDS + syncthreads.
+    const int bh = valid ? (warp_id / v_head_dim) : 0;
+    const int v_idx = valid ? (warp_id - bh * v_head_dim) : 0;
+    const int state_stride = k_head_dim * v_head_dim;
+    const int token_stride_k = seq_len * k_head_dim;
+    const int token_stride_v = seq_len * v_head_dim;
+    const int token_stride_s = seq_len;
+    const int out_base = bh * (seq_len + k_head_dim) * v_head_dim;
+    const int tid = static_cast<int>(threadIdx.y * blockDim.x + threadIdx.x);
+
+    // Double-buffered k/q so token t+1 can fill LDS under token t FMAs.
+    __shared__ float s_k[2][256];
+    __shared__ float s_q[2][256];
+
+    float state[MAX_K_PER_LANE];
+    int k_ids[MAX_K_PER_LANE];
+    int nk = 0;
+    if (valid) {
+        for (int k_idx = lane; k_idx < k_head_dim && nk < MAX_K_PER_LANE; k_idx += 32) {
+            k_ids[nk] = k_idx;
+            state[nk] = supersonic_qwen35_to_float(
+                initial_state[bh * state_stride + k_idx * v_head_dim + v_idx]);
+            ++nk;
+        }
+    }
+
+    // Block-shared k/q: 8 warps of one head used to reread the same row
+    // from global. Double-buffer so token t+1 fills LDS under token t.
+    float g_cur = 0.0f;
+    float ds_cur = 0.0f;
+    float v_cur = 0.0f;
+    if (seq_len > 0) {
+        if (valid) {
+            g_cur = __expf(supersonic_qwen35_to_float(g[bh * token_stride_s]));
+            ds_cur = supersonic_qwen35_to_float(beta[bh * token_stride_s]);
+            v_cur = supersonic_qwen35_to_float(value[bh * token_stride_v + v_idx]);
+        }
+        if (tid < k_head_dim) {
+            s_k[0][tid] = supersonic_qwen35_to_float(key[bh * token_stride_k + tid]);
+            s_q[0][tid] = supersonic_qwen35_to_float(query[bh * token_stride_k + tid]);
+        }
+    }
+    __syncthreads();
+    for (int t = 0; t < seq_len; ++t) {
+        const int cur = t & 1;
+        const int nxt = cur ^ 1;
+        float g_n = 0.0f;
+        float ds_n = 0.0f;
+        float v_n = 0.0f;
+        if (t + 1 < seq_len) {
+            const int tn = t + 1;
+            if (valid) {
+                g_n = __expf(supersonic_qwen35_to_float(g[bh * token_stride_s + tn]));
+                ds_n = supersonic_qwen35_to_float(beta[bh * token_stride_s + tn]);
+                v_n = supersonic_qwen35_to_float(
+                    value[bh * token_stride_v + tn * v_head_dim + v_idx]);
+            }
+            if (tid < k_head_dim) {
+                const int key_row_n = bh * token_stride_k + tn * k_head_dim;
+                s_k[nxt][tid] = supersonic_qwen35_to_float(key[key_row_n + tid]);
+                s_q[nxt][tid] = supersonic_qwen35_to_float(query[key_row_n + tid]);
+            }
+        }
+
+        float k_reg[MAX_K_PER_LANE];
+        float q_reg[MAX_K_PER_LANE];
+        float kv_mem = 0.0f;
+#pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < nk) {
+                k_reg[i] = s_k[cur][k_ids[i]];
+                q_reg[i] = s_q[cur][k_ids[i]];
+                state[i] *= g_cur;
+                kv_mem += state[i] * k_reg[i];
+            }
+        }
+        kv_mem = __shfl(supersonic_qwen35_wave_sum(kv_mem), 0);
+        const float delta = (v_cur - kv_mem) * ds_cur;
+
+        float out_t = 0.0f;
+#pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < nk) {
+                state[i] += k_reg[i] * delta;
+                out_t += state[i] * q_reg[i];
+            }
+        }
+        out_t = __shfl(supersonic_qwen35_wave_sum(out_t), 0);
+        if (valid && lane == 0) {
+            out[out_base + t * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(out_t);
+        }
+
+        __syncthreads();
+        g_cur = g_n;
+        ds_cur = ds_n;
+        v_cur = v_n;
+    }
+
+    if (valid) {
+        const int state_out = out_base + seq_len * v_head_dim;
+        for (int i = 0; i < nk; ++i) {
+            out[state_out + k_ids[i] * v_head_dim + v_idx] =
+                supersonic_qwen35_from_float<T>(state[i]);
+        }
+    }
 }
 
 __device__ inline float supersonic_qwen35_block_sum_128(float value, float* smem) {

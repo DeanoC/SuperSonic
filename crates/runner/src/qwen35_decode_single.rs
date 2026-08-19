@@ -51,7 +51,15 @@ pub(crate) fn run_qwen35_single_decode_step(
 ) -> Result<u32> {
     let mut maybe_fast_token = None;
     let mut can_rescore_with_normed = false;
-    let logits = if step.decode_modes.cuda_fast_greedy_enabled {
+    let logits = if step.decode_modes.hip_fast_greedy_enabled {
+        let (token, timings) = step
+            .engine
+            .decode_step_hip_fast_greedy(step.next_token, step.seqlen_offset)?;
+        state.native_decode_timings.add_assign(timings);
+        *state.native_decode_timing_steps += 1;
+        maybe_fast_token = Some(token);
+        Vec::new()
+    } else if step.decode_modes.cuda_fast_greedy_enabled {
         let (token, timings) = step
             .engine
             .decode_step_cuda_fast_greedy(step.next_token, step.seqlen_offset)?;

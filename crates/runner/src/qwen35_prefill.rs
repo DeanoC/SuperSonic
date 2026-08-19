@@ -176,9 +176,29 @@ pub(crate) fn run_qwen35_prefill(
     }
 
     if std::env::var_os("SUPERSONIC_QWEN35_PREFILL_DECODE_LOOP").is_some() {
+        let dump_step = |pos: usize, logits: &[f32]| {
+            let (argmax, max_v) = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| {
+                    a.1.partial_cmp(b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.0.cmp(&a.0))
+                })
+                .map(|(i, v)| (i, *v))
+                .unwrap_or((0, 0.0));
+            let v32 = logits.get(32).copied().unwrap_or(f32::NAN);
+            let v2014 = logits.get(2014).copied().unwrap_or(f32::NAN);
+            eprintln!(
+                "[logits] pos={pos} argmax={argmax} v={max_v} tok32={v32} tok2014={v2014} delta_A_minus_An={}",
+                v32 - v2014
+            );
+        };
         let mut logits = engine.prefill_native(&prompt_ids[..1])?;
+        dump_step(0, &logits);
         for (pos, &token_id) in prompt_ids.iter().enumerate().skip(1) {
             logits = engine.decode_step_batch(&[token_id], pos)?.remove(0);
+            dump_step(pos, &logits);
         }
         let first = DecodeEngine::greedy_sample(&logits);
         eprintln!(
@@ -271,6 +291,7 @@ pub(crate) fn run_qwen35_prefill(
             dir.display()
         );
     }
+    kernel_ffi::gqh::gemm_flush();
     let first = sample_qwen_prefill_token(
         &prefill_result,
         host_lm_head_rescorer.filter(|_| allow_host_lm_head_rescore),

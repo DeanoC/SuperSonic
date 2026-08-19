@@ -52,6 +52,7 @@ pub(crate) fn run_qwen35_decode_loop(
     let mut next_token = decode.next_token;
     let mut batch_next_tokens: Vec<u32> = vec![next_token; decode.cli.batch_size];
 
+    decode.engine.prepare_hip_gqh_decode()?;
     let decode_start = Instant::now();
     for step in 0..decode.cli.max_new_tokens {
         if !decode.cli.ignore_eos && decode.eos_ids.contains(&next_token) {

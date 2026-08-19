@@ -85,6 +85,29 @@ int argmax_bf16_rows_device(
     return launch_result(332, 333);
 }
 
+int argmax_f32_as_bf16_rows_device(
+    int device_ordinal,
+    size_t rows,
+    size_t cols,
+    const void* logits,
+    void* out_index
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (rows == 0 || cols == 0) return 331;
+    constexpr int block = 256;
+    hipLaunchKernelGGL(
+        pfx_argmax_f32_as_bf16_rows_kernel,
+        dim3(static_cast<unsigned int>(rows)),
+        dim3(block),
+        0,
+        0,
+        rows,
+        cols,
+        static_cast<const float*>(logits),
+        static_cast<uint32_t*>(out_index));
+    return launch_result(332, 333);
+}
+
 // ---- apply_rope_prefill ----
 
 template <typename T>
@@ -743,6 +766,21 @@ extern "C" int supersonic_qwen35_hip_argmax_bf16_rows(
     void* out_index
 ) {
     return argmax_bf16_rows_device(
+        static_cast<int>(device_ordinal),
+        rows,
+        cols,
+        logits,
+        out_index);
+}
+
+extern "C" int supersonic_qwen35_hip_argmax_f32_as_bf16_rows(
+    size_t device_ordinal,
+    size_t rows,
+    size_t cols,
+    const void* logits,
+    void* out_index
+) {
+    return argmax_f32_as_bf16_rows_device(
         static_cast<int>(device_ordinal),
         rows,
         cols,

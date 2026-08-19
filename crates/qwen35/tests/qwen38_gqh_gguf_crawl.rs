@@ -395,6 +395,91 @@ fn rung7b_batched_gqh_matvec_ncols4() {
     }
 }
 
+/// Large-m GQH must use dequant+GEMM (llama MMVQ cap is 8) and stay close
+/// to the fused matvec on the same weights/activations.
+#[test]
+fn rung7c_gqh_large_m_dequant_gemm_matches_fused() {
+    let Some(path) = gguf_path() else {
+        return;
+    };
+    if !hf_dir().join("config.json").is_file() {
+        return;
+    }
+    let Some(ordinal) = require_hip() else {
+        return;
+    };
+    let config = load_text_config(&hf_dir()).expect("hf config");
+    let file = GgufFile::open(&path).expect("open");
+    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let _file = file;
+    let header = weights
+        .gqh_header("layers.0.mlp.up_proj")
+        .cloned()
+        .expect("up header");
+    let w = &weights.layers[0].up_proj_w;
+    let qtype = infer_lowbit_type(w, config.hidden_size, false);
+    assert!(qtype == LOWBIT_GQH3 || qtype == LOWBIT_GQH2_H, "up qtype {qtype}");
+    let k = config.hidden_size;
+    let n = 64usize;
+    let m = 16usize;
+    let mut x_bf16 = vec![0u8; m * k * 2];
+    for row in 0..m {
+        for col in 0..k {
+            let v = (((col + 3 * row) % 17) as f32 - 8.0) / 32.0;
+            let bits = half::bf16::from_f32(v).to_bits().to_le_bytes();
+            x_bf16[(row * k + col) * 2] = bits[0];
+            x_bf16[(row * k + col) * 2 + 1] = bits[1];
+        }
+    }
+    let x = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &x_bf16).expect("x");
+    let _ = header;
+
+    std::env::set_var("SUPERSONIC_GQH_FORCE_FUSED", "1");
+    let mut fused = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n]).expect("fused");
+    matmul_gqh(ordinal, m, n, k, &x, w, qtype, &mut fused).expect("fused");
+    std::env::remove_var("SUPERSONIC_GQH_FORCE_FUSED");
+    let mut gemm = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n]).expect("gemm");
+    matmul_gqh(ordinal, m, n, k, &x, w, qtype, &mut gemm).expect("gemm");
+
+    let decode = |buf: &GpuBuffer| -> Vec<f32> {
+        buf.to_host_bytes()
+            .expect("d2h")
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect()
+    };
+    let a = decode(&fused);
+    let b = decode(&gemm);
+    println!(
+        "rung7c sample fused {:?} gemm {:?}",
+        &a[..4.min(a.len())],
+        &b[..4.min(b.len())]
+    );
+    assert_eq!(a.len(), m * n);
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    let mut maxabs = 0.0f32;
+    let mut n_finite = 0usize;
+    for (x, y) in a.iter().zip(&b) {
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        n_finite += 1;
+        dot += (*x as f64) * (*y as f64);
+        na += (*x as f64) * (*x as f64);
+        nb += (*y as f64) * (*y as f64);
+        maxabs = maxabs.max((x - y).abs());
+    }
+    assert!(n_finite > a.len() / 2, "too many non-finite pairs {n_finite}/{}", a.len());
+    let cos = dot / (na.sqrt() * nb.sqrt() + 1e-30);
+    assert!(
+        cos > 0.999,
+        "large-m GQH GEMM vs fused cos={cos} maxabs={maxabs}"
+    );
+    println!("rung7c: m={m} n={n} k={k} cos={cos:.6} maxabs={maxabs:.5}");
+}
+
 #[test]
 fn rung8_embed_row_then_prefill_gqh_qkv() {
     let Some(path) = gguf_path() else {

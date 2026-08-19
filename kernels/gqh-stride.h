@@ -12,6 +12,13 @@
 #include "gqh-tables.h"
 
 #define GQH_PLANE_ALIGN 64
+// Decode-only padded AoS: 7 bytes after ratio so lo starts at 16.
+// Product bytes are unchanged; pad is unused. 16-byte SB alignment lets
+// the GEMV issue aligned ushort/hi loads instead of odd-offset memcpy.
+#define GQH2H_PAD_SB_BYTES 80
+#define GQH3_PAD_SB_BYTES  112
+#define GQH_PAD_LO           16
+#define GQH_PAD_HI           80
 
 #ifdef __HIPCC__
 #define GQH_HD __host__ __device__

@@ -127,6 +127,56 @@ __global__ void pfx_argmax_bf16_rows_kernel(
     }
 }
 
+// Greedy argmax on F32 logits, comparing the same BF16-rounded values
+// argmax_bf16_rows would see after an F32→BF16 store. Used so HIP greedy
+// decode can skip the 248k-logit cast.
+__global__ void pfx_argmax_f32_as_bf16_rows_kernel(
+    size_t rows,
+    size_t cols,
+    const float* __restrict__ logits,
+    uint32_t* __restrict__ out_index
+) {
+    __shared__ float shared_vals[256];
+    __shared__ uint32_t shared_idx[256];
+
+    const size_t row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int tid = threadIdx.x;
+    const float* row_logits = logits + row * cols;
+
+    float best_val = -1.0e30f;
+    uint32_t best_idx = 0;
+    for (size_t col = tid; col < cols; col += blockDim.x) {
+        const float val = static_cast<float>(hip_bfloat16(row_logits[col]));
+        const uint32_t idx = static_cast<uint32_t>(col);
+        if (val > best_val || (val == best_val && idx < best_idx)) {
+            best_val = val;
+            best_idx = idx;
+        }
+    }
+
+    shared_vals[tid] = best_val;
+    shared_idx[tid] = best_idx;
+    __syncthreads();
+
+    for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            const float rhs_val = shared_vals[tid + offset];
+            const uint32_t rhs_idx = shared_idx[tid + offset];
+            if (rhs_val > shared_vals[tid] ||
+                (rhs_val == shared_vals[tid] && rhs_idx < shared_idx[tid])) {
+                shared_vals[tid] = rhs_val;
+                shared_idx[tid] = rhs_idx;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_index[row] = shared_idx[0];
+    }
+}
+
 // ---- Kernel 2: RoPE for prefill ----
 // Applies RoPE in-place on tensor with layout [seq_len, num_heads, head_dim].
 // Only the first rotary_dim dimensions of each head are rotated.

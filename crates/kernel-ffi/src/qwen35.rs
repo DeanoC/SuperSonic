@@ -432,6 +432,20 @@ pub fn persistent_decode_qwen08_sm86_specialized(
 ///   `tap_layers` into `tap_workspace` at offset `i * hidden_dim` (i = tap index, not layer
 ///   index). Both must be Some together or both None. The kernel body short-circuits the
 ///   tap write when `tap_workspace` is null to preserve gfx1150 codegen on the hot path.
+#[cfg(supersonic_backend_hip)]
+unsafe extern "C" {
+    fn supersonic_qwen35_4b_hip_set_gqh_prepare_only(on: c_int);
+}
+
+pub fn set_hip_gqh_prepare_only(on: bool) {
+    #[cfg(supersonic_backend_hip)]
+    unsafe {
+        supersonic_qwen35_4b_hip_set_gqh_prepare_only(if on { 1 } else { 0 });
+    }
+    #[cfg(not(supersonic_backend_hip))]
+    let _ = on;
+}
+
 pub fn persistent_decode_4b(
     ordinal: usize,
     dtype: ScalarType,

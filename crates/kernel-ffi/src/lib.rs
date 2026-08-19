@@ -19,6 +19,7 @@ pub use qwen35::{
     metal_lm_head_argmax_bf16_into, metal_lm_head_argmax_bf16_with_partials_into,
     persistent_decode, persistent_decode_4b, persistent_decode_4b_qwen35_sm86_specialized,
     persistent_decode_qwen08_sm86_specialized, query_gpu_info, query_hip_device_clock_khz,
+    set_hip_gqh_prepare_only,
     qwen_rms_norm_standalone_matvec_host_f32, rms_norm, rms_norm_4b, rms_norm_4b_multirow,
     set_qwen35_4b_launch_preset, standalone_matvec, standalone_matvec_4b,
     standalone_matvec_host_f32,

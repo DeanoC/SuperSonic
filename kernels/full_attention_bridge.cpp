@@ -1,8 +1,11 @@
 #include "full_attention.hip"
 
+#include <cstdio>
 #include <cstdlib>
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 #include <stdint.h>
+#include <type_traits>
 
 namespace {
 
@@ -55,6 +58,204 @@ hipError_t maybe_sync() {
     const char* value = std::getenv("SUPERSONIC_SYNC_EACH_KERNEL");
     const bool enabled = value != nullptr && value[0] != '\0' && value[0] != '0';
     return enabled ? hipDeviceSynchronize() : hipSuccess;
+}
+
+hipblasHandle_t attn_hipblas() {
+    static hipblasHandle_t handle = nullptr;
+    static bool ready = false;
+    if (!ready) {
+        if (hipblasCreate(&handle) != HIPBLAS_STATUS_SUCCESS) {
+            handle = nullptr;
+        }
+        ready = true;
+    }
+    return handle;
+}
+
+float* attn_scratch_f32(size_t n, float** slot, size_t* cap) {
+    if (n <= *cap && *slot != nullptr) {
+        return *slot;
+    }
+    if (*slot != nullptr) {
+        (void)hipFree(*slot);
+        *slot = nullptr;
+        *cap = 0;
+    }
+    if (hipMalloc(slot, n * sizeof(float)) != hipSuccess) {
+        *slot = nullptr;
+        return nullptr;
+    }
+    *cap = n;
+    return *slot;
+}
+
+hip_bfloat16* attn_scratch_bf16(size_t n, hip_bfloat16** slot, size_t* cap) {
+    if (n <= *cap && *slot != nullptr) {
+        return *slot;
+    }
+    if (*slot != nullptr) {
+        (void)hipFree(*slot);
+        *slot = nullptr;
+        *cap = 0;
+    }
+    if (hipMalloc(slot, n * sizeof(hip_bfloat16)) != hipSuccess) {
+        *slot = nullptr;
+        return nullptr;
+    }
+    *cap = n;
+    return *slot;
+}
+
+// scores = Q[pack*q_len,hd] @ K[kv_len,hd]^T then causal softmax, then
+// out = scores @ V[kv_len,hd]. Packs the Q heads that share a KV head.
+// Scores stay BF16 (half the F32 footprint, tensor-core AV). Softmax
+// uses qi = row % q_len. Falls back to a smaller pack if the score
+// matrix will not allocate.
+int launch_gemm_attn_bf16(
+    int batch_size,
+    int q_heads,
+    int kv_heads,
+    int q_len,
+    int kv_len,
+    int head_dim,
+    int num_kv_groups,
+    float scale,
+    int seqlen_offset,
+    const hip_bfloat16* query,
+    const hip_bfloat16* key,
+    const hip_bfloat16* value,
+    float* out
+) {
+    hipblasHandle_t blas = attn_hipblas();
+    if (blas == nullptr || q_len <= 0 || kv_len <= 0 || q_heads <= 0 || kv_heads <= 0) {
+        return 1;
+    }
+    static hip_bfloat16* scores = nullptr;
+    static size_t scores_cap = 0;
+    const int groups = num_kv_groups > 0 ? num_kv_groups : 1;
+    const size_t per_head = static_cast<size_t>(q_len) * static_cast<size_t>(kv_len);
+    int pack = groups;
+    if (pack < 1) {
+        pack = 1;
+    }
+    if (pack > q_heads) {
+        pack = q_heads;
+    }
+    while (pack > 1 &&
+           attn_scratch_bf16(per_head * static_cast<size_t>(pack), &scores, &scores_cap) ==
+               nullptr) {
+        pack = pack > 2 ? pack / 2 : 1;
+    }
+    if (attn_scratch_bf16(per_head * static_cast<size_t>(pack), &scores, &scores_cap) ==
+        nullptr) {
+        return 2;
+    }
+    static bool dumped_pack = false;
+    if (!dumped_pack) {
+        dumped_pack = true;
+        std::fprintf(
+            stderr,
+            "[attn-gemm] gqa pack=%d/%d scores_bf16=%.1fMiB q_len=%d kv_len=%d\n",
+            pack,
+            groups,
+            static_cast<double>(per_head * static_cast<size_t>(pack) * 2) / (1024.0 * 1024.0),
+            q_len,
+            kv_len);
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    for (int b = 0; b < batch_size; ++b) {
+        for (int kvh = 0; kvh < kv_heads; ++kvh) {
+            const int h_begin = kvh * groups;
+            int h_end = h_begin + groups;
+            if (h_end > q_heads) {
+                h_end = q_heads;
+            }
+            if (h_begin >= h_end) {
+                continue;
+            }
+            const hip_bfloat16* k =
+                key + (static_cast<size_t>(b * kv_heads + kvh) * kv_len * head_dim);
+            const hip_bfloat16* v =
+                value + (static_cast<size_t>(b * kv_heads + kvh) * kv_len * head_dim);
+            for (int h0 = h_begin; h0 < h_end; h0 += pack) {
+                int ph = pack;
+                if (h0 + ph > h_end) {
+                    ph = h_end - h0;
+                }
+                const int m = ph * q_len;
+                const hip_bfloat16* q =
+                    query + (static_cast<size_t>(b * q_heads + h0) * q_len * head_dim);
+                float* y =
+                    out + (static_cast<size_t>(b * q_heads + h0) * q_len * head_dim);
+
+                // scores[m, kv_len] = Q[m, hd] @ K[kv_len, hd]^T  (BF16 out)
+                const hipblasStatus_t st_qk = hipblasGemmEx(
+                    blas,
+                    HIPBLAS_OP_T,
+                    HIPBLAS_OP_N,
+                    kv_len,
+                    m,
+                    head_dim,
+                    &alpha,
+                    k,
+                    HIP_R_16BF,
+                    head_dim,
+                    q,
+                    HIP_R_16BF,
+                    head_dim,
+                    &beta,
+                    scores,
+                    HIP_R_16BF,
+                    kv_len,
+                    HIPBLAS_COMPUTE_32F,
+                    HIPBLAS_GEMM_DEFAULT);
+                if (st_qk != HIPBLAS_STATUS_SUCCESS) {
+                    return 4;
+                }
+                hipLaunchKernelGGL(
+                    supersonic_qwen35_causal_softmax_rows_bf16,
+                    dim3(static_cast<unsigned int>(m)),
+                    dim3(256),
+                    0,
+                    0,
+                    scores,
+                    m,
+                    q_len,
+                    kv_len,
+                    seqlen_offset,
+                    scale);
+                if (hipGetLastError() != hipSuccess) {
+                    return 5;
+                }
+                // out[m, hd] = scores[m, kv_len] @ V[kv_len, hd]
+                const hipblasStatus_t st_av = hipblasGemmEx(
+                    blas,
+                    HIPBLAS_OP_N,
+                    HIPBLAS_OP_N,
+                    head_dim,
+                    m,
+                    kv_len,
+                    &alpha,
+                    v,
+                    HIP_R_16BF,
+                    head_dim,
+                    scores,
+                    HIP_R_16BF,
+                    kv_len,
+                    &beta,
+                    y,
+                    HIP_R_32F,
+                    head_dim,
+                    HIPBLAS_COMPUTE_32F,
+                    HIPBLAS_GEMM_DEFAULT);
+                if (st_av != HIPBLAS_STATUS_SUCCESS) {
+                    return 7;
+                }
+            }
+        }
+    }
+    return maybe_sync() == hipSuccess ? 0 : 8;
 }
 
 template <typename T>
@@ -127,7 +328,7 @@ int full_attention_prefill_device(
         d_out,
         d_row_counter);
     if (hipGetLastError() != hipSuccess) return 11;
-    if (hipDeviceSynchronize() != hipSuccess) return 12;
+    if (maybe_sync() != hipSuccess) return 12;
 
     hipFree(d_row_counter);
     return 0;
@@ -207,7 +408,7 @@ int full_attention_tree_prefill_device(
         d_out,
         d_row_counter);
     if (hipGetLastError() != hipSuccess) return 11;
-    if (hipDeviceSynchronize() != hipSuccess) return 12;
+    if (maybe_sync() != hipSuccess) return 12;
 
     hipFree(d_row_counter);
     return 0;
@@ -244,7 +445,7 @@ static int launch_tree_tiled(
         static_cast<const uint8_t*>(visibility),
         static_cast<float*>(out));
     if (hipGetLastError() != hipSuccess) return 144;
-    if (hipDeviceSynchronize() != hipSuccess) return 145;
+    if (maybe_sync() != hipSuccess) return 145;
     return 0;
 }
 
@@ -314,7 +515,7 @@ static int launch_tiled(
     dim3 grid(grid_x, q_heads, batch_size);
     dim3 block(32, BM, 1);
     const size_t lds_bytes = (size_t)2 * BK * head_dim * sizeof(T);
-    if (lds_bytes > 48 * 1024) return 133;
+    if (lds_bytes > 64 * 1024) return 133;
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(supersonic_qwen35_full_attention_prefill_tiled_kernel<T, BM, BK>),
         grid, block, lds_bytes, 0,
@@ -325,7 +526,7 @@ static int launch_tiled(
         static_cast<const T*>(value),
         static_cast<float*>(out));
     if (hipGetLastError() != hipSuccess) return 134;
-    if (hipDeviceSynchronize() != hipSuccess) return 135;
+    if (maybe_sync() != hipSuccess) return 135;
     return 0;
 }
 
@@ -346,7 +547,6 @@ int full_attention_prefill_tiled_device(
     const void* value,
     void* out
 ) {
-    constexpr int BM = 4;
     if (head_dim > 8 * 32) return 132;       // ACC_MAX=8 × warpSize=32 cap
     if (q_len <= 0) return 0;
 
@@ -358,20 +558,54 @@ int full_attention_prefill_tiled_device(
     // the strided loops would skip half of head_dim. Refuse the launch so
     // the dispatcher falls through to the legacy single-warp kernel, which
     // does adapt to props.warpSize.
-    hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 136;
-    if (props.warpSize != 32) return 137;
+    static int cached_warp = 0;
+    if (cached_warp == 0) {
+        hipDeviceProp_t props;
+        if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 136;
+        cached_warp = props.warpSize > 0 ? props.warpSize : -1;
+    }
+    if (cached_warp != 32) return 137;
+
+    // BM=4 left K/V tiles reused by only 4 queries. Longer prefills share
+    // each tile across 8 or 16 query rows (LDS size does not depend on BM).
+    const bool long_seq = q_len >= 1024;
 
     if (head_dim <= 64) {
-        return launch_tiled<T, BM, 128>(batch_size, q_heads, kv_heads,
+        if (long_seq) {
+            return launch_tiled<T, 16, 128>(batch_size, q_heads, kv_heads,
+                q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
+                query, key, value, out);
+        }
+        return launch_tiled<T, 8, 128>(batch_size, q_heads, kv_heads,
             q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
             query, key, value, out);
     } else if (head_dim <= 128) {
-        return launch_tiled<T, BM, 64>(batch_size, q_heads, kv_heads,
+        if (long_seq) {
+            return launch_tiled<T, 16, 64>(batch_size, q_heads, kv_heads,
+                q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
+                query, key, value, out);
+        }
+        return launch_tiled<T, 8, 64>(batch_size, q_heads, kv_heads,
+            q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
+            query, key, value, out);
+    } else if (long_seq) {
+        if constexpr (std::is_same<T, hip_bfloat16>::value) {
+            const int rc = launch_gemm_attn_bf16(
+                batch_size, q_heads, kv_heads, q_len, kv_len, head_dim,
+                num_kv_groups, scale, seqlen_offset,
+                static_cast<const hip_bfloat16*>(query),
+                static_cast<const hip_bfloat16*>(key),
+                static_cast<const hip_bfloat16*>(value),
+                static_cast<float*>(out));
+            if (rc == 0) {
+                return 0;
+            }
+        }
+        return launch_tiled<T, 32, 32>(batch_size, q_heads, kv_heads,
             q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
             query, key, value, out);
     } else {
-        return launch_tiled<T, BM, 32>(batch_size, q_heads, kv_heads,
+        return launch_tiled<T, 8, 32>(batch_size, q_heads, kv_heads,
             q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
             query, key, value, out);
     }
@@ -409,7 +643,7 @@ int linear_prefill_conv_pack_device(
         static_cast<const T*>(weights),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 60;
-    if (hipDeviceSynchronize() != hipSuccess) return 61;
+    if (maybe_sync() != hipSuccess) return 61;
     return 0;
 }
 
@@ -448,7 +682,7 @@ int linear_tree_conv_pack_device(
         static_cast<const int*>(parent_ids),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 60;
-    if (hipDeviceSynchronize() != hipSuccess) return 61;
+    if (maybe_sync() != hipSuccess) return 61;
     return 0;
 }
 
@@ -490,7 +724,7 @@ int linear_tree_conv_pack_indexed_device(
         static_cast<const int*>(source_cols),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 60;
-    if (hipDeviceSynchronize() != hipSuccess) return 61;
+    if (maybe_sync() != hipSuccess) return 61;
     return 0;
 }
 
@@ -696,7 +930,7 @@ int linear_decode_prepare_device(
         static_cast<const T*>(a_log_exp),
         static_cast<float*>(out));
     if (hipGetLastError() != hipSuccess) return 69;
-    if (hipDeviceSynchronize() != hipSuccess) return 70;
+    if (maybe_sync() != hipSuccess) return 70;
     return 0;
 }
 
@@ -731,7 +965,7 @@ int linear_decode_apply_device(
         static_cast<const float*>(initial_state),
         static_cast<float*>(out));
     if (hipGetLastError() != hipSuccess) return 71;
-    if (hipDeviceSynchronize() != hipSuccess) return 72;
+    if (maybe_sync() != hipSuccess) return 72;
     return 0;
 }
 
@@ -753,6 +987,68 @@ int delta_recurrent_prefill_device(
 ) {
     ScopedHipDevice scoped(device_ordinal);
     if (k_head_dim > 256) return 69;
+    static const bool disable_warp = [] {
+        const char* e = std::getenv("SUPERSONIC_REC_WARP");
+        return e != nullptr && e[0] == '0';
+    }();
+    // Capture/trace needs the original one-thread-per-v walk so the
+    // exported state dump stays element-order identical.
+    if (state_trace == nullptr && !disable_warp && seq_len > 1 &&
+        k_head_dim == 128 && v_head_dim == 128) {
+        constexpr int warps_per_block = 4;
+        const size_t total_warps =
+            static_cast<size_t>(batch_heads) *
+            static_cast<size_t>(v_head_dim / 4);
+        const unsigned int grid = static_cast<unsigned int>(
+            (total_warps + static_cast<size_t>(warps_per_block) - 1) /
+            static_cast<size_t>(warps_per_block));
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(supersonic_qwen35_delta_recurrent_prefill_warp_k128_kernel<T>),
+            dim3(grid > 0 ? grid : 1u),
+            dim3(32, warps_per_block),
+            0,
+            0,
+            batch_heads,
+            seq_len,
+            static_cast<const T*>(initial_state),
+            static_cast<const T*>(query),
+            static_cast<const T*>(key),
+            static_cast<const T*>(value),
+            static_cast<const T*>(beta),
+            static_cast<const T*>(g),
+            static_cast<T*>(out));
+        if (hipGetLastError() != hipSuccess) return 67;
+        if (maybe_sync() != hipSuccess) return 68;
+        return 0;
+    }
+    if (state_trace == nullptr && !disable_warp && seq_len > 1) {
+        constexpr int warps_per_block = 8;
+        const size_t total_warps =
+            static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
+        const unsigned int grid = static_cast<unsigned int>(
+            (total_warps + static_cast<size_t>(warps_per_block) - 1) /
+            static_cast<size_t>(warps_per_block));
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(supersonic_qwen35_delta_recurrent_prefill_warp_kernel<T>),
+            dim3(grid > 0 ? grid : 1u),
+            dim3(32, warps_per_block),
+            0,
+            0,
+            batch_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            static_cast<const T*>(initial_state),
+            static_cast<const T*>(query),
+            static_cast<const T*>(key),
+            static_cast<const T*>(value),
+            static_cast<const T*>(beta),
+            static_cast<const T*>(g),
+            static_cast<T*>(out));
+        if (hipGetLastError() != hipSuccess) return 67;
+        if (maybe_sync() != hipSuccess) return 68;
+        return 0;
+    }
     constexpr int block = 256;
     const size_t total_threads =
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
@@ -798,6 +1094,62 @@ int delta_recurrent_prefill_device_stream(
 ) {
     ScopedHipDevice scoped(device_ordinal);
     if (k_head_dim > 256) return 69;
+    static const bool disable_warp = [] {
+        const char* e = std::getenv("SUPERSONIC_REC_WARP");
+        return e != nullptr && e[0] == '0';
+    }();
+    if (!disable_warp && seq_len >= 1 &&
+        k_head_dim == 128 && v_head_dim == 128) {
+        constexpr int warps_per_block = 4;
+        const size_t total_warps =
+            static_cast<size_t>(batch_heads) *
+            static_cast<size_t>(v_head_dim / 4);
+        const unsigned int grid = static_cast<unsigned int>(
+            (total_warps + static_cast<size_t>(warps_per_block) - 1) /
+            static_cast<size_t>(warps_per_block));
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(supersonic_qwen35_delta_recurrent_prefill_warp_k128_kernel<T>),
+            dim3(grid > 0 ? grid : 1u),
+            dim3(32, warps_per_block),
+            0,
+            stream,
+            batch_heads,
+            seq_len,
+            static_cast<const T*>(initial_state),
+            static_cast<const T*>(query),
+            static_cast<const T*>(key),
+            static_cast<const T*>(value),
+            static_cast<const T*>(beta),
+            static_cast<const T*>(g),
+            static_cast<T*>(out));
+        return hipGetLastError() == hipSuccess ? 0 : 67;
+    }
+    if (!disable_warp && seq_len >= 1) {
+        constexpr int warps_per_block = 8;
+        const size_t total_warps =
+            static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
+        const unsigned int grid = static_cast<unsigned int>(
+            (total_warps + static_cast<size_t>(warps_per_block) - 1) /
+            static_cast<size_t>(warps_per_block));
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(supersonic_qwen35_delta_recurrent_prefill_warp_kernel<T>),
+            dim3(grid > 0 ? grid : 1u),
+            dim3(32, warps_per_block),
+            0,
+            stream,
+            batch_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            static_cast<const T*>(initial_state),
+            static_cast<const T*>(query),
+            static_cast<const T*>(key),
+            static_cast<const T*>(value),
+            static_cast<const T*>(beta),
+            static_cast<const T*>(g),
+            static_cast<T*>(out));
+        return hipGetLastError() == hipSuccess ? 0 : 67;
+    }
     constexpr int block = 256;
     const size_t total_threads =
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
@@ -1601,7 +1953,7 @@ int delta_chunk_single_prefill_device(
         static_cast<const T*>(g),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 77;
-    if (hipDeviceSynchronize() != hipSuccess) return 78;
+    if (maybe_sync() != hipSuccess) return 78;
     return 0;
 }
 
@@ -1644,7 +1996,7 @@ int delta_chunk_step_device(
         static_cast<const T*>(g),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 81;
-    if (hipDeviceSynchronize() != hipSuccess) return 82;
+    if (maybe_sync() != hipSuccess) return 82;
     return 0;
 }
 
@@ -1689,7 +2041,7 @@ int delta_chunk_scan_raw_device(
         static_cast<const T*>(g),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 84;
-    if (hipDeviceSynchronize() != hipSuccess) return 85;
+    if (maybe_sync() != hipSuccess) return 85;
     return 0;
 }
 
@@ -1728,7 +2080,7 @@ int delta_state_scan_device(
         static_cast<const T*>(value),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 89;
-    if (hipDeviceSynchronize() != hipSuccess) return 96;
+    if (maybe_sync() != hipSuccess) return 96;
     return 0;
 }
 
@@ -1765,7 +2117,7 @@ int delta_chunk_fused_device(
         static_cast<const T*>(value),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 98;
-    if (hipDeviceSynchronize() != hipSuccess) return 99;
+    if (maybe_sync() != hipSuccess) return 99;
     return 0;
 }
 
@@ -1812,7 +2164,7 @@ int delta_full_scan_device(
         static_cast<const T*>(value),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 101;
-    if (hipDeviceSynchronize() != hipSuccess) return 102;
+    if (maybe_sync() != hipSuccess) return 102;
     return 0;
 }
 
@@ -1872,7 +2224,7 @@ int delta_local_attn_scan_device(
             static_cast<T*>(out));
     }
     if (hipGetLastError() != hipSuccess) return 113;
-    if (hipDeviceSynchronize() != hipSuccess) return 114;
+    if (maybe_sync() != hipSuccess) return 114;
     return 0;
 }
 
@@ -1910,7 +2262,7 @@ int delta_base_attn_scan_device(
         static_cast<const T*>(exp_g_scan),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 116;
-    if (hipDeviceSynchronize() != hipSuccess) return 117;
+    if (maybe_sync() != hipSuccess) return 117;
     return 0;
 }
 
@@ -1940,7 +2292,7 @@ int delta_attn_solve_scan_device(
         static_cast<const T*>(base_attn_scan),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 119;
-    if (hipDeviceSynchronize() != hipSuccess) return 120;
+    if (maybe_sync() != hipSuccess) return 120;
     return 0;
 }
 
@@ -1976,7 +2328,7 @@ int delta_attn_solve_from_inputs_device(
         static_cast<const T*>(exp_g_scan),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 122;
-    if (hipDeviceSynchronize() != hipSuccess) return 123;
+    if (maybe_sync() != hipSuccess) return 123;
     return 0;
 }
 
@@ -2035,7 +2387,7 @@ int swiglu_mul_split_device(
         static_cast<const T*>(gate_up),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 123;
-    if (hipDeviceSynchronize() != hipSuccess) return 124;
+    if (maybe_sync() != hipSuccess) return 124;
     return 0;
 }
 
@@ -2066,7 +2418,7 @@ int embedding_lookup_device(
         static_cast<const IndexT*>(indexes),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 123;
-    if (hipDeviceSynchronize() != hipSuccess) return 124;
+    if (maybe_sync() != hipSuccess) return 124;
     return 0;
 }
 
@@ -2094,7 +2446,7 @@ int causal_mask_device(
         seqlen_offset,
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 125;
-    if (hipDeviceSynchronize() != hipSuccess) return 126;
+    if (maybe_sync() != hipSuccess) return 126;
     return 0;
 }
 
@@ -2118,7 +2470,7 @@ int cumsum_last_dim_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 127;
-    if (hipDeviceSynchronize() != hipSuccess) return 128;
+    if (maybe_sync() != hipSuccess) return 128;
     return 0;
 }
 
@@ -2143,7 +2495,7 @@ int exp_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 129;
-    if (hipDeviceSynchronize() != hipSuccess) return 130;
+    if (maybe_sync() != hipSuccess) return 130;
     return 0;
 }
 
@@ -2168,7 +2520,7 @@ int recip_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 131;
-    if (hipDeviceSynchronize() != hipSuccess) return 132;
+    if (maybe_sync() != hipSuccess) return 132;
     return 0;
 }
 
@@ -2193,7 +2545,7 @@ int sigmoid_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 133;
-    if (hipDeviceSynchronize() != hipSuccess) return 134;
+    if (maybe_sync() != hipSuccess) return 134;
     return 0;
 }
 
@@ -2218,7 +2570,7 @@ int log_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 155;
-    if (hipDeviceSynchronize() != hipSuccess) return 156;
+    if (maybe_sync() != hipSuccess) return 156;
     return 0;
 }
 
@@ -2246,9 +2598,8 @@ int cast_device(
     if (launch_status != hipSuccess) {
         return prefill_backend_failure(135, launch_status);
     }
-    const hipError_t sync_status = hipDeviceSynchronize();
-    if (sync_status != hipSuccess) {
-        return prefill_backend_failure(136, sync_status);
+    if (maybe_sync() != hipSuccess) {
+        return prefill_backend_failure(136, hipGetLastError());
     }
     return 0;
 }
@@ -2306,7 +2657,7 @@ int unary_view_device(
         }
         return 159;
     }
-    if (hipDeviceSynchronize() != hipSuccess) {
+    if (maybe_sync() != hipSuccess) {
         if (rank > 0) {
             hipFree(in_strides_dev);
             hipFree(out_dims_dev);
@@ -2369,7 +2720,7 @@ int cast_view_device(
         }
         return 162;
     }
-    if (hipDeviceSynchronize() != hipSuccess) {
+    if (maybe_sync() != hipSuccess) {
         if (rank > 0) {
             hipFree(in_strides_dev);
             hipFree(out_dims_dev);
@@ -2443,7 +2794,7 @@ int binary_broadcast_device(
         hipFree(out_dims_dev);
         return 138;
     }
-    if (hipDeviceSynchronize() != hipSuccess) {
+    if (maybe_sync() != hipSuccess) {
         hipFree(lhs_strides_dev);
         hipFree(rhs_strides_dev);
         hipFree(out_dims_dev);
@@ -2510,7 +2861,7 @@ int reduce_keepdim_view_device(
         }
         return 168;
     }
-    if (hipDeviceSynchronize() != hipSuccess) {
+    if (maybe_sync() != hipSuccess) {
         if (rank > 0) {
             hipFree(in_strides_dev);
             hipFree(out_dims_dev);
@@ -2593,7 +2944,7 @@ int batched_matmul_device(
         }
         return 142;
     }
-    if (hipDeviceSynchronize() != hipSuccess) {
+    if (maybe_sync() != hipSuccess) {
         if (batch_rank > 0) {
             hipFree(lhs_batch_dims_dev);
             hipFree(rhs_batch_dims_dev);
@@ -2686,7 +3037,7 @@ int batched_matmul_view_device(
         }
         return 172;
     }
-    if (hipDeviceSynchronize() != hipSuccess) {
+    if (maybe_sync() != hipSuccess) {
         if (batch_rank > 0) {
             hipFree(lhs_batch_strides_dev);
             hipFree(rhs_batch_strides_dev);
@@ -2725,7 +3076,7 @@ int mul_scalar_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 145;
-    if (hipDeviceSynchronize() != hipSuccess) return 146;
+    if (maybe_sync() != hipSuccess) return 146;
     return 0;
 }
 
@@ -2757,7 +3108,7 @@ int reduce_keepdim_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 147;
-    if (hipDeviceSynchronize() != hipSuccess) return 148;
+    if (maybe_sync() != hipSuccess) return 148;
     return 0;
 }
 
@@ -2784,7 +3135,7 @@ int add_scalar_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 149;
-    if (hipDeviceSynchronize() != hipSuccess) return 150;
+    if (maybe_sync() != hipSuccess) return 150;
     return 0;
 }
 
@@ -2809,7 +3160,7 @@ int sqrt_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 151;
-    if (hipDeviceSynchronize() != hipSuccess) return 152;
+    if (maybe_sync() != hipSuccess) return 152;
     return 0;
 }
 
@@ -2849,7 +3200,7 @@ int delta_full_scan_pack_device(
         static_cast<const T*>(k_cumdecay_scan),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 107;
-    if (hipDeviceSynchronize() != hipSuccess) return 108;
+    if (maybe_sync() != hipSuccess) return 108;
     return 0;
 }
 
@@ -2890,7 +3241,7 @@ int delta_full_scan_packed_device(
         static_cast<const T*>(value),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 110;
-    if (hipDeviceSynchronize() != hipSuccess) return 111;
+    if (maybe_sync() != hipSuccess) return 111;
     return 0;
 }
 
@@ -2917,7 +3268,7 @@ int l2norm_device(
         static_cast<const T*>(xs),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 90;
-    if (hipDeviceSynchronize() != hipSuccess) return 91;
+    if (maybe_sync() != hipSuccess) return 91;
     return 0;
 }
 
@@ -2948,7 +3299,7 @@ int value_decay_device(
         static_cast<const T*>(a_log_exp),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 93;
-    if (hipDeviceSynchronize() != hipSuccess) return 94;
+    if (maybe_sync() != hipSuccess) return 94;
     return 0;
 }
 
@@ -3016,7 +3367,7 @@ int fused_rms_norm_linear_device(
         static_cast<const T*>(proj_weight),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 130;
-    if (hipDeviceSynchronize() != hipSuccess) return 131;
+    if (maybe_sync() != hipSuccess) return 131;
     return 0;
 }
 
@@ -3047,7 +3398,7 @@ int rms_norm_gated_device(
         static_cast<const T*>(weight),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 81;
-    if (hipDeviceSynchronize() != hipSuccess) return 82;
+    if (maybe_sync() != hipSuccess) return 82;
     return 0;
 }
 
@@ -3627,6 +3978,52 @@ extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill_on_stream(
         g,
         out,
         static_cast<hipStream_t>(stream));
+}
+
+extern "C" int supersonic_qwen35_hip_decode_rec_k128_fused(
+    int device_ordinal,
+    int nv,
+    int nk,
+    float* rec_state,
+    const float* q_unique,
+    const float* k_unique,
+    const float* value,
+    const float* b,
+    const float* a,
+    const hip_bfloat16* dt_bias,
+    const hip_bfloat16* a_log_exp,
+    float* out,
+    void* stream) {
+    if (nv <= 0 || nk <= 0 || rec_state == nullptr || q_unique == nullptr ||
+        k_unique == nullptr || value == nullptr || b == nullptr || a == nullptr ||
+        out == nullptr) {
+        return 405;
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int warps_per_block = 4;
+    const size_t total_warps =
+        static_cast<size_t>(nv) * static_cast<size_t>(128 / 4);
+    const unsigned int grid = static_cast<unsigned int>(
+        (total_warps + static_cast<size_t>(warps_per_block) - 1) /
+        static_cast<size_t>(warps_per_block));
+    hipLaunchKernelGGL(
+        supersonic_qwen35_decode_rec_k128_fused_kernel,
+        dim3(grid > 0 ? grid : 1u),
+        dim3(32, warps_per_block),
+        0,
+        static_cast<hipStream_t>(stream),
+        nv,
+        nk,
+        rec_state,
+        q_unique,
+        k_unique,
+        value,
+        b,
+        a,
+        dt_bias,
+        a_log_exp,
+        out);
+    return hipGetLastError() == hipSuccess ? 0 : 67;
 }
 
 extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill_capture(
@@ -6490,7 +6887,7 @@ int mlp_decode_megakernel_device(
     unsigned int zero = 0;
     if (hipMemcpy(row_counter, &zero, sizeof(unsigned int), hipMemcpyHostToDevice) != hipSuccess)
         return 201;
-    if (hipDeviceSynchronize() != hipSuccess) return 202;
+    if (maybe_sync() != hipSuccess) return 202;
 
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(supersonic_qwen35_mlp_decode_megakernel<T>),
@@ -6510,7 +6907,7 @@ int mlp_decode_megakernel_device(
         static_cast<T*>(hidden_out),
         row_counter);
     if (hipGetLastError() != hipSuccess) return 203;
-    if (hipDeviceSynchronize() != hipSuccess) return 204;
+    if (maybe_sync() != hipSuccess) return 204;
 
     // --- Phase 2: SwiGLU activation ---
     {
@@ -6525,13 +6922,13 @@ int mlp_decode_megakernel_device(
             intermediate_size,
             gate_up_scratch);
         if (hipGetLastError() != hipSuccess) return 205;
-        if (hipDeviceSynchronize() != hipSuccess) return 206;
+        if (maybe_sync() != hipSuccess) return 206;
     }
 
     // --- Phase 3: down_proj matvec ---
     if (hipMemcpy(row_counter, &zero, sizeof(unsigned int), hipMemcpyHostToDevice) != hipSuccess)
         return 207;
-    if (hipDeviceSynchronize() != hipSuccess) return 208;
+    if (maybe_sync() != hipSuccess) return 208;
 
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(supersonic_qwen35_mlp_down_proj_kernel<T>),
@@ -6546,7 +6943,7 @@ int mlp_decode_megakernel_device(
         static_cast<T*>(hidden_out),
         row_counter);
     if (hipGetLastError() != hipSuccess) return 209;
-    if (hipDeviceSynchronize() != hipSuccess) return 210;
+    if (maybe_sync() != hipSuccess) return 210;
     return 0;
 }
 
@@ -6606,7 +7003,7 @@ int norm_multi_proj_device(
     unsigned int zero = 0;
     if (hipMemcpy(row_counter, &zero, sizeof(unsigned int), hipMemcpyHostToDevice) != hipSuccess)
         return 221;
-    if (hipDeviceSynchronize() != hipSuccess) return 222;
+    if (maybe_sync() != hipSuccess) return 222;
 
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(supersonic_qwen35_norm_multi_proj_kernel<T>),
@@ -6624,7 +7021,7 @@ int norm_multi_proj_device(
         output,
         row_counter);
     if (hipGetLastError() != hipSuccess) return 223;
-    if (hipDeviceSynchronize() != hipSuccess) return 224;
+    if (maybe_sync() != hipSuccess) return 224;
     return 0;
 }
 
@@ -6681,7 +7078,7 @@ int standalone_matvec_device(
     unsigned int zero = 0;
     if (hipMemcpy(row_counter, &zero, sizeof(unsigned int), hipMemcpyHostToDevice) != hipSuccess)
         return 231;
-    if (hipDeviceSynchronize() != hipSuccess) return 232;
+    if (maybe_sync() != hipSuccess) return 232;
 
     const size_t shared_bytes = block_size * sizeof(float);
     hipLaunchKernelGGL(
@@ -6697,7 +7094,7 @@ int standalone_matvec_device(
         static_cast<T*>(output),
         row_counter);
     if (hipGetLastError() != hipSuccess) return 233;
-    if (hipDeviceSynchronize() != hipSuccess) return 234;
+    if (maybe_sync() != hipSuccess) return 234;
     return 0;
 }
 

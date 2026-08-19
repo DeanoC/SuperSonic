@@ -12,6 +12,7 @@ pub(crate) struct Qwen35DecodeModes {
     pub(crate) kernel_single_decode_enabled: bool,
     pub(crate) cuda_fast_greedy_enabled: bool,
     pub(crate) metal_fast_greedy_enabled: bool,
+    pub(crate) hip_fast_greedy_enabled: bool,
 }
 
 pub(crate) fn resolve_qwen35_decode_modes(
@@ -68,6 +69,17 @@ pub(crate) fn resolve_qwen35_decode_modes(
         && !cli.force_kernel_decode
         && !oracle_output_present
         && !metal_fast_greedy_disabled;
+    let hip_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_HIP_FAST_GREEDY").is_some();
+    let hip_fast_greedy_enabled = backend == Backend::Hip
+        && use_4b_kernel
+        && cli.batch_size == 1
+        && !cli.validate
+        && !gpu_validate_enabled
+        && !force_component_decode
+        && !cli.force_kernel_decode
+        && !cli.kv_fp8
+        && !oracle_output_present
+        && !hip_fast_greedy_disabled;
 
     Qwen35DecodeModes {
         cuda_qwen2b_replay_default,
@@ -78,6 +90,7 @@ pub(crate) fn resolve_qwen35_decode_modes(
         kernel_single_decode_enabled,
         cuda_fast_greedy_enabled,
         metal_fast_greedy_enabled,
+        hip_fast_greedy_enabled,
     }
 }
 
@@ -124,5 +137,8 @@ pub(crate) fn report_qwen35_decode_modes(
         eprintln!("[decode] CUDA 0.8B sm86 hero path enabled");
     } else if modes.cuda_fast_greedy_enabled {
         eprintln!("[decode] CUDA fast greedy sampling enabled for the non-4B native decode path");
+    }
+    if modes.hip_fast_greedy_enabled {
+        eprintln!("[decode] HIP fast greedy sampling enabled (GPU argmax, no logits D2H)");
     }
 }

@@ -1184,6 +1184,14 @@ unsafe extern "C" {
         out_index: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_argmax_f32_as_bf16_rows(
+        device_ordinal: usize,
+        rows: usize,
+        cols: usize,
+        logits: *const c_void,
+        out_index: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_apply_rope_prefill(
         dtype: c_int,
         device_ordinal: usize,
@@ -2390,6 +2398,7 @@ pub fn full_attention_prefill(
     value: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         if dtype == ScalarType::BF16
@@ -2929,6 +2938,7 @@ pub fn linear_prefill_conv_pack(
     weights: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         if dtype == ScalarType::BF16
@@ -3364,6 +3374,7 @@ pub fn delta_recurrent_prefill(
     g: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         if dtype == ScalarType::F32 && !metal_native::disabled_by_env() {
@@ -4335,6 +4346,7 @@ pub fn dflash_extract_recurrent_attn(
     recurrent_state: &mut GpuBuffer,
     attn_output: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if delta_out.backend() != Backend::Hip {
         return Err(ffi_error(
             "dflash_extract_recurrent_attn is only implemented for HIP".into(),
@@ -4414,6 +4426,7 @@ pub fn swiglu_mul(
     up: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     swiglu_mul_impl(ordinal, dtype, elem_count, gate, up, out, None)
 }
 
@@ -5159,6 +5172,18 @@ fn matmul_rhs_transposed_int4_impl(
 /// BF16/F32 `[>=ncols, n]`. Only the first `ncols` rows are read/written so
 /// oversized prefill scratch is safe. Activations are cast to f32 for the
 /// kernel, which must not reassociate the GQH scale products.
+///
+/// For `ncols > 8` (llama.cpp `MMVQ_MAX_BATCH_SIZE`) the fused per-token
+/// matvec rereads the weight matrix once per token. Prefill instead
+/// dequantizes once and uses the tiled BF16 GEMM, matching ggml's
+/// dequant→hipBLAS fallback. Opt out with `SUPERSONIC_GQH_FORCE_FUSED=1`.
+const GQH_FUSED_MAX_COLS: usize = 8;
+const GQH_DEQUANT_GEMM_MAX_WEIGHT_BYTES: usize = 768 * 1024 * 1024;
+
+fn gqh_force_fused() -> bool {
+    std::env::var_os("SUPERSONIC_GQH_FORCE_FUSED").is_some()
+}
+
 pub fn matmul_rhs_transposed_gqh(
     ordinal: usize,
     ncols: usize,
@@ -5200,6 +5225,25 @@ pub fn matmul_rhs_transposed_gqh(
             out.elem_count(),
             ncols * n
         )));
+    }
+    let dequant_bytes = n.saturating_mul(k).saturating_mul(4);
+    if ncols > GQH_FUSED_MAX_COLS
+        && !gqh_force_fused()
+        && dequant_bytes > 0
+        && dequant_bytes <= GQH_DEQUANT_GEMM_MAX_WEIGHT_BYTES
+    {
+        return matmul_gqh_dequant_gemm(
+            ordinal,
+            ncols,
+            n,
+            k,
+            lhs,
+            rhs,
+            tensor_scale,
+            grid_code,
+            rung,
+            out,
+        );
     }
     thread_local! {
         static GQH_X: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };
@@ -5278,6 +5322,122 @@ pub fn matmul_rhs_transposed_gqh(
         put_scratch(&GQH_Y, buf);
     }
     Ok(())
+}
+
+fn matmul_gqh_dequant_gemm(
+    ordinal: usize,
+    ncols: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    tensor_scale: f32,
+    grid_code: u8,
+    rung: i32,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    thread_local! {
+        static W_F32: std::cell::RefCell<Option<GpuBuffer>> =
+            const { std::cell::RefCell::new(None) };
+        static W_BF16: std::cell::RefCell<Option<GpuBuffer>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let take = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+                dtype: ScalarType,
+                elems: usize|
+     -> Result<GpuBuffer, GpuError> {
+        slot.with(|cell| {
+            let mut held = cell.borrow_mut();
+            if let Some(buf) = held.as_ref() {
+                if buf.dtype() == dtype && buf.elem_count() >= elems {
+                    return Ok(held.take().expect("scratch present"));
+                }
+            }
+            held.take();
+            GpuBuffer::zeros(ordinal, dtype, &[elems])
+        })
+    };
+    let put = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+               buf: GpuBuffer| {
+        slot.with(|cell| {
+            *cell.borrow_mut() = Some(buf);
+        });
+    };
+
+    let status = if lhs.dtype() == ScalarType::BF16 && out.dtype() == ScalarType::BF16 {
+        crate::gqh::dequant_gemm_bf16(
+            ordinal,
+            rung,
+            rhs,
+            tensor_scale,
+            grid_code,
+            lhs,
+            out,
+            ncols,
+            n,
+            k,
+        )
+    } else {
+        thread_local! {
+            static X: std::cell::RefCell<Option<GpuBuffer>> =
+                const { std::cell::RefCell::new(None) };
+            static Y: std::cell::RefCell<Option<GpuBuffer>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let mut w_f32 = take(&W_F32, ScalarType::F32, n * k)?;
+        crate::gqh::decode(ordinal, rung, rhs, tensor_scale, grid_code, &mut w_f32, n, k)?;
+        let x_owned = if lhs.dtype() == ScalarType::F32 {
+            None
+        } else {
+            let mut buf = take(&X, ScalarType::F32, ncols * k)?;
+            cast(
+                ordinal,
+                ScalarType::BF16,
+                ScalarType::F32,
+                ncols * k,
+                lhs,
+                &mut buf,
+            )?;
+            Some(buf)
+        };
+        let x_ref = x_owned.as_ref().unwrap_or(lhs);
+        let mut y_owned = if out.dtype() == ScalarType::F32 {
+            None
+        } else {
+            Some(take(&Y, ScalarType::F32, ncols * n)?)
+        };
+        let y_ref = y_owned.as_mut().unwrap_or(out);
+        let gemm = matmul_rhs_transposed(
+            ordinal,
+            ScalarType::F32,
+            1,
+            ncols,
+            n,
+            k,
+            x_ref,
+            &w_f32,
+            y_ref,
+        );
+        if let Some(y) = y_owned.as_ref() {
+            cast(
+                ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                ncols * n,
+                y,
+                out,
+            )?;
+        }
+        if let Some(buf) = x_owned {
+            put(&X, buf);
+        }
+        if let Some(buf) = y_owned {
+            put(&Y, buf);
+        }
+        put(&W_F32, w_f32);
+        gemm
+    };
+    status
 }
 
 /// Mix qtype 105/106 fused dequant-matmul. Same scratch/cast convention as GQH.
@@ -5910,6 +6070,7 @@ pub fn rms_norm_rows(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     rms_norm_rows_impl(
         ordinal, dtype, n_rows, n_cols, eps, input, weight, out, None,
     )
@@ -6028,6 +6189,7 @@ pub fn rms_norm_rows_plain(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         if dtype == ScalarType::BF16
@@ -6095,6 +6257,7 @@ pub fn rms_norm_rows_plain_inplace(
     data: &mut GpuBuffer,
     weight: &GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if data.backend() == Backend::Metal {
         let mut input = GpuBuffer::zeros(ordinal, dtype, data.shape())?;
         metal_native::flush_batch()?;
@@ -6338,6 +6501,7 @@ pub fn cast(
     input: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     cast_impl(
         ordinal,
         input_dtype,
@@ -6425,6 +6589,7 @@ pub fn element_add(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         if !metal_native::disabled_by_env() && !metal_force_host_element_add() {
@@ -6508,6 +6673,59 @@ pub fn argmax_bf16_rows(
     })
 }
 
+pub fn argmax_f32_as_bf16_rows(
+    ordinal: usize,
+    rows: usize,
+    cols: usize,
+    logits: &GpuBuffer,
+    out_index: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if gpu_hal::current_backend() != Backend::Hip {
+        return Err(ffi_error(
+            "argmax_f32_as_bf16_rows requires the HIP backend".to_string(),
+        ));
+    }
+    if rows == 0 || cols == 0 {
+        return Err(GpuError::InvalidArg(
+            "argmax_f32_as_bf16_rows requires non-zero rows and cols".into(),
+        ));
+    }
+    if logits.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "argmax_f32_as_bf16_rows logits must be F32, got {:?}",
+            logits.dtype()
+        )));
+    }
+    if logits.elem_count() < rows.saturating_mul(cols) {
+        return Err(GpuError::InvalidArg(format!(
+            "argmax_f32_as_bf16_rows logits has {} elems, need {}",
+            logits.elem_count(),
+            rows.saturating_mul(cols)
+        )));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() < rows {
+        return Err(GpuError::InvalidArg(format!(
+            "argmax_f32_as_bf16_rows output must be U32[{rows}], got {:?}[{}]",
+            out_index.dtype(),
+            out_index.elem_count()
+        )));
+    }
+
+    ffi_profile_time_result("qwen.argmax_f32_as_bf16_rows", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_argmax_f32_as_bf16_rows(
+                ordinal,
+                rows,
+                cols,
+                logits.as_ptr(),
+                out_index.as_mut_ptr(),
+            )
+        };
+        prefill_bridge_result(gpu_hal::current_backend(), "argmax_f32_as_bf16_rows", status)?;
+        Ok(())
+    })
+}
+
 // ---- RoPE for prefill ----
 
 /// Apply RoPE in-place on tensor [seq_len, num_heads, head_dim].
@@ -6527,6 +6745,7 @@ pub fn apply_rope_prefill(
     pos_offset: usize,
     data: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     apply_rope_prefill_impl(
         ordinal, dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset,
         data, None,
@@ -6904,6 +7123,7 @@ pub fn transpose_shd_hsd(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     transpose_shd_hsd_impl(ordinal, dtype, s, h, d, src, dst, None)
 }
 
@@ -7016,6 +7236,7 @@ pub fn transpose_shd_to_cache_bf16(
     src: &GpuBuffer,
     cache: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if cache.backend() == Backend::Metal {
         return Err(ffi_error(
             "transpose_shd_to_cache_bf16 is currently implemented only for HIP/CUDA".into(),
@@ -7069,6 +7290,7 @@ pub fn transpose_pad_conv(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
         if !metal_native::disabled_by_env() {
@@ -7290,6 +7512,7 @@ pub fn cast_transpose_gate_hsd_to_shd_bf16(
     gate_shd: &GpuBuffer,
     out_shd: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if out_shd.backend() == Backend::Metal {
         return Err(ffi_error(
             "cast_transpose_gate_hsd_to_shd_bf16 is currently implemented only for HIP".into(),
@@ -7530,6 +7753,7 @@ pub fn split_qgate(
     query_out: &mut GpuBuffer,
     gate_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     split_qgate_impl(
         ordinal, dtype, s, num_heads, head_dim, src, query_out, gate_out, None,
     )
@@ -7626,6 +7850,7 @@ pub fn split_qgate_norm_bf16(
     query_out: &mut GpuBuffer,
     gate_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if query_out.backend() == Backend::Metal {
         return Err(ffi_error(
             "split_qgate_norm_bf16 is currently implemented only for HIP/CUDA".into(),
@@ -7678,6 +7903,7 @@ pub fn split_qkv(
     k: &mut GpuBuffer,
     v: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if q.backend() == Backend::Metal {
         let _ = ordinal;
         if !metal_native::disabled_by_env() && !metal_force_host_split_qkv() {
@@ -7787,6 +8013,7 @@ pub fn split_norm_transpose_qkv_bf16(
     k: &mut GpuBuffer,
     v: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if q.backend() != Backend::Hip {
         return Err(ffi_error(
             "split_norm_transpose_qkv_bf16 is only implemented for HIP".into(),
@@ -7827,6 +8054,7 @@ pub fn split_qkvz_bf16(
     qkv: &mut GpuBuffer,
     z: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush();
     if qkv.backend() != Backend::Hip {
         return Err(ffi_error(
             "split_qkvz_bf16 is only implemented for HIP".into(),

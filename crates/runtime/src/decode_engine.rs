@@ -1071,6 +1071,8 @@ pub struct DecodeEngine {
     hidden_io: GpuBuffer,
     normed_buf: GpuBuffer,
     logits_buf: GpuBuffer,
+    /// F32 lm_head scratch for HIP greedy: skip the 248k F32→BF16 store.
+    logits_f32_buf: GpuBuffer,
     argmax_buf: GpuBuffer,
     lm_head_block_best_vals: GpuBuffer,
     lm_head_block_best_idxs: GpuBuffer,
@@ -4203,18 +4205,60 @@ impl DecodeEngine {
 
         if cuda_greedy {
             let lm_head_start = Instant::now();
-            kernel_ffi::cuda_lm_head_argmax_bf16(
-                self.ordinal,
-                &self.normed_buf,
-                &*self.weights.lm_head,
-                &mut self.lm_head_block_best_vals,
-                &mut self.lm_head_block_best_idxs,
-                &mut self.argmax_buf,
-                hidden_dim,
-                vocab_size,
-            )
-            .map_err(|e| anyhow::anyhow!("cuda fused lm_head argmax 4b: {e}"))?;
-            self.sync_stage_if_requested(collect_timings, "cuda fused lm_head argmax 4b")?;
+            if self.hidden_io.backend() == gpu_hal::Backend::Hip {
+                if !lm_head_lowbit(
+                    self.ordinal,
+                    1,
+                    vocab_size,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &self.weights,
+                    &mut self.logits_f32_buf,
+                    "hip greedy lm_head",
+                )? {
+                    kernel_ffi::standalone_matvec_4b(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        &mut self.logits_buf,
+                        &self.normed_buf,
+                        &*self.weights.lm_head,
+                        hidden_dim,
+                        vocab_size,
+                        &mut self.matvec_counter,
+                    )
+                    .map_err(|e| anyhow::anyhow!("hip greedy lm_head matvec: {e}"))?;
+                    kernel_ffi::prefill_ffi::argmax_bf16_rows(
+                        self.ordinal,
+                        1,
+                        vocab_size,
+                        &self.logits_buf,
+                        &mut self.argmax_buf,
+                    )
+                    .map_err(|e| anyhow::anyhow!("hip greedy argmax: {e}"))?;
+                } else {
+                    kernel_ffi::prefill_ffi::argmax_f32_as_bf16_rows(
+                        self.ordinal,
+                        1,
+                        vocab_size,
+                        &self.logits_f32_buf,
+                        &mut self.argmax_buf,
+                    )
+                    .map_err(|e| anyhow::anyhow!("hip greedy f32 argmax: {e}"))?;
+                }
+            } else {
+                kernel_ffi::cuda_lm_head_argmax_bf16(
+                    self.ordinal,
+                    &self.normed_buf,
+                    &*self.weights.lm_head,
+                    &mut self.lm_head_block_best_vals,
+                    &mut self.lm_head_block_best_idxs,
+                    &mut self.argmax_buf,
+                    hidden_dim,
+                    vocab_size,
+                )
+                .map_err(|e| anyhow::anyhow!("cuda fused lm_head argmax 4b: {e}"))?;
+            }
+            self.sync_stage_if_requested(collect_timings, "gpu greedy lm_head/argmax")?;
             if let Some(t) = timings.as_mut() {
                 t.lm_head_ms += lm_head_start.elapsed().as_secs_f64() * 1000.0;
             }
@@ -4368,6 +4412,88 @@ impl DecodeEngine {
             traced_layer,
             traced_linear,
         ))
+    }
+
+    /// Pay planar→tight convert and HIP graph capture before decode_ms.
+    /// llama.cpp GQH is already compact on disk; this is SuperSonic setup.
+    pub fn prepare_hip_gqh_decode(&mut self) -> Result<()> {
+        if self.hidden_io.backend() != gpu_hal::Backend::Hip || !self.use_4b_kernel {
+            return Ok(());
+        }
+        kernel_ffi::gqh::enable_tight_decode();
+        let hidden = self.weights.config.hidden_size;
+        let vocab = self.weights.config.vocab_size;
+        if let Some((qtype, _, _)) = self.weights.lm_head_lowbit_params(hidden) {
+            if let Some(rung) = kernel_ffi::gqh::rung_from_ggml_type(qtype as u32) {
+                kernel_ffi::gqh::ensure_tight(
+                    self.ordinal,
+                    rung,
+                    self.weights.lm_head.as_ptr() as *mut _,
+                    hidden as i32,
+                    vocab as i32,
+                )?;
+            }
+        }
+        let seqlen_offset = 0usize;
+        let descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
+        self.scratch
+            .upload_descs(&descs)
+            .map_err(|e| anyhow::anyhow!("prepare gqh upload descs: {e}"))?;
+        kernel_ffi::set_hip_gqh_prepare_only(true);
+        let persist = kernel_ffi::persistent_decode_4b(
+            self.ordinal,
+            ScalarType::BF16,
+            self.weights.config.num_hidden_layers,
+            hidden,
+            self.weights.config.intermediate_size,
+            seqlen_offset,
+            &self.scratch.desc_device,
+            &mut self.hidden_io,
+            &mut self.scratch.workspace,
+            &mut self.scratch.sync_buf,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            self.rotary.rotary_dim,
+            self.proj_buf_floats,
+            self.attn_scratch_floats,
+            self.fp8_scale_device.as_ref(),
+            self.scratch.kv_fp8_desc_device.as_ref(),
+            1,
+            self.scratch.batch_seq_desc_device.as_ref(),
+            self.int4_scale_device.as_ref(),
+            false,
+            false,
+            None,
+            None,
+        );
+        kernel_ffi::set_hip_gqh_prepare_only(false);
+        persist.map_err(|e| anyhow::anyhow!("prepare hip gqh decode: {e}"))?;
+        Ok(())
+    }
+
+    pub fn decode_step_hip_fast_greedy(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(u32, DecodeStageTimings)> {
+        anyhow::ensure!(
+            self.hidden_io.backend() == gpu_hal::Backend::Hip,
+            "decode_step_hip_fast_greedy requires HIP"
+        );
+        anyhow::ensure!(
+            self.batch_size == 1,
+            "decode_step_hip_fast_greedy requires batch_size == 1"
+        );
+        // Stay on the GQH-split persistent path. The component 4B walk is
+        // numerically fine but ~46× slower than dedicated GEMVs.
+        let (all_logits, timings) =
+            self.decode_step_batch_impl(&[token_id], seqlen_offset, false, true)?;
+        if let Some(row) = all_logits.first() {
+            if row.len() == 1 {
+                return Ok((row[0].to_bits(), timings));
+            }
+        }
+        anyhow::bail!("hip fast greedy missing token")
     }
 
     fn component_decode_step_4b(
@@ -10366,6 +10492,12 @@ impl DecodeEngine {
             &[batch_size, 1, config.vocab_size],
         )
         .map_err(|e| anyhow::anyhow!("logits_buf: {e}"))?;
+        let logits_f32_buf = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::F32,
+            &[batch_size, 1, config.vocab_size],
+        )
+        .map_err(|e| anyhow::anyhow!("logits_f32_buf: {e}"))?;
         let argmax_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("argmax_buf: {e}"))?;
         let lm_head_block_best_vals = GpuBuffer::zeros(ordinal, ScalarType::F32, &[512])
@@ -10439,6 +10571,7 @@ impl DecodeEngine {
             hidden_io,
             normed_buf,
             logits_buf,
+            logits_f32_buf,
             argmax_buf,
             lm_head_block_best_vals,
             lm_head_block_best_idxs,
@@ -11495,7 +11628,7 @@ impl DecodeEngine {
         );
 
         let (mut batch_logits, mut timings) =
-            self.decode_step_batch_impl(&[token_id], seqlen_offset, true)?;
+            self.decode_step_batch_impl(&[token_id], seqlen_offset, true, false)?;
         let logits = batch_logits
             .pop()
             .ok_or_else(|| anyhow::anyhow!("single-sequence 4B kernel timings missing logits"))?;
@@ -12808,7 +12941,7 @@ impl DecodeEngine {
         token_ids: &[u32],
         seqlen_offset: usize,
     ) -> Result<Vec<Vec<f32>>> {
-        let (all_logits, _) = self.decode_step_batch_impl(token_ids, seqlen_offset, false)?;
+        let (all_logits, _) = self.decode_step_batch_impl(token_ids, seqlen_offset, false, false)?;
         Ok(all_logits)
     }
 
@@ -12819,7 +12952,7 @@ impl DecodeEngine {
         token_ids: &[u32],
         seqlen_offset: usize,
     ) -> Result<(Vec<Vec<f32>>, DecodeStageTimings)> {
-        self.decode_step_batch_impl(token_ids, seqlen_offset, true)
+        self.decode_step_batch_impl(token_ids, seqlen_offset, true, false)
     }
 
     fn decode_step_batch_impl(
@@ -12827,6 +12960,7 @@ impl DecodeEngine {
         token_ids: &[u32],
         seqlen_offset: usize,
         enable_timing_slots: bool,
+        greedy_argmax: bool,
     ) -> Result<(Vec<Vec<f32>>, DecodeStageTimings)> {
         assert_eq!(token_ids.len(), self.batch_size);
         assert!(self.use_4b_kernel, "batched decode requires 4b kernel");
@@ -12835,6 +12969,10 @@ impl DecodeEngine {
         if b == 1 && self.gqh_component_decode_enabled() {
             let (logits, timings) =
                 self.decode_step_gqh_component(token_ids[0], seqlen_offset)?;
+            if greedy_argmax {
+                let token = Self::greedy_sample(&logits);
+                return Ok((vec![vec![f32::from_bits(token)]], timings));
+            }
             return Ok((vec![logits], timings));
         }
         let use_qwen35_4b_cuda_long_context_component_fallback = self.hidden_io.backend()
@@ -12848,6 +12986,13 @@ impl DecodeEngine {
             && seqlen_offset >= QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS;
         if use_qwen35_4b_cuda_long_context_component_fallback {
             let logits = self.component_decode_step_4b(token_ids[0], seqlen_offset)?;
+            if greedy_argmax {
+                let token = Self::greedy_sample(&logits);
+                return Ok((
+                    vec![vec![f32::from_bits(token)]],
+                    DecodeStageTimings::default(),
+                ));
+            }
             return Ok((vec![logits], DecodeStageTimings::default()));
         }
         let mut timings = DecodeStageTimings::default();
@@ -13243,7 +13388,33 @@ impl DecodeEngine {
         timings.rms_norm_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let start = Instant::now();
-        if lm_head_lowbit(
+        let greedy_f32 = greedy_argmax && b == 1;
+        if greedy_f32 {
+            if lm_head_lowbit(
+                self.ordinal,
+                b,
+                config.vocab_size,
+                config.hidden_size,
+                &self.normed_buf,
+                &self.weights,
+                &mut self.logits_f32_buf,
+                "tiled lm_head batch f32",
+            )? {
+            } else {
+                kernel_ffi::matmul_rhs_transposed_4b(
+                    self.ordinal,
+                    ScalarType::F32,
+                    1,
+                    b,
+                    config.vocab_size,
+                    config.hidden_size,
+                    &self.normed_buf,
+                    &*self.weights.lm_head,
+                    &mut self.logits_f32_buf,
+                )
+                .map_err(|e| anyhow::anyhow!("tiled lm_head batch matmul f32: {e}"))?;
+            }
+        } else if lm_head_lowbit(
             self.ordinal,
             b,
             config.vocab_size,
@@ -13268,6 +13439,31 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("tiled lm_head batch matmul: {e}"))?;
         }
         timings.lm_head_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        if greedy_f32 {
+            let start = Instant::now();
+            kernel_ffi::prefill_ffi::argmax_f32_as_bf16_rows(
+                self.ordinal,
+                1,
+                config.vocab_size,
+                &self.logits_f32_buf,
+                &mut self.argmax_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("hip greedy argmax: {e}"))?;
+            let token_bytes = self
+                .argmax_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("argmax D2H: {e}"))?;
+            timings.logits_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let token = u32::from_le_bytes(
+                token_bytes[..4]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?,
+            );
+            // Bit-cast so decode_step_hip_fast_greedy can recover the id
+            // without a 248k-logit D2H. Not a numeric conversion.
+            return Ok((vec![vec![f32::from_bits(token)]], timings));
+        }
 
         let start = Instant::now();
         let logits_host = self

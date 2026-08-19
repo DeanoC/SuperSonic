@@ -373,6 +373,7 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
         );
     }
     println!("cargo:rustc-link-lib=dylib=amdhip64");
+    println!("cargo:rustc-link-lib=dylib=hipblas");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-cfg=supersonic_backend_hip");
 }

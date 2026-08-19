@@ -3826,6 +3826,21 @@ fn prefill_inner(
             &token_ids_gpu,
             &mut scratch.hidden,
         )?;
+        if chunk_start == 0 {
+            if let Ok(path) = std::env::var("SUPERSONIC_QWEN35_DUMP_EMBED") {
+                let n = (chunk_len * hidden_dim).min(hidden_dim);
+                let bytes = copy_bf16_row(
+                    ordinal,
+                    &scratch.hidden,
+                    0,
+                    n,
+                    "prefill embed dump",
+                )?;
+                std::fs::write(&path, bytes)
+                    .map_err(|e| anyhow::anyhow!("write embed dump {path}: {e}"))?;
+                eprintln!("[prefill] dumped embed row0 n={n} to {path}");
+            }
+        }
         scratch.seed_f32_from_hidden(ordinal, chunk_len * hidden_dim, "prefill embedding")?;
 
         // Layer loop (all layers for this chunk, or 0..=last_layer when

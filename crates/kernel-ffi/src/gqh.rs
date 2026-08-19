@@ -101,6 +101,23 @@ unsafe extern "C" {
         dst: *mut c_void,
         rows: c_int,
         cols: c_int,
+        dst_is_bf16: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_gqh_hip_gemm_flush();
+
+    fn supersonic_gqh_hip_dequant_gemm_bf16(
+        device_ordinal: c_int,
+        rung: c_int,
+        wire: *const c_void,
+        tensor_scale: f32,
+        grid_code: c_int,
+        lhs: *const c_void,
+        out: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
     ) -> c_int;
 
     fn supersonic_gqh_hip_mix_matvec_stream(
@@ -116,6 +133,15 @@ unsafe extern "C" {
         mode: c_int,
         lut: *const f32,
         stream: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_gqh_hip_enable_tight_decode();
+    fn supersonic_gqh_hip_ensure_tight(
+        device_ordinal: c_int,
+        rung: c_int,
+        wire: *mut c_void,
+        in_dim: c_int,
+        out_dim: c_int,
     ) -> c_int;
 
     fn supersonic_gqh_hip_matvec(
@@ -156,7 +182,7 @@ pub fn rung_from_flm_codec(semantic_id: u16) -> Option<i32> {
     }
 }
 
-/// Dequantize packed GQH superblocks to f32. `wire` is the post-header stream.
+/// Dequantize packed GQH superblocks to f32 or bf16. `wire` is the post-header stream.
 pub fn decode(
     ordinal: usize,
     rung: i32,
@@ -172,12 +198,15 @@ pub fn decode(
             "gqh decode cols {cols} is not a positive multiple of {SUPERBLOCK}"
         )));
     }
-    if dst.dtype() != ScalarType::F32 {
-        return Err(GpuError::InvalidArg(format!(
-            "gqh decode dst must be f32, got {:?}",
-            dst.dtype()
-        )));
-    }
+    let dst_is_bf16 = match dst.dtype() {
+        ScalarType::F32 => 0,
+        ScalarType::BF16 => 1,
+        other => {
+            return Err(GpuError::InvalidArg(format!(
+                "gqh decode dst must be f32/bf16, got {other:?}"
+            )));
+        }
+    };
     if dst.elem_count() < rows * cols {
         return Err(GpuError::InvalidArg(format!(
             "gqh decode dst has {} elems, need {}",
@@ -199,6 +228,8 @@ pub fn decode(
                     dst.as_mut_ptr(),
                     rows as c_int,
                     cols as c_int,
+                    dst_is_bf16,
+                    std::ptr::null_mut(),
                 )
             }
             #[cfg(not(supersonic_backend_hip))]
@@ -216,6 +247,120 @@ pub fn decode(
         return Err(backend_error(backend, "gqh decode", status));
     }
     Ok(())
+}
+
+/// Decode GQH to BF16 and GEMM `out[m,n] = lhs[m,k] @ W[n,k]^T`.
+/// Overlaps this dequant with the previous call's GEMM via two streams.
+pub fn dequant_gemm_bf16(
+    ordinal: usize,
+    rung: i32,
+    wire: &GpuBuffer,
+    tensor_scale: f32,
+    grid_code: u8,
+    lhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16 || out.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh dequant_gemm requires bf16 lhs/out, got {:?}/{:?}",
+            lhs.dtype(),
+            out.dtype()
+        )));
+    }
+    if m == 0 || n == 0 || k == 0 || k % SUPERBLOCK != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh dequant_gemm m={m} n={n} k={k} invalid"
+        )));
+    }
+    if lhs.elem_count() < m * k || out.elem_count() < m * n {
+        return Err(GpuError::InvalidArg(
+            "gqh dequant_gemm lhs/out too small".into(),
+        ));
+    }
+    let backend = out.backend();
+    let status = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                supersonic_gqh_hip_dequant_gemm_bf16(
+                    ordinal as c_int,
+                    rung as c_int,
+                    wire.as_ptr(),
+                    tensor_scale,
+                    grid_code as c_int,
+                    lhs.as_ptr(),
+                    out.as_mut_ptr(),
+                    m as c_int,
+                    n as c_int,
+                    k as c_int,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
+            }
+        }
+        other => {
+            return Err(GpuError::Unsupported(format!(
+                "gqh dequant_gemm is HIP-only, got {other:?}"
+            )));
+        }
+    };
+    if status != 0 {
+        return Err(backend_error(backend, "gqh dequant_gemm", status));
+    }
+    Ok(())
+}
+
+pub fn gemm_flush() {
+    #[cfg(supersonic_backend_hip)]
+    unsafe {
+        supersonic_gqh_hip_gemm_flush();
+    }
+}
+
+pub fn enable_tight_decode() {
+    #[cfg(supersonic_backend_hip)]
+    unsafe {
+        supersonic_gqh_hip_enable_tight_decode();
+    }
+}
+
+pub fn ensure_tight(
+    ordinal: usize,
+    rung: i32,
+    wire: *mut c_void,
+    in_dim: i32,
+    out_dim: i32,
+) -> Result<(), GpuError> {
+    #[cfg(not(supersonic_backend_hip))]
+    {
+        let _ = (ordinal, rung, wire, in_dim, out_dim);
+        return Ok(());
+    }
+    #[cfg(supersonic_backend_hip)]
+    {
+        let status = unsafe {
+            supersonic_gqh_hip_ensure_tight(
+                ordinal as c_int,
+                rung,
+                wire,
+                in_dim,
+                out_dim,
+            )
+        };
+        if status != 0 {
+            return Err(backend_error(
+                Backend::Hip,
+                "gqh ensure_tight",
+                status,
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Fused `y[ncols, out] = W[out, in] @ x[ncols, in]` with inline GQH decode.

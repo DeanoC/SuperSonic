@@ -36,9 +36,12 @@ pub(crate) fn emit_qwen35_last_logits_if_requested(cli: &Cli, logits: &[f32]) {
             .map(|(i, v)| (i, *v))
             .unwrap_or((0, 0.0));
         let v30 = logits.get(30).copied().unwrap_or(f32::NAN);
+        let v32 = logits.get(32).copied().unwrap_or(f32::NAN);
+        let v2014 = logits.get(2014).copied().unwrap_or(f32::NAN);
         let v3242 = logits.get(3242).copied().unwrap_or(f32::NAN);
         eprintln!(
-            "[logits] argmax={argmax} v={max_v} tok30={v30} tok3242={v3242} delta_today_minus_q={}",
+            "[logits] argmax={argmax} v={max_v} tok30={v30} tok32={v32} tok2014={v2014} tok3242={v3242} delta_A_minus_An={} delta_today_minus_q={}",
+            v32 - v2014,
             v3242 - v30
         );
     }

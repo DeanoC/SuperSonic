@@ -1362,64 +1362,50 @@ __global__ void supersonic_qwen35_full_attention_prefill_kernel(
             local_dims[local_count++] = d;
         }
 
-        __shared__ float shared_prev_scale;
-        __shared__ float shared_curr_scale;
-        __shared__ float shared_denom;
-        __shared__ float shared_inv_denom;
-        __shared__ float shared_new_max;
-
+        // Warp-only online softmax. The previous shared+syncthreads path
+        // issued two block barriers per key (8070 keys × 24 heads).
         for (int k_pos = 0; k_pos < causal_limit; ++k_pos) {
             const T* k_row = k_head_ptr + k_pos * head_dim;
             const T* v_row = v_head_ptr + k_pos * head_dim;
 
             float partial = 0.0f;
             for (int d = lane; d < head_dim; d += warpSize) {
-                partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
+                partial += supersonic_qwen35_to_float(q_row[d]) *
+                    supersonic_qwen35_to_float(k_row[d]);
             }
-            float score = supersonic_qwen35_wave_sum(partial) * scale;
+            const float score = supersonic_qwen35_wave_sum(partial) * scale;
 
-            if (lane == 0) {
-                if (!isfinite(running_max)) {
-                    running_max = score;
-                    denom = 1.0f;
-                    shared_prev_scale = 0.0f;
-                    shared_curr_scale = 1.0f;
-                    shared_new_max = running_max;
-                } else {
-                    const float new_max = fmaxf(running_max, score);
-                    const float prev_scale = expf(running_max - new_max);
-                    const float curr_scale = expf(score - new_max);
-                    denom = denom * prev_scale + curr_scale;
-                    running_max = new_max;
-                    shared_prev_scale = prev_scale;
-                    shared_curr_scale = curr_scale;
-                    shared_new_max = new_max;
-                }
-                shared_denom = denom;
+            float prev_scale;
+            float curr_scale;
+            if (!isfinite(running_max)) {
+                running_max = score;
+                denom = 1.0f;
+                prev_scale = 0.0f;
+                curr_scale = 1.0f;
+            } else {
+                const float new_max = fmaxf(running_max, score);
+                prev_scale = expf(running_max - new_max);
+                curr_scale = expf(score - new_max);
+                denom = denom * prev_scale + curr_scale;
+                running_max = new_max;
             }
-            __syncthreads();
 
-            if (shared_curr_scale == 1.0f && shared_prev_scale == 0.0f) {
+            if (curr_scale == 1.0f && prev_scale == 0.0f) {
                 for (int i = 0; i < local_count; ++i) {
                     local_acc[i] = supersonic_qwen35_to_float(v_row[local_dims[i]]);
                 }
             } else {
                 for (int i = 0; i < local_count; ++i) {
-                    local_acc[i] = local_acc[i] * shared_prev_scale +
-                        shared_curr_scale * supersonic_qwen35_to_float(v_row[local_dims[i]]);
+                    local_acc[i] = local_acc[i] * prev_scale +
+                        curr_scale * supersonic_qwen35_to_float(v_row[local_dims[i]]);
                 }
             }
-            __syncthreads();
         }
 
-        if (lane == 0) {
-            shared_inv_denom = shared_denom > 0.0f ? 1.0f / shared_denom : 0.0f;
-        }
-        __syncthreads();
+        const float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
         for (int i = 0; i < local_count; ++i) {
-            out_row[local_dims[i]] = local_acc[i] * shared_inv_denom;
+            out_row[local_dims[i]] = local_acc[i] * inv_denom;
         }
-        __syncthreads();
     }
 }
 
@@ -1970,25 +1956,52 @@ __device__ inline void supersonic_qwen35_delta_recurrent_prefill_impl(
         const int value_row = bh * token_stride_v + t * v_head_dim;
         const int beta_row = bh * token_stride_s + t;
 
-        for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            state[k_idx] *= g_t;
-        }
-
         float kv_mem = 0.0f;
-        for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
+        float out_t = 0.0f;
+        const float delta_scale = supersonic_qwen35_to_float(beta[beta_row]);
+        const float v_t = supersonic_qwen35_to_float(value[value_row + v_idx]);
+        int k_idx = 0;
+        for (; k_idx + 3 < k_head_dim; k_idx += 4) {
+            const float k0 = supersonic_qwen35_to_float(key[key_row + k_idx]);
+            const float k1 = supersonic_qwen35_to_float(key[key_row + k_idx + 1]);
+            const float k2 = supersonic_qwen35_to_float(key[key_row + k_idx + 2]);
+            const float k3 = supersonic_qwen35_to_float(key[key_row + k_idx + 3]);
+            float s0 = state[k_idx] * g_t;
+            float s1 = state[k_idx + 1] * g_t;
+            float s2 = state[k_idx + 2] * g_t;
+            float s3 = state[k_idx + 3] * g_t;
+            kv_mem += s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3;
+            state[k_idx] = s0;
+            state[k_idx + 1] = s1;
+            state[k_idx + 2] = s2;
+            state[k_idx + 3] = s3;
+        }
+        for (; k_idx < k_head_dim; ++k_idx) {
+            state[k_idx] *= g_t;
             kv_mem += state[k_idx] * supersonic_qwen35_to_float(key[key_row + k_idx]);
         }
-
-        const float delta =
-            (supersonic_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
-            supersonic_qwen35_to_float(beta[beta_row]);
-
-        for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            state[k_idx] += supersonic_qwen35_to_float(key[key_row + k_idx]) * delta;
+        const float delta = (v_t - kv_mem) * delta_scale;
+        k_idx = 0;
+        for (; k_idx + 3 < k_head_dim; k_idx += 4) {
+            const float k0 = supersonic_qwen35_to_float(key[key_row + k_idx]);
+            const float k1 = supersonic_qwen35_to_float(key[key_row + k_idx + 1]);
+            const float k2 = supersonic_qwen35_to_float(key[key_row + k_idx + 2]);
+            const float k3 = supersonic_qwen35_to_float(key[key_row + k_idx + 3]);
+            float s0 = state[k_idx] + k0 * delta;
+            float s1 = state[k_idx + 1] + k1 * delta;
+            float s2 = state[k_idx + 2] + k2 * delta;
+            float s3 = state[k_idx + 3] + k3 * delta;
+            state[k_idx] = s0;
+            state[k_idx + 1] = s1;
+            state[k_idx + 2] = s2;
+            state[k_idx + 3] = s3;
+            out_t += s0 * supersonic_qwen35_to_float(query[key_row + k_idx]) +
+                s1 * supersonic_qwen35_to_float(query[key_row + k_idx + 1]) +
+                s2 * supersonic_qwen35_to_float(query[key_row + k_idx + 2]) +
+                s3 * supersonic_qwen35_to_float(query[key_row + k_idx + 3]);
         }
-
-        float out_t = 0.0f;
-        for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
+        for (; k_idx < k_head_dim; ++k_idx) {
+            state[k_idx] += supersonic_qwen35_to_float(key[key_row + k_idx]) * delta;
             out_t += state[k_idx] * supersonic_qwen35_to_float(query[key_row + k_idx]);
         }
         out[out_base + t * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(out_t);
@@ -8254,6 +8267,130 @@ __global__ void supersonic_qwen35_swiglu_f32_kernel(
     gate[i] = bf16_round_rne_f32_finite(silu * u);
 }
 
+// Dedicated decode RMS. Matches split-1 / split-4 numerics in
+// supersonic_qwen35_persistent_decode_kernel (256-thread tree reduction,
+// BF16 round-trip store into dest). flags: bit0 unpack hidden_io→hidden_f32,
+// bit1 BF16-round hidden_f32 before RMS (split-1 always, split-4 never).
+// 20×256 covers hidden=5120 with one element per thread. Two kernels on
+// the same stream keep all 20 CUs busy (the 1-block RMS left 95 CUs idle).
+__global__ __launch_bounds__(256, 4) void supersonic_qwen35_decode_rms_partial_kernel(
+    float* __restrict__ hidden_f32,
+    const hip_bfloat16* __restrict__ hidden_io,
+    float* __restrict__ partials,
+    int hidden_dim,
+    float /*eps*/,
+    int flags
+) {
+    extern __shared__ float lds[];
+    const int tid = threadIdx.x;
+    const int c = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
+    float x = 0.0f;
+    if (c < hidden_dim) {
+        if ((flags & 1) != 0 && hidden_io != nullptr) {
+            x = static_cast<float>(hidden_io[c]);
+        } else {
+            x = hidden_f32[c];
+        }
+        if ((flags & 2) != 0) {
+            x = bf16_round_rne_f32_finite(x);
+        }
+        hidden_f32[c] = x;
+    }
+    float partial_sq = x * x;
+    lds[tid] = partial_sq;
+    __syncthreads();
+    for (int s = static_cast<int>(blockDim.x) / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            lds[tid] += lds[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partials[blockIdx.x] = lds[0];
+    }
+}
+
+__global__ __launch_bounds__(256, 4) void supersonic_qwen35_decode_rms_scale_kernel(
+    const float* __restrict__ hidden_f32,
+    float* __restrict__ normed,
+    const hip_bfloat16* __restrict__ norm_w,
+    const float* __restrict__ partials,
+    int hidden_dim,
+    int npartials,
+    float eps,
+    float unit_offset
+) {
+    __shared__ float s_inv;
+    if (threadIdx.x == 0) {
+        float tot = 0.0f;
+        for (int i = 0; i < npartials; ++i) {
+            tot += partials[i];
+        }
+        s_inv = rsqrtf(tot / static_cast<float>(hidden_dim) + eps);
+    }
+    __syncthreads();
+    const int c = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + threadIdx.x;
+    if (c < hidden_dim) {
+        const float y =
+            hidden_f32[c] * s_inv * (static_cast<float>(norm_w[c]) + unit_offset);
+        normed[c] = static_cast<float>(hip_bfloat16(y));
+    }
+}
+
+__global__ __launch_bounds__(256, 8) void supersonic_qwen35_decode_rms_kernel(
+    float* __restrict__ hidden_f32,
+    float* __restrict__ normed,
+    const hip_bfloat16* __restrict__ hidden_io,
+    const hip_bfloat16* __restrict__ norm_w,
+    int hidden_dim,
+    int batch_size,
+    float eps,
+    float unit_offset,
+    int flags
+) {
+    extern __shared__ float lds[];
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int B = batch_size > 0 ? batch_size : 1;
+    for (int b = 0; b < B; b++) {
+        float* src = hidden_f32 + b * hidden_dim;
+        float* dst = normed + b * hidden_dim;
+        if ((flags & 1) != 0 && hidden_io != nullptr) {
+            const hip_bfloat16* io = hidden_io + b * hidden_dim;
+            for (int c = tid; c < hidden_dim; c += bs) {
+                src[c] = static_cast<float>(io[c]);
+            }
+            __syncthreads();
+        }
+        if ((flags & 2) != 0) {
+            for (int c = tid; c < hidden_dim; c += bs) {
+                src[c] = bf16_round_rne_f32_finite(src[c]);
+            }
+            __syncthreads();
+        }
+        float partial_sq = 0.0f;
+        for (int c = tid; c < hidden_dim; c += bs) {
+            partial_sq += src[c] * src[c];
+        }
+        lds[tid] = partial_sq;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                lds[tid] += lds[tid + s];
+            }
+            __syncthreads();
+        }
+        const float inv_rms =
+            rsqrtf(lds[0] / static_cast<float>(hidden_dim) + eps);
+        for (int c = tid; c < hidden_dim; c += bs) {
+            const float y =
+                src[c] * inv_rms * (static_cast<float>(norm_w[c]) + unit_offset);
+            dst[c] = static_cast<float>(hip_bfloat16(y));
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void supersonic_qwen35_bf16_round_f32_kernel(float* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -8300,6 +8437,303 @@ __global__ void supersonic_qwen35_pack_full_q_interleaved_kernel(
     const int h = i / hd;
     const int d = i - h * hd;
     q_out[i] = hip_bfloat16(q_int[h * hd * 2 + d]);
+}
+
+// Decode attention over [kv_heads, kv_stride, head_dim].
+// Pass 1: grid (q_heads, n_splits), block 32. Each warp owns every
+// n_splits-th key and writes (m, l, acc[8]) into partials.
+// Pass 2: grid q_heads, block 32. Merges the split stats.
+template <typename T>
+__global__ void supersonic_qwen35_full_attention_decode_split_kernel(
+    int kv_len,
+    int kv_stride,
+    int head_dim,
+    int num_kv_groups,
+    int n_splits,
+    float scale,
+    const T* __restrict__ query,
+    const T* __restrict__ key,
+    const T* __restrict__ value,
+    float* __restrict__ part_m,
+    float* __restrict__ part_l,
+    float* __restrict__ part_acc
+) {
+    if (kv_len < 0) {
+        kv_len = qwen35_split_seqlen + 1;
+    }
+    const int lane = threadIdx.x;
+    const int qh = static_cast<int>(blockIdx.x);
+    const int split = static_cast<int>(blockIdx.y);
+    const int kvh = qh / num_kv_groups;
+    const T* q_row = query + static_cast<size_t>(qh) * head_dim;
+    const T* k_head = key +
+        static_cast<size_t>(kvh) * static_cast<size_t>(kv_stride) * head_dim;
+    const T* v_head = value +
+        static_cast<size_t>(kvh) * static_cast<size_t>(kv_stride) * head_dim;
+
+    float q_reg[8];
+    float acc[8];
+    int acc_dim[8];
+    int acc_count = 0;
+    const bool pack8 = (head_dim == 256);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        q_reg[i] = 0.0f;
+        acc[i] = 0.0f;
+        acc_dim[i] = -1;
+    }
+    if (pack8) {
+        const int d0 = lane * 8;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc_dim[i] = d0 + i;
+            q_reg[i] = supersonic_qwen35_to_float(q_row[d0 + i]);
+        }
+        acc_count = 8;
+    } else {
+        for (int d = lane; d < head_dim && acc_count < 8; d += 32) {
+            acc_dim[acc_count] = d;
+            q_reg[acc_count] = supersonic_qwen35_to_float(q_row[d]);
+            ++acc_count;
+        }
+    }
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    for (int t = split; t < kv_len; t += n_splits) {
+        const T* k_row = k_head + static_cast<size_t>(t) * head_dim;
+        const T* v_row = v_head + static_cast<size_t>(t) * head_dim;
+        float partial = 0.0f;
+        if (pack8) {
+            const int d0 = lane * 8;
+            const uint4 ku = *reinterpret_cast<const uint4*>(k_row + d0);
+            const uint32_t kbits[4] = {ku.x, ku.y, ku.z, ku.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t w = kbits[i];
+                hip_bfloat16 lo, hi;
+                memcpy(&lo, &w, 2);
+                const uint16_t hi16 = static_cast<uint16_t>(w >> 16);
+                memcpy(&hi, &hi16, 2);
+                partial += q_reg[2 * i] * supersonic_qwen35_to_float(lo);
+                partial += q_reg[2 * i + 1] * supersonic_qwen35_to_float(hi);
+            }
+        } else {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (i < acc_count) {
+                partial += q_reg[i] * supersonic_qwen35_to_float(k_row[acc_dim[i]]);
+            }
+        }
+        }
+        const float score =
+            __shfl(supersonic_qwen35_wave_sum(partial), 0) * scale;
+        const float m_old = m_i;
+        const float m_new = score > m_old ? score : m_old;
+        const float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+        const float weight = expf(score - m_new);
+        l_i = l_i * alpha + weight;
+        m_i = m_new;
+        if (pack8) {
+            const int d0 = lane * 8;
+            const uint4 vu = *reinterpret_cast<const uint4*>(v_row + d0);
+            const uint32_t vbits[4] = {vu.x, vu.y, vu.z, vu.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t w = vbits[i];
+                hip_bfloat16 lo, hi;
+                memcpy(&lo, &w, 2);
+                const uint16_t hi16 = static_cast<uint16_t>(w >> 16);
+                memcpy(&hi, &hi16, 2);
+                acc[2 * i] = acc[2 * i] * alpha +
+                    weight * supersonic_qwen35_to_float(lo);
+                acc[2 * i + 1] = acc[2 * i + 1] * alpha +
+                    weight * supersonic_qwen35_to_float(hi);
+            }
+        } else {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (i < acc_count) {
+                acc[i] = acc[i] * alpha +
+                    weight * supersonic_qwen35_to_float(v_row[acc_dim[i]]);
+            }
+        }
+        }
+    }
+
+    const int slot = qh * n_splits + split;
+    if (lane == 0) {
+        part_m[slot] = m_i;
+        part_l[slot] = l_i;
+    }
+    float* acc_out = part_acc + (static_cast<size_t>(slot) * 32 + lane) * 8;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        acc_out[i] = acc[i];
+    }
+}
+
+// GQA decode: one warp owns kQ consecutive Q heads that share a KV head,
+// so K/V load once. Same per-head online softmax as the 1-head kernel.
+template <typename T, int kQ>
+__global__ void supersonic_qwen35_full_attention_decode_split_gqa_kernel(
+    int kv_len,
+    int kv_stride,
+    int head_dim,
+    int num_kv_groups,
+    int n_splits,
+    float scale,
+    const T* __restrict__ query,
+    const T* __restrict__ key,
+    const T* __restrict__ value,
+    float* __restrict__ part_m,
+    float* __restrict__ part_l,
+    float* __restrict__ part_acc
+) {
+    if (kv_len < 0) {
+        kv_len = qwen35_split_seqlen + 1;
+    }
+    const int lane = threadIdx.x;
+    const int split = static_cast<int>(blockIdx.y);
+    const int qh0 = static_cast<int>(blockIdx.x) * kQ;
+    const int kvh = qh0 / num_kv_groups;
+    const T* k_head = key +
+        static_cast<size_t>(kvh) * static_cast<size_t>(kv_stride) * head_dim;
+    const T* v_head = value +
+        static_cast<size_t>(kvh) * static_cast<size_t>(kv_stride) * head_dim;
+
+    const int d0 = lane * 8;
+    float q_reg[kQ][8];
+    float acc[kQ][8];
+#pragma unroll
+    for (int h = 0; h < kQ; ++h) {
+        const T* q_row = query + static_cast<size_t>(qh0 + h) * head_dim;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            q_reg[h][i] = supersonic_qwen35_to_float(q_row[d0 + i]);
+            acc[h][i] = 0.0f;
+        }
+    }
+
+    float m_i[kQ];
+    float l_i[kQ];
+#pragma unroll
+    for (int h = 0; h < kQ; ++h) {
+        m_i[h] = -INFINITY;
+        l_i[h] = 0.0f;
+    }
+
+    for (int t = split; t < kv_len; t += n_splits) {
+        const T* k_row = k_head + static_cast<size_t>(t) * head_dim;
+        const T* v_row = v_head + static_cast<size_t>(t) * head_dim;
+        const uint4 ku = *reinterpret_cast<const uint4*>(k_row + d0);
+        const uint32_t kbits[4] = {ku.x, ku.y, ku.z, ku.w};
+        float k_f[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t w = kbits[i];
+            hip_bfloat16 lo, hi;
+            memcpy(&lo, &w, 2);
+            const uint16_t hi16 = static_cast<uint16_t>(w >> 16);
+            memcpy(&hi, &hi16, 2);
+            k_f[2 * i] = supersonic_qwen35_to_float(lo);
+            k_f[2 * i + 1] = supersonic_qwen35_to_float(hi);
+        }
+        const uint4 vu = *reinterpret_cast<const uint4*>(v_row + d0);
+        const uint32_t vbits[4] = {vu.x, vu.y, vu.z, vu.w};
+        float v_f[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t w = vbits[i];
+            hip_bfloat16 lo, hi;
+            memcpy(&lo, &w, 2);
+            const uint16_t hi16 = static_cast<uint16_t>(w >> 16);
+            memcpy(&hi, &hi16, 2);
+            v_f[2 * i] = supersonic_qwen35_to_float(lo);
+            v_f[2 * i + 1] = supersonic_qwen35_to_float(hi);
+        }
+#pragma unroll
+        for (int h = 0; h < kQ; ++h) {
+            float partial = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                partial += q_reg[h][i] * k_f[i];
+            }
+            const float score =
+                __shfl(supersonic_qwen35_wave_sum(partial), 0) * scale;
+            const float m_old = m_i[h];
+            const float m_new = score > m_old ? score : m_old;
+            const float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+            const float weight = expf(score - m_new);
+            l_i[h] = l_i[h] * alpha + weight;
+            m_i[h] = m_new;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                acc[h][i] = acc[h][i] * alpha + weight * v_f[i];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < kQ; ++h) {
+        const int slot = (qh0 + h) * n_splits + split;
+        if (lane == 0) {
+            part_m[slot] = m_i[h];
+            part_l[slot] = l_i[h];
+        }
+        float* acc_out = part_acc + (static_cast<size_t>(slot) * 32 + lane) * 8;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc_out[i] = acc[h][i];
+        }
+    }
+}
+
+__global__ void supersonic_qwen35_full_attention_decode_merge_kernel(
+    int n_splits,
+    int head_dim,
+    const float* __restrict__ part_m,
+    const float* __restrict__ part_l,
+    const float* __restrict__ part_acc,
+    float* __restrict__ out
+) {
+    const int lane = threadIdx.x;
+    const int qh = static_cast<int>(blockIdx.x);
+    int acc_count = 0;
+    int acc_dim[8];
+    if (head_dim == 256) {
+        const int d0 = lane * 8;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc_dim[i] = d0 + i;
+        }
+        acc_count = 8;
+    } else {
+        for (int d = lane; d < head_dim && acc_count < 8; d += 32) {
+            acc_dim[acc_count++] = d;
+        }
+    }
+    float m_all = -INFINITY;
+    for (int s = 0; s < n_splits; ++s) {
+        m_all = fmaxf(m_all, part_m[qh * n_splits + s]);
+    }
+    float l_all = 0.0f;
+    float acc_all[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int s = 0; s < n_splits; ++s) {
+        const int slot = qh * n_splits + s;
+        const float m_s = part_m[slot];
+        const float alpha = (m_s == -INFINITY) ? 0.0f : expf(m_s - m_all);
+        l_all += part_l[slot] * alpha;
+        const float* acc_s = part_acc + (static_cast<size_t>(slot) * 32 + lane) * 8;
+        for (int i = 0; i < acc_count; ++i) {
+            acc_all[i] += acc_s[i] * alpha;
+        }
+    }
+    const float inv = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
+    float* out_row = out + static_cast<size_t>(qh) * head_dim;
+    for (int i = 0; i < acc_count; ++i) {
+        out_row[acc_dim[i]] = acc_all[i] * inv;
+    }
 }
 
 __global__ void supersonic_qwen35_full_attn_gate_f32_kernel(
@@ -8509,23 +8943,12 @@ __global__ void supersonic_qwen35_q8_0_wmma_gemv_f32_kernel(
 // Same wave-per-row walk as steal o/out: lane owns columns lane, lane+32, ...
 // then xor-reduce. Per-block scales are hoisted; the product order matches
 // ggml_k_dequant_scalar_from_row so GQH-mixed ggml-K rows stay bit-exact.
-template <int kQtype, bool kAcc = false>
-__global__ void supersonic_qwen35_ggml_k_matvec_kernel(
-    const uint8_t* __restrict__ w,
+template <int kQtype>
+__device__ inline float ggml_k_matvec_row_dot(
+    const uint8_t* __restrict__ row_data,
     const float* __restrict__ x,
-    float* __restrict__ y,
     int in_dim,
-    int out_dim) {
-    constexpr int kWarp = 32;
-    constexpr int kWarps = 4;
-    const int row = static_cast<int>(blockIdx.x) * kWarps +
-        (static_cast<int>(threadIdx.x) / kWarp);
-    const int lane = static_cast<int>(threadIdx.x) % kWarp;
-    if (row >= out_dim) {
-        return;
-    }
-    const uint8_t* row_data =
-        w + static_cast<size_t>(row) * ggml_k_row_bytes(kQtype, in_dim);
+    int lane) {
     float p = 0.0f;
     if constexpr (kQtype == QWEN35_LOWBIT_GGML_Q8_0) {
         const int nblk = in_dim / 32;
@@ -8630,19 +9053,59 @@ __global__ void supersonic_qwen35_ggml_k_matvec_kernel(
             }
         }
     } else {
-        for (int c = lane; c < in_dim; c += kWarp) {
+        for (int c = lane; c < in_dim; c += 32) {
             p += ggml_k_dequant_scalar_from_row(row_data, kQtype, c, in_dim) * x[c];
         }
     }
+    return p;
+}
+
+// kRows=2: one warp does two consecutive rows and shares x. Product order
+// per row is unchanged. Launch only when out % (warps*2) == 0.
+template <int kQtype, bool kAcc = false, int kRows = 1>
+__global__ void supersonic_qwen35_ggml_k_matvec_kernel(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int in_dim,
+    int out_dim) {
+    constexpr int kWarp = 32;
+    constexpr int kWarps = 4;
+    const int row0 = (static_cast<int>(blockIdx.x) * kWarps +
+        (static_cast<int>(threadIdx.x) / kWarp)) * kRows;
+    const int lane = static_cast<int>(threadIdx.x) % kWarp;
+    if (row0 >= out_dim) {
+        return;
+    }
+    const int row_bytes = ggml_k_row_bytes(kQtype, in_dim);
+    const uint8_t* row0_data =
+        w + static_cast<size_t>(row0) * static_cast<size_t>(row_bytes);
+    float p0 = ggml_k_matvec_row_dot<kQtype>(row0_data, x, in_dim, lane);
+    float p1 = 0.0f;
+    if constexpr (kRows == 2) {
+        p1 = ggml_k_matvec_row_dot<kQtype>(
+            row0_data + row_bytes, x, in_dim, lane);
+    }
     for (int off = kWarp / 2; off > 0; off >>= 1) {
-        p += __shfl_xor(p, off);
+        p0 += __shfl_xor(p0, off);
+        if constexpr (kRows == 2) {
+            p1 += __shfl_xor(p1, off);
+        }
     }
     if (lane == 0) {
         if constexpr (kAcc) {
-            y[row] = bf16_round_rne_f32_finite(
-                y[row] + bf16_round_rne_f32_finite(p));
+            y[row0] = bf16_round_rne_f32_finite(
+                y[row0] + bf16_round_rne_f32_finite(p0));
         } else {
-            y[row] = p;
+            y[row0] = p0;
+        }
+        if constexpr (kRows == 2) {
+            if constexpr (kAcc) {
+                y[row0 + 1] = bf16_round_rne_f32_finite(
+                    y[row0 + 1] + bf16_round_rne_f32_finite(p1));
+            } else {
+                y[row0 + 1] = p1;
+            }
         }
     }
 }
@@ -8996,16 +9459,19 @@ __global__ void supersonic_qwen35_decode_extract_rec_gated_kernel(
     const float* __restrict__ z,
     const float* __restrict__ norm_w,
     float* __restrict__ rec_state,
-    float* __restrict__ attn_out) {
+    float* __restrict__ attn_out,
+    int compact) {
     const int h = static_cast<int>(blockIdx.x);
     if (h >= nv) {
         return;
     }
     const int tid = static_cast<int>(threadIdx.x);
-    const int out_base = h * (1 + khd) * vhd;
+    const int out_base = compact ? (h * vhd) : (h * (1 + khd) * vhd);
     const int state_n = khd * vhd;
-    for (int i = tid; i < state_n; i += static_cast<int>(blockDim.x)) {
-        rec_state[h * state_n + i] = rec_out[out_base + vhd + i];
+    if (rec_state != nullptr && !compact) {
+        for (int i = tid; i < state_n; i += static_cast<int>(blockDim.x)) {
+            rec_state[h * state_n + i] = rec_out[out_base + vhd + i];
+        }
     }
     __shared__ float xs[256];
     const float xv = (tid < vhd)
@@ -9031,6 +9497,63 @@ __global__ void supersonic_qwen35_decode_extract_rec_gated_kernel(
         const float gate_silu = zv * supersonic_qwen35_sigmoid_fast(zv);
         attn_out[h * vhd + tid] =
             bf16_round_rne_f32_finite(xv * inv * w * gate_silu);
+    }
+}
+
+// Per-channel dwconv4+SiLU+state shift. Each qkv channel is independent, so
+// this replaces the split-2 kq handshake + 48-block grid_barrier.
+__global__ void supersonic_qwen35_decode_rec_conv_kernel(
+    int conv_dim,
+    const float* __restrict__ qkv_f32,
+    hip_bfloat16* __restrict__ conv_state,
+    const hip_bfloat16* __restrict__ conv_w,
+    float* __restrict__ conv_out) {
+    const int c = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= conv_dim) {
+        return;
+    }
+    hip_bfloat16* cs = conv_state + static_cast<size_t>(c) * 3;
+    const hip_bfloat16* cw = conv_w + static_cast<size_t>(c) * 4;
+    const hip_bfloat16 qnew = hip_bfloat16(qkv_f32[c]);
+    conv_out[c] = gqh_dwconv4_silu(
+        supersonic_qwen35_to_float(cs[0]),
+        supersonic_qwen35_to_float(cs[1]),
+        supersonic_qwen35_to_float(cs[2]),
+        supersonic_qwen35_to_float(qnew),
+        supersonic_qwen35_to_float(cw[0]),
+        supersonic_qwen35_to_float(cw[1]),
+        supersonic_qwen35_to_float(cw[2]),
+        supersonic_qwen35_to_float(cw[3]));
+    cs[0] = cs[1];
+    cs[1] = cs[2];
+    cs[2] = qnew;
+}
+
+// Q then K RMS. blockIdx.x < nk is Q, else K. Tree sum matches split-2.
+__global__ void supersonic_qwen35_decode_rec_qk_rms_kernel(
+    int nk,
+    int hkd,
+    int key_dim,
+    int conv_dim,
+    float* __restrict__ conv_out) {
+    const int is_k = static_cast<int>(blockIdx.x) >= nk;
+    const int h = is_k ? static_cast<int>(blockIdx.x) - nk
+                       : static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int src_off = (is_k ? key_dim : 0) + h * hkd;
+    const int dst_off = conv_dim + (is_k ? key_dim : 0) + h * hkd;
+    __shared__ float xs[256];
+    const float qv = (tid < hkd) ? conv_out[src_off + tid] : 0.0f;
+    xs[tid] = (tid < hkd) ? qv * qv : 0.0f;
+    __syncthreads();
+    const float q_sum = gqh_tree_sum(xs, hkd, tid);
+    const float inv = rsqrtf(q_sum + 1e-6f);
+    if (tid < hkd) {
+        float y = qv * inv;
+        if (!is_k) {
+            y *= 1.0f / sqrtf(static_cast<float>(hkd));
+        }
+        conv_out[dst_off + tid] = y;
     }
 }
 
@@ -9143,6 +9666,88 @@ __device__ __forceinline__ void qwen35_4b_hip_record_timing(
 ) {
     if (timing_slots != nullptr && threadIdx.x == 0) {
         atomicMax(&timing_slots[slot], clock64() - start_clock);
+    }
+}
+
+// Isolated so split-2 host-rec (flag 128) does not allocate st[256] in
+// the parent kernel. That array was 1024 B of scratch and crushed occupancy.
+template <typename T>
+__device__ __noinline__ void qwen35_split2_rec_st256(
+    int tid,
+    int h,
+    int hvd,
+    int hkd,
+    int h_k,
+    int v,
+    int key_dim,
+    int conv_dim,
+    int q_key_offset,
+    int k_key_offset,
+    int v_val_offset,
+    bool cache_kq,
+    bool head_local,
+    const float* b_f32_,
+    const float* a_f32_,
+    const T* dt_bw,
+    const T* ale_w,
+    float* sh,
+    float* conv_out,
+    float* k_s,
+    const float* q_s,
+    float v_conv,
+    float* attn_scratch_b_) {
+    if (tid >= hvd) {
+        return;
+    }
+    const float beta = 1.0f / (1.0f + expf(-b_f32_[h]));
+    float decay = 1.0f;
+    if (dt_bw != nullptr && ale_w != nullptr) {
+        const float sp = logf(1.0f + expf(
+            a_f32_[h] + supersonic_qwen35_to_float(dt_bw[h])));
+        const float g = -sp * supersonic_qwen35_to_float(ale_w[h]);
+        decay = expf(g);
+    }
+    float st[256];
+    const int nk_rec = hkd < 256 ? hkd : 256;
+    for (int k = 0; k < nk_rec; ++k) {
+        st[k] = sh[k * hvd + v];
+    }
+    for (int k = 0; k < nk_rec; ++k) {
+        st[k] *= decay;
+    }
+    float kv_mem_v = 0.0f;
+    for (int k = 0; k < nk_rec; ++k) {
+        const float kk = cache_kq
+            ? k_s[k]
+            : conv_out[k_key_offset + h_k * hkd + k];
+        kv_mem_v += st[k] * kk;
+    }
+    const float val = head_local
+        ? v_conv
+        : conv_out[v_val_offset + h * hvd + v];
+    const float delta = (val - kv_mem_v) * beta;
+    for (int k = 0; k < nk_rec; ++k) {
+        const float kk = cache_kq
+            ? k_s[k]
+            : conv_out[k_key_offset + h_k * hkd + k];
+        st[k] += kk * delta;
+    }
+    float out_v = 0.0f;
+    for (int k = 0; k < nk_rec; ++k) {
+        const float qq = cache_kq
+            ? q_s[k]
+            : conv_out[q_key_offset + h_k * hkd + k];
+        out_v += st[k] * qq;
+    }
+    for (int k = 0; k < nk_rec; ++k) {
+        sh[k * hvd + v] = st[k];
+    }
+    const float out_r = bf16_round_rne_f32_finite(out_v);
+    if (head_local) {
+        k_s[v] = out_r;
+        conv_out[conv_dim + key_dim * 2 + h * hvd + v] = out_r;
+    } else {
+        attn_scratch_b_[h * hvd + v] = out_r;
     }
 }
 
@@ -9737,12 +10342,14 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         __syncthreads();
                     }
                 } else {
-                    // Match component tiled prefill: wave32, 8 dims/lane,
-                    // shfl_down score, online softmax from -inf, F32 out.
+                    // Flash-decode: 8 warps split the KV axis, then merge
+                    // online-softmax stats. The previous path used one warp
+                    // of a 256-thread block and scanned every key serially.
                     const T* ck = static_cast<const T*>(kv_k_b);
                     const T* cv = static_cast<const T*>(kv_v_b);
-                    const int lane = tid;
-                    const bool do_attn = (lane < warpSize);
+                    const int lane = tid % warpSize;
+                    const int warp = tid / warpSize;
+                    const int nwarps = bs / warpSize;
 
                     for (int qh = blockIdx.x; qh < nh; qh += nb) {
                         const int kvh = qh / kv_groups;
@@ -9751,25 +10358,23 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                             static_cast<size_t>(kvh) * kv_max_b * hd;
 
                         float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                        float q_reg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                         int acc_dim[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
                         int acc_count = 0;
-                        if (do_attn) {
-                            for (int d = lane; d < hd && acc_count < 8;
-                                 d += warpSize) {
-                                acc_dim[acc_count++] = d;
-                            }
+                        for (int d = lane; d < hd && acc_count < 8;
+                             d += warpSize) {
+                            acc_dim[acc_count++] = d;
+                            q_reg[acc_count - 1] = q_head[d];
                         }
                         float m_i = -INFINITY;
                         float l_i = 0.0f;
-                        if (do_attn) {
-                        for (int t = 0; t < kv_len_b; ++t) {
+                        for (int t = warp; t < kv_len_b; t += nwarps) {
                             const size_t pos =
                                 kv_head_base + static_cast<size_t>(t) * hd;
                             float partial = 0.0f;
                             for (int i = 0; i < acc_count; ++i) {
-                                const int d = acc_dim[i];
-                                partial += q_head[d] *
-                                    supersonic_qwen35_to_float(ck[pos + d]);
+                                partial += q_reg[i] *
+                                    supersonic_qwen35_to_float(ck[pos + acc_dim[i]]);
                             }
                             const float score = __shfl(
                                 supersonic_qwen35_wave_sum(partial), 0) *
@@ -9782,8 +10387,8 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                                 score > m_old ? score : m_old;
                             const float alpha = (m_old == -INFINITY)
                                 ? 0.0f
-                                : expf(m_old - m_new);
-                            const float weight = expf(score - m_new);
+                                : __expf(m_old - m_new);
+                            const float weight = __expf(score - m_new);
                             l_i = l_i * alpha + weight;
                             m_i = m_new;
                             for (int i = 0; i < acc_count; ++i) {
@@ -9792,11 +10397,37 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                                 acc[i] = acc[i] * alpha + weight * v;
                             }
                         }
-                        const float inv = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+                        // Merge per-warp (m, l, acc) with the online-softmax
+                        // rescale identity. LDS layout: m[8] | l[8] | acc[8][8].
+                        if (lane == 0) {
+                            lds[warp] = m_i;
+                            lds[nwarps + warp] = l_i;
+                        }
+                        for (int i = 0; i < acc_count; ++i) {
+                            lds[2 * nwarps + warp * 8 + i] = acc[i];
+                        }
+                        __syncthreads();
+                        float m_all = -INFINITY;
+                        for (int w = 0; w < nwarps; ++w) {
+                            m_all = fmaxf(m_all, lds[w]);
+                        }
+                        float l_all = 0.0f;
+                        float acc_all[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                        for (int w = 0; w < nwarps; ++w) {
+                            const float m_w = lds[w];
+                            const float alpha = (m_w == -INFINITY)
+                                ? 0.0f
+                                : __expf(m_w - m_all);
+                            l_all += lds[nwarps + w] * alpha;
+                            for (int i = 0; i < acc_count; ++i) {
+                                acc_all[i] +=
+                                    lds[2 * nwarps + w * 8 + i] * alpha;
+                            }
+                        }
+                        const float inv = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
                         for (int i = 0; i < acc_count; ++i) {
                             attn_flat[qh * hd + acc_dim[i]] =
-                                bf16_round_rne_f32_finite(acc[i] * inv);
-                        }
+                                bf16_round_rne_f32_finite(acc_all[i] * inv);
                         }
                         __syncthreads();
                     }
@@ -10632,62 +11263,33 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         continue;
                     }
 
-                    if (tid < hvd) {
-                    const float beta = 1.0f / (1.0f + expf(-b_f32_[h]));
-                    float decay = 1.0f;
-                    if (dt_bw != nullptr && ale_w != nullptr) {
-                        const float sp = logf(1.0f + expf(
-                            a_f32_[h] + supersonic_qwen35_to_float(dt_bw[h])));
-                        const float g =
-                            -sp * supersonic_qwen35_to_float(ale_w[h]);
-                        decay = expf(g);
-                    }
-
-                    // Same register-file walk as delta_recurrent_prefill_impl
-                    // (MAX_K=256) so codegen matches the component kernel.
-                    float st[256];
-                    const int nk_rec = hkd < 256 ? hkd : 256;
-                    for (int k = 0; k < nk_rec; ++k) {
-                        st[k] = sh[k * hvd + v];
-                    }
-                    for (int k = 0; k < nk_rec; ++k) {
-                        st[k] *= decay;
-                    }
-                    float kv_mem_v = 0.0f;
-                    for (int k = 0; k < nk_rec; ++k) {
-                        const float kk = cache_kq
-                            ? k_s[k]
-                            : conv_out[k_key_offset + h_k * hkd + k];
-                        kv_mem_v += st[k] * kk;
-                    }
-                    const float val = head_local
-                        ? v_conv
-                        : conv_out[v_val_offset + h * hvd + v];
-                    const float delta = (val - kv_mem_v) * beta;
-                    for (int k = 0; k < nk_rec; ++k) {
-                        const float kk = cache_kq
-                            ? k_s[k]
-                            : conv_out[k_key_offset + h_k * hkd + k];
-                        st[k] += kk * delta;
-                    }
-                    float out_v = 0.0f;
-                    for (int k = 0; k < nk_rec; ++k) {
-                        const float qq = cache_kq
-                            ? q_s[k]
-                            : conv_out[q_key_offset + h_k * hkd + k];
-                        out_v += st[k] * qq;
-                    }
-                    for (int k = 0; k < nk_rec; ++k) {
-                        sh[k * hvd + v] = st[k];
-                    }
-
-                    const float out_r = bf16_round_rne_f32_finite(out_v);
-                    if (head_local) {
-                        k_s[v] = out_r;
-                        conv_out[conv_dim + key_dim * 2 + h * hvd + v] = out_r;
-                    } else {
-                        attn_scratch_b_[h * hvd + v] = out_r;
-                    }
+                    // kSplit==2 always host-launches rec (flag 128). Keep
+                    // st[256] out of this instantiation so mid has no scratch.
+                    if constexpr (kSplit != 2) {
+                    qwen35_split2_rec_st256<T>(
+                        tid,
+                        h,
+                        hvd,
+                        hkd,
+                        h_k,
+                        v,
+                        key_dim,
+                        conv_dim,
+                        q_key_offset,
+                        k_key_offset,
+                        v_val_offset,
+                        cache_kq,
+                        head_local,
+                        b_f32_,
+                        a_f32_,
+                        dt_bw,
+                        ale_w,
+                        sh,
+                        conv_out,
+                        k_s,
+                        q_s,
+                        v_conv,
+                        attn_scratch_b_);
                     }
                     __syncthreads();
                     if (head_local) {
@@ -10731,7 +11333,8 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
             // across that boundary (Hello 8192 today/? split).
             __threadfence();
 
-            if (!head_local) {
+            const bool host_rec_done = (kSplit == 2) && ((io_flags & 128) != 0);
+            if (!head_local && !host_rec_done) {
             {
                 // Step D: Per-head RMSNorm + weight + SiLU(z) gating.
                 // Sequential per-head sum stays on tid 0 (same order as
