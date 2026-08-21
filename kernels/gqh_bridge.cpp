@@ -19,13 +19,19 @@ std::unordered_set<const void*> g_gqh_ileave;
 std::unordered_map<const void*, uint8_t*> g_gqh_padded;
 std::vector<uint8_t*> g_gqh_padded_allocs;
 int g_gqh_row_off = 0;
+
+// Defined with the gate/up fusion block below. Issues any launch that block is
+// holding back; every bridge entry point calls it before doing anything else.
+int gqh_gemv_flush();
 }  // namespace
 
 extern "C" void supersonic_gqh_hip_set_row_off(int off) {
+    (void)gqh_gemv_flush();
     g_gqh_row_off = off < 0 ? 0 : off;
 }
 
 extern "C" void supersonic_gqh_hip_enable_tight_decode() {
+    (void)gqh_gemv_flush();
     g_gqh_allow_tight = true;
 }
 
@@ -513,13 +519,60 @@ void launch_gqh12_matvec(
         packed = gqh_decode_wire(packed);
         const int nsb = in_dim / GQH_SUPERBLOCK;
         const int ncols_in = (int)blocks.y;
-        // Fat-K / residual / lm_head / inproj: 4-wave. Skinny B>1 down
+        // Fat-K / residual / inproj: 4-wave. Skinny B>1 down
         // (nsb=68, out=5120) uses 8-wave blocks so fewer CTAs share x.
-        const int kTightWarps =
-            (ncols_in > 1 && nsb == 68 && out_dim == 5120) ? 8 : 4;
+        // The GQH2H lm_head (nsb=20, out=248320 -> 62080 4-wave blocks) also
+        // prefers 8-wave: 404 -> 413 GB/s (+2.2%, reproduced in two separate
+        // sweeps). It is the only nsb=20 shape that does -- out=17408 is -1.1%
+        // and out=12288 is -0.7% at 8 waves -- so the arm is gated on an
+        // out_dim no decode projection reaches.
+        const int kBaseWarps =
+            (ncols_in > 1 && nsb == 68 && out_dim == 5120) ||
+                (rung == GQH_RUNG_GQH2_H && nsb == 20 && out_dim >= 65536)
+            ? 8
+            : 4;
         const int ileave = gqh_is_ileave(packed) ? 1 : 0;
-        const bool dual =
-            out_dim > 5120 && (out_dim % (kTightWarps * 2)) == 0;
+        // kRows=2 shares one x float4 pair between two weight rows. That pays
+        // on the fat-K arms (nsb=68: 467 vs 430 GB/s for kRows=1) but loses on
+        // nsb=20, where halving the grid costs more than the x reuse buys.
+        // Measured kRows=1 vs kRows=2, nsb=20, gfx1201 (isolated, warm clocks,
+        // DRAM-only): out=6144 +5.7%, 10240 +6.9%, 12288 +8.0%, 17408 +7.5%,
+        // 248320 +3.5%. Needs the rows==1 && nsb_t==20 dispatch arms below --
+        // without them kRows=1 lands on the runtime-nsb instantiation and the
+        // -18% there swamps the win (that is why the iteration-1 attempt at
+        // this regressed).
+        const bool dual = out_dim > 5120 && nsb != 20 &&
+            (out_dim % (kBaseWarps * 2)) == 0;
+        // 2-wave blocks on the two GQH3 decode singles that measure faster
+        // with them (iteration 14, gfx1201, A/A-controlled, 5 passes, base
+        // column of an identical-TU driver so this is one kernel at two launch
+        // geometries):
+        //     tight<3,acc,68>  o=5120   482.9 -> 491.4 GB/s  +1.76%
+        //     tight<3,_,20>    o=10240  472.2 -> 474.4       +0.47%
+        // This is NOT an occupancy change: hipOccupancyMaxActiveBlocksPer-
+        // MultiprocessorS reports 64 waves/WGP = 16 waves/SIMD at 1, 2, 4 and
+        // 8 warps/block alike (96 B LDS), so wave count, per-wave bytes and
+        // per-wave quantum are all identical -- only block retire/refill
+        // granularity changes. That is what distinguishes it from Killed 2's
+        // kRows=2, which halved the wave count and doubled the quantum.
+        // Bit-exact by construction: each output row is still computed by one
+        // wave running the identical superblock loop; only the wave -> block
+        // packing moves.
+        // Gated to the two shapes that measured positive, and to GQH3:
+        //     tight<3,_,20>    o=6144   418.6 -> 412.5  -1.46%  (stays 4)
+        //     tight<3,acc,24>  o=5120   414.9 -> 415.0  +0.02%  (stays 4)
+        //     tight<2h,_,20>   o=12288  375.7 -> 356.4  -5.14%  (stays 4)
+        //     tight<2h,acc,68> o=5120   414.0 -> 407.5  -1.57%  (stays 4)
+        //     tight<2h,_,20>  lm_head   466.3 (w8) -> 458.7     (stays 8)
+        // The rung split is the same asymmetry the prefetch block records: 2H
+        // carries far more exposed compute per byte and reacts badly to any
+        // schedule perturbation. Requires !dual so the dual arm's grid math
+        // and its (out_dim % (kBaseWarps*2)) test are provably untouched.
+        const bool narrow2 = !dual && ncols_in == 1 &&
+            rung == GQH_RUNG_GQH3 &&
+            ((nsb == 68 && out_dim == 5120) ||
+             (nsb == 20 && out_dim == 10240));
+        const int kTightWarps = narrow2 ? 2 : kBaseWarps;
         static bool dumped_tight = false;
         if (!dumped_tight) {
             dumped_tight = true;
@@ -539,6 +592,13 @@ void launch_gqh12_matvec(
             tblocks.x = 1;
         }
         const dim3 tthreads(GQH_WARP * kTightWarps, 1, 1);
+        // Compile-time kNsb arms for every nsb the decode path launches:
+        // 20 (in=5120), 24 (in=6144), 68 (in=17408). Falling through to the
+        // runtime-nsb kNsb=0 instantiation loses the unrolled/strength-reduced
+        // superblock loop -- measured 338 -> 414 GB/s (+22.5%) at nsb=24,
+        // out=5120 on gfx1201. The rows==1 && nsb_t==20 arms are what a
+        // kRows=1 dispatch for in=5120 needs; without them it silently lands
+        // on kNsb=0 and loses more than the row change can win.
         auto launch12 = [&](auto /*tag*/, bool is3, int rows, bool is_pad, int nsb_t,
                             float4 mag) {
             if (is3 && rows == 2 && is_pad) {
@@ -571,6 +631,11 @@ void launch_gqh12_matvec(
                     tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
                     tensor_scale, mag, x_col_stride, y_col_stride, ileave,
                     g_gqh_row_off);
+            } else if (is3 && rows == 2 && nsb_t == 24) {
+                launch_gqh12_tight<true, kAcc, 2, false, 24>(
+                    tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
+                    tensor_scale, mag, x_col_stride, y_col_stride, ileave,
+                    g_gqh_row_off);
             } else if (is3 && rows == 2) {
                 launch_gqh12_tight<true, kAcc, 2, false, 0>(
                     tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
@@ -578,6 +643,16 @@ void launch_gqh12_matvec(
                     g_gqh_row_off);
             } else if (is3 && nsb_t == 68) {
                 launch_gqh12_tight<true, kAcc, 1, false, 68>(
+                    tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
+                    tensor_scale, mag, x_col_stride, y_col_stride, ileave,
+                    g_gqh_row_off);
+            } else if (is3 && nsb_t == 20) {
+                launch_gqh12_tight<true, kAcc, 1, false, 20>(
+                    tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
+                    tensor_scale, mag, x_col_stride, y_col_stride, ileave,
+                    g_gqh_row_off);
+            } else if (is3 && nsb_t == 24) {
+                launch_gqh12_tight<true, kAcc, 1, false, 24>(
                     tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
                     tensor_scale, mag, x_col_stride, y_col_stride, ileave,
                     g_gqh_row_off);
@@ -596,6 +671,11 @@ void launch_gqh12_matvec(
                     tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
                     tensor_scale, mag, x_col_stride, y_col_stride, ileave,
                     g_gqh_row_off);
+            } else if (rows == 2 && nsb_t == 24) {
+                launch_gqh12_tight<false, kAcc, 2, false, 24>(
+                    tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
+                    tensor_scale, mag, x_col_stride, y_col_stride, ileave,
+                    g_gqh_row_off);
             } else if (rows == 2) {
                 launch_gqh12_tight<false, kAcc, 2, false, 0>(
                     tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
@@ -603,6 +683,16 @@ void launch_gqh12_matvec(
                     g_gqh_row_off);
             } else if (nsb_t == 68) {
                 launch_gqh12_tight<false, kAcc, 1, false, 68>(
+                    tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
+                    tensor_scale, mag, x_col_stride, y_col_stride, ileave,
+                    g_gqh_row_off);
+            } else if (nsb_t == 20) {
+                launch_gqh12_tight<false, kAcc, 1, false, 20>(
+                    tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
+                    tensor_scale, mag, x_col_stride, y_col_stride, ileave,
+                    g_gqh_row_off);
+            } else if (nsb_t == 24) {
+                launch_gqh12_tight<false, kAcc, 1, false, 24>(
                     tblocks, tthreads, stream, packed, xv, yv, in_dim, out_dim,
                     tensor_scale, mag, x_col_stride, y_col_stride, ileave,
                     g_gqh_row_off);
@@ -717,6 +807,7 @@ extern "C" int supersonic_gqh_hip_decode(
     int cols,
     int dst_is_bf16,
     void* stream) {
+    (void)gqh_gemv_flush();
     const int shape_status = validate_shape(rung, rows, cols, grid_code);
     if (shape_status != 0) {
         return shape_status;
@@ -856,6 +947,7 @@ extern "C" int supersonic_gqh_hip_matvec(
     int64_t y_col_stride,
     float tensor_scale,
     int grid_code) {
+    (void)gqh_gemv_flush();
     const int shape_status = validate_shape(rung, out_dim, in_dim, grid_code);
     if (shape_status != 0) {
         return shape_status;
@@ -923,7 +1015,11 @@ extern "C" int supersonic_gqh_hip_matvec(
     return launch_result(421, 422);
 }
 
-extern "C" int supersonic_gqh_hip_matvec_stream(
+namespace {
+// The un-fused single-tensor GEMV launch. This used to be the body of
+// supersonic_gqh_hip_matvec_stream; the extern "C" entry point below wraps it
+// with the mixed-rung gate/up pairing.
+int gqh_gemv_launch_single(
     int device_ordinal,
     int rung,
     const void* wire,
@@ -1004,6 +1100,256 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
     return launch_result(421, 422);
 }
 
+// --- mixed-rung MLP gate/up fusion ---------------------------------------
+//
+// full_attention_bridge_4b.cpp takes the fused gate/up path only when
+// `gate_h.rung == up_h.rung`. On Qwen3.8-27B GQH ~28.5 of 64 layers per token
+// have gate=GQH3 and up=GQH2H, so they fall into the else branch: two separate
+// matvec_stream launches plus a host swiglu_f32. The fused kernel and its
+// <3,2h> / <2h,3> dispatch arms already exist and are dead code today. That
+// call site is not in this file, so recover the fusion here -- hold the first
+// launch of a pair that has already been *observed*, and when its partner
+// arrives issue gqh_matvec_pair_swiglu_kernel<..., kFuse=false> instead of the
+// two singles.
+//
+// Bit-exact: kFuse=false writes both fp32 accumulators (y = A.x, y_b = B.x)
+// with the same per-row product order as the singles, so the host's own
+// swiglu_f32 still runs on identical inputs. gfx1201, in=5120 out=17408
+// nsb=20 warps=4: 118.1 us fused vs 131.9 us for the two singles (+11.7%).
+//
+// Safety, in order of how much it matters:
+//  * A call is held only if its wire has already been seen being immediately
+//    followed by a pairable partner. The first occurrence of any pair runs
+//    unfused, so the pattern is learned, never assumed.
+//  * "Immediately followed" is enforced by clearing g_gemv_prev in every other
+//    bridge entry point -- all of which also flush a held launch first, so the
+//    stream order a caller sees is never reordered.
+//  * A call is held only if it would have passed every validation the single
+//    path applies, so holding cannot swallow an error status.
+//  * Held state is per-process and single-threaded, like g_gqh_tight above.
+struct GqhGemvArgs {
+    int device_ordinal;
+    int rung;
+    const void* wire;
+    const void* x;
+    void* y;
+    int in_dim;
+    int out_dim;
+    int ncols;
+    int64_t x_col_stride;
+    int64_t y_col_stride;
+    float tensor_scale;
+    int grid_code;
+    void* stream;
+    int row_off;
+};
+
+GqhGemvArgs g_gemv_prev{};
+bool g_gemv_prev_valid = false;
+GqhGemvArgs g_gemv_held{};
+bool g_gemv_held_valid = false;
+std::unordered_set<const void*> g_gemv_fusable;
+
+int gqh_gemv_launch_args(const GqhGemvArgs& a) {
+    return gqh_gemv_launch_single(
+        a.device_ordinal, a.rung, a.wire, a.x, a.y, a.in_dim, a.out_dim,
+        a.ncols, a.x_col_stride, a.y_col_stride, a.tensor_scale, a.grid_code,
+        a.stream);
+}
+
+// Everything the fused kernel needs from one half, plus everything the single
+// path validates -- so a held call can never turn into a late error.
+bool gqh_gemv_fusable(const GqhGemvArgs& a) {
+    if (!g_gqh_allow_tight || a.ncols != 1 || a.row_off != 0) {
+        return false;
+    }
+    if (a.rung != GQH_RUNG_GQH3 && a.rung != GQH_RUNG_GQH2_H) {
+        return false;
+    }
+    if (validate_shape(a.rung, a.out_dim, a.in_dim, a.grid_code) != 0) {
+        return false;
+    }
+    if (a.wire == nullptr || a.x == nullptr || a.y == nullptr) {
+        return false;
+    }
+    // nsb=20 only. gqh_matvec_pair_swiglu_kernel has compile-time kNsb arms
+    // for 20 and nothing else; falling through to the runtime-nsb kNsb=0
+    // instantiation costs ~18% (iteration 4), which would swamp the fusion.
+    if (a.in_dim != 20 * GQH_SUPERBLOCK) {
+        return false;
+    }
+    if (a.x_col_stride < a.in_dim || a.y_col_stride < a.out_dim) {
+        return false;
+    }
+    if ((reinterpret_cast<uintptr_t>(a.x) % sizeof(float4)) != 0 ||
+        ((a.x_col_stride * static_cast<int64_t>(sizeof(float))) %
+         static_cast<int64_t>(sizeof(float4))) != 0) {
+        return false;
+    }
+    return true;
+}
+
+// One kernel, one grid, one x: the two halves must agree on everything except
+// which weight tensor they read and where they write.
+bool gqh_gemv_pairable(const GqhGemvArgs& a, const GqhGemvArgs& b) {
+    return gqh_gemv_fusable(a) && gqh_gemv_fusable(b) &&
+        a.device_ordinal == b.device_ordinal && a.stream == b.stream &&
+        a.x == b.x && a.in_dim == b.in_dim && a.out_dim == b.out_dim &&
+        a.x_col_stride == b.x_col_stride &&
+        a.y_col_stride == b.y_col_stride && a.wire != b.wire && a.y != b.y;
+}
+
+// 0 on launch, non-zero when the fused arm is unavailable and the caller must
+// fall back to the two singles.
+int gqh_gemv_launch_pair(const GqhGemvArgs& a, const GqhGemvArgs& b) {
+    ScopedHipDevice scoped(a.device_ordinal);
+    hipStream_t hs = static_cast<hipStream_t>(a.stream);
+    auto* pa = static_cast<const uint8_t*>(a.wire);
+    auto* pb = static_cast<const uint8_t*>(b.wire);
+    gqh_ensure_tight(
+        const_cast<uint8_t*>(pa), a.in_dim, a.out_dim, a.rung, hs);
+    gqh_ensure_tight(
+        const_cast<uint8_t*>(pb), b.in_dim, b.out_dim, b.rung, hs);
+    // The pair kernel is tight-only, has no padded-AoS or interleaved arm, and
+    // !padded means gqh_decode_wire() is the identity here.
+    if (!gqh_is_tight(pa) || !gqh_is_tight(pb) || gqh_is_padded(pa) ||
+        gqh_is_padded(pb) || gqh_is_ileave(pa) || gqh_is_ileave(pb)) {
+        return 1;
+    }
+    // Mirror the single path's wave count so a fused pair never launches at a
+    // different occupancy than the two launches it replaces (GQH2H nsb=20 with
+    // out_dim >= 65536 -- the lm_head shape -- prefers 8).
+    // 2-wave blocks when either half is GQH3 (iteration 14; see the narrow2
+    // note on the tight singles for why this is not an occupancy change and
+    // why it is bit-exact). Measured on the shipped decode shape, nsb=20
+    // out=17408: pss<2h,3> 552.8 -> 558.5 GB/s (+1.03%). in_dim is pinned to
+    // nsb=20 by gqh_gemv_fusable() and this site is kCols=1 only, so the gate
+    // matches the measured arm exactly. A 2H/2H pair keeps its old count.
+    const bool narrow2 =
+        a.in_dim == 5120 &&
+        (a.rung == GQH_RUNG_GQH3 || b.rung == GQH_RUNG_GQH3);
+    const int kSwigluWarps =
+        (a.rung == GQH_RUNG_GQH2_H && b.rung == GQH_RUNG_GQH2_H &&
+         a.out_dim >= 65536)
+        ? 8
+        : (narrow2 ? 2 : 4);
+    dim3 sblocks(
+        static_cast<unsigned int>(
+            (a.out_dim + kSwigluWarps - 1) / kSwigluWarps),
+        1,
+        1);
+    if (sblocks.x == 0) {
+        sblocks.x = 1;
+    }
+    const dim3 sthreads(GQH_WARP * kSwigluWarps, 1, 1);
+    const bool a3 = a.rung == GQH_RUNG_GQH3;
+    const bool b3 = b.rung == GQH_RUNG_GQH3;
+    const float4 mag_a =
+        a3 ? load_gqh3_mag(a.grid_code) : load_gqh2h_mag(a.grid_code);
+    const float4 mag_b =
+        b3 ? load_gqh3_mag(b.grid_code) : load_gqh2h_mag(b.grid_code);
+    auto* xv = static_cast<const float*>(a.x);
+    auto* ya = static_cast<float*>(a.y);
+    auto* yb = static_cast<float*>(b.y);
+    // One line per distinct (a3, b3, out_dim) signature: the learned set is
+    // not just gate/up (k/v in the layer_type==1 branch pair too), so a single
+    // run has to say which arms actually fused.
+    static std::unordered_set<int64_t> dumped_split;
+    const int64_t sig = ((int64_t)a.out_dim << 2) | (a3 ? 2 : 0) | (b3 ? 1 : 0);
+    if (dumped_split.insert(sig).second) {
+        std::fprintf(
+            stderr,
+            "[gqh-gemv] split-pair fused a=%s b=%s in=%d out=%d warps=%d\n",
+            a3 ? "3" : "2h",
+            b3 ? "3" : "2h",
+            a.in_dim,
+            a.out_dim,
+            kSwigluWarps);
+    }
+    // in_dim is pinned to nsb=20 by gqh_gemv_fusable(), so these four arms are
+    // the whole dispatch.
+#define GQH_LAUNCH_SPLIT_PAIR(A, B)                                           \
+    hipLaunchKernelGGL(                                                       \
+        HIP_KERNEL_NAME(                                                      \
+            (gqh_matvec_pair_swiglu_kernel<A, B, 20, 1, false>)),              \
+        sblocks, sthreads, 0, hs, pa, pb, xv, ya, yb, a.in_dim, a.out_dim,     \
+        a.tensor_scale, b.tensor_scale, mag_a, mag_b, a.x_col_stride,          \
+        a.y_col_stride, 1)
+    if (a3 && b3) {
+        GQH_LAUNCH_SPLIT_PAIR(true, true);
+    } else if (a3) {
+        GQH_LAUNCH_SPLIT_PAIR(true, false);
+    } else if (b3) {
+        GQH_LAUNCH_SPLIT_PAIR(false, true);
+    } else {
+        GQH_LAUNCH_SPLIT_PAIR(false, false);
+    }
+#undef GQH_LAUNCH_SPLIT_PAIR
+    return 0;
+}
+
+int gqh_gemv_flush() {
+    g_gemv_prev_valid = false;
+    if (!g_gemv_held_valid) {
+        return 0;
+    }
+    const GqhGemvArgs held = g_gemv_held;
+    g_gemv_held_valid = false;
+    return gqh_gemv_launch_args(held);
+}
+}  // namespace
+
+extern "C" int supersonic_gqh_hip_matvec_stream(
+    int device_ordinal,
+    int rung,
+    const void* wire,
+    const void* x,
+    void* y,
+    int in_dim,
+    int out_dim,
+    int ncols,
+    int64_t x_col_stride,
+    int64_t y_col_stride,
+    float tensor_scale,
+    int grid_code,
+    void* stream) {
+    const GqhGemvArgs cur{device_ordinal, rung,          wire,
+                          x,              y,             in_dim,
+                          out_dim,        ncols,         x_col_stride,
+                          y_col_stride,   tensor_scale,  grid_code,
+                          stream,         g_gqh_row_off};
+    if (g_gemv_held_valid) {
+        const GqhGemvArgs held = g_gemv_held;
+        g_gemv_held_valid = false;
+        g_gemv_prev_valid = false;
+        if (gqh_gemv_pairable(held, cur)) {
+            if (gqh_gemv_launch_pair(held, cur) == 0) {
+                return launch_result(421, 422);
+            }
+            const int st = gqh_gemv_launch_args(held);
+            return st != 0 ? st : gqh_gemv_launch_args(cur);
+        }
+        const int st = gqh_gemv_launch_args(held);
+        if (st != 0) {
+            return st;
+        }
+    }
+    if (g_gemv_prev_valid && gqh_gemv_pairable(g_gemv_prev, cur)) {
+        g_gemv_fusable.insert(g_gemv_prev.wire);
+    }
+    if (gqh_gemv_fusable(cur) &&
+        g_gemv_fusable.find(cur.wire) != g_gemv_fusable.end()) {
+        g_gemv_held = cur;
+        g_gemv_held_valid = true;
+        g_gemv_prev_valid = false;
+        return 0;
+    }
+    const int st = gqh_gemv_launch_args(cur);
+    g_gemv_prev = cur;
+    g_gemv_prev_valid = st == 0;
+    return st;
+}
+
 extern "C" int supersonic_gqh_hip_matvec_stream_acc(
     int device_ordinal,
     int rung,
@@ -1018,6 +1364,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
     float tensor_scale,
     int grid_code,
     void* stream) {
+    (void)gqh_gemv_flush();
     const int shape_status = validate_shape(rung, out_dim, in_dim, grid_code);
     if (shape_status != 0) {
         return shape_status;
@@ -1091,6 +1438,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
     int ncols,
     int64_t x_col_stride,
     int64_t y_col_stride) {
+    (void)gqh_gemv_flush();
     const bool a_ok = rung_a == GQH_RUNG_GQH3 || rung_a == GQH_RUNG_GQH2_H ||
         rung_a == GQH_RUNG_GQH4;
     const bool b_ok = rung_b == GQH_RUNG_GQH3 || rung_b == GQH_RUNG_GQH2_H ||
@@ -1243,8 +1591,16 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
         const dim3 tthreads(GQH_WARP * kTightWarps, 1, 1);
         const size_t tlds = 0;
         if (fuse_swiglu && !dual && ileave == 0 && out_dim == out_b_eff) {
-            constexpr int kSwigluWarps = 4;
             const bool pair_skinny = ncols > 1 && ncols <= 4;
+            // 2-wave blocks for the kCols=1 (decode) GQH3 pair; see the
+            // narrow2 note on the tight singles. Measured nsb=20 out=17408:
+            // ps<3,3> 565.8 -> 571.9 GB/s (+1.08%). Restricted to ncols == 1
+            // and in_dim == 5120 so the B>1 / skinny arms keep the geometry
+            // their own sweeps chose.
+            const bool pair_narrow2 = !pair_skinny && ncols == 1 &&
+                in_dim == 5120 &&
+                (rung_a == GQH_RUNG_GQH3 || rung_b == GQH_RUNG_GQH3);
+            const int kSwigluWarps = pair_narrow2 ? 2 : 4;
             dim3 sblocks(
                 static_cast<unsigned int>(
                     (out_dim + kSwigluWarps - 1) / kSwigluWarps),
@@ -1284,168 +1640,168 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, true, 20, 3>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && b3 && nsb_t == 20 && cols == 4) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, true, 20, 4>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && b3 && nsb_t == 20) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, true, 20, 1>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && b3 && cols == 3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, true, 0, 3>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && b3 && cols == 4) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, true, 0, 4>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && b3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, true, 0, 1>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && nsb_t == 20 && cols == 3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, false, 20, 3>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && nsb_t == 20 && cols == 4) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, false, 20, 4>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && nsb_t == 20) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, false, 20, 1>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && cols == 3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, false, 0, 3>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3 && cols == 4) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, false, 0, 4>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (a3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<true, false, 0, 1>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (b3 && nsb_t == 20 && cols == 3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, true, 20, 3>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (b3 && nsb_t == 20 && cols == 4) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, true, 20, 4>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (b3 && nsb_t == 20) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, true, 20, 1>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (b3 && cols == 3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, true, 0, 3>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (b3 && cols == 4) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, true, 0, 4>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (b3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, true, 0, 1>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (nsb_t == 20 && cols == 3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, false, 20, 3>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (nsb_t == 20 && cols == 4) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, false, 20, 4>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (nsb_t == 20) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, false, 20, 1>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (cols == 3) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, false, 0, 3>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else if (cols == 4) {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, false, 0, 4>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 } else {
                     hipLaunchKernelGGL(
                         HIP_KERNEL_NAME(
                             (gqh_matvec_pair_swiglu_kernel<false, false, 0, 1>)),
-                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, in_dim,
+                        sblocks, sthreads, tlds, hs, pa, pb, xv, ya, (float*)nullptr, in_dim,
                         out_dim, scale_a, scale_b, mag_a, mag_b, x_col_stride,
                         y_col_stride, ncols);
                 }
@@ -1622,6 +1978,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_ab(
     int grid_a,
     int grid_b,
     void* stream) {
+    (void)gqh_gemv_flush();
     const bool a_ok = rung_a == GQH_RUNG_GQH3 || rung_a == GQH_RUNG_GQH2_H;
     const bool b_ok = rung_b == GQH_RUNG_GQH3 || rung_b == GQH_RUNG_GQH2_H;
     if (!a_ok || !b_ok) {
@@ -1706,6 +2063,7 @@ extern "C" int supersonic_gqh_hip_mix_matvec_stream(
     int mode,
     const float* lut,
     void* stream) {
+    (void)gqh_gemv_flush();
     if (wire == nullptr || x == nullptr || y == nullptr || lut == nullptr) {
         return 405;
     }
@@ -1764,6 +2122,7 @@ extern "C" int supersonic_gqh_hip_ensure_tight(
     void* wire,
     int in_dim,
     int out_dim) {
+    (void)gqh_gemv_flush();
     if (wire == nullptr) {
         return 405;
     }
@@ -1778,6 +2137,7 @@ extern "C" int supersonic_gqh_hip_ensure_padded(
     void* wire,
     int in_dim,
     int out_dim) {
+    (void)gqh_gemv_flush();
     if (wire == nullptr) {
         return 405;
     }
