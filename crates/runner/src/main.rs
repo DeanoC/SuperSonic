@@ -2,165 +2,39 @@
 
 mod backend_runtime;
 mod bakes;
-mod certified_kv;
 mod cli;
 mod decode_engine;
-mod dflash_ddtree;
-mod flm_model_source;
-mod flm_tokenizer;
 mod model_files;
-mod oracle;
-mod policy;
-mod prefill_engine;
 mod profiling;
-mod qwen35_alt_runtime;
-mod qwen35_component_decode;
-mod qwen35_decode_batch;
-mod qwen35_decode_loop;
-mod qwen35_decode_modes;
 mod qwen35_decode_report;
-mod qwen35_decode_single;
-mod qwen35_decode_traces;
-mod qwen35_decode_util;
-mod qwen35_decode_validation;
-mod qwen35_dflash_engine;
 mod qwen35_engine_setup;
-mod qwen35_kv_trace;
-mod qwen35_oracle_prefill_trace;
 mod qwen35_prefill;
-mod qwen35_prefill_validation_report;
 mod qwen35_runtime;
 mod qwen35_startup;
-mod qwen35_trace;
-mod qwen35_trace_utils;
-mod qwen35_validation;
-mod qwen35_virtual_kv;
-mod qwen35_vram;
-#[path = "qwen36_moe/mod.rs"]
-mod qwen36_moe_cli;
-#[path = "qwen36_moe/decode.rs"]
-mod qwen36_moe_decode;
-#[path = "qwen36_moe/logits.rs"]
-mod qwen36_moe_logits;
-#[path = "qwen36_moe/mtp.rs"]
-mod qwen36_moe_mtp;
-#[path = "qwen36_moe/persistent_decode.rs"]
-mod qwen36_moe_persistent_decode;
-#[path = "qwen36_moe/residency.rs"]
-mod qwen36_moe_residency;
-#[path = "qwen36_moe/residency_pages.rs"]
-mod qwen36_moe_residency_pages;
-#[path = "qwen36_moe/residency_types.rs"]
-mod qwen36_moe_residency_types;
-#[path = "qwen36_moe/speculative.rs"]
-mod qwen36_moe_speculative;
-#[path = "qwen36_moe/state.rs"]
-mod qwen36_moe_state;
-#[path = "qwen36_moe/telemetry.rs"]
-mod qwen36_moe_telemetry;
-#[path = "qwen36_moe/types.rs"]
-mod qwen36_moe_types;
 mod registry;
-mod specprefill;
-mod specprefill_engine;
-mod tensor_bytes;
-mod validate;
 
 use anyhow::Result;
 use clap::Parser;
 
-pub(crate) use backend_runtime::resolve_oracle_device;
-use backend_runtime::{
-    install_arch_profile, lookup_registry_entry, query_gpu_info, resolve_backend,
-};
-pub(crate) use bakes::{should_fetch_exact_bake, try_download_bake};
-pub(crate) use cli::Cli;
-pub(crate) use model_files::{load_tokenizer, resolve_prompt_token_ids};
-use policy::{
-    q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags,
-    validate_specprefill_flags,
-};
-use profiling::MetalProfileScope;
+use backend_runtime::{install_arch_profile, lookup_registry_entry, query_gpu_info};
+use cli::Cli;
+use model_files::validate_input_contract;
 use qwen35_runtime::run_qwen35;
-use registry::ModelFamily;
-use supersonic_core::backend::{BackendChoice, BACKEND_CHOICES};
+use registry::Backend;
+
 fn main() -> Result<()> {
-    let model_arg_present = bakes::cli_args_include_model(std::env::args_os());
     let cli = Cli::parse();
-    let _metal_profile_scope = MetalProfileScope::new();
-    let ordinal = cli.device;
-    let backend_choice = BackendChoice::parse(&cli.backend).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Unknown backend '{}'. Expected one of: {}",
-            cli.backend,
-            BACKEND_CHOICES
-        )
-    })?;
-    let backend = resolve_backend(backend_choice, ordinal)?;
-    gpu_hal::set_backend(backend);
 
-    // 1. Resolve model variant from explicit CLI choice or a self-contained FLM descriptor.
-    let model_variant = bakes::resolve_model_variant(&cli, model_arg_present)?;
+    // Keep all artifact/configuration errors on the host side. This must run
+    // before HIP setup or any registry/engine path that can allocate buffers.
+    validate_input_contract(&cli)?;
 
-    validate_global_flags(&cli, &model_variant, backend)?;
-    let q4km_like = q4km_like(&cli);
-    // 2. Detect GPU
-    let gpu = query_gpu_info(backend, ordinal)?;
-
-    // 3. Registry lookup
-    let entry = lookup_registry_entry(
-        &model_variant,
-        backend,
-        &gpu.gpu_arch,
-        cli.allow_untested_gpu.as_deref(),
-    )?;
-    validate_gfx942_policy(&cli, &model_variant, backend, &gpu.gpu_arch)?;
+    // HIP is implicit in the product contract; there is no backend argument
+    // or environment fallback in public startup.
+    gpu_hal::set_backend(Backend::Hip);
+    let gpu = query_gpu_info(cli.device)?;
+    let entry = lookup_registry_entry(&gpu.gpu_arch)?;
     install_arch_profile(entry);
 
-    // Run before family dispatch so DFlash flags are not silently ignored by
-    // non-Qwen branches.
-    validate_dflash_flags(&cli, &model_variant)?;
-    validate_specprefill_flags(&cli, &model_variant, backend)?;
-
-    if cli.teacher_forced {
-        match model_variant.family() {
-            ModelFamily::Qwen35 => {}
-            ModelFamily::Qwen36Moe => {
-                anyhow::bail!("Qwen3.6-MoE teacher-forced out of Phase 1 scope")
-            }
-            other => anyhow::bail!("{other} is not part of the slim HIP/Qwen CLI"),
-        }
-    }
-
-    match model_variant.family() {
-        ModelFamily::Qwen36Moe => {
-            // Route Qwen3.6-MoE through the SpecPrefill orchestrator when the
-            // drafter flag is set, so the cross-family R1 path
-            // (Qwen3.5-0.8B drafter -> Qwen3.6-35B-A3B target) actually engages.
-            // Without this branch `--specprefill-draft-dir` would be silently
-            // ignored — the dense MoE path runs and the user gets no signal.
-            if cli.specprefill_draft_dir.is_some() {
-                specprefill_engine::run_specprefill(
-                    &cli,
-                    &model_variant,
-                    entry,
-                    ordinal,
-                    gpu.total_vram,
-                )
-            } else {
-                qwen36_moe_cli::run(&cli, entry, gpu.total_vram)
-            }
-        }
-        ModelFamily::Qwen35 => run_qwen35(
-            &cli,
-            &model_variant,
-            entry,
-            backend,
-            gpu.gpu_arch,
-            ordinal,
-            gpu.total_vram,
-            q4km_like,
-        ),
-        other => anyhow::bail!("{other} is not part of the slim HIP/Qwen CLI"),
-    }
+    run_qwen35(&cli, entry, cli.device)
 }

@@ -11,10 +11,8 @@
 //! root present, the same files get compiled once into the library crate
 //! (`runner::…`) for external consumers.
 
-#[path = "certified_kv.rs"]
-mod certified_kv;
 pub mod cli;
-pub use cli::Cli;
+pub use cli::{parse_cli_from, Cli};
 
 #[cfg(feature = "bughunt")]
 pub mod backend_runtime;
@@ -24,6 +22,8 @@ pub mod decode_engine;
 pub mod dflash_ddtree;
 pub mod flm_model_source;
 pub mod flm_tokenizer;
+pub mod model_files;
+pub use model_files::validate_input_contract;
 pub mod oracle;
 pub mod prefill_engine;
 pub mod profile;

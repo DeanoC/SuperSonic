@@ -1,61 +1,15 @@
 use anyhow::Result;
 
 use crate::decode_engine::DecodeStageTimings;
-use crate::Cli;
-
 pub(crate) struct Qwen35DecodeReport<'a> {
     pub(crate) tokenizer: &'a tokenizers::Tokenizer,
     pub(crate) prompt_ids: &'a [u32],
     pub(crate) generated_ids: &'a [u32],
     pub(crate) emit_generated_json: bool,
     pub(crate) decode_ms: f64,
-    pub(crate) max_delta: f32,
-    pub(crate) gpu_max_delta: f32,
-    pub(crate) batch_size: usize,
     pub(crate) emit_stage_timings: bool,
     pub(crate) native_decode_timings: &'a DecodeStageTimings,
     pub(crate) native_decode_timing_steps: usize,
-}
-
-pub(crate) fn emit_qwen35_last_logits_if_requested(cli: &Cli, logits: &[f32]) {
-    if !cli.dump_last_logits {
-        return;
-    }
-
-    // Hello 8192 split is 3242 ("today") vs 30 ("?"). Print the pair plus
-    // argmax so we can compare SuperSonic vs lucebox without a 248k dump.
-    if !logits.is_empty() {
-        let (argmax, max_v) = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| {
-                a.1.partial_cmp(b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.0.cmp(&a.0))
-            })
-            .map(|(i, v)| (i, *v))
-            .unwrap_or((0, 0.0));
-        let v30 = logits.get(30).copied().unwrap_or(f32::NAN);
-        let v32 = logits.get(32).copied().unwrap_or(f32::NAN);
-        let v2014 = logits.get(2014).copied().unwrap_or(f32::NAN);
-        let v3242 = logits.get(3242).copied().unwrap_or(f32::NAN);
-        eprintln!(
-            "[logits] argmax={argmax} v={max_v} tok30={v30} tok32={v32} tok2014={v2014} tok3242={v3242} delta_A_minus_An={} delta_today_minus_q={}",
-            v32 - v2014,
-            v3242 - v30
-        );
-    }
-
-    use std::io::Write as _;
-    print!("\nLAST_LOGITS: ");
-    for (i, x) in logits.iter().enumerate() {
-        if i > 0 {
-            print!(",");
-        }
-        print!("{}", x);
-    }
-    println!();
-    std::io::stdout().flush().ok();
 }
 
 pub(crate) fn emit_qwen35_decode_report(report: Qwen35DecodeReport<'_>) -> Result<()> {
@@ -91,7 +45,7 @@ pub(crate) fn emit_qwen35_decode_report(report: Qwen35DecodeReport<'_>) -> Resul
             .join(" ")
     );
     eprintln!(
-        "[result] prompt_tokens={} generated_tokens={} decode_ms={:.0} ms_per_tok={:.0} decode_max_delta={:.4} gpu_oracle_max_delta={:.4} batch_size={}",
+        "[result] prompt_tokens={} generated_tokens={} decode_ms={:.0} ms_per_tok={:.0}",
         report.prompt_ids.len(),
         report.generated_ids.len(),
         report.decode_ms,
@@ -100,9 +54,6 @@ pub(crate) fn emit_qwen35_decode_report(report: Qwen35DecodeReport<'_>) -> Resul
         } else {
             report.decode_ms / report.generated_ids.len() as f64
         },
-        report.max_delta,
-        report.gpu_max_delta,
-        report.batch_size,
     );
     if report.emit_stage_timings {
         emit_qwen35_stage_timings(
