@@ -11,6 +11,11 @@
 //! root present, the same files get compiled once into the library crate
 //! (`runner::…`) for external consumers.
 
+#[path = "certified_kv.rs"]
+mod certified_kv;
+pub mod cli;
+pub use cli::Cli;
+
 #[cfg(feature = "bughunt")]
 pub mod backend_runtime;
 #[cfg(feature = "bughunt")]
