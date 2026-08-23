@@ -45,7 +45,7 @@ FORBIDDEN_MTP_TERMS = (
 # historical ABI symbols outside `crates/runtime` are therefore not in scope.
 FORBIDDEN_MTP_ENV_RE = re.compile(
     r"\bSUPERSONIC_(?:DFLASH[A-Z0-9_]*|METALV2[A-Z0-9_]*|"
-    r"METAL_V2[A-Z0-9_]*|QWEN35_[A-Z0-9_]*MTP[A-Z0-9_]*)\b",
+    r"METAL_V2[A-Z0-9_]*|QWEN35_?[A-Z0-9_]*MTP[A-Z0-9_]*)\b",
     re.IGNORECASE,
 )
 FORBIDDEN_KERNEL_PRODUCT_RE = re.compile(r"qwen\s*3[.]5", re.IGNORECASE)
@@ -161,12 +161,12 @@ def _decode_rust_escape(source: str, slash: int) -> tuple[str, int]:
         return "x", index + 1
 
     if escaped == "u" and index + 1 < len(source) and source[index + 1] == "{":
-        close = source.find("}", index + 2, index + 9)
+        close = source.find("}", index + 2)
         if close >= 0:
-            digits = source[index + 2 : close]
+            digits = source[index + 2 : close].replace("_", "")
             if 1 <= len(digits) <= 6 and all(char in _HEX_DIGITS for char in digits):
                 codepoint = int(digits, 16)
-                if codepoint <= 0x10FFFF:
+                if codepoint <= 0x10FFFF and not 0xD800 <= codepoint <= 0xDFFF:
                     return chr(codepoint), close + 1
         return "u", index + 1
 
@@ -201,6 +201,69 @@ def _parse_raw_string(source: str, quote: int, hashes: int) -> tuple[str, int]:
     if content_end < 0:
         return source[content_start:], len(source)
     return source[content_start:content_end], content_end + len(closing)
+
+
+def _skip_rust_space_and_comments(source: str, start: int) -> int:
+    index = start
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+            continue
+        if source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline
+            continue
+        if source.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < len(source) and depth:
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            continue
+        break
+    return index
+
+
+def _parse_concat_macro(source: str, name_end: int) -> tuple[str, int] | None:
+    index = _skip_rust_space_and_comments(source, name_end)
+    if index >= len(source) or source[index] != "!":
+        return None
+    index = _skip_rust_space_and_comments(source, index + 1)
+    if index >= len(source) or source[index] != "(":
+        return None
+    index += 1
+    values: list[str] = []
+    while True:
+        index = _skip_rust_space_and_comments(source, index)
+        if index >= len(source):
+            return None
+        if source[index] == ")":
+            return "".join(values), index + 1
+
+        raw_opener = _raw_string_opener(source, index)
+        if raw_opener is not None:
+            quote, hashes = raw_opener
+            value, index = _parse_raw_string(source, quote, hashes)
+        else:
+            quote = _normal_string_quote(source, index)
+            if quote is None:
+                return None
+            value, index = _parse_normal_string(source, quote)
+        values.append(value)
+
+        index = _skip_rust_space_and_comments(source, index)
+        if index < len(source) and source[index] == ",":
+            index += 1
+            continue
+        if index < len(source) and source[index] == ")":
+            return "".join(values), index + 1
+        return None
 
 
 def _char_literal_end(source: str, start: int) -> int | None:
@@ -256,7 +319,12 @@ def _lex_rust(source: str) -> list[_RustLexeme]:
 
         if source[index] == "'":
             end = _char_literal_end(source, index)
-            index = end if end is not None else index + 1
+            if end is not None:
+                index = end
+            elif index + 1 < len(source) and _is_identifier_start(source[index + 1]):
+                _, index = _consume_identifier(source, index + 1)
+            else:
+                index += 1
             continue
 
         if source.startswith("r#", index) and index + 2 < len(source):
@@ -266,8 +334,15 @@ def _lex_rust(source: str) -> list[_RustLexeme]:
                 continue
 
         if _is_identifier_start(source[index]):
+            token_start = index
             value, index = _consume_identifier(source, index)
-            lexemes.append(_RustLexeme("identifier", value, index - len(value)))
+            if value == "concat":
+                parsed = _parse_concat_macro(source, index)
+                if parsed is not None:
+                    value, index = parsed
+                    lexemes.append(_RustLexeme("string", value, token_start))
+                    continue
+            lexemes.append(_RustLexeme("identifier", value, token_start))
             continue
 
         index += 1
@@ -325,7 +400,9 @@ def _legacy_identifier_reason(identifier: str) -> str | None:
     if "metalv2" in normalized and has_mtp:
         return "metalv2/mtp legacy identifier"
 
-    if "dflash" in parts:
+    if "dflash" in parts or any(
+        part.startswith("dflash") and part[6:7].isdigit() for part in parts
+    ):
         return "standalone dflash legacy identifier"
     if _has_compound(parts, ("metal", "v2")) or any(
         part.startswith("metalv2") for part in parts

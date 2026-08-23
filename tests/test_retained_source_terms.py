@@ -172,6 +172,54 @@ class RetainedSourceTermsTests(unittest.TestCase):
             violations,
         )
 
+    def test_lexer_edge_cases_for_escapes_suffixes_lifetimes_and_concat(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crates" / "runtime" / "src"
+            runtime.mkdir(parents=True)
+            (runtime / "edge_cases.rs").write_text(
+                "fn dflash2_cache() {}\n"
+                "fn DFlash2Cache() {}\n"
+                "fn r#dflash2_cache() {}\n"
+                "fn lifetime_only<'dflash, 'mtp>() {}\n"
+                "fn lifetime_label() { 'dflash: loop { break 'dflash; } }\n"
+                "fn actual_dflash_after_lifetime() {}\n"
+                "let escaped = \"SUPERSONIC_\\u{4_4}FLASH_PROFILE\";\n"
+                "let concat_qwen = concat!(\n"
+                "    \"SUPERSONIC_\", /* split legacy control */\n"
+                "    \"qwen35\", \"mtp_PROFILE\",\n"
+                ");\n"
+                "let assembled_control = concat!(\"SUPERSONIC_\", \"D\", \"FLASH_PROFILE\",);\n"
+                "let no_separator = \"superSONIC_qwen35mtp_profile\";\n"
+                "let raw_no_separator = r#\"SUPERSONIC_QWEN35MTP_PROFILE\"#;\n"
+                "// 'dflash 'mtp SUPERSONIC_DFLASH are historical prose only.\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        terms = [term for _, _, term, _ in violations]
+        rendered = "\n".join(terms)
+        for term in (
+            "dflash2_cache",
+            "DFlash2Cache",
+            "SUPERSONIC_DFLASH_PROFILE",
+            "SUPERSONIC_qwen35mtp_PROFILE",
+            "SUPERSONIC_DFLASH_PROFILE",
+            "superSONIC_qwen35mtp_profile",
+            "SUPERSONIC_QWEN35MTP_PROFILE",
+            "actual_dflash_after_lifetime",
+        ):
+            self.assertIn(term, rendered)
+        self.assertNotIn("dflash\n", rendered)
+        self.assertNotIn("mtp\n", rendered)
+        self.assertEqual(
+            {path for path, *_ in violations},
+            {Path("crates/runtime/src/edge_cases.rs")},
+            violations,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
