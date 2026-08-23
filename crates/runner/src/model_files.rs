@@ -544,6 +544,10 @@ fn validate_wire_size(file: &model_store::gguf::GgufFile, name: &str, qtype: u32
             .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
             .and_then(|elements| elements.checked_mul(4))
             .ok_or_else(|| anyhow::anyhow!("{name} F32 byte length overflows"))?
+    } else if qtype == 11 {
+        model_store::q3k::row_bytes(tensor.dims[0])?
+            .checked_mul(tensor.dims[1])
+            .ok_or_else(|| anyhow::anyhow!("{name} Q3_K byte length overflows"))?
     } else {
         qwen35::weights::ggml_k_row_bytes(qtype as i32, tensor.dims[0])
             .and_then(|row| row.checked_mul(tensor.dims[1]))

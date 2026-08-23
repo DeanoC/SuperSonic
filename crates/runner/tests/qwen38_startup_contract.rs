@@ -406,3 +406,18 @@ fn accepts_real_qwen38_artifact_when_available() {
     validate_input_contract(&cli(model_dir, gguf))
         .expect("the approved Qwen3.8 GQH artifact must pass host preflight");
 }
+
+#[test]
+fn accepts_q3k_token_embedding_variant_when_available() {
+    let model_dir = Path::new("/data/models/Qwen3.8-27B");
+    let gguf = Path::new("/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf");
+    if !model_dir.join("config.json").is_file()
+        || !model_dir.join("tokenizer.json").is_file()
+        || !gguf.is_file()
+    {
+        return;
+    }
+
+    validate_input_contract(&cli(model_dir, gguf))
+        .expect("the Q3_K token-embedding Qwen3.8 variant must pass host preflight");
+}
