@@ -78,6 +78,15 @@ class _RustLexeme:
         self.offset = offset
 
 
+class _ConcatResult:
+    __slots__ = ("value", "end", "unknown")
+
+    def __init__(self, value: str, end: int, unknown: bool) -> None:
+        self.value = value
+        self.end = end
+        self.unknown = unknown
+
+
 _SIMPLE_RUST_ESCAPES = {
     "0": "\0",
     "\\": "\\",
@@ -88,6 +97,17 @@ _SIMPLE_RUST_ESCAPES = {
     "t": "\t",
 }
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_INTEGER_LITERAL_RE = re.compile(
+    r"(?P<body>0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*|"
+    r"0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|[0-9](?:_?[0-9])*)"
+    r"(?P<suffix>u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize)?"
+)
+_FLOAT_LITERAL_RE = re.compile(
+    r"(?P<body>(?:[0-9](?:_?[0-9])*\.(?:[0-9](?:_?[0-9])*)?"
+    r"(?:[eE][+-]?[0-9](?:_?[0-9])*)?|"
+    r"[0-9](?:_?[0-9])*[eE][+-]?[0-9](?:_?[0-9])*))"
+    r"(?P<suffix>f32|f64)?"
+)
 
 
 def _is_identifier_start(char: str) -> bool:
@@ -307,7 +327,7 @@ def _matching_rust_group_end(source: str, opener: int) -> int | None:
     return None
 
 
-def _parse_concat_macro(source: str, name_end: int) -> tuple[str, int] | None:
+def _parse_concat_macro(source: str, name_end: int) -> _ConcatResult | None:
     index = _skip_rust_space_and_comments(source, name_end)
     if index >= len(source) or source[index] != "!":
         return None
@@ -321,25 +341,31 @@ def _parse_concat_macro(source: str, name_end: int) -> tuple[str, int] | None:
     body_end = group_end - 1
     index += 1
     values: list[str] = []
+    unknown = False
     while index < body_end:
         index = _skip_rust_space_and_comments(source, index)
         if index >= body_end:
             break
-        if source[index] in _RUST_GROUP_OPENERS:
-            return None
 
-        raw_opener = _raw_string_opener(source, index)
-        if raw_opener is not None:
-            quote, hashes = raw_opener
-            value, index = _parse_raw_string(source, quote, hashes)
+        if source[index] == ",":
+            unknown = True
+            index += 1
+            continue
+
+        literal = _parse_concat_literal(source, index, body_end)
+        if literal is not None:
+            value, index = literal
+            values.append(value)
         else:
-            quote = _normal_string_quote(source, index)
-            if quote is None:
-                return None
-            value, index = _parse_normal_string(source, quote)
-        if index > body_end:
-            return None
-        values.append(value)
+            unknown = True
+            next_index = _skip_concat_argument(source, index, body_end)
+            if next_index <= index:
+                index += 1
+            else:
+                observed = _collect_concat_argument_text(source, index, next_index)
+                if observed:
+                    values.append(observed)
+                index = next_index
 
         index = _skip_rust_space_and_comments(source, index)
         if index == body_end:
@@ -347,9 +373,20 @@ def _parse_concat_macro(source: str, name_end: int) -> tuple[str, int] | None:
         if source[index] == ",":
             index += 1
             continue
-        return None
+        unknown = True
+        next_index = _skip_concat_argument(source, index, body_end)
+        if next_index <= index:
+            break
+        index = next_index
+        if index < body_end and source[index] == ",":
+            index += 1
 
-    return "".join(values), group_end
+    value = "".join(values)
+    if unknown:
+        if "SUPERSONIC_" not in value.upper():
+            return None
+        return _ConcatResult(value, group_end, True)
+    return _ConcatResult(value, group_end, False)
 
 
 def _char_literal_end(source: str, start: int) -> int | None:
@@ -363,6 +400,199 @@ def _char_literal_end(source: str, start: int) -> int | None:
     if index < len(source) and source[index] == "'":
         return index + 1
     return None
+
+
+def _parse_char_literal(source: str, start: int) -> tuple[str, int] | None:
+    end = _char_literal_end(source, start)
+    if end is None:
+        return None
+    if source[start + 1] == "\\":
+        value, _ = _decode_rust_escape(source, start + 1)
+        return value, end
+    return source[start + 1], end
+
+
+def _parse_numeric_literal(source: str, start: int) -> tuple[str, int] | None:
+    float_match = _FLOAT_LITERAL_RE.match(source, start)
+    if float_match is not None:
+        end = float_match.end()
+        if end < len(source) and (
+            _is_identifier_continue(source[end]) or source[end] == "."
+        ):
+            return None
+        return float_match.group("body").replace("_", ""), end
+
+    integer_match = _INTEGER_LITERAL_RE.match(source, start)
+    if integer_match is None:
+        return None
+    end = integer_match.end()
+    if end < len(source) and (
+        _is_identifier_continue(source[end]) or source[end] == "."
+    ):
+        return None
+
+    body = integer_match.group("body").replace("_", "")
+    if body.lower().startswith("0x"):
+        base = 16
+    elif body.lower().startswith("0o"):
+        base = 8
+    elif body.lower().startswith("0b"):
+        base = 2
+    else:
+        base = 10
+    return str(int(body, base)), end
+
+
+def _parse_concat_literal(
+    source: str, start: int, body_end: int
+) -> tuple[str, int] | None:
+    raw_opener = _raw_string_opener(source, start)
+    if raw_opener is not None:
+        if source.startswith(("br", "cr"), start):
+            return None
+        quote, hashes = raw_opener
+        value, end = _parse_raw_string(source, quote, hashes)
+        if end <= body_end:
+            return value, end
+        return None
+
+    if source[start] == '"':
+        value, end = _parse_normal_string(source, start)
+        if end <= body_end:
+            return value, end
+        return None
+    if source.startswith(("b\"", "c\""), start):
+        return None
+
+    if source[start] == "'":
+        literal = _parse_char_literal(source, start)
+        if literal is not None and literal[1] <= body_end:
+            return literal
+        return None
+
+    numeric = _parse_numeric_literal(source, start)
+    if numeric is not None and numeric[1] <= body_end:
+        return numeric
+
+    if source.startswith("r#", start):
+        return None
+    if _is_identifier_start(source[start]):
+        value, end = _consume_identifier(source, start)
+        if value in {"true", "false"} and end <= body_end:
+            return value, end
+    return None
+
+
+def _collect_concat_argument_text(source: str, start: int, end: int) -> str:
+    """Collect decoded literal text nested inside an unsupported argument."""
+
+    values: list[str] = []
+    index = start
+    while index < end:
+        if source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = end if newline < 0 else min(newline, end)
+            continue
+        if source.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < end and depth:
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            continue
+
+        raw_opener = _raw_string_opener(source, index)
+        if raw_opener is not None:
+            quote, hashes = raw_opener
+            value, next_index = _parse_raw_string(source, quote, hashes)
+            if next_index <= index or next_index > end:
+                break
+            values.append(value)
+            index = next_index
+            continue
+
+        quote = _normal_string_quote(source, index)
+        if quote is not None:
+            value, next_index = _parse_normal_string(source, quote)
+            if next_index <= index or next_index > end:
+                break
+            values.append(value)
+            index = next_index
+            continue
+
+        if source[index] == "'":
+            char_literal = _parse_char_literal(source, index)
+            if char_literal is not None and char_literal[1] <= end:
+                values.append(char_literal[0])
+                index = char_literal[1]
+                continue
+        index += 1
+    return "".join(values)
+
+
+def _skip_concat_argument(source: str, start: int, body_end: int) -> int:
+    """Skip an unsupported concat argument to its top-level comma or close."""
+
+    index = start
+    while index < body_end:
+        if source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = body_end if newline < 0 else min(newline, body_end)
+            continue
+        if source.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < body_end and depth:
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            continue
+
+        raw_opener = _raw_string_opener(source, index)
+        if raw_opener is not None:
+            quote, hashes = raw_opener
+            _, end = _parse_raw_string(source, quote, hashes)
+            if end <= index or end > body_end:
+                return body_end
+            index = end
+            continue
+
+        quote = _normal_string_quote(source, index)
+        if quote is not None:
+            _, end = _parse_normal_string(source, quote)
+            if end <= index or end > body_end:
+                return body_end
+            index = end
+            continue
+
+        if source[index] == "'":
+            char_end = _char_literal_end(source, index)
+            if char_end is not None:
+                index = char_end
+                continue
+
+        if source[index] in _RUST_GROUP_OPENERS:
+            nested_end = _matching_rust_group_end(source, index)
+            if nested_end is None or nested_end > body_end:
+                return body_end
+            index = nested_end
+            continue
+
+        if source[index] == ",":
+            return index
+        index += 1
+    return body_end
 
 
 def _lex_rust(source: str) -> list[_RustLexeme]:
@@ -420,8 +650,9 @@ def _lex_rust(source: str) -> list[_RustLexeme]:
                 if value == "concat":
                     parsed = _parse_concat_macro(source, index)
                     if parsed is not None:
-                        value, index = parsed
-                        lexemes.append(_RustLexeme("string", value, token_start))
+                        index = parsed.end
+                        kind = "unknown_concat" if parsed.unknown else "string"
+                        lexemes.append(_RustLexeme(kind, parsed.value, token_start))
                         continue
                 lexemes.append(_RustLexeme("identifier", value, token_start))
                 continue
@@ -432,8 +663,9 @@ def _lex_rust(source: str) -> list[_RustLexeme]:
             if value == "concat":
                 parsed = _parse_concat_macro(source, index)
                 if parsed is not None:
-                    value, index = parsed
-                    lexemes.append(_RustLexeme("string", value, token_start))
+                    index = parsed.end
+                    kind = "unknown_concat" if parsed.unknown else "string"
+                    lexemes.append(_RustLexeme(kind, parsed.value, token_start))
                     continue
             lexemes.append(_RustLexeme("identifier", value, token_start))
             continue
@@ -523,6 +755,11 @@ def _legacy_mtp_violations(
         if lexeme.kind == "identifier":
             if _legacy_identifier_reason(lexeme.value) is not None:
                 violations.append((relative, line_number, lexeme.value, line))
+            continue
+        if lexeme.kind == "unknown_concat":
+            match = FORBIDDEN_MTP_ENV_RE.search(lexeme.value)
+            term = match.group(0) if match else lexeme.value
+            violations.append((relative, line_number, term, line))
             continue
         match = FORBIDDEN_MTP_ENV_RE.search(lexeme.value)
         if match:

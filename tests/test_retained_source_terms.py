@@ -275,6 +275,61 @@ class RetainedSourceTermsTests(unittest.TestCase):
             violations,
         )
 
+    def test_concat_renders_char_numeric_and_bool_literals_for_all_forms(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crates" / "runtime" / "src"
+            runtime.mkdir(parents=True)
+            source = (
+                "let parens = concat!(\"SUPERSONIC_\", \"D\", \"FLASH_PROFILE\", 'x');\n"
+                "let brackets = concat![\"SUPERSONIC_\", \"D\", \"FLASH_PROFILE\", '\\x78'];\n"
+                "let braces = concat!{\"SUPERSONIC_\", \"D\", \"FLASH_PROFILE\", '\\u{78}'};\n"
+                "let raw_parens = r#concat!(\"SUPERSONIC_\", \"D\", \"FLASH_PROFILE\", 'x');\n"
+                "let raw_brackets = r#concat![\"SUPERSONIC_\", \"D\", \"FLASH_PROFILE\", '\\x78'];\n"
+                "let raw_braces = r#concat!{\"SUPERSONIC_\", \"D\", \"FLASH_PROFILE\", '\\u{78}'};\n"
+                "let supported = concat!(\"SUPERSONIC_\", \"D\", \"FLASH_PROFILE\", '\\x78', 42u8, 3.50f32, true, false);\n"
+                "let unrelated = concat!(\"hello\", 'x', 42u32, 3.50f64, true, false);\n"
+            )
+            (runtime / "literal_arguments.rs").write_text(source, encoding="utf-8")
+
+            violations = checker.find_violations(root)
+            lexemes = checker._lex_rust(source)
+
+        terms = [term for _, _, term, _ in violations]
+        rendered = "\n".join(terms)
+        self.assertEqual(terms.count("SUPERSONIC_DFLASH_PROFILEx"), 6, rendered)
+        self.assertIn(
+            "SUPERSONIC_DFLASH_PROFILEx423.50truefalse",
+            [lexeme.value for lexeme in lexemes if lexeme.kind == "string"],
+        )
+        self.assertNotIn("hello", rendered)
+
+    def test_concat_unknown_arguments_fail_closed_only_with_supersonic_prefix(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crates" / "runtime" / "src"
+            runtime.mkdir(parents=True)
+            (runtime / "unknown_arguments.rs").write_text(
+                "fn unknown_fragment() -> &'static str { \"D\" }\n"
+                "let after = concat!(\"SUPERSONIC_\", unknown_fragment());\n"
+                "let before = concat!(unknown_fragment(), \"SUPERSONIC_\");\n"
+                "let split = concat![\"SUPER\", \"SONIC_\", unknown_fragment()];\n"
+                "let unsupported = r#concat!{\"SUPERSONIC_\", b\"D\"};\n"
+                "let unsupported_prefix = concat!(b\"SUPERSONIC_\", unknown_fragment());\n"
+                "let unrelated = concat!(\"hello\", unknown_fragment(), b\"world\");\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        terms = [term for _, _, term, _ in violations]
+        prefix_terms = [term for term in terms if "SUPERSONIC_" in term.upper()]
+        self.assertEqual(len(prefix_terms), 5, violations)
+        self.assertTrue(all("SUPERSONIC_" in term.upper() for term in prefix_terms))
+        self.assertNotIn("hello", "\n".join(terms))
+
 
 if __name__ == "__main__":
     unittest.main()
