@@ -522,6 +522,10 @@ fn rung7c_gqh_large_m_dequant_gemm_matches_fused() {
     std::env::remove_var("SUPERSONIC_GQH_FORCE_FUSED");
     let mut gemm = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n]).expect("gemm");
     matmul_gqh(ordinal, m, n, k, &x, w, qtype, &mut gemm).expect("gemm");
+    // Dequant+GEMM queues hipBLAS work on a non-default stream. Cross that
+    // stream boundary before the direct D2H read so release timing cannot
+    // observe the output buffer before GEMM has completed.
+    kernel_ffi::gqh::gemm_flush();
 
     let decode = |buf: &GpuBuffer| -> Vec<f32> {
         buf.to_host_bytes()
