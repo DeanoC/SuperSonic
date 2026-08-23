@@ -220,6 +220,61 @@ class RetainedSourceTermsTests(unittest.TestCase):
             violations,
         )
 
+    def test_concat_uses_all_rust_delimiters_and_raw_identifiers(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crates" / "runtime" / "src"
+            runtime.mkdir(parents=True)
+            (runtime / "concat_delimiters.rs").write_text(
+                "let parens = concat!(\n"
+                "    \"SUPERSONIC_\", /* ) ] } /* nested ( [ { */ */\n"
+                "    \"D\", \"FLASH_PARENS_PROFILE\",\n"
+                ");\n"
+                "let brackets = concat![\n"
+                "    \"SUPERSONIC_\", // ] } )\n"
+                "    \"METAL\", \"V2_BRACKET_PROFILE\",\n"
+                "];\n"
+                "let braces = concat! {\n"
+                "    \"SUPERSONIC_\", /* { [ ( ] } ) */\n"
+                "    \"QWEN35\", \"MTP_BRACE_PROFILE\",\n"
+                "};\n"
+                "let raw_parens = r#concat!(\n"
+                "    \"SUPERSONIC_\", \"D\", \"FLASH_RAW_PARENS_PROFILE\",\n"
+                ");\n"
+                "let raw_brackets = r#concat /* between raw id and bang */ ![\n"
+                "    \"SUPERSONIC_\", \"METAL\", \"V2_RAW_BRACKET_PROFILE\",\n"
+                "];\n"
+                "let raw_braces = r#concat!{\n"
+                "    \"SUPERSONIC_\", /* nested /* ( [ { */ */\n"
+                "    \"QWEN35\", \"MTP_RAW_BRACE_PROFILE\",\n"
+                "};\n"
+                "fn r#concat_suffix() {}\n"
+                "fn r#concat() {}\n"
+                "fn r#dflash_cache() {}\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        rendered = "\n".join(term for _, _, term, _ in violations)
+        for term in (
+            "SUPERSONIC_DFLASH_PARENS_PROFILE",
+            "SUPERSONIC_METALV2_BRACKET_PROFILE",
+            "SUPERSONIC_QWEN35MTP_BRACE_PROFILE",
+            "SUPERSONIC_DFLASH_RAW_PARENS_PROFILE",
+            "SUPERSONIC_METALV2_RAW_BRACKET_PROFILE",
+            "SUPERSONIC_QWEN35MTP_RAW_BRACE_PROFILE",
+            "dflash_cache",
+        ):
+            self.assertIn(term, rendered)
+        self.assertNotIn("concat_suffix", rendered)
+        self.assertEqual(
+            {path for path, *_ in violations},
+            {Path("crates/runtime/src/concat_delimiters.rs")},
+            violations,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

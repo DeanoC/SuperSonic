@@ -230,21 +230,103 @@ def _skip_rust_space_and_comments(source: str, start: int) -> int:
     return index
 
 
+_RUST_GROUP_CLOSERS = {"(": ")", "[": "]", "{": "}"}
+_RUST_GROUP_OPENERS = frozenset(_RUST_GROUP_CLOSERS)
+
+
+def _matching_rust_group_end(source: str, opener: int) -> int | None:
+    """Return the end of a balanced Rust delimiter group, if it is valid."""
+
+    first_close = _RUST_GROUP_CLOSERS.get(source[opener])
+    if first_close is None:
+        return None
+
+    expected_closers = [first_close]
+    index = opener + 1
+    while index < len(source):
+        if source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline
+            continue
+
+        if source.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < len(source) and depth:
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                return None
+            continue
+
+        raw_opener = _raw_string_opener(source, index)
+        if raw_opener is not None:
+            quote, hashes = raw_opener
+            closing = '"' + ("#" * hashes)
+            content_end = source.find(closing, quote + 1)
+            if content_end < 0:
+                return None
+            index = content_end + len(closing)
+            continue
+
+        quote = _normal_string_quote(source, index)
+        if quote is not None:
+            _, end = _parse_normal_string(source, quote)
+            if end <= quote or end > len(source) or source[end - 1] != '"':
+                return None
+            index = end
+            continue
+
+        if source[index] == "'":
+            char_end = _char_literal_end(source, index)
+            if char_end is not None:
+                index = char_end
+                continue
+
+        char = source[index]
+        if char in _RUST_GROUP_OPENERS:
+            expected_closers.append(_RUST_GROUP_CLOSERS[char])
+            index += 1
+            continue
+        if char in _RUST_GROUP_CLOSERS.values():
+            if char != expected_closers[-1]:
+                return None
+            expected_closers.pop()
+            index += 1
+            if not expected_closers:
+                return index
+            continue
+        index += 1
+
+    return None
+
+
 def _parse_concat_macro(source: str, name_end: int) -> tuple[str, int] | None:
     index = _skip_rust_space_and_comments(source, name_end)
     if index >= len(source) or source[index] != "!":
         return None
     index = _skip_rust_space_and_comments(source, index + 1)
-    if index >= len(source) or source[index] != "(":
+    if index >= len(source) or source[index] not in _RUST_GROUP_OPENERS:
         return None
+
+    group_end = _matching_rust_group_end(source, index)
+    if group_end is None:
+        return None
+    body_end = group_end - 1
     index += 1
     values: list[str] = []
-    while True:
+    while index < body_end:
         index = _skip_rust_space_and_comments(source, index)
-        if index >= len(source):
+        if index >= body_end:
+            break
+        if source[index] in _RUST_GROUP_OPENERS:
             return None
-        if source[index] == ")":
-            return "".join(values), index + 1
 
         raw_opener = _raw_string_opener(source, index)
         if raw_opener is not None:
@@ -255,15 +337,19 @@ def _parse_concat_macro(source: str, name_end: int) -> tuple[str, int] | None:
             if quote is None:
                 return None
             value, index = _parse_normal_string(source, quote)
+        if index > body_end:
+            return None
         values.append(value)
 
         index = _skip_rust_space_and_comments(source, index)
-        if index < len(source) and source[index] == ",":
+        if index == body_end:
+            break
+        if source[index] == ",":
             index += 1
             continue
-        if index < len(source) and source[index] == ")":
-            return "".join(values), index + 1
         return None
+
+    return "".join(values), group_end
 
 
 def _char_literal_end(source: str, start: int) -> int | None:
@@ -329,8 +415,15 @@ def _lex_rust(source: str) -> list[_RustLexeme]:
 
         if source.startswith("r#", index) and index + 2 < len(source):
             if _is_identifier_start(source[index + 2]):
+                token_start = index
                 value, index = _consume_identifier(source, index)
-                lexemes.append(_RustLexeme("identifier", value, index - len(value)))
+                if value == "concat":
+                    parsed = _parse_concat_macro(source, index)
+                    if parsed is not None:
+                        value, index = parsed
+                        lexemes.append(_RustLexeme("string", value, token_start))
+                        continue
+                lexemes.append(_RustLexeme("identifier", value, token_start))
                 continue
 
         if _is_identifier_start(source[index]):
