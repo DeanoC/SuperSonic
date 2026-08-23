@@ -3,80 +3,14 @@
 version = 1
 
 [[entry]]
-id = "hip-gfx1100-qwen35-all-lanes"
-backend = "hip"
-arch = "gfx1100"
-status = "validated"
-models = ["qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b"]
-quants = ["bf16", "int4", "fp8-runtime", "kv-fp8"]
-support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
-gate_scripts = ["tests/gfx1100/run_matrix.sh"]
-benchmark_doc = "docs/benchmarks.md#bench-perf"
-notes = "RDNA3 7900 XTX Qwen3.5 lanes are the mature HIP baseline."
-
-[[entry]]
-id = "hip-gfx1100-qwen36-27b"
-backend = "hip"
-arch = "gfx1100"
-status = "experimental"
-models = ["qwen3.6-27b"]
-quants = ["int4"]
-support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
-notes = "Dense hybrid 27B product lane. Same kernel geometry as Qwen3.8-27B."
-
-[[entry]]
 id = "hip-gfx1100-qwen38-27b"
 backend = "hip"
 arch = "gfx1100"
 status = "experimental"
 models = ["qwen3.8-27b"]
-quants = ["int4"]
-model_sources = ["flm"]
+quants = ["gqh"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
-notes = "Qwen3.8-27B is the same dense hybrid geometry as Qwen3.6-27B. Prefer FLM (GGUF conversion) via --model qwen3.8-27b."
-
-[[entry]]
-id = "hip-gfx1100-qwen36-35b-a3b-int4"
-backend = "hip"
-arch = "gfx1100"
-status = "experimental"
-models = ["qwen3.6-35b-a3b"]
-quants = ["int4"]
-support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
-notes = "MoE scale-up lane. FLM-first."
-
-[[entry]]
-id = "hip-gfx1100-qwen36-35b-a3b-flm-int4"
-backend = "hip"
-arch = "gfx1100"
-status = "experimental"
-models = ["qwen3.6-35b-a3b"]
-quants = ["int4"]
-model_sources = ["flm"]
-support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
-notes = "First-class no-HF FLM lane."
-
-[[entry]]
-id = "hip-gfx1201-qwen35-tbm"
-backend = "hip"
-arch = "gfx1201"
-status = "tbm"
-models = ["qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b"]
-quants = ["bf16", "int4", "fp8-runtime", "kv-fp8"]
-support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
-gate_scripts = ["tests/gfx1201/run_matrix.sh"]
-notes = "Registered and buildable on RDNA4."
-
-[[entry]]
-id = "hip-gfx1201-qwen36-27b-int4"
-backend = "hip"
-arch = "gfx1201"
-status = "validated"
-models = ["qwen3.6-27b"]
-quants = ["int4"]
-support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
-gate_scripts = ["tests/gfx1201/run_matrix.sh"]
-notes = "R9700 dense 27B lane."
+notes = "Qwen3.8-27B custom GQH GGUF lane."
 
 [[entry]]
 id = "hip-gfx1201-qwen38-27b"
@@ -84,34 +18,6 @@ backend = "hip"
 arch = "gfx1201"
 status = "experimental"
 models = ["qwen3.8-27b"]
-quants = ["int4"]
-model_sources = ["flm"]
+quants = ["gqh"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
-notes = "Qwen3.8-27B on R9700; same HIP 4B-kernel path as 3.6-27B."
-
-[[entry]]
-id = "hip-gfx1150-qwen35-all-lanes"
-backend = "hip"
-arch = "gfx1150"
-status = "validated"
-models = ["qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b"]
-quants = ["bf16", "int4", "fp8-runtime", "kv-fp8"]
-support_doc = "docs/supported-matrix.md#hip-on-gfx1150"
-gate_scripts = [
-  "tests/gfx1150/run.sh",
-  "tests/gfx1150/run_4b.sh",
-  "tests/gfx1150/run_4b_fp8.sh",
-  "tests/gfx1150/run_quant_regression.sh",
-]
-notes = "RDNA3.5 iGPU correctness lane."
-
-[[entry]]
-id = "hip-gfx942-qwen36-35b-a3b-int4"
-backend = "hip"
-arch = "gfx942"
-status = "experimental"
-models = ["qwen3.6-35b-a3b"]
-quants = ["int4"]
-support_doc = "docs/supported-matrix.md#hip-on-gfx942"
-gate_scripts = ["tests/gfx942/run_qwen36_verify_suite.sh"]
-notes = "CDNA3 host-orchestrated chained decode path."
+notes = "Qwen3.8-27B custom GQH GGUF lane on R9700."

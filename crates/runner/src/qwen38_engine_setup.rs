@@ -2,29 +2,20 @@ use anyhow::Result;
 
 use crate::bakes::load_qwen38_weights;
 use crate::decode_engine::DecodeEngine;
-use crate::registry::{self, Qwen35KernelParams, RegistryEntry};
+use crate::registry::Qwen38KernelParams;
 use crate::Cli;
 
-pub(crate) struct Qwen35EngineSetup {
+pub(crate) struct Qwen38EngineSetup {
     pub(crate) engine: DecodeEngine,
 }
 
-pub(crate) fn install_qwen35_launch_preset(entry: &RegistryEntry) {
-    let preset = registry::qwen35_4b_launch_preset(&entry.arch, &entry.model);
-    let (blocks, cooperative) = preset.unwrap_or((0, false));
-    kernel_ffi::set_qwen35_4b_launch_preset(blocks, cooperative);
-    if let Some((blocks, cooperative)) = preset {
-        eprintln!("[preset] qwen3.8 4B launch: blocks={blocks} cooperative={cooperative}");
-    }
-}
-
-pub(crate) fn load_qwen35_engine(
+pub(crate) fn load_qwen38_engine(
     cli: &Cli,
-    text_config: &qwen35::config::TextConfig,
-    params: &Qwen35KernelParams,
+    text_config: &qwen38::config::TextConfig,
+    params: &Qwen38KernelParams,
     ordinal: usize,
     context_tokens: usize,
-) -> Result<Qwen35EngineSetup> {
+) -> Result<Qwen38EngineSetup> {
     let t0 = std::time::Instant::now();
     let weights = load_qwen38_weights(cli, text_config, ordinal)?;
     eprintln!(
@@ -33,7 +24,7 @@ pub(crate) fn load_qwen35_engine(
     );
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
-    let required_attn_scratch = qwen35::scratch::required_attn_scratch_floats(
+    let required_attn_scratch = qwen38::scratch::required_attn_scratch_floats(
         text_config.num_attention_heads,
         text_config.head_dim,
         context_tokens,
@@ -69,5 +60,5 @@ pub(crate) fn load_qwen35_engine(
         eprintln!("[qwen38-mtp] loaded NextN blk.64 (pass --speculative-decode to enable)");
     }
 
-    Ok(Qwen35EngineSetup { engine })
+    Ok(Qwen38EngineSetup { engine })
 }

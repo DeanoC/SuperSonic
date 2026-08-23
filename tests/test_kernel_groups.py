@@ -19,7 +19,7 @@ RETAINED_SOURCE_ROOTS = (
     ROOT / "crates" / "core" / "src",
     ROOT / "crates" / "gpu-hal" / "src",
     ROOT / "crates" / "kernel-ffi" / "src",
-    ROOT / "crates" / "qwen35" / "src",
+    ROOT / "crates" / "qwen38" / "src",
     ROOT / "crates" / "runtime" / "src",
     ROOT / "kernels",
 )
@@ -129,7 +129,7 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
         api_files = (
             ROOT / "crates" / "kernel-ffi" / "src" / "lib.rs",
             ROOT / "crates" / "kernel-ffi" / "src" / "prefill_ffi.rs",
-            ROOT / "crates" / "kernel-ffi" / "src" / "qwen35.rs",
+            ROOT / "crates" / "kernel-ffi" / "src" / "qwen38.rs",
             ROOT / "crates" / "gpu-hal" / "src" / "backend.rs",
             ROOT / "crates" / "gpu-hal" / "src" / "lib.rs",
         )
@@ -165,7 +165,7 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
         for path in (
             HAL_OPS,
             HAL_VMM,
-            KERNEL_FFI_SRC / "qwen35.rs",
+            KERNEL_FFI_SRC / "qwen38.rs",
         ):
             source = path.read_text(encoding="utf-8")
             self.assertNotIn(

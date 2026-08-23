@@ -1,5 +1,5 @@
 //! Qwen3.8 GGUF → SuperSonic role map and packed weight load.
-//! NextN/MTP `blk.64` is loaded into [`Qwen35Weights::mtp`] when present.
+//! NextN/MTP `blk.64` is loaded into [`Qwen38Weights::mtp`] when present.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,7 +13,7 @@ use model_store::gqh::{self, GqhHeader, GqhRung};
 use crate::config::TextConfig;
 use crate::weights::{
     ggml_k_row_bytes, FullWeights, LayerKind, LayerWeights, LinearWeights, MtpWeights,
-    Qwen35Weights, LOWBIT_GGML_Q2_K, LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K,
+    Qwen38Weights, LOWBIT_GGML_Q2_K, LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K,
     LOWBIT_GGML_Q8_0, LOWBIT_ROCMFP2_MIX, LOWBIT_ROCMFP3_MIX,
 };
 
@@ -500,7 +500,7 @@ pub fn load_weights(
     file: &GgufFile,
     config: &TextConfig,
     ordinal: usize,
-) -> Result<Qwen35Weights, model_store::Error> {
+) -> Result<Qwen38Weights, model_store::Error> {
     check_mapping(file, config).map_err(err)?;
     let hidden = config.hidden_size;
     let mut headers = BTreeMap::new();
@@ -760,7 +760,7 @@ pub fn load_weights(
         eprintln!("[qwen38-mtp] loaded NextN blk.64 (shared embed/lm_head)");
     }
 
-    Ok(Qwen35Weights {
+    Ok(Qwen38Weights {
         config,
         weight_prefix: "gguf".to_string(),
         embed_tokens,

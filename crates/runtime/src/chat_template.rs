@@ -1,6 +1,6 @@
 //! Load and render the chat template shipped with the model.
 //!
-//! Both Qwen3.5 and Gemma 4 bundle a Jinja chat template in
+//! Both Qwen3.8 and Gemma 4 bundle a Jinja chat template in
 //! `tokenizer_config.json`. The template expects variables like `messages`
 //! and `add_generation_prompt`, and commonly references `bos_token` /
 //! `eos_token`. We parse it once at startup with `minijinja` and render per

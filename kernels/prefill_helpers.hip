@@ -1,4 +1,4 @@
-// Prefill-specific helper kernels.
+// Qwen3.8 prefill-specific helper kernels.
 // Kept in a separate compilation unit to avoid touching the decode megakernel
 // files (hipcc codegen sensitivity on gfx1150).
 
@@ -181,7 +181,7 @@ __global__ void pfx_argmax_f32_as_bf16_rows_kernel(
 // Applies RoPE in-place on tensor with layout [seq_len, num_heads, head_dim].
 // Only the first rotary_dim dimensions of each head are rotated.
 // cos_table/sin_table: [max_pos, half_rot] where half_rot = rotary_dim / 2.
-// Qwen3.5 uses rotate_half over the rotary slice:
+// Qwen3.8 uses rotate_half over the rotary slice:
 // new[i]            = old[i] * cos[i] - old[i + half_rot] * sin[i]
 // new[i + half_rot] = old[i] * sin[i] + old[i + half_rot] * cos[i]
 

@@ -130,6 +130,8 @@ fn write_gqh_gguf(path: &Path, tensors: &[FixtureTensor<'_>], headers: &[(&str, 
 
     write_string(&mut bytes, "general.architecture");
     bytes.extend_from_slice(&8u32.to_le_bytes());
+    // The fixture models the historical architecture ID in the GQH wire
+    // schema; public startup accepts it only for a Qwen3.8 artifact.
     write_string(&mut bytes, "qwen35");
     write_string(&mut bytes, "general.basename");
     bytes.extend_from_slice(&8u32.to_le_bytes());

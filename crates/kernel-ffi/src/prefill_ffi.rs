@@ -1,6 +1,10 @@
 //! FFI bindings for prefill kernels.
 //! These are component kernels (not megakernels) — the prefill engine
 //! orchestrates them layer by layer.
+//!
+//! The `supersonic_qwen35_*` names in the extern block are historical HIP
+//! bridge symbols and remain solely as an external ABI contract; all Rust
+//! callers and product types use Qwen3.8 terminology.
 
 use std::collections::BTreeMap;
 use std::ffi::{c_int, c_void};
@@ -1367,7 +1371,7 @@ pub fn fused_rms_norm_linear_rows(
                 hidden_dim,
                 out_dim,
                 eps,
-                1, // add_unit_offset (Qwen3.5 uses w + 1.0)
+                1, // Qwen3.8 norm convention: apply (w + 1.0) * x.
                 hidden_ptr,
                 norm_weight.as_ptr(),
                 proj_weight.as_ptr(),
@@ -2275,7 +2279,7 @@ pub fn device_supports_wmma_i8(ordinal: usize) -> Result<bool, GpuError> {
 // ---- Multi-row RMSNorm (for prefill — n_rows > 1) ----
 
 /// RMSNorm on multiple rows. Each row is independently normalized.
-/// Qwen3.5 uses add_unit_offset=1 (weight applied as (w + 1.0) * x).
+/// Qwen3.8 uses add_unit_offset=1 (weight applied as (w + 1.0) * x).
 pub fn rms_norm_rows(
     ordinal: usize,
     dtype: ScalarType,

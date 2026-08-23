@@ -15,20 +15,23 @@ kernel_sources = [
   "kernels/prefill_helpers.hip",
 ]
 rust_modules = [
-  "crates/kernel-ffi/src/qwen35.rs",
+  "crates/kernel-ffi/src/qwen38.rs",
   "crates/kernel-ffi/src/prefill_ffi.rs",
 ]
 
 [[group.bridge]]
 source = "kernels/full_attention_bridge.cpp"
+# Historical bridge object name retained for link/ABI compatibility.
 object = "qwen35_megakernel_hip.o"
 
 [[group.bridge]]
 source = "kernels/full_attention_bridge_4b.cpp"
+# Historical bridge object name retained for link/ABI compatibility.
 object = "qwen35_4b_megakernel_hip.o"
 
 [[group.bridge]]
 source = "kernels/prefill_helpers_bridge.cpp"
+# Historical bridge object name retained for link/ABI compatibility.
 object = "qwen35_prefill_helpers_hip.o"
 
 [[group]]

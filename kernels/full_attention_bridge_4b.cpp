@@ -1,5 +1,9 @@
 #include "full_attention_4b.hip"
 
+// This bridge serves the Qwen3.8 product. qwen35-prefixed kernel/C symbols
+// remain only as historical bridge ABI spellings and are not compatibility
+// aliases for another model.
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>

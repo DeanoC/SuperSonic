@@ -8,10 +8,10 @@ use std::{env, ffi::c_void};
 use anyhow::Result;
 use gpu_hal::{copy_h2d, Backend, GpuBuffer, ScalarType};
 
-use qwen35::config::TextConfig;
-use qwen35::rotary::RotaryTables;
-use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
-use qwen35::weights::Qwen35Weights;
+use qwen38::config::TextConfig;
+use qwen38::rotary::RotaryTables;
+use qwen38::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
+use qwen38::weights::Qwen38Weights;
 
 use crate::mtp::{MtpPrefillAppendCache, MtpVerifyScratch};
 use crate::tensor_bytes::{
@@ -51,19 +51,19 @@ fn matmul_proj(
     int4_awq_inv_scale: Option<&GpuBuffer>,
     int4_group_size: usize,
 ) -> Result<()> {
-    let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
-    if qwen35::weights::is_gqh_qtype(qtype) {
+    let qtype = qwen38::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
+    if qwen38::weights::is_gqh_qtype(qtype) {
         if batch != 1 {
             anyhow::bail!("GQH matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
         }
-        return qwen35::weights::matmul_gqh(ordinal, m, n, k, lhs, weight, qtype, out)
+        return qwen38::weights::matmul_gqh(ordinal, m, n, k, lhs, weight, qtype, out)
             .map_err(|e| anyhow::anyhow!("matmul_gqh: {e}"));
     }
-    if qwen35::weights::is_mix_qtype(qtype) {
+    if qwen38::weights::is_mix_qtype(qtype) {
         if batch != 1 {
             anyhow::bail!("mix matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
         }
-        return qwen35::weights::matmul_mix(ordinal, m, n, k, lhs, weight, qtype, out)
+        return qwen38::weights::matmul_mix(ordinal, m, n, k, lhs, weight, qtype, out)
             .map_err(|e| anyhow::anyhow!("matmul_mix: {e}"));
     }
     if qtype != 0 {
@@ -115,15 +115,15 @@ fn prefill_lm_head_lowbit(
     vocab_size: usize,
     hidden_dim: usize,
     lhs: &GpuBuffer,
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     out: &mut GpuBuffer,
     label: &str,
 ) -> Result<bool> {
     let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) else {
         return Ok(false);
     };
-    if qwen35::weights::is_gqh_qtype(qtype) {
-        qwen35::weights::matmul_gqh(
+    if qwen38::weights::is_gqh_qtype(qtype) {
+        qwen38::weights::matmul_gqh(
             ordinal,
             count,
             vocab_size,
@@ -136,8 +136,8 @@ fn prefill_lm_head_lowbit(
         .map_err(|e| anyhow::anyhow!("{label} gqh: {e}"))?;
         return Ok(true);
     }
-    if qwen35::weights::is_mix_qtype(qtype) {
-        qwen35::weights::matmul_mix(
+    if qwen38::weights::is_mix_qtype(qtype) {
+        qwen38::weights::matmul_mix(
             ordinal,
             count,
             vocab_size,
@@ -209,13 +209,13 @@ fn matmul_proj_residual_add_inplace(
         return Ok(false);
     }
 
-    let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
+    let qtype = qwen38::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
     let raw_ggml = matches!(
         qtype,
-        qwen35::weights::LOWBIT_GGML_Q8_0
-            | qwen35::weights::LOWBIT_GGML_Q4_K
-            | qwen35::weights::LOWBIT_GGML_Q5_K
-            | qwen35::weights::LOWBIT_GGML_Q6_K
+        qwen38::weights::LOWBIT_GGML_Q8_0
+            | qwen38::weights::LOWBIT_GGML_Q4_K
+            | qwen38::weights::LOWBIT_GGML_Q5_K
+            | qwen38::weights::LOWBIT_GGML_Q6_K
     );
     if !raw_ggml {
         return Ok(false);
@@ -303,10 +303,10 @@ fn ggml_mlp_gate_up_swiglu_fused_enabled() -> bool {
 fn raw_ggml_qtype(qtype: i32) -> bool {
     matches!(
         qtype,
-        qwen35::weights::LOWBIT_GGML_Q8_0
-            | qwen35::weights::LOWBIT_GGML_Q4_K
-            | qwen35::weights::LOWBIT_GGML_Q5_K
-            | qwen35::weights::LOWBIT_GGML_Q6_K
+        qwen38::weights::LOWBIT_GGML_Q8_0
+            | qwen38::weights::LOWBIT_GGML_Q4_K
+            | qwen38::weights::LOWBIT_GGML_Q5_K
+            | qwen38::weights::LOWBIT_GGML_Q6_K
     )
 }
 
@@ -326,7 +326,7 @@ pub(crate) fn maybe_matmul_q6_k_mmq_lm_head(
     if !q6_k_mmq_lm_head_enabled(m)
         || gpu_hal::current_backend() != Backend::Hip
         || batch != 1
-        || qtype != qwen35::weights::LOWBIT_GGML_Q6_K
+        || qtype != qwen38::weights::LOWBIT_GGML_Q6_K
         || awq_inv_scale.is_some()
         || k % 256 != 0
     {
@@ -348,7 +348,7 @@ pub(crate) fn maybe_matmul_q6_k_mmq_lm_head(
         m,
         k,
         lhs,
-        qwen35::weights::LOWBIT_GGML_Q6_K,
+        qwen38::weights::LOWBIT_GGML_Q6_K,
         &mut q8_workspace,
     )
     .map_err(|e| anyhow::anyhow!("q6_k_mmq lm_head quantize q8_1: {e}"))?;
@@ -380,7 +380,7 @@ fn maybe_matmul_q6_k_lm_head_argmax(
         || k == 0
         || n % 16 != 0
         || k % 256 != 0
-        || qtype != qwen35::weights::LOWBIT_GGML_Q6_K
+        || qtype != qwen38::weights::LOWBIT_GGML_Q6_K
         || awq_inv_scale.is_some()
     {
         return Ok(false);
@@ -446,8 +446,8 @@ fn maybe_matmul_ggml_mlp_gate_up_pair(
         return Ok(false);
     }
 
-    let gate_qtype = qwen35::weights::infer_lowbit_type(gate_weight, k, false);
-    let up_qtype = qwen35::weights::infer_lowbit_type(up_weight, k, false);
+    let gate_qtype = qwen38::weights::infer_lowbit_type(gate_weight, k, false);
+    let up_qtype = qwen38::weights::infer_lowbit_type(up_weight, k, false);
     if gate_qtype != up_qtype || !raw_ggml_qtype(gate_qtype) {
         return Ok(false);
     }
@@ -518,7 +518,7 @@ fn maybe_matmul_q6_k_mmq_mlp_down(
         || m == 0
         || n == 0
         || k == 0
-        || qtype != qwen35::weights::LOWBIT_GGML_Q6_K
+        || qtype != qwen38::weights::LOWBIT_GGML_Q6_K
         || scale.is_some()
         || int4_scale.is_some()
         || int4_zero.is_some()
@@ -548,7 +548,7 @@ fn maybe_matmul_q6_k_mmq_mlp_down(
         m,
         k,
         lhs,
-        qwen35::weights::LOWBIT_GGML_Q6_K,
+        qwen38::weights::LOWBIT_GGML_Q6_K,
         q8_workspace,
     )
     .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down quantize q8_1: {e}"))?;
@@ -581,7 +581,7 @@ fn maybe_matmul_q6_k_mmq_mlp_down_residual_add(
         || m == 0
         || n == 0
         || k == 0
-        || qtype != qwen35::weights::LOWBIT_GGML_Q6_K
+        || qtype != qwen38::weights::LOWBIT_GGML_Q6_K
         || scale.is_some()
         || int4_scale.is_some()
         || int4_zero.is_some()
@@ -611,7 +611,7 @@ fn maybe_matmul_q6_k_mmq_mlp_down_residual_add(
         m,
         k,
         lhs,
-        qwen35::weights::LOWBIT_GGML_Q6_K,
+        qwen38::weights::LOWBIT_GGML_Q6_K,
         q8_workspace,
     )
     .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down residual quantize q8_1: {e}"))?;
@@ -790,7 +790,7 @@ fn maybe_split_qgate_norm_bf16(
 /// amortized. Hot-path prefill also goes through here with `count=1`.
 pub fn compute_logits_for_range(
     hidden: &GpuBuffer,
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     config: &TextConfig,
     start: usize,
     count: usize,
@@ -827,7 +827,7 @@ pub fn compute_logits_for_range(
         &slice_storage
     };
 
-    // Final RMSNorm → BF16 [count, hidden_dim]. Qwen3.5 uses add_unit_offset=1.
+    // Final RMSNorm → BF16 [count, hidden_dim]. Qwen3.8 uses add_unit_offset=1.
     let mut normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, hidden_dim])
         .map_err(|e| anyhow::anyhow!("range normed alloc: {e}"))?;
     rms_norm_rows_model(
@@ -909,7 +909,7 @@ pub fn compute_logits_for_range(
 
 fn compute_logits_for_range_f32_hidden(
     hidden_f32: &GpuBuffer,
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     config: &TextConfig,
     start: usize,
     count: usize,
@@ -1048,7 +1048,7 @@ fn compute_logits_for_range_f32_hidden(
 
 pub fn compute_greedy_for_range(
     hidden: &GpuBuffer,
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     config: &TextConfig,
     start: usize,
     count: usize,
@@ -1215,7 +1215,7 @@ pub fn compute_greedy_for_range(
 
 fn compute_greedy_for_acceptance(
     hidden: &GpuBuffer,
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     config: &TextConfig,
     count: usize,
     compare_tokens: &[u32],
@@ -1588,7 +1588,7 @@ enum ResidualSource {
 }
 
 fn prefill_f32_activation_carry_enabled() -> bool {
-    env::var_os("SUPERSONIC_QWEN35_PREFILL_F32_ACTIVATION_CARRY").is_some()
+    env::var_os("SUPERSONIC_QWEN38_PREFILL_F32_ACTIVATION_CARRY").is_some()
 }
 
 impl PrefillScratch {
@@ -1787,7 +1787,7 @@ impl PrefillScratch {
 /// Run native prefill on GPU, returning logits and leaving state filled.
 /// When `prefill_chunk_size > 0`, processes the prompt in chunks to reduce activation VRAM.
 pub fn prefill(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     prompt_ids: &[u32],
@@ -1838,8 +1838,8 @@ fn copy_bf16_row(
 }
 
 fn decode_hidden_dump_dir_and_pos() -> Option<(std::path::PathBuf, usize)> {
-    let dir = std::env::var_os("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_DIR")?;
-    let pos = std::env::var("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_POS")
+    let dir = std::env::var_os("SUPERSONIC_QWEN38_DUMP_DECODE_HIDDENS_DIR")?;
+    let pos = std::env::var("SUPERSONIC_QWEN38_DUMP_DECODE_HIDDENS_POS")
         .ok()?
         .parse::<usize>()
         .ok()?;
@@ -1903,19 +1903,19 @@ fn dump_named_f32_row(
 }
 
 fn linear_layer_dump_dir(idx: usize) -> Option<std::path::PathBuf> {
-    let want = std::env::var("SUPERSONIC_QWEN35_DUMP_LINEAR_LAYER")
+    let want = std::env::var("SUPERSONIC_QWEN38_DUMP_LINEAR_LAYER")
         .ok()?
         .parse::<usize>()
         .ok()?;
     if want != idx {
         return None;
     }
-    std::env::var_os("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_DIR").map(std::path::PathBuf::from)
+    std::env::var_os("SUPERSONIC_QWEN38_DUMP_DECODE_HIDDENS_DIR").map(std::path::PathBuf::from)
 }
 
 #[allow(dead_code)]
 fn prefill_inner(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     prompt_ids: &[u32],
@@ -2040,7 +2040,7 @@ fn prefill_inner(
             &mut scratch.hidden,
         )?;
         if chunk_start == 0 {
-            if let Ok(path) = std::env::var("SUPERSONIC_QWEN35_DUMP_EMBED") {
+            if let Ok(path) = std::env::var("SUPERSONIC_QWEN38_DUMP_EMBED") {
                 let n = (chunk_len * hidden_dim).min(hidden_dim);
                 let bytes = copy_bf16_row(ordinal, &scratch.hidden, 0, n, "prefill embed dump")?;
                 std::fs::write(&path, bytes)
@@ -2403,7 +2403,7 @@ pub fn convert_kv_caches_to_fp8(
 /// return last-token logits. Slower than incremental decode, but much closer to
 /// the native path than the experimental component decode oracle.
 pub fn gpu_reference_replay_step(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     rotary: &RotaryTables,
     token_ids: &[u32],
     ordinal: usize,
@@ -2439,7 +2439,7 @@ pub fn gpu_reference_replay_step(
 /// snapshots/restores linear state around this call, just as it does for the
 /// persistent fused verifier.
 pub fn prefill_append_logits(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     token_ids: &[u32],
@@ -2467,7 +2467,7 @@ pub fn prefill_append_logits(
 
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_append_verify_cached(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     token_ids: &[u32],
@@ -2496,7 +2496,7 @@ pub fn prefill_append_verify_cached(
 
 #[allow(clippy::too_many_arguments)]
 fn prefill_append_verify_impl(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     token_ids: &[u32],
@@ -2794,7 +2794,7 @@ fn prefill_append_verify_impl(
 /// `scratch.scratch.hidden`. Caller is responsible for the final RMSNorm +
 /// lm_head and for owning the batch guard around the call.
 fn mtp_decode_step_body(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     scratch: &mut MtpVerifyScratch,
@@ -2970,7 +2970,7 @@ fn mtp_decode_step_body(
 /// `mtp_decode_step_greedy` to skip the 250k-element D2H + host argmax
 /// when only the sampled token is needed.
 pub fn mtp_decode_step(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     scratch: &mut MtpVerifyScratch,
@@ -3008,7 +3008,7 @@ pub fn mtp_decode_step(
 
 /// Same forward pass as `mtp_decode_step`, returning the host greedy token.
 pub fn mtp_decode_step_greedy(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     scratch: &mut MtpVerifyScratch,
@@ -3039,9 +3039,9 @@ pub fn mtp_decode_step_greedy(
 ///
 /// `commit_kv_filled` controls whether the full-attention cache cursor advances.
 fn prefill_full_attention_layer(
-    weights: &Qwen35Weights,
-    fw: &qwen35::weights::FullWeights,
-    ls: &mut qwen35::state::LayerState,
+    weights: &Qwen38Weights,
+    fw: &qwen38::weights::FullWeights,
+    ls: &mut qwen38::state::LayerState,
     rotary: &RotaryTables,
     scratch: &mut PrefillScratch,
     config: &TextConfig,
@@ -3620,7 +3620,7 @@ fn prefill_full_attention_layer(
 
 #[allow(clippy::too_many_arguments)]
 fn prefill_linear_attention_layer(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     scratch: &mut PrefillScratch,
     config: &TextConfig,
@@ -4693,8 +4693,8 @@ fn prefill_linear_attention_layer(
 
 #[allow(clippy::too_many_arguments)]
 fn prefill_mlp_layer(
-    weights: &Qwen35Weights,
-    lw: &qwen35::weights::LayerWeights,
+    weights: &Qwen38Weights,
+    lw: &qwen38::weights::LayerWeights,
     scratch: &mut PrefillScratch,
     config: &TextConfig,
     _idx: usize,
@@ -4778,12 +4778,12 @@ fn prefill_mlp_layer(
     }
 
     // down_proj: mlp_buf [seq, intermediate] x down_w [hidden, intermediate]^T -> [seq, hidden]
-    let down_qtype = qwen35::weights::infer_lowbit_type(
+    let down_qtype = qwen38::weights::infer_lowbit_type(
         &lw.down_proj_w,
         intermediate,
         lw.down_proj_int4_scale.is_some(),
     );
-    let fused_down_residual = down_qtype != qwen35::weights::LOWBIT_GGML_Q6_K
+    let fused_down_residual = down_qtype != qwen38::weights::LOWBIT_GGML_Q6_K
         && !scratch.has_f32_activation_carry()
         && matmul_proj_residual_add_inplace(
             ordinal,
@@ -4872,7 +4872,7 @@ fn prefill_mlp_layer(
 /// row (`h_is_nextn=true`). Compact MTP KV is written at `ls.kv_filled`;
 /// RoPE uses `abs_pos`. Writes shared-head hidden into `out_h`.
 pub fn mtp_forward(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     scratch: &mut MtpVerifyScratch,
@@ -5102,7 +5102,7 @@ pub fn mtp_forward(
 
 /// Diagnostic wrapper: trunk residual in, greedy draft token out.
 pub fn mtp_draft_greedy(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     scratch: &mut MtpVerifyScratch,

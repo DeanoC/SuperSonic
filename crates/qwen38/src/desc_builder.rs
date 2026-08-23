@@ -3,12 +3,12 @@ use kernel_ffi::{
 };
 
 use crate::state::ModelState;
-use crate::weights::{infer_lowbit_type, LayerKind, Qwen35Weights};
+use crate::weights::{infer_lowbit_type, LayerKind, Qwen38Weights};
 
 /// Build the array of layer descriptors for the persistent decode kernel.
 /// Must be called each decode step (kv_len changes).
 pub fn build_layer_descs(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &ModelState,
     seqlen_offset: usize,
 ) -> Vec<DecodeLayerDesc> {
@@ -125,7 +125,7 @@ pub fn build_layer_descs(
 
 /// Build FP8 scale descriptors (parallel to layer descs) for runtime FP8 dequant.
 /// Returns None if weights are not FP8.
-pub fn build_fp8_scale_descs(weights: &Qwen35Weights) -> Option<Vec<FP8ScaleDesc>> {
+pub fn build_fp8_scale_descs(weights: &Qwen38Weights) -> Option<Vec<FP8ScaleDesc>> {
     if !weights.is_fp8 {
         return None;
     }
@@ -173,7 +173,7 @@ pub fn build_fp8_scale_descs(weights: &Qwen35Weights) -> Option<Vec<FP8ScaleDesc
 /// stability. For Qwen3.8 GQH tensors, each `*_proj_scale` slot is a pointer
 /// to the GQH `{tensor_scale, grid_code}` sidecar; it is not a GPTQ scale.
 /// Returns None if the megakernel has no low-bit weights to dequant.
-pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDesc>> {
+pub fn build_int4_scale_descs(weights: &Qwen38Weights) -> Option<Vec<INT4ScaleDesc>> {
     if !weights.is_int4 && weights.gqh_headers.is_empty() {
         return None;
     }

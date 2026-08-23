@@ -6,13 +6,13 @@ pub use gpu_hal::{AllocStrategy, Backend, BufferPolicy, MemoryArchitecture};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
-    Qwen35,
+    Qwen38,
 }
 
 impl fmt::Display for ModelFamily {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Qwen35 => write!(f, "qwen3.8"),
+            Self::Qwen38 => write!(f, "qwen3.8"),
         }
     }
 }
@@ -29,10 +29,8 @@ pub enum ModelVariant {
 
 impl ModelVariant {
     pub fn from_cli_str(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "qwen3.8-27b" | "qwen38-27b" | "qwen3.8-27b-fp8" | "qwen38-27b-fp8" => {
-                Some(Self::Qwen3_8_27B)
-            }
+        match s {
+            "qwen3.8-27b" => Some(Self::Qwen3_8_27B),
             _ => None,
         }
     }
@@ -44,7 +42,7 @@ impl ModelVariant {
     }
 
     pub fn family(&self) -> ModelFamily {
-        ModelFamily::Qwen35
+        ModelFamily::Qwen38
     }
 
     pub fn architecture_family(&self) -> ArchitectureFamily {
@@ -63,9 +61,7 @@ impl fmt::Display for ModelVariant {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GpuArch {
     Gfx1100,
-    Gfx1150,
     Gfx1201,
-    Gfx942,
     Unknown(String),
 }
 
@@ -74,9 +70,7 @@ impl GpuArch {
         match backend {
             Backend::Hip => match name.trim().split(':').next().unwrap_or(name.trim()) {
                 "gfx1100" => Self::Gfx1100,
-                "gfx1150" => Self::Gfx1150,
                 "gfx1201" => Self::Gfx1201,
-                "gfx942" => Self::Gfx942,
                 other => Self::Unknown(other.to_owned()),
             },
         }
@@ -87,9 +81,7 @@ impl fmt::Display for GpuArch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Gfx1100 => write!(f, "gfx1100"),
-            Self::Gfx1150 => write!(f, "gfx1150"),
             Self::Gfx1201 => write!(f, "gfx1201"),
-            Self::Gfx942 => write!(f, "gfx942"),
             Self::Unknown(s) => write!(f, "{s}"),
         }
     }
@@ -102,34 +94,16 @@ pub struct ArchProfile {
 }
 
 impl ArchProfile {
-    pub fn for_arch(arch: &GpuArch) -> Self {
-        let memory = match arch {
-            GpuArch::Gfx1150 => MemoryArchitecture::Unified,
-            _ => MemoryArchitecture::Discrete,
-        };
-        let buffer_policy = match arch {
-            GpuArch::Gfx1150 => BufferPolicy {
-                persistent: AllocStrategy::Default,
-                scratch: AllocStrategy::HostMapped,
-            },
-            _ => BufferPolicy::all_default(),
-        };
+    pub fn for_arch(_arch: &GpuArch) -> Self {
         Self {
-            memory,
-            buffer_policy,
+            memory: MemoryArchitecture::Discrete,
+            buffer_policy: BufferPolicy::all_default(),
         }
     }
 }
 
-pub fn qwen35_4b_launch_preset(arch: &GpuArch, model: &ModelVariant) -> Option<(i32, bool)> {
-    match (arch, model) {
-        (GpuArch::Gfx1150, ModelVariant::Qwen3_8_27B) => Some((32, true)),
-        _ => None,
-    }
-}
-
 #[derive(Clone, Copy)]
-pub struct Qwen35KernelParams {
+pub struct Qwen38KernelParams {
     pub proj_buf_floats: usize,
     pub attn_scratch_floats: usize,
     pub weight_prefix: &'static str,
@@ -138,7 +112,7 @@ pub struct Qwen35KernelParams {
 }
 
 pub enum FamilyParams {
-    Qwen35(Qwen35KernelParams),
+    Qwen38(Qwen38KernelParams),
 }
 
 pub struct VramBudget {
@@ -172,23 +146,7 @@ static REGISTRY: &[RegistryEntry] = &[
             fixed_bytes: 22 * GIB,
             overhead_factor: 1.05,
         },
-        params: FamilyParams::Qwen35(Qwen35KernelParams {
-            proj_buf_floats: 16_480,
-            attn_scratch_floats: 24_576,
-            weight_prefix: "model.language_model",
-            kv_chunk_size: 256,
-            use_4b_kernel: true,
-        }),
-    },
-    RegistryEntry {
-        model: ModelVariant::Qwen3_8_27B,
-        backend: Backend::Hip,
-        arch: GpuArch::Gfx1150,
-        vram: VramBudget {
-            fixed_bytes: 22 * GIB,
-            overhead_factor: 1.05,
-        },
-        params: FamilyParams::Qwen35(Qwen35KernelParams {
+        params: FamilyParams::Qwen38(Qwen38KernelParams {
             proj_buf_floats: 16_480,
             attn_scratch_floats: 24_576,
             weight_prefix: "model.language_model",
@@ -204,23 +162,7 @@ static REGISTRY: &[RegistryEntry] = &[
             fixed_bytes: 22 * GIB,
             overhead_factor: 1.05,
         },
-        params: FamilyParams::Qwen35(Qwen35KernelParams {
-            proj_buf_floats: 16_480,
-            attn_scratch_floats: 24_576,
-            weight_prefix: "model.language_model",
-            kv_chunk_size: 256,
-            use_4b_kernel: true,
-        }),
-    },
-    RegistryEntry {
-        model: ModelVariant::Qwen3_8_27B,
-        backend: Backend::Hip,
-        arch: GpuArch::Gfx942,
-        vram: VramBudget {
-            fixed_bytes: 22 * GIB,
-            overhead_factor: 1.05,
-        },
-        params: FamilyParams::Qwen35(Qwen35KernelParams {
+        params: FamilyParams::Qwen38(Qwen38KernelParams {
             proj_buf_floats: 16_480,
             attn_scratch_floats: 24_576,
             weight_prefix: "model.language_model",
@@ -260,10 +202,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qwen38_registry_is_hip_only() {
-        let model = ModelVariant::from_cli_str("qwen38-27b").unwrap();
+    fn qwen38_registry_accepts_only_canonical_model_name() {
+        let model = ModelVariant::from_cli_str("qwen3.8-27b").unwrap();
         assert_eq!(model, ModelVariant::Qwen3_8_27B);
-        assert_eq!(model.family(), ModelFamily::Qwen35);
+        for alias in [
+            "qwen38-27b",
+            "qwen3.8-27b-fp8",
+            "qwen38-27b-fp8",
+            "Qwen3.8-27B",
+            "qwen3.5-0.8b",
+        ] {
+            assert_eq!(
+                ModelVariant::from_cli_str(alias),
+                None,
+                "unsupported model spelling must be rejected: {alias}"
+            );
+        }
+        assert_eq!(format!("{:?}", model.family()), "Qwen38");
         assert_eq!(
             model.architecture_family(),
             ArchitectureFamily::QwenHybridDense
@@ -271,7 +226,27 @@ mod tests {
         assert_eq!(supported_models_list(), vec!["qwen3.8-27b"]);
         assert_eq!(
             supported_archs_for(&model, &Backend::Hip),
-            vec!["gfx1100", "gfx1150", "gfx1201", "gfx942"]
+            vec!["gfx1100", "gfx1201"]
         );
+    }
+
+    #[test]
+    fn qwen38_registry_rows_are_hip_only() {
+        assert!(REGISTRY.iter().all(|entry| {
+            entry.backend == Backend::Hip
+                && entry.model == ModelVariant::Qwen3_8_27B
+                && format!("{:?}", entry.model.family()) == "Qwen38"
+        }));
+
+        let mut archs: Vec<_> = REGISTRY.iter().map(|entry| entry.arch.to_string()).collect();
+        archs.sort();
+        archs.dedup();
+        assert_eq!(archs, vec!["gfx1100", "gfx1201"]);
+        for unsupported in ["gfx1150", "gfx942", "sm86"] {
+            assert_eq!(
+                GpuArch::from_backend_name(&Backend::Hip, unsupported),
+                GpuArch::Unknown(unsupported.to_owned())
+            );
+        }
     }
 }

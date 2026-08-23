@@ -1,5 +1,10 @@
 #pragma once
 
+// Qwen3.8 is the sole public model. The qwen35-prefixed HIP identifiers in
+// this translation unit are retained only where the bridge/archive ABI or
+// hipcc's existing kernel symbol linkage requires the historical spelling;
+// they are not compatibility aliases or additional model implementations.
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
@@ -36,7 +41,7 @@ enum Qwen35Persistent4BTimingSlot {
 };
 
 // Weight descriptor for the persistent decode megakernel.
-// One struct per decoder layer (24 total for Qwen3.5-0.8B).
+// One struct per decoder layer (24 total for the retained Qwen3.8 geometry).
 // Immutable weight pointers are const; mutable state pointers are non-const.
 struct Qwen35DecodeLayerDesc {
     int layer_type;                    // 0=linear_attention, 1=full_attention

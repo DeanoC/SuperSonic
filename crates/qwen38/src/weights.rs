@@ -290,7 +290,7 @@ pub fn matmul_mix(
 }
 
 /// All immutable model weights on GPU.
-pub struct Qwen35Weights {
+pub struct Qwen38Weights {
     pub config: TextConfig,
     pub weight_prefix: String,
     pub embed_tokens: Arc<GpuBuffer>,
@@ -339,7 +339,7 @@ pub struct MtpWeights {
     pub layer: LayerWeights,
 }
 
-impl Qwen35Weights {
+impl Qwen38Weights {
     pub fn lm_head_lowbit_params(
         &self,
         logical_cols: usize,
@@ -483,7 +483,7 @@ pub struct FullWeights {
     pub o_proj_awq_inv_scale: Option<GpuBuffer>,
 }
 
-impl Qwen35Weights {
+impl Qwen38Weights {
     /// Load all weights from a HuggingFace model directory.
     pub fn load(
         model_dir: &Path,

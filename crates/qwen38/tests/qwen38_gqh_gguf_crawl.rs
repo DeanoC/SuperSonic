@@ -7,10 +7,10 @@ use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use kernel_ffi::gqh::{self, RUNG_GQH2_H, RUNG_GQH3};
 use model_store::gguf::GgufFile;
 use model_store::gqh::GqhRung;
-use qwen35::desc_builder::build_int4_scale_descs;
-use qwen35::gguf_ingest::{check_mapping, load_text_config};
-use qwen35::weights::{
-    infer_lowbit_type, is_gqh_qtype, matmul_gqh, LayerKind, Qwen35Weights, LOWBIT_GGML_Q2_K,
+use qwen38::desc_builder::build_int4_scale_descs;
+use qwen38::gguf_ingest::{check_mapping, load_text_config};
+use qwen38::weights::{
+    infer_lowbit_type, is_gqh_qtype, matmul_gqh, LayerKind, Qwen38Weights, LOWBIT_GGML_Q2_K,
     LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K, LOWBIT_GGML_Q8_0, LOWBIT_GQH2_H,
     LOWBIT_GQH3,
 };
@@ -87,6 +87,8 @@ fn rung2_hf_config_matches_gguf_geometry() {
     assert_eq!(config.num_full_attention_layers(), 16);
 
     let file = GgufFile::open(&path).expect("open gguf");
+    // `qwen35` is the historical architecture key in the external GQH wire
+    // schema; the crate and public model identity are Qwen3.8.
     assert_eq!(file.kv("general.architecture"), Some("qwen35"));
     let mapped = check_mapping(&file, &config).expect("role map");
     assert!(mapped.len() > 800, "mapped {}", mapped.len());
@@ -187,7 +189,7 @@ fn rung6_load_gguf_weights() {
         return;
     };
     let config = load_text_config(&model_dir).expect("hf config");
-    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let weights = Qwen38Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     assert_eq!(weights.layers.len(), 64);
     assert_eq!(weights.embed_tokens.dtype(), ScalarType::BF16);
     assert_eq!(weights.embed_tokens.shape(), &[248320, 5120]);
@@ -248,7 +250,7 @@ fn rung7_loaded_ffn_up_gqh_matvec() {
     };
     let config = load_text_config(&model_dir).expect("hf config");
     let file = GgufFile::open(&path).expect("open");
-    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let weights = Qwen38Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let header = weights
         .gqh_header("layers.0.mlp.up_proj")
         .cloned()
@@ -352,7 +354,7 @@ fn rung7b_batched_gqh_matvec_ncols4() {
     };
     let config = load_text_config(&model_dir).expect("hf config");
     let file = GgufFile::open(&path).expect("open");
-    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let weights = Qwen38Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let header = weights
         .gqh_header("layers.0.mlp.up_proj")
         .cloned()
@@ -462,7 +464,7 @@ fn rung7c_gqh_large_m_dequant_gemm_matches_fused() {
     };
     let config = load_text_config(&model_dir).expect("hf config");
     let file = GgufFile::open(&path).expect("open");
-    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let weights = Qwen38Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let _file = file;
     let header = weights
         .gqh_header("layers.0.mlp.up_proj")
@@ -551,7 +553,7 @@ fn rung8_embed_row_then_prefill_gqh_qkv() {
         return;
     };
     let config = load_text_config(&model_dir).expect("hf config");
-    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let weights = Qwen38Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let hidden = config.hidden_size;
     let token = 9707usize; // arbitrary in-vocab token for gather+matvec
     let mut hidden_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden]).expect("hidden");
@@ -654,7 +656,7 @@ fn assert_finite_energy(vals: &[f32], label: &str) {
     assert!(energy > 0.0, "{label} is all zeros");
 }
 
-fn gather_embed(ordinal: usize, weights: &Qwen35Weights, token: usize) -> GpuBuffer {
+fn gather_embed(ordinal: usize, weights: &Qwen38Weights, token: usize) -> GpuBuffer {
     let hidden = weights.config.hidden_size;
     let mut hidden_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden]).expect("hidden");
     gpu_hal::copy_d2d(
@@ -707,7 +709,7 @@ fn rung9_gqh_dispatch_and_ggml_k_kv() {
         return;
     };
     let config = load_text_config(&model_dir).expect("hf config");
-    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let weights = Qwen38Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let hidden = config.hidden_size;
     let token = 9707usize;
     let hidden_bf16 = gather_embed(ordinal, &weights, token);
@@ -796,7 +798,7 @@ fn rung10_linear_layer0_norm_projs_mlp() {
         return;
     };
     let config = load_text_config(&model_dir).expect("hf config");
-    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let weights = Qwen38Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
     let nv = config.linear_num_value_heads;

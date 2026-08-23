@@ -9,18 +9,18 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use gpu_hal::{GpuBuffer, ScalarType};
 
-use qwen35::config::TextConfig;
-use qwen35::desc_builder::{
+use qwen38::config::TextConfig;
+use qwen38::desc_builder::{
     build_batch_seq_descs, build_fp8_scale_descs, build_int4_scale_descs, build_kv_fp8_descs,
     build_layer_descs,
 };
-use qwen35::rotary::RotaryTables;
-use qwen35::scratch::PersistentDecodeScratch;
-use qwen35::state::{
+use qwen38::rotary::RotaryTables;
+use qwen38::scratch::PersistentDecodeScratch;
+use qwen38::state::{
     kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, LinearStateSnapshot,
     ModelState, ModelStateDiskSnapshot,
 };
-use qwen35::weights::Qwen35Weights;
+use qwen38::weights::Qwen38Weights;
 use serde::{Deserialize, Serialize};
 
 use crate::mtp::{
@@ -56,18 +56,18 @@ fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
 }
 
 fn gqh_state_dump_enabled() -> bool {
-    env::var_os("SUPERSONIC_QWEN35_GQH_STATE_DUMP").is_some()
+    env::var_os("SUPERSONIC_QWEN38_GQH_STATE_DUMP").is_some()
 }
 
 fn linear_layer_dump_dir(idx: usize) -> Option<std::path::PathBuf> {
-    let want = env::var("SUPERSONIC_QWEN35_DUMP_LINEAR_LAYER")
+    let want = env::var("SUPERSONIC_QWEN38_DUMP_LINEAR_LAYER")
         .ok()?
         .parse::<usize>()
         .ok()?;
     if want != idx {
         return None;
     }
-    env::var_os("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_DIR").map(std::path::PathBuf::from)
+    env::var_os("SUPERSONIC_QWEN38_DUMP_DECODE_HIDDENS_DIR").map(std::path::PathBuf::from)
 }
 
 fn dump_buf_as_f32(dir: &std::path::Path, name: &str, buf: &GpuBuffer, cols: usize) -> Result<()> {
@@ -228,15 +228,15 @@ fn lm_head_lowbit(
     vocab_size: usize,
     hidden_dim: usize,
     lhs: &GpuBuffer,
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     out: &mut GpuBuffer,
     label: &str,
 ) -> Result<bool> {
     let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) else {
         return Ok(false);
     };
-    if qwen35::weights::is_gqh_qtype(qtype) {
-        qwen35::weights::matmul_gqh(
+    if qwen38::weights::is_gqh_qtype(qtype) {
+        qwen38::weights::matmul_gqh(
             ordinal,
             m,
             vocab_size,
@@ -249,8 +249,8 @@ fn lm_head_lowbit(
         .map_err(|e| anyhow::anyhow!("{label} gqh matmul: {e}"))?;
         return Ok(true);
     }
-    if qwen35::weights::is_mix_qtype(qtype) {
-        qwen35::weights::matmul_mix(
+    if qwen38::weights::is_mix_qtype(qtype) {
+        qwen38::weights::matmul_mix(
             ordinal,
             m,
             vocab_size,
@@ -299,19 +299,19 @@ fn matmul_proj(
     int4_awq_inv_scale: Option<&GpuBuffer>,
     int4_group_size: usize,
 ) -> Result<()> {
-    let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
-    if qwen35::weights::is_gqh_qtype(qtype) {
+    let qtype = qwen38::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
+    if qwen38::weights::is_gqh_qtype(qtype) {
         if batch != 1 {
             anyhow::bail!("GQH matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
         }
-        return qwen35::weights::matmul_gqh(ordinal, m, n, k, lhs, weight, qtype, out)
+        return qwen38::weights::matmul_gqh(ordinal, m, n, k, lhs, weight, qtype, out)
             .map_err(|e| anyhow::anyhow!("matmul_gqh: {e}"));
     }
-    if qwen35::weights::is_mix_qtype(qtype) {
+    if qwen38::weights::is_mix_qtype(qtype) {
         if batch != 1 {
             anyhow::bail!("mix matmul is batch-1 only (batch={batch} m={m} n={n} k={k})");
         }
-        return qwen35::weights::matmul_mix(ordinal, m, n, k, lhs, weight, qtype, out)
+        return qwen38::weights::matmul_mix(ordinal, m, n, k, lhs, weight, qtype, out)
             .map_err(|e| anyhow::anyhow!("matmul_mix: {e}"));
     }
     if qtype != 0 {
@@ -463,7 +463,7 @@ fn f32_to_bf16_bytes_host(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
         .collect()
 }
 
-fn is_qwen35_4b_shape(config: &TextConfig) -> bool {
+fn is_qwen38_4b_shape(config: &TextConfig) -> bool {
     config.hidden_size == 2560
         && config.intermediate_size == 9216
         && config.num_hidden_layers == 32
@@ -479,7 +479,7 @@ pub struct MtpSpecRound {
 }
 
 pub struct DecodeEngine {
-    weights: Qwen35Weights,
+    weights: Qwen38Weights,
     state: ModelState,
     /// Extra model states for batch items 1..batch_size-1.
     extra_states: Vec<ModelState>,
@@ -1063,7 +1063,7 @@ impl DecodeEngine {
     }
 
     pub fn new(
-        weights: Qwen35Weights,
+        weights: Qwen38Weights,
         ordinal: usize,
         proj_buf_floats: usize,
         attn_scratch_floats: usize,
@@ -1091,7 +1091,7 @@ impl DecodeEngine {
     }
 
     pub fn new_with_rotary(
-        weights: Qwen35Weights,
+        weights: Qwen38Weights,
         rotary: RotaryTables,
         ordinal: usize,
         proj_buf_floats: usize,
@@ -1243,7 +1243,7 @@ impl DecodeEngine {
         })
     }
 
-    pub fn weights(&self) -> &Qwen35Weights {
+    pub fn weights(&self) -> &Qwen38Weights {
         &self.weights
     }
 
@@ -1754,13 +1754,13 @@ impl DecodeEngine {
         self.kv_fp8
     }
 
-    pub fn virtual_kv_memory_stats(&self) -> qwen35::state::VirtualKvMemoryStats {
+    pub fn virtual_kv_memory_stats(&self) -> qwen38::state::VirtualKvMemoryStats {
         self.state.virtual_kv_memory_stats()
     }
 
     pub fn virtual_kv_memory_stats_by_layer(
         &self,
-    ) -> Vec<(usize, qwen35::state::VirtualKvMemoryStats)> {
+    ) -> Vec<(usize, qwen38::state::VirtualKvMemoryStats)> {
         self.state.virtual_kv_memory_stats_by_layer()
     }
 
@@ -1823,7 +1823,7 @@ impl DecodeEngine {
         self.state
             .enable_virtual_bf16_kv(&self.weights.config, context_tokens);
         eprintln!(
-            "[vmm] Qwen3.5 BF16 dense KV uses reserved virtual memory for {} tokens",
+            "[vmm] Qwen3.8 BF16 dense KV uses reserved virtual memory for {} tokens",
             context_tokens
         );
     }
@@ -2202,7 +2202,7 @@ impl DecodeEngine {
 
     fn gqh_component_decode_enabled(&self) -> bool {
         !self.weights.gqh_headers.is_empty()
-            && std::env::var_os("SUPERSONIC_QWEN35_GQH_COMPONENT_DECODE").is_some()
+            && std::env::var_os("SUPERSONIC_QWEN38_GQH_COMPONENT_DECODE").is_some()
     }
 
     /// Dedicated GQH/ggml-K matvecs plus the slim prefill attention/linear/MLP

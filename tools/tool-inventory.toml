@@ -31,14 +31,6 @@ future_home = "tools/validation"
 notes = "INT4 validation harness."
 
 [[runner_bin]]
-name = "qwen35_bughunt"
-path = "crates/runner/src/bin/qwen35_bughunt.rs"
-class = "lab"
-future_home = "tools/lab"
-required_features = ["bughunt"]
-notes = "Qwen3.5 feature-gated bughunt tool."
-
-[[runner_bin]]
 name = "qwen36_ffn_expert_microbench"
 path = "crates/runner/src/bin/qwen36_ffn_expert_microbench.rs"
 class = "microbench"

@@ -8,9 +8,9 @@ use crate::Cli;
 /// GPU memory for model weights.
 pub(crate) fn load_qwen38_weights(
     cli: &Cli,
-    text_config: &qwen35::config::TextConfig,
+    text_config: &qwen38::config::TextConfig,
     ordinal: usize,
-) -> Result<qwen35::weights::Qwen35Weights> {
+) -> Result<qwen38::weights::Qwen38Weights> {
     let gguf_path = cli.gguf_file.as_deref().ok_or_else(|| {
         anyhow::anyhow!("--gguf-file is required for the Qwen3.8 GQH startup path")
     })?;
@@ -18,6 +18,6 @@ pub(crate) fn load_qwen38_weights(
         "[weights] loading Qwen3.8 GQH GGUF from {} (HIP fused dequant-matvec)",
         gguf_path.display()
     );
-    qwen35::weights::Qwen35Weights::load_gguf(gguf_path, text_config, ordinal)
+    qwen38::weights::Qwen38Weights::load_gguf(gguf_path, text_config, ordinal)
         .map_err(|e| anyhow::anyhow!("load Qwen3.8 GQH GGUF {}: {e}", gguf_path.display()))
 }

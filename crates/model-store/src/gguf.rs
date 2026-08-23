@@ -425,6 +425,7 @@ mod tests {
             return;
         };
         let file = GgufFile::open(&path).expect("open");
+        // Historical GGUF wire ID retained for the custom GQH schema.
         assert_eq!(file.kv("general.architecture"), Some("qwen35"));
         assert_eq!(file.kv("general.basename"), Some("qwen38"));
         assert_eq!(file.gqh_header_count(), 350);

@@ -10,7 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }
-qwen35 = { path = "../qwen35" }
+qwen38 = { path = "../qwen38" }
 
 anyhow = "1"
 base64 = "0.22"

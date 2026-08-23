@@ -77,7 +77,7 @@ pub fn validate_input_contract(cli: &Cli) -> Result<()> {
 
     let config_path = cli.model_dir.join("config.json");
     require_file(&config_path, "Qwen3.8 config.json")?;
-    let config = qwen35::config::load_config(&cli.model_dir).map_err(|e| {
+    let config = qwen38::config::load_config(&cli.model_dir).map_err(|e| {
         anyhow::anyhow!("invalid Qwen3.8 config.json {}: {e}", config_path.display())
     })?;
     validate_qwen38_geometry(&config.text_config)?;
@@ -126,10 +126,12 @@ pub fn validate_input_contract(cli: &Cli) -> Result<()> {
             gguf_path.display()
         );
     }
+    // The custom GQH artifact schema still carries this historical wire ID;
+    // it is not the public Qwen3.8 model identity.
     match gguf.kv("general.architecture") {
         Some("qwen35") => {}
         Some(architecture) => anyhow::bail!(
-            "GQH GGUF {} has unsupported architecture {:?}; expected qwen35 for Qwen3.8",
+            "GQH GGUF {} has unsupported architecture {:?}; expected the qwen35 wire ID for Qwen3.8",
             gguf_path.display(),
             architecture
         ),
@@ -156,7 +158,7 @@ pub fn validate_input_contract(cli: &Cli) -> Result<()> {
         )
     })?;
 
-    qwen35::gguf_ingest::check_mapping(&gguf, &config.text_config).map_err(|e| {
+    qwen38::gguf_ingest::check_mapping(&gguf, &config.text_config).map_err(|e| {
         anyhow::anyhow!(
             "GQH GGUF {} is incompatible with Qwen3.8 geometry or qtypes: {e}",
             gguf_path.display()
@@ -165,7 +167,7 @@ pub fn validate_input_contract(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn validate_qwen38_geometry(config: &qwen35::config::TextConfig) -> Result<()> {
+fn validate_qwen38_geometry(config: &qwen38::config::TextConfig) -> Result<()> {
     let checks = [
         ("vocab_size", config.vocab_size, QWEN38_VOCAB_SIZE),
         ("hidden_size", config.hidden_size, QWEN38_HIDDEN_SIZE),
@@ -279,13 +281,13 @@ fn validate_qwen38_geometry(config: &qwen35::config::TextConfig) -> Result<()> {
 
 fn validate_qwen38_artifact(
     file: &model_store::gguf::GgufFile,
-    config: &qwen35::config::TextConfig,
+    config: &qwen38::config::TextConfig,
     speculative_decode: bool,
 ) -> Result<()> {
     validate_gqh_header_inventory(file)?;
     validate_mtp_block(file, config, speculative_decode)?;
 
-    let expected = qwen35::gguf_ingest::expected_gguf_names(config);
+    let expected = qwen38::gguf_ingest::expected_gguf_names(config);
     let mut missing = Vec::new();
     for item in expected {
         let Some((dims, encoding)) = expected_tensor_contract(&item.gguf_name, config) else {
@@ -347,7 +349,7 @@ fn validate_gqh_header_inventory(file: &model_store::gguf::GgufFile) -> Result<(
 
 fn expected_tensor_contract(
     name: &str,
-    config: &qwen35::config::TextConfig,
+    config: &qwen38::config::TextConfig,
 ) -> Option<(Vec<usize>, TensorEncoding)> {
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
@@ -549,7 +551,7 @@ fn validate_wire_size(file: &model_store::gguf::GgufFile, name: &str, qtype: u32
             .checked_mul(tensor.dims[1])
             .ok_or_else(|| anyhow::anyhow!("{name} Q3_K byte length overflows"))?
     } else {
-        qwen35::weights::ggml_k_row_bytes(qtype as i32, tensor.dims[0])
+        qwen38::weights::ggml_k_row_bytes(qtype as i32, tensor.dims[0])
             .and_then(|row| row.checked_mul(tensor.dims[1]))
             .ok_or_else(|| anyhow::anyhow!("{name} qtype {qtype} has invalid packed geometry"))?
     };
@@ -564,7 +566,7 @@ fn validate_wire_size(file: &model_store::gguf::GgufFile, name: &str, qtype: u32
 
 fn validate_mtp_block(
     file: &model_store::gguf::GgufFile,
-    config: &qwen35::config::TextConfig,
+    config: &qwen38::config::TextConfig,
     speculative_decode: bool,
 ) -> Result<()> {
     let present = MTP_TENSORS

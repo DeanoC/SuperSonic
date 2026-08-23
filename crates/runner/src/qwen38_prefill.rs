@@ -6,16 +6,16 @@ use crate::decode_engine::DecodeEngine;
 use crate::profiling::PrefillProfileScope;
 use crate::Cli;
 
-pub(crate) struct Qwen35Prefill {
+pub(crate) struct Qwen38Prefill {
     pub(crate) final_norm: Option<Vec<u8>>,
     pub(crate) next_token: u32,
 }
 
-pub(crate) fn run_qwen35_prefill(
+pub(crate) fn run_qwen38_prefill(
     cli: &Cli,
     engine: &mut DecodeEngine,
     prompt_ids: &[u32],
-) -> Result<Qwen35Prefill> {
+) -> Result<Qwen38Prefill> {
     let prefill_start = Instant::now();
     let profile = PrefillProfileScope::new(
         cli.profile_prefill,
@@ -40,7 +40,7 @@ pub(crate) fn run_qwen35_prefill(
     );
     profile.finish()?;
 
-    Ok(Qwen35Prefill {
+    Ok(Qwen38Prefill {
         final_norm: result.final_norm_trace,
         next_token,
     })

@@ -619,6 +619,7 @@ mod tests {
             return;
         };
         let file = model_store::gguf::GgufFile::open(&path).expect("open qwen38 gguf");
+        // Historical GGUF wire ID; Qwen3.8 is the sole public model identity.
         assert_eq!(file.kv("general.architecture"), Some("qwen35"));
         assert_eq!(file.gqh_header_count(), 350);
 

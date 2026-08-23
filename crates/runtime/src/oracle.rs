@@ -120,7 +120,7 @@ pub struct OracleOutput {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Qwen35TraceOutput {
+pub struct Qwen38TraceOutput {
     #[serde(default)]
     pub trace_linear_layer: Option<usize>,
     #[serde(default)]
@@ -321,7 +321,7 @@ pub fn run_oracle(
     Ok(oracle)
 }
 
-pub fn run_qwen35_trace_oracle(
+pub fn run_qwen38_trace_oracle(
     oracle_script: &Path,
     model_id: &str,
     prompt_ids: &[u32],
@@ -332,7 +332,7 @@ pub fn run_qwen35_trace_oracle(
     trace_full_layer: Option<usize>,
     trace_mlp_layer: Option<usize>,
     trace_position: Option<usize>,
-) -> Result<Qwen35TraceOutput> {
+) -> Result<Qwen38TraceOutput> {
     let python = resolve_oracle_python();
     let ids_str = prompt_ids
         .iter()
@@ -367,18 +367,18 @@ pub fn run_qwen35_trace_oracle(
 
     let output = cmd
         .output()
-        .context("failed to start qwen35 trace oracle process")?;
+        .context("failed to start qwen38 trace oracle process")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "qwen35 trace oracle failed (exit {}): {stderr}",
+            "qwen38 trace oracle failed (exit {}): {stderr}",
             output.status
         );
     }
 
     let stdout =
-        String::from_utf8(output.stdout).context("qwen35 trace oracle stdout not UTF-8")?;
-    serde_json::from_str(&stdout).context("failed to parse qwen35 trace oracle JSON output")
+        String::from_utf8(output.stdout).context("qwen38 trace oracle stdout not UTF-8")?;
+    serde_json::from_str(&stdout).context("failed to parse qwen38 trace oracle JSON output")
 }
 
 /// Run the Phi-4 oracle (`oracle/phi4_oracle.py`) for a single prompt.

@@ -870,7 +870,7 @@ mod tests {
         let partial = tmp.path().join("partial");
 
         let manifest_bytes =
-            br#"{"format_version":1,"converter_version":2,"model_family":"qwen35","tensors":[]}"#;
+            br#"{"format_version":1,"converter_version":2,"model_family":"qwen38","tensors":[]}"#;
         let weights_bytes = b"fake weights";
         let cfg_bytes = br#"{"hidden_size":128}"#;
         let tok_bytes = br#"{"model":{"type":"BPE"}}"#;
@@ -905,7 +905,7 @@ mod tests {
         let partial = tmp.path().join("partial");
 
         let manifest_bytes =
-            br#"{"format_version":1,"converter_version":2,"model_family":"qwen35","tensors":[]}"#;
+            br#"{"format_version":1,"converter_version":2,"model_family":"qwen38","tensors":[]}"#;
         let archive = make_tar_zst(&[
             ("manifest.json", manifest_bytes),
             ("weights.bin", b"x"),

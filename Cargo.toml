@@ -4,7 +4,7 @@ members = [
     "crates/gpu-hal",
     "crates/kernel-ffi",
     "crates/model-store",
-    "crates/qwen35",
+    "crates/qwen38",
     "crates/runtime",
     "crates/runner",
 ]

@@ -3,29 +3,26 @@ use std::time::Instant;
 use anyhow::Result;
 
 use crate::decode_engine::DecodeStageTimings;
-use crate::qwen35_decode_report::{emit_qwen35_decode_report, Qwen35DecodeReport};
-use crate::qwen35_engine_setup::{install_qwen35_launch_preset, load_qwen35_engine};
-use crate::qwen35_prefill::run_qwen35_prefill;
-use crate::qwen35_startup::load_qwen35_startup;
+use crate::qwen38_decode_report::{emit_qwen38_decode_report, Qwen38DecodeReport};
+use crate::qwen38_engine_setup::load_qwen38_engine;
+use crate::qwen38_prefill::run_qwen38_prefill;
+use crate::qwen38_startup::load_qwen38_startup;
 use crate::registry::{FamilyParams, RegistryEntry};
 use crate::Cli;
 
-pub(crate) fn run_qwen35(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Result<()> {
+pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Result<()> {
     let params = match &entry.params {
-        FamilyParams::Qwen35(params) => params,
-        _ => unreachable!("the direct startup entry must be Qwen3.8 Qwen35 parameters"),
+        FamilyParams::Qwen38(params) => params,
     };
-    install_qwen35_launch_preset(entry);
-
-    let startup = load_qwen35_startup(cli)?;
-    let mut setup = load_qwen35_engine(
+    let startup = load_qwen38_startup(cli)?;
+    let mut setup = load_qwen38_engine(
         cli,
         &startup.text_config,
         params,
         ordinal,
         startup.context_tokens,
     )?;
-    let prefill = run_qwen35_prefill(cli, &mut setup.engine, &startup.prompt_ids)?;
+    let prefill = run_qwen38_prefill(cli, &mut setup.engine, &startup.prompt_ids)?;
     setup.engine.prepare_hip_gqh_decode()?;
 
     let mut generated_ids = Vec::new();
@@ -98,7 +95,7 @@ pub(crate) fn run_qwen35(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
         }
     }
 
-    emit_qwen35_decode_report(Qwen35DecodeReport {
+    emit_qwen38_decode_report(Qwen38DecodeReport {
         tokenizer: &startup.tokenizer,
         prompt_ids: &startup.prompt_ids,
         generated_ids: &generated_ids,
@@ -111,7 +108,7 @@ pub(crate) fn run_qwen35(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
 }
 
 fn qwen_eos_ids(
-    text_config: &qwen35::config::TextConfig,
+    text_config: &qwen38::config::TextConfig,
     tokenizer: &tokenizers::Tokenizer,
     chat: bool,
 ) -> Vec<u32> {

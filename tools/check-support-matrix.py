@@ -18,13 +18,11 @@ MANIFEST = ROOT / "support" / "matrix.toml"
 
 VALID_BACKENDS = {"hip"}
 VALID_STATUSES = {"validated", "tbm", "experimental", "inherited", "pending", "unsupported"}
-VALID_QUANTS = {"bf16", "int4", "fp8-runtime", "kv-fp8", "int8"}
+VALID_QUANTS = {"bf16", "int4", "fp8-runtime", "kv-fp8", "int8", "gqh"}
 VALID_MODEL_SOURCES = {"hf-snapshot", "flm"}
 EXPECTED_ARCHES = {
     "gfx1100",
-    "gfx1150",
     "gfx1201",
-    "gfx942",
 }
 
 

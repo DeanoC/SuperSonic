@@ -1,3 +1,10 @@
+//! Qwen3.8 HIP FFI wrappers.
+//!
+//! The `supersonic_qwen35_*` identifiers in the `extern "C"` block are
+//! historical symbols exported by the retained HIP bridge. They are an
+//! external ABI contract, so only those link names remain legacy-spelled;
+//! Rust-facing wrappers use Qwen3.8 names.
+
 use std::ffi::{c_int, c_uint, c_void};
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
@@ -118,7 +125,6 @@ unsafe extern "C" {
         clock_rate_khz_out: *mut u32,
     ) -> c_int;
 
-    fn supersonic_qwen35_4b_hip_set_launch_preset(blocks: c_int, coop: c_int);
     fn supersonic_qwen35_4b_hip_set_gqh_prepare_only(on: c_int);
 
     #[link_name = "supersonic_qwen35_hip_mtp_restore_linear_prefix"]
@@ -555,11 +561,5 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
             return Err(hip_error("hip_device_clock_khz", status));
         }
         Ok(clock_khz)
-    }
-}
-
-pub fn set_qwen35_4b_launch_preset(blocks: i32, coop: bool) {
-    unsafe {
-        supersonic_qwen35_4b_hip_set_launch_preset(blocks as c_int, if coop { 1 } else { 0 });
     }
 }

@@ -4,7 +4,8 @@ use std::ffi::{c_int, c_void};
 /// Struct arrays in BatchSeqDesc are fixed to this size.
 pub const MAX_BATCH_SIZE: usize = 8;
 
-/// Rust mirror of `Qwen35DecodeLayerDesc` in full_attention.hip.
+/// Rust mirror of the historical `Qwen35DecodeLayerDesc` bridge layout.
+/// The C++ field spelling is an external ABI detail; the product is Qwen3.8.
 /// Describes one decoder layer for the persistent decode megakernel.
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -150,8 +151,9 @@ impl Default for KVCacheFp8Desc {
 /// The historical `INT4ScaleDesc` name is retained for the external kernel
 /// ABI. For GQH rows the `*_proj_scale` pointers carry GQH tensor-header
 /// sidecars, not GPTQ metadata; the C++ `Qwen35INT4ScaleDesc` mirror and
-/// `qwen35::desc_builder::build_int4_scale_descs` depend on this exact field
-/// order and tail layout. Do not reorder, remove, or repurpose these fields
+/// `qwen38::desc_builder::build_int4_scale_descs` depend on this exact field
+/// order and tail layout. The C++ type spelling is retained for ABI only.
+/// Do not reorder, remove, or repurpose these fields
 /// without changing both FFI mirrors together and updating the layout test.
 #[repr(C)]
 #[derive(Debug, Clone)]

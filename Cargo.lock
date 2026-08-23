@@ -968,7 +968,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qwen35"
+name = "qwen38"
 version = "0.1.0"
 dependencies = [
  "gpu-hal",
@@ -1109,7 +1109,7 @@ dependencies = [
  "gpu-hal",
  "kernel-ffi",
  "model-store",
- "qwen35",
+ "qwen38",
  "serde",
  "serde_json",
  "supersonic-core",
@@ -1308,7 +1308,7 @@ dependencies = [
  "kernel-ffi",
  "minijinja",
  "minijinja-contrib",
- "qwen35",
+ "qwen38",
  "serde",
  "serde_json",
  "tokenizers",

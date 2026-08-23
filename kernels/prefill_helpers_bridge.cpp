@@ -1,5 +1,6 @@
-// Bridge for prefill helper kernels.
+// Bridge for the Qwen3.8 prefill helper kernels.
 // Separate compilation unit — does not touch the decode megakernel files.
+// The qwen35-prefixed extern symbols below are historical ABI spellings only.
 
 #include "prefill_helpers.hip"
 

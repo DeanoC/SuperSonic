@@ -1,5 +1,9 @@
 #include "full_attention.hip"
 
+// This bridge is the retained Qwen3.8 implementation. Its qwen35-prefixed
+// kernel/C symbols are historical bridge ABI spellings; changing them would
+// invalidate the linked HIP archive, so no alternate qwen35 model path exists.
+
 #include <cstdio>
 #include <cstdlib>
 #include <hip/hip_runtime.h>

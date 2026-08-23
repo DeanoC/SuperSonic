@@ -5,7 +5,7 @@ This is deliberately a source-boundary check rather than a blanket ban on
 historical words in the runtime.  Task 5 leaves the outer tree/tap/rollback
 experiments in place for the later kernel reduction, so those names are not
 part of this check.  The symbols below are the shared MTP cache/scratch and
-the Qwen3.5 MTP entry points that are part of the retained product path.
+the Qwen3.8 MTP entry points that are part of the retained product path.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ FORBIDDEN_MTP_TERMS = (
     "dflash_fused_verify_cache",
     "MetalV2DecodeScratch",
     "metal_v2_scratch",
+    # Legacy names this checker must continue to reject.
     "qwen35_mtp_forward",
     "qwen35_mtp_draft_greedy",
 )

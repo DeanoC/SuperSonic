@@ -1399,7 +1399,7 @@ mod tests {
     /// with bytes B, restore, assert we read back bytes A everywhere.
     ///
     /// `#[ignore]` because it needs a HIP runtime. Run with:
-    ///   cargo test -p qwen35 -- --ignored linear_snapshot_roundtrip_bit_exact
+    ///   cargo test -p qwen38 -- --ignored linear_snapshot_roundtrip_bit_exact
     #[test]
     #[ignore = "requires a GPU runtime"]
     fn linear_snapshot_roundtrip_bit_exact() {

@@ -7,10 +7,10 @@
 
 use anyhow::Result;
 use gpu_hal::{GpuBuffer, ScalarType};
-use qwen35::config::TextConfig;
-use qwen35::rotary::RotaryTables;
-use qwen35::state::{LinearStateSnapshot, ModelState};
-use qwen35::weights::Qwen35Weights;
+use qwen38::config::TextConfig;
+use qwen38::rotary::RotaryTables;
+use qwen38::state::{LinearStateSnapshot, ModelState};
+use qwen38::weights::Qwen38Weights;
 
 use crate::prefill_engine::{PrefillAppendVerifyResult, PrefillScratch};
 
@@ -202,7 +202,7 @@ pub(crate) fn restore_linear_prefix(commit_len: usize) -> Result<bool> {
 /// MTP-owned entry point for the cached prefill-append verifier.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_append_verify_cached(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     token_ids: &[u32],
@@ -232,7 +232,7 @@ pub fn prefill_append_verify_cached(
 /// MTP-owned entry point for the NextN forward helper.
 #[allow(clippy::too_many_arguments)]
 pub fn mtp_forward(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     scratch: &mut MtpVerifyScratch,
@@ -261,7 +261,7 @@ pub fn mtp_forward(
 
 /// MTP-owned entry point for the diagnostic one-step draft helper.
 pub fn mtp_draft_greedy(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     scratch: &mut MtpVerifyScratch,
@@ -287,7 +287,7 @@ pub fn mtp_draft_greedy(
 /// MTP-owned entry point for one-token component decode with full logits.
 #[allow(clippy::too_many_arguments)]
 pub fn mtp_decode_step(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     scratch: &mut MtpVerifyScratch,
@@ -310,7 +310,7 @@ pub fn mtp_decode_step(
 
 /// MTP-owned entry point for one-token component decode with fused argmax.
 pub fn mtp_decode_step_greedy(
-    weights: &Qwen35Weights,
+    weights: &Qwen38Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
     scratch: &mut MtpVerifyScratch,

@@ -6,11 +6,11 @@ mod cli;
 mod decode_engine;
 mod model_files;
 mod profiling;
-mod qwen35_decode_report;
-mod qwen35_engine_setup;
-mod qwen35_prefill;
-mod qwen35_runtime;
-mod qwen35_startup;
+mod qwen38_decode_report;
+mod qwen38_engine_setup;
+mod qwen38_prefill;
+mod qwen38_runtime;
+mod qwen38_startup;
 mod registry;
 
 use anyhow::Result;
@@ -19,8 +19,7 @@ use clap::Parser;
 use backend_runtime::{install_arch_profile, lookup_registry_entry, query_gpu_info};
 use cli::Cli;
 use model_files::validate_input_contract;
-use qwen35_runtime::run_qwen35;
-use registry::Backend;
+use qwen38_runtime::run_qwen38;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -35,5 +34,5 @@ fn main() -> Result<()> {
     let entry = lookup_registry_entry(&gpu.gpu_arch)?;
     install_arch_profile(entry);
 
-    run_qwen35(&cli, entry, cli.device)
+    run_qwen38(&cli, entry, cli.device)
 }

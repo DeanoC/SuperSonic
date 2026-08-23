@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use manifest::{Manifest, QuantProfile, CONVERTER_VERSION, FORMAT_VERSION};
 
-pub use baker::{bake_phi4, bake_qwen35};
+pub use baker::{bake_phi4, bake_qwen38};
 pub use flm::{
     FlmAsset, FlmQwen36DenseConfig, FlmQwen36MoeConfig, FlmRuntimeDirectory, FlmRuntimeIdentity,
     FlmTokenizerDescriptor,

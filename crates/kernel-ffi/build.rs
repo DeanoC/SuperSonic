@@ -217,6 +217,8 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path, bridges: &[KernelBridge]) {
         objects.push(object);
     }
 
+    // Keep the historical archive name: downstream linkers may refer to this
+    // retained HIP bridge artifact by its pre-rename ABI identity.
     archive(
         out_dir,
         "qwen35_megakernel_hip",

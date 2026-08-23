@@ -129,7 +129,7 @@ fn open_sharded(
 ///
 /// `layer_is_full[i]` should be true if layer i is full-attention.
 /// `progress` is called with status messages during baking.
-pub fn bake_qwen35(
+pub fn bake_qwen38(
     model_dir: &Path,
     weight_prefix: &str,
     num_layers: usize,
@@ -331,7 +331,7 @@ pub fn bake_qwen35(
     let manifest = Manifest {
         format_version: FORMAT_VERSION,
         converter_version: CONVERTER_VERSION,
-        model_family: "qwen35".to_string(),
+        model_family: "qwen38".to_string(),
         quant_profile: None,
         source_format: None,
         source_quant: None,
@@ -362,7 +362,7 @@ fn dtype_bytes(dt: safetensors::Dtype) -> Result<usize, Error> {
 
 /// Bake Phi-4 HuggingFace safetensors into a SuperSonic binary package.
 ///
-/// Unlike Qwen3.5, Phi-4 stores fused `qkv_proj` and `gate_up_proj` tensors.
+/// Unlike Qwen3.8, Phi-4 stores fused `qkv_proj` and `gate_up_proj` tensors.
 /// This baker splits them at bake time so the Rust runtime sees canonical
 /// q_proj / k_proj / v_proj / gate_proj / up_proj tensors (all `LayoutTag::Raw`).
 pub fn bake_phi4(

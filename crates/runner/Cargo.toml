@@ -17,7 +17,7 @@ supersonic-core = { path = "../core" }
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }
 model-store = { path = "../model-store" }
-qwen35 = { path = "../qwen35" }
+qwen38 = { path = "../qwen38" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

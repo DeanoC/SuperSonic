@@ -4,15 +4,15 @@ use crate::model_files::load_tokenizer;
 use crate::Cli;
 
 /// Host-side startup state shared by the direct Qwen3.8 generation path.
-pub(crate) struct Qwen35Startup {
-    pub(crate) text_config: qwen35::config::TextConfig,
+pub(crate) struct Qwen38Startup {
+    pub(crate) text_config: qwen38::config::TextConfig,
     pub(crate) tokenizer: tokenizers::Tokenizer,
     pub(crate) prompt_ids: Vec<u32>,
     pub(crate) context_tokens: usize,
 }
 
-pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
-    let config = qwen35::config::load_config(&cli.model_dir)
+pub(crate) fn load_qwen38_startup(cli: &Cli) -> Result<Qwen38Startup> {
+    let config = qwen38::config::load_config(&cli.model_dir)
         .map_err(|e| anyhow::anyhow!("loading Qwen3.8 config.json: {e}"))?;
     let text_config = config.text_config;
     eprintln!(
@@ -70,7 +70,7 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
         );
     }
 
-    Ok(Qwen35Startup {
+    Ok(Qwen38Startup {
         text_config,
         tokenizer,
         prompt_ids,

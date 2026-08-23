@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use gpu_hal::Backend;
-use qwen35::gguf_ingest::load_text_config;
-use qwen35::scratch::required_attn_scratch_floats;
-use qwen35::weights::Qwen35Weights;
+use qwen38::gguf_ingest::load_text_config;
+use qwen38::scratch::required_attn_scratch_floats;
+use qwen38::weights::Qwen38Weights;
 use supersonic_runtime::chat_template::{ChatMessage, ChatTemplate};
 use supersonic_runtime::decode_engine::DecodeEngine;
 
@@ -77,7 +77,7 @@ fn greedy_token(logits: &[f32]) -> u32 {
         .expect("logits")
 }
 
-fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen35::config::TextConfig)> {
+fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen38::config::TextConfig)> {
     let path = gguf_path()?;
     let model_dir = qwen38_model_dir()?;
     if kernel_ffi::query_gpu_info(0).is_err() {
@@ -86,7 +86,7 @@ fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen35::config::Tex
     }
     let ordinal = 0usize;
     let config = load_text_config(&model_dir).expect("hf config");
-    let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
+    let weights = Qwen38Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let attn_scratch = required_attn_scratch_floats(
         config.num_attention_heads,
         config.head_dim,
