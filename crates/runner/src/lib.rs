@@ -1,49 +1,12 @@
 #![recursion_limit = "512"]
 
-//! SuperSonic runner library — exposes the decode engines, prefill engine,
-//! model/backend registry, and validation helpers so downstream crates (the
-//! `server` crate in particular) can reuse them without duplicating the
-//! module tree.
+//! Public runner library surface for the Qwen3.8 GQH contract.
 //!
-//! The `supersonic` CLI binary lives in `src/main.rs` and historically
-//! declared these modules locally via `mod …;`. Those declarations are kept
-//! so existing `#[path]`-style bin crates continue to compile; with a lib
-//! root present, the same files get compiled once into the library crate
-//! (`runner::…`) for external consumers.
+//! The production binary owns its private decode modules. Integration tests
+//! use only the parser and host-side artifact validator exported here.
 
 pub mod cli;
 pub use cli::{parse_cli_from, Cli};
 
-pub mod decode_engine;
-pub mod dflash_ddtree;
-pub mod flm_model_source;
-pub mod flm_tokenizer;
 pub mod model_files;
 pub use model_files::validate_input_contract;
-pub mod oracle;
-pub mod prefill_engine;
-pub mod profile;
-pub use supersonic_runtime::qwen36_moe::decode as qwen36_moe_decode;
-pub use supersonic_runtime::qwen36_moe::engine as qwen36_moe_engine;
-pub use supersonic_runtime::qwen36_moe::load_policy as qwen36_moe_load_policy;
-#[path = "qwen36_moe/logits.rs"]
-pub mod qwen36_moe_logits;
-#[path = "qwen36_moe/mtp.rs"]
-pub mod qwen36_moe_mtp;
-pub use supersonic_runtime::qwen36_moe::persistent_decode as qwen36_moe_persistent_decode;
-pub use supersonic_runtime::qwen36_moe::prefill as qwen36_moe_prefill;
-pub use supersonic_runtime::qwen36_moe::residency as qwen36_moe_residency;
-pub use supersonic_runtime::qwen36_moe::residency as qwen36_moe_residency_types;
-pub use supersonic_runtime::qwen36_moe::residency_pages as qwen36_moe_residency_pages;
-#[path = "qwen36_moe/speculative.rs"]
-pub mod qwen36_moe_speculative;
-#[path = "qwen36_moe/state.rs"]
-pub mod qwen36_moe_state;
-#[path = "qwen36_moe/telemetry.rs"]
-pub mod qwen36_moe_telemetry;
-pub use supersonic_runtime::qwen36_moe::types as qwen36_moe_types;
-pub mod qwen36_q4km_audit;
-pub mod registry;
-pub mod specprefill;
-pub mod tensor_bytes;
-pub mod validate;

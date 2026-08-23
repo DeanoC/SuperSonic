@@ -1,1 +1,0 @@
-[result] prompt_tokens=6 generated_tokens=4 decode_ms=32 ms_per_step=8 decode_max_delta=0.0000 gpu_oracle_max_delta=0.0000 batch_size=1
