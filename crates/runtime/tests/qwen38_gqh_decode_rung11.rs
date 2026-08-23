@@ -13,12 +13,61 @@ use supersonic_runtime::decode_engine::DecodeEngine;
 static GPU: Mutex<()> = Mutex::new(());
 
 fn gguf_path() -> Option<PathBuf> {
-    let path = PathBuf::from("/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf");
-    path.is_file().then_some(path)
+    let Some(value) = std::env::var_os("SUPERSONIC_GQH_GGUF") else {
+        if require_gqh_artifacts() {
+            panic!("SUPERSONIC_GQH_GGUF is required for Qwen3.8 GQH artifact tests");
+        }
+        return None;
+    };
+    let path = PathBuf::from(value);
+    if path.is_file() {
+        Some(path)
+    } else if require_gqh_artifacts() {
+        panic!(
+            "SUPERSONIC_GQH_GGUF points to a missing artifact: {}",
+            path.display()
+        );
+    } else {
+        None
+    }
 }
 
-fn hf_dir() -> PathBuf {
-    PathBuf::from("/data/models/Qwen3.8-27B")
+fn require_gqh_artifacts() -> bool {
+    std::env::var("SUPERSONIC_REQUIRE_GQH_ARTIFACTS").as_deref() == Ok("1")
+}
+
+fn qwen38_model_dir() -> Option<PathBuf> {
+    let Some(value) = std::env::var_os("SUPERSONIC_QWEN38_MODEL_DIR") else {
+        if require_gqh_artifacts() {
+            panic!(
+                "SUPERSONIC_QWEN38_MODEL_DIR is required for Qwen3.8 GQH artifact tests"
+            );
+        }
+        return None;
+    };
+    let path = PathBuf::from(value);
+    if !path.is_dir() {
+        if require_gqh_artifacts() {
+            panic!(
+                "SUPERSONIC_QWEN38_MODEL_DIR points to a missing model directory: {}",
+                path.display()
+            );
+        }
+        return None;
+    }
+    for required in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
+        let child = path.join(required);
+        if !child.is_file() {
+            if require_gqh_artifacts() {
+                panic!(
+                    "SUPERSONIC_QWEN38_MODEL_DIR is missing required file: {}",
+                    child.display()
+                );
+            }
+            return None;
+        }
+    }
+    Some(path)
 }
 
 fn greedy_token(logits: &[f32]) -> u32 {
@@ -32,16 +81,14 @@ fn greedy_token(logits: &[f32]) -> u32 {
 
 fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen35::config::TextConfig)> {
     let path = gguf_path()?;
-    if !hf_dir().join("config.json").is_file() {
-        return None;
-    }
+    let model_dir = qwen38_model_dir()?;
     set_backend(Backend::Hip);
     if kernel_ffi::query_gpu_info(0).is_err() {
         eprintln!("skip: no HIP device 0");
         return None;
     }
     let ordinal = 0usize;
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    let config = load_text_config(&model_dir).expect("hf config");
     let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let attn_scratch = required_attn_scratch_floats(
         config.num_attention_heads,
@@ -66,6 +113,7 @@ fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen35::config::Tex
 }
 
 #[test]
+#[ignore = "requires R9700 artifact CI"]
 fn rung11_one_token_component_decode() {
     let _guard = GPU.lock().expect("gpu lock");
     let Some((mut engine, config)) = build_engine(16) else {
@@ -99,14 +147,15 @@ fn rung11_one_token_component_decode() {
         .map(|(i, v)| (*i as u32, *v))
         .collect();
 
-    let decoded = tokenizers::Tokenizer::from_file(hf_dir().join("tokenizer.json"))
+    let model_dir = qwen38_model_dir().expect("model dir");
+    let decoded = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .ok()
         .and_then(|tok| tok.decode(&[argmax], false).ok());
     println!(
         "rung11: token={token} argmax={argmax} piece={decoded:?} top5={top5:?} energy={energy:.4} {elapsed_ms:.0}ms"
     );
 
-    let tokenizer = tokenizers::Tokenizer::from_file(hf_dir().join("tokenizer.json")).ok();
+    let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).ok();
     let mut tokens = vec![token, argmax];
     for step in 1..8 {
         let started = std::time::Instant::now();
@@ -137,14 +186,16 @@ fn rung11_one_token_component_decode() {
 }
 
 #[test]
+#[ignore = "requires R9700 artifact CI"]
 fn rung13_chat_hello_generate() {
     let _guard = GPU.lock().expect("gpu lock");
     let Some((mut engine, config)) = build_engine(64) else {
         return;
     };
-    let tokenizer = tokenizers::Tokenizer::from_file(hf_dir().join("tokenizer.json"))
+    let model_dir = qwen38_model_dir().expect("model dir");
+    let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .expect("tokenizer.json");
-    let template = ChatTemplate::try_load(&hf_dir())
+    let template = ChatTemplate::try_load(&model_dir)
         .expect("load chat template")
         .expect("Qwen3.8 ships a chat template");
     let prompt = template

@@ -675,22 +675,37 @@ mod tests {
         }
     }
 
+    fn require_gqh_artifacts() -> bool {
+        std::env::var("SUPERSONIC_REQUIRE_GQH_ARTIFACTS").as_deref() == Ok("1")
+    }
+
     fn qwen38_gguf_path() -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("SUPERSONIC_GQH_GGUF") {
-            let path = PathBuf::from(path);
-            return path.is_file().then_some(path);
+        let Some(value) = std::env::var_os("SUPERSONIC_GQH_GGUF") else {
+            if require_gqh_artifacts() {
+                panic!("SUPERSONIC_GQH_GGUF is required for Qwen3.8 GQH artifact tests");
+            }
+            return None;
+        };
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            Some(path)
+        } else if require_gqh_artifacts() {
+            panic!(
+                "SUPERSONIC_GQH_GGUF points to a missing artifact: {}",
+                path.display()
+            );
+        } else {
+            None
         }
-        let default = PathBuf::from("/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf");
-        default.is_file().then_some(default)
     }
 
     #[test]
     fn hip_qwen38_gguf_gqh_linears_match_cpu() {
-        let Some(ordinal) = require_hip() else {
-            return;
-        };
         let Some(path) = qwen38_gguf_path() else {
             eprintln!("skip: Qwen3.8 GQH GGUF not present");
+            return;
+        };
+        let Some(ordinal) = require_hip() else {
             return;
         };
         let file = model_store::gguf::GgufFile::open(&path).expect("open qwen38 gguf");
@@ -778,12 +793,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires R9700 artifact CI"]
     fn hip_qwen38_gguf_every_gqh_tensor_one_row() {
-        let Some(ordinal) = require_hip() else {
-            return;
-        };
         let Some(path) = qwen38_gguf_path() else {
             eprintln!("skip: Qwen3.8 GQH GGUF not present");
+            return;
+        };
+        let Some(ordinal) = require_hip() else {
             return;
         };
         let file = model_store::gguf::GgufFile::open(&path).expect("open qwen38 gguf");

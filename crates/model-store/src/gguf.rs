@@ -395,9 +395,28 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn require_gqh_artifacts() -> bool {
+        std::env::var("SUPERSONIC_REQUIRE_GQH_ARTIFACTS").as_deref() == Ok("1")
+    }
+
     fn qwen38_gguf() -> Option<PathBuf> {
-        let default = PathBuf::from("/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf");
-        default.is_file().then_some(default)
+        let Some(value) = std::env::var_os("SUPERSONIC_GQH_GGUF") else {
+            if require_gqh_artifacts() {
+                panic!("SUPERSONIC_GQH_GGUF is required for Qwen3.8 GQH artifact tests");
+            }
+            return None;
+        };
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            Some(path)
+        } else if require_gqh_artifacts() {
+            panic!(
+                "SUPERSONIC_GQH_GGUF points to a missing artifact: {}",
+                path.display()
+            );
+        } else {
+            None
+        }
     }
 
     #[test]

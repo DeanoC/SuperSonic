@@ -16,12 +16,61 @@ use qwen35::weights::{
 };
 
 fn gguf_path() -> Option<PathBuf> {
-    let path = PathBuf::from("/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf");
-    path.is_file().then_some(path)
+    let Some(value) = std::env::var_os("SUPERSONIC_GQH_GGUF") else {
+        if require_gqh_artifacts() {
+            panic!("SUPERSONIC_GQH_GGUF is required for Qwen3.8 GQH artifact tests");
+        }
+        return None;
+    };
+    let path = PathBuf::from(value);
+    if path.is_file() {
+        Some(path)
+    } else if require_gqh_artifacts() {
+        panic!(
+            "SUPERSONIC_GQH_GGUF points to a missing artifact: {}",
+            path.display()
+        );
+    } else {
+        None
+    }
 }
 
-fn hf_dir() -> PathBuf {
-    PathBuf::from("/data/models/Qwen3.8-27B")
+fn require_gqh_artifacts() -> bool {
+    std::env::var("SUPERSONIC_REQUIRE_GQH_ARTIFACTS").as_deref() == Ok("1")
+}
+
+fn qwen38_model_dir() -> Option<PathBuf> {
+    let Some(value) = std::env::var_os("SUPERSONIC_QWEN38_MODEL_DIR") else {
+        if require_gqh_artifacts() {
+            panic!(
+                "SUPERSONIC_QWEN38_MODEL_DIR is required for Qwen3.8 GQH artifact tests"
+            );
+        }
+        return None;
+    };
+    let path = PathBuf::from(value);
+    if !path.is_dir() {
+        if require_gqh_artifacts() {
+            panic!(
+                "SUPERSONIC_QWEN38_MODEL_DIR points to a missing model directory: {}",
+                path.display()
+            );
+        }
+        return None;
+    }
+    for required in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
+        let child = path.join(required);
+        if !child.is_file() {
+            if require_gqh_artifacts() {
+                panic!(
+                    "SUPERSONIC_QWEN38_MODEL_DIR is missing required file: {}",
+                    child.display()
+                );
+            }
+            return None;
+        }
+    }
+    Some(path)
 }
 
 #[test]
@@ -29,10 +78,10 @@ fn rung2_hf_config_matches_gguf_geometry() {
     let Some(path) = gguf_path() else {
         return;
     };
-    if !hf_dir().join("config.json").is_file() {
+    let Some(model_dir) = qwen38_model_dir() else {
         return;
-    }
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    };
+    let config = load_text_config(&model_dir).expect("hf config");
     assert_eq!(config.num_hidden_layers, 64);
     assert_eq!(config.linear_num_value_heads, 48);
     assert_eq!(config.linear_value_dim(), 6144);
@@ -78,19 +127,20 @@ fn rung3_q2k_embed_row_is_finite() {
 }
 
 #[test]
+#[ignore = "requires R9700 artifact CI"]
 fn rung5_upload_packed_mapped_tensors_to_device0() {
     let Some(path) = gguf_path() else {
         return;
     };
-    if !hf_dir().join("config.json").is_file() {
+    let Some(model_dir) = qwen38_model_dir() else {
         return;
-    }
+    };
     set_backend(Backend::Hip);
     if kernel_ffi::query_gpu_info(0).is_err() {
         eprintln!("skip: no HIP device 0");
         return;
     }
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    let config = load_text_config(&model_dir).expect("hf config");
     let file = GgufFile::open(&path).expect("open gguf");
     let mapped = check_mapping(&file, &config).expect("role map");
 
@@ -126,17 +176,18 @@ fn require_hip() -> Option<usize> {
 }
 
 #[test]
+#[ignore = "requires R9700 artifact CI"]
 fn rung6_load_gguf_weights() {
     let Some(path) = gguf_path() else {
         return;
     };
-    if !hf_dir().join("config.json").is_file() {
+    let Some(model_dir) = qwen38_model_dir() else {
         return;
-    }
+    };
     let Some(ordinal) = require_hip() else {
         return;
     };
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    let config = load_text_config(&model_dir).expect("hf config");
     let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     assert_eq!(weights.layers.len(), 64);
     assert_eq!(weights.embed_tokens.dtype(), ScalarType::BF16);
@@ -190,13 +241,13 @@ fn rung7_loaded_ffn_up_gqh_matvec() {
     let Some(path) = gguf_path() else {
         return;
     };
-    if !hf_dir().join("config.json").is_file() {
+    let Some(model_dir) = qwen38_model_dir() else {
         return;
-    }
+    };
     let Some(ordinal) = require_hip() else {
         return;
     };
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    let config = load_text_config(&model_dir).expect("hf config");
     let file = GgufFile::open(&path).expect("open");
     let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let header = weights
@@ -294,13 +345,13 @@ fn rung7b_batched_gqh_matvec_ncols4() {
     let Some(path) = gguf_path() else {
         return;
     };
-    if !hf_dir().join("config.json").is_file() {
+    let Some(model_dir) = qwen38_model_dir() else {
         return;
-    }
+    };
     let Some(ordinal) = require_hip() else {
         return;
     };
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    let config = load_text_config(&model_dir).expect("hf config");
     let file = GgufFile::open(&path).expect("open");
     let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let header = weights
@@ -404,13 +455,13 @@ fn rung7c_gqh_large_m_dequant_gemm_matches_fused() {
     let Some(path) = gguf_path() else {
         return;
     };
-    if !hf_dir().join("config.json").is_file() {
+    let Some(model_dir) = qwen38_model_dir() else {
         return;
-    }
+    };
     let Some(ordinal) = require_hip() else {
         return;
     };
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    let config = load_text_config(&model_dir).expect("hf config");
     let file = GgufFile::open(&path).expect("open");
     let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let _file = file;
@@ -487,13 +538,13 @@ fn rung8_embed_row_then_prefill_gqh_qkv() {
     let Some(path) = gguf_path() else {
         return;
     };
-    if !hf_dir().join("config.json").is_file() {
+    let Some(model_dir) = qwen38_model_dir() else {
         return;
-    }
+    };
     let Some(ordinal) = require_hip() else {
         return;
     };
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    let config = load_text_config(&model_dir).expect("hf config");
     let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let hidden = config.hidden_size;
     let token = 9707usize; // arbitrary in-vocab token for gather+matvec
@@ -645,13 +696,13 @@ fn rung9_gqh_dispatch_and_ggml_k_kv() {
     let Some(path) = gguf_path() else {
         return;
     };
-    if !hf_dir().join("config.json").is_file() {
+    let Some(model_dir) = qwen38_model_dir() else {
         return;
-    }
+    };
     let Some(ordinal) = require_hip() else {
         return;
     };
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    let config = load_text_config(&model_dir).expect("hf config");
     let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let hidden = config.hidden_size;
     let token = 9707usize;
@@ -717,13 +768,13 @@ fn rung10_linear_layer0_norm_projs_mlp() {
     let Some(path) = gguf_path() else {
         return;
     };
-    if !hf_dir().join("config.json").is_file() {
+    let Some(model_dir) = qwen38_model_dir() else {
         return;
-    }
+    };
     let Some(ordinal) = require_hip() else {
         return;
     };
-    let config = load_text_config(&hf_dir()).expect("hf config");
+    let config = load_text_config(&model_dir).expect("hf config");
     let weights = Qwen35Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
@@ -814,8 +865,20 @@ fn rung10_linear_layer0_norm_projs_mlp() {
 }
 
 fn gguf_8192_path() -> Option<PathBuf> {
-    let path = PathBuf::from("/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf");
-    path.is_file().then_some(path)
+    let Some(value) = std::env::var_os("SUPERSONIC_GQH_8192_GGUF") else {
+        return None;
+    };
+    let path = PathBuf::from(value);
+    if path.is_file() {
+        Some(path)
+    } else if require_gqh_artifacts() {
+        panic!(
+            "SUPERSONIC_GQH_8192_GGUF points to a missing artifact: {}",
+            path.display()
+        );
+    } else {
+        None
+    }
 }
 
 #[test]
@@ -938,4 +1001,3 @@ fn mix105_onehot_matches_cpu_decode() {
         );
     }
 }
-
