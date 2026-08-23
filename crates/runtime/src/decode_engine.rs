@@ -242,7 +242,7 @@ fn lm_head_lowbit(
             vocab_size,
             hidden_dim,
             lhs,
-            &*weights.lm_head,
+            weights.lm_head(),
             qtype,
             out,
         )
@@ -256,7 +256,7 @@ fn lm_head_lowbit(
             vocab_size,
             hidden_dim,
             lhs,
-            &*weights.lm_head,
+            weights.lm_head(),
             qtype,
             out,
         )
@@ -270,7 +270,7 @@ fn lm_head_lowbit(
         vocab_size,
         hidden_dim,
         lhs,
-        &*weights.lm_head,
+        weights.lm_head(),
         scale,
         zero,
         weights.lm_head_awq_inv_scale.as_ref(),
@@ -560,7 +560,11 @@ impl Drop for DecodeEngine {
             .as_ref()
             .map(|buffer| buffer.as_ptr())
             .unwrap_or(std::ptr::null());
-        kernel_ffi::gqh::invalidate_decode_cache(self.scratch.desc_device.as_ptr(), int4);
+        kernel_ffi::gqh::invalidate_decode_cache(
+            self.ordinal,
+            self.scratch.desc_device.as_ptr(),
+            int4,
+        );
     }
 }
 
@@ -1539,7 +1543,7 @@ impl DecodeEngine {
         if commit_len == block.len() {
             return self.mtp_commit_prefix(block, greedy, commit_len, n_acc, pos, true);
         }
-        match restore_linear_prefix(commit_len) {
+        match restore_linear_prefix(self.ordinal, &self.scratch.desc_device, commit_len) {
             Ok(true) => {
                 if env::var_os("SUPERSONIC_QWEN38_MTP_PROFILE").is_some() {
                     eprintln!(
@@ -2089,7 +2093,7 @@ impl DecodeEngine {
             self.ordinal,
             self.hidden_io.as_ptr() as *mut c_void,
             self.weights
-                .embed_tokens
+                .embed_tokens()
                 .offset_ptr(token_id as usize * row_bytes),
             row_bytes,
         )
@@ -2172,7 +2176,7 @@ impl DecodeEngine {
             ScalarType::BF16,
             &mut self.logits_buf,
             &self.normed_buf,
-            &*self.weights.lm_head,
+            self.weights.lm_head(),
             config.hidden_size,
             config.vocab_size,
             &mut self.matvec_counter,
@@ -2302,7 +2306,7 @@ impl DecodeEngine {
                 kernel_ffi::gqh::ensure_tight(
                     self.ordinal,
                     rung,
-                    self.weights.lm_head.as_ptr() as *mut _,
+                    self.weights.lm_head().as_ptr() as *mut _,
                     hidden as i32,
                     vocab as i32,
                 )?;
@@ -2687,7 +2691,7 @@ impl DecodeEngine {
             gpu_hal::copy_d2d(
                 self.ordinal,
                 unsafe { (cache.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void },
-                self.weights.embed_tokens.offset_ptr(src_offset),
+                self.weights.embed_tokens().offset_ptr(src_offset),
                 row_bytes,
             )
             .map_err(|e| anyhow::anyhow!("fused verify embedding slot {bi}: {e}"))?;
@@ -2776,7 +2780,7 @@ impl DecodeEngine {
                 vocab_size,
                 hidden_dim,
                 &cache.normed_buf,
-                &*self.weights.lm_head,
+                self.weights.lm_head(),
                 &mut cache.logits_buf,
             )
             .map_err(|e| anyhow::anyhow!("fused verify lm_head matmul: {e}"))?;
@@ -2944,7 +2948,7 @@ impl DecodeEngine {
                 self.ordinal,
                 unsafe { (self.hidden_io.as_ptr() as *mut u8).add(bi * row_bytes) as *mut c_void },
                 self.weights
-                    .embed_tokens
+                    .embed_tokens()
                     .offset_ptr(token_id as usize * row_bytes),
                 row_bytes,
             )
@@ -3093,7 +3097,7 @@ impl DecodeEngine {
                     config.vocab_size,
                     config.hidden_size,
                     &self.normed_buf,
-                    &*self.weights.lm_head,
+                    self.weights.lm_head(),
                     &mut self.logits_f32_buf,
                 )
                 .map_err(|e| anyhow::anyhow!("greedy lm_head: {e}"))?;
@@ -3140,7 +3144,7 @@ impl DecodeEngine {
                 config.vocab_size,
                 config.hidden_size,
                 &self.normed_buf,
-                &*self.weights.lm_head,
+                self.weights.lm_head(),
                 &mut self.logits_buf,
             )
             .map_err(|e| anyhow::anyhow!("lm_head: {e}"))?;

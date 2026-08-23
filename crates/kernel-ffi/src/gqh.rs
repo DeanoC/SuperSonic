@@ -16,8 +16,8 @@ pub struct RegisteredHeader {
     pub grid_code: u8,
 }
 
-fn header_map() -> &'static Mutex<HashMap<usize, RegisteredHeader>> {
-    static MAP: OnceLock<Mutex<HashMap<usize, RegisteredHeader>>> = OnceLock::new();
+fn header_map() -> &'static Mutex<HashMap<(usize, usize), RegisteredHeader>> {
+    static MAP: OnceLock<Mutex<HashMap<(usize, usize), RegisteredHeader>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -29,38 +29,38 @@ pub struct RegisteredMix {
     pub lut: [f32; 16],
 }
 
-fn mix_map() -> &'static Mutex<HashMap<usize, RegisteredMix>> {
-    static MAP: OnceLock<Mutex<HashMap<usize, RegisteredMix>>> = OnceLock::new();
+fn mix_map() -> &'static Mutex<HashMap<(usize, usize), RegisteredMix>> {
+    static MAP: OnceLock<Mutex<HashMap<(usize, usize), RegisteredMix>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn register_mix(ptr: *const c_void, qtype: i32, mode: i32, lut: [f32; 16]) {
+pub fn register_mix(ordinal: usize, ptr: *const c_void, qtype: i32, mode: i32, lut: [f32; 16]) {
     if ptr.is_null() {
         return;
     }
     mix_map()
         .lock()
         .expect("mix registry")
-        .insert(ptr as usize, RegisteredMix { qtype, mode, lut });
+        .insert((ordinal, ptr as usize), RegisteredMix { qtype, mode, lut });
 }
 
-pub fn lookup_mix(ptr: *const c_void) -> Option<RegisteredMix> {
+pub fn lookup_mix(ordinal: usize, ptr: *const c_void) -> Option<RegisteredMix> {
     if ptr.is_null() {
         return None;
     }
     mix_map()
         .lock()
         .expect("mix registry")
-        .get(&(ptr as usize))
+        .get(&(ordinal, ptr as usize))
         .copied()
 }
 
-pub fn register_header(ptr: *const c_void, tensor_scale: f32, grid_code: u8) {
+pub fn register_header(ordinal: usize, ptr: *const c_void, tensor_scale: f32, grid_code: u8) {
     if ptr.is_null() {
         return;
     }
     header_map().lock().expect("gqh header registry").insert(
-        ptr as usize,
+        (ordinal, ptr as usize),
         RegisteredHeader {
             tensor_scale,
             grid_code,
@@ -68,14 +68,14 @@ pub fn register_header(ptr: *const c_void, tensor_scale: f32, grid_code: u8) {
     );
 }
 
-pub fn lookup_header(ptr: *const c_void) -> Option<RegisteredHeader> {
+pub fn lookup_header(ordinal: usize, ptr: *const c_void) -> Option<RegisteredHeader> {
     if ptr.is_null() {
         return None;
     }
     header_map()
         .lock()
         .expect("gqh header registry")
-        .get(&(ptr as usize))
+        .get(&(ordinal, ptr as usize))
         .copied()
 }
 
@@ -84,20 +84,20 @@ pub fn lookup_header(ptr: *const c_void) -> Option<RegisteredHeader> {
 /// The C++ bridge caches layout conversion state by raw pointer, so this must
 /// run before the owning `GpuBuffer` is freed. It is intentionally idempotent:
 /// cleanup can run during both normal destruction and error unwinding.
-pub fn unregister(ptr: *const c_void) {
+pub fn unregister(ordinal: usize, ptr: *const c_void) {
     if ptr.is_null() {
         return;
     }
     header_map()
         .lock()
         .expect("gqh header registry")
-        .remove(&(ptr as usize));
+        .remove(&(ordinal, ptr as usize));
     mix_map()
         .lock()
         .expect("mix registry")
-        .remove(&(ptr as usize));
+        .remove(&(ordinal, ptr as usize));
     unsafe {
-        supersonic_gqh_hip_unregister_wire(ptr);
+        supersonic_gqh_hip_unregister_wire(ordinal as c_int, ptr);
     }
 }
 
@@ -105,19 +105,23 @@ pub fn unregister(ptr: *const c_void) {
 /// `Qwen38Weights` keeps these guards so partial loads and normal model drops
 /// both invalidate bridge metadata before HIP frees the allocation.
 pub struct Registration {
+    ordinal: usize,
     ptr: usize,
 }
 
 impl Registration {
-    pub fn new(ptr: *const c_void) -> Self {
-        Self { ptr: ptr as usize }
+    pub fn new(ordinal: usize, ptr: *const c_void) -> Self {
+        Self {
+            ordinal,
+            ptr: ptr as usize,
+        }
     }
 
     pub fn unregister(&mut self) {
         if self.ptr == 0 {
             return;
         }
-        unregister(self.ptr as *const c_void);
+        unregister(self.ordinal, self.ptr as *const c_void);
         self.ptr = 0;
     }
 }
@@ -128,13 +132,133 @@ impl Drop for Registration {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PendingRegistration {
+    ordinal: usize,
+    ptr: usize,
+    header: Option<RegisteredHeader>,
+    mix: Option<RegisteredMix>,
+}
+
+/// Defers publication of process-global metadata until the model owns every
+/// packed buffer. Pending entries are inert, so a failed GGUF load cannot
+/// publish a pointer whose buffer is subsequently dropped. Once committed,
+/// the guards retain normal before-buffer-drop cleanup semantics.
+pub struct RegistrationBatch {
+    pending: Vec<PendingRegistration>,
+    committed: Vec<Registration>,
+}
+
+impl RegistrationBatch {
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            committed: Vec::new(),
+        }
+    }
+
+    pub fn stage_header(
+        &mut self,
+        ordinal: usize,
+        ptr: *const c_void,
+        tensor_scale: f32,
+        grid_code: u8,
+    ) {
+        self.stage(
+            ordinal,
+            ptr,
+            Some(RegisteredHeader {
+                tensor_scale,
+                grid_code,
+            }),
+            None,
+        );
+    }
+
+    pub fn stage_mix(
+        &mut self,
+        ordinal: usize,
+        ptr: *const c_void,
+        qtype: i32,
+        mode: i32,
+        lut: [f32; 16],
+    ) {
+        self.stage(ordinal, ptr, None, Some(RegisteredMix { qtype, mode, lut }));
+    }
+
+    pub fn stage(
+        &mut self,
+        ordinal: usize,
+        ptr: *const c_void,
+        header: Option<RegisteredHeader>,
+        mix: Option<RegisteredMix>,
+    ) {
+        if ptr.is_null() || (header.is_none() && mix.is_none()) {
+            return;
+        }
+        if let Some(existing) = self
+            .pending
+            .iter_mut()
+            .find(|entry| entry.ordinal == ordinal && entry.ptr == ptr as usize)
+        {
+            existing.header = existing.header.or(header);
+            existing.mix = existing.mix.or(mix);
+            return;
+        }
+        self.pending.push(PendingRegistration {
+            ordinal,
+            ptr: ptr as usize,
+            header,
+            mix,
+        });
+    }
+
+    pub fn commit(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.committed.reserve(pending.len());
+        for entry in pending {
+            let ptr = entry.ptr as *const c_void;
+            if let Some(header) = entry.header {
+                register_header(entry.ordinal, ptr, header.tensor_scale, header.grid_code);
+            }
+            if let Some(mix) = entry.mix {
+                register_mix(entry.ordinal, ptr, mix.qtype, mix.mode, mix.lut);
+            }
+            self.committed.push(Registration::new(entry.ordinal, ptr));
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        for registration in &mut self.committed {
+            registration.unregister();
+        }
+        self.committed.clear();
+    }
+}
+
+impl Default for RegistrationBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for RegistrationBatch {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 /// Invalidate bridge-side decode caches owned by one engine instance.
-pub fn invalidate_decode_cache(layers: *const c_void, int4: *const c_void) {
+pub fn invalidate_decode_cache(ordinal: usize, layers: *const c_void, int4: *const c_void) {
     if layers.is_null() && int4.is_null() {
         return;
     }
     unsafe {
-        supersonic_qwen35_4b_hip_invalidate_decode_cache(layers, int4);
+        supersonic_qwen35_4b_hip_invalidate_decode_cache(ordinal as c_int, layers, int4);
     }
 }
 
@@ -191,9 +315,13 @@ unsafe extern "C" {
 
     fn supersonic_gqh_hip_enable_tight_decode();
 
-    fn supersonic_gqh_hip_unregister_wire(wire: *const c_void);
+    fn supersonic_gqh_hip_unregister_wire(device_ordinal: c_int, wire: *const c_void);
 
-    fn supersonic_qwen35_4b_hip_invalidate_decode_cache(layers: *const c_void, int4: *const c_void);
+    fn supersonic_qwen35_4b_hip_invalidate_decode_cache(
+        device_ordinal: c_int,
+        layers: *const c_void,
+        int4: *const c_void,
+    );
     fn supersonic_gqh_hip_ensure_tight(
         device_ordinal: c_int,
         rung: c_int,
@@ -575,40 +703,128 @@ mod tests {
     #[test]
     fn register_and_lookup_header_by_pointer() {
         let ptr = 0x1000 as *const c_void;
-        register_header(ptr, 1.25, 3);
-        let got = lookup_header(ptr).expect("registered");
+        register_header(0, ptr, 1.25, 3);
+        let got = lookup_header(0, ptr).expect("registered");
         assert_eq!(got.tensor_scale, 1.25);
         assert_eq!(got.grid_code, 3);
-        assert!(lookup_header(std::ptr::null()).is_none());
-        unregister(ptr);
+        assert!(lookup_header(0, std::ptr::null()).is_none());
+        unregister(0, ptr);
     }
 
     #[test]
     fn unregister_is_idempotent_for_header_and_mix_metadata() {
         let ptr = 0x2000 as *const c_void;
-        register_header(ptr, 2.5, 7);
-        register_mix(ptr, 105, 3, [0.0; 16]);
-        assert!(lookup_header(ptr).is_some());
-        assert!(lookup_mix(ptr).is_some());
+        register_header(0, ptr, 2.5, 7);
+        register_mix(0, ptr, 105, 3, [0.0; 16]);
+        assert!(lookup_header(0, ptr).is_some());
+        assert!(lookup_mix(0, ptr).is_some());
 
-        unregister(ptr);
-        assert!(lookup_header(ptr).is_none());
-        assert!(lookup_mix(ptr).is_none());
+        unregister(0, ptr);
+        assert!(lookup_header(0, ptr).is_none());
+        assert!(lookup_mix(0, ptr).is_none());
 
         // A buffer can be observed by more than one owner-cleanup path while
         // unwinding a failed load. Repeated cleanup must remain harmless.
-        unregister(ptr);
+        unregister(0, ptr);
     }
 
     #[test]
     fn registration_guard_cleans_up_on_drop() {
         let ptr = 0x3000 as *const c_void;
-        register_header(ptr, 3.75, 2);
+        register_header(0, ptr, 3.75, 2);
         {
-            let _registration = Registration::new(ptr);
-            assert!(lookup_header(ptr).is_some());
+            let _registration = Registration::new(0, ptr);
+            assert!(lookup_header(0, ptr).is_some());
         }
-        assert!(lookup_header(ptr).is_none());
+        assert!(lookup_header(0, ptr).is_none());
+    }
+
+    #[test]
+    fn registration_batch_failure_does_not_publish_uncommitted_metadata() {
+        let ptr = 0x4000 as *const c_void;
+        {
+            let mut batch = RegistrationBatch::new();
+            batch.stage_header(0, ptr, 4.5, 5);
+            batch.stage_mix(0, ptr, 105, 3, [0.0; 16]);
+            assert!(lookup_header(0, ptr).is_none());
+            assert!(lookup_mix(0, ptr).is_none());
+        }
+        assert!(lookup_header(0, ptr).is_none());
+        assert!(lookup_mix(0, ptr).is_none());
+    }
+
+    #[test]
+    fn registration_batch_commit_is_raii_cleanup() {
+        let ptr = 0x5000 as *const c_void;
+        {
+            let mut batch = RegistrationBatch::new();
+            batch.stage_header(0, ptr, 5.5, 6);
+            batch.commit();
+            assert!(lookup_header(0, ptr).is_some());
+            batch.commit();
+        }
+        assert!(lookup_header(0, ptr).is_none());
+    }
+
+    #[test]
+    fn registration_batch_reuses_pointer_after_owner_drop() {
+        let ptr = 0x6000 as *const c_void;
+        {
+            let mut first = RegistrationBatch::new();
+            first.stage_header(0, ptr, 6.5, 1);
+            first.commit();
+            assert_eq!(lookup_header(0, ptr).unwrap().tensor_scale, 6.5);
+        }
+        assert!(lookup_header(0, ptr).is_none());
+
+        // A later model may receive the same allocator address. Its metadata
+        // must be independent of the dropped model's registration.
+        {
+            let mut second = RegistrationBatch::new();
+            second.stage_header(0, ptr, 7.5, 2);
+            second.commit();
+            assert_eq!(lookup_header(0, ptr).unwrap().tensor_scale, 7.5);
+        }
+        assert!(lookup_header(0, ptr).is_none());
+    }
+
+    #[test]
+    fn registration_registry_isolated_by_device_ordinal() {
+        let ptr = 0x7000 as *const c_void;
+        register_header(0, ptr, 8.5, 3);
+        register_header(1, ptr, 9.5, 4);
+        assert_eq!(lookup_header(0, ptr).unwrap().grid_code, 3);
+        assert_eq!(lookup_header(1, ptr).unwrap().grid_code, 4);
+        unregister(0, ptr);
+        assert!(lookup_header(0, ptr).is_none());
+        assert!(lookup_header(1, ptr).is_some());
+        unregister(1, ptr);
+        assert!(lookup_header(1, ptr).is_none());
+    }
+
+    #[test]
+    fn registry_concurrent_register_lookup_unregister_stress() {
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    for iteration in 0..256usize {
+                        let ordinal = worker % 2;
+                        let ptr =
+                            (0x10_0000 + worker * 0x10_000 + iteration * 0x100) as *const c_void;
+                        register_header(ordinal, ptr, iteration as f32, worker as u8);
+                        register_mix(ordinal, ptr, 105, worker as i32, [worker as f32; 16]);
+                        assert!(lookup_header(ordinal, ptr).is_some());
+                        assert!(lookup_mix(ordinal, ptr).is_some());
+                        unregister(ordinal, ptr);
+                        assert!(lookup_header(ordinal, ptr).is_none());
+                        assert!(lookup_mix(ordinal, ptr).is_none());
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("registry worker");
+        }
     }
 
     #[test]

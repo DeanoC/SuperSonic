@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use gpu_hal::{GpuBuffer, ScalarType};
 use qwen38::gguf_ingest::load_text_config;
 use qwen38::scratch::required_attn_scratch_floats;
 use qwen38::weights::Qwen38Weights;
@@ -253,4 +254,52 @@ fn rung13_chat_hello_generate() {
     let reply = tokenizer.decode(&generated, false).expect("decode reply");
     println!("rung13 reply: {reply:?}");
     assert!(!generated.is_empty(), "chat generate produced no tokens");
+}
+
+#[test]
+#[ignore = "requires R9700 artifact CI"]
+fn rung14_reset_refreshes_mutable_state_with_stable_descriptors() {
+    let _guard = GPU.lock().expect("gpu lock");
+    let Some((mut engine, _config)) = build_engine(16) else {
+        return;
+    };
+
+    let before: Vec<usize> = engine
+        .state_for_batch(0)
+        .layers
+        .iter()
+        .filter_map(|layer| {
+            layer
+                .recurrent_state
+                .as_ref()
+                .map(|buf| buf.as_ptr() as usize)
+        })
+        .collect();
+    assert!(!before.is_empty(), "expected linear recurrent state");
+    let blockers: Vec<GpuBuffer> = (0..before.len())
+        .map(|_| {
+            GpuBuffer::zeros(0, ScalarType::F32, &[16, 128, 128])
+                .expect("state-reallocation blocker")
+        })
+        .collect();
+
+    engine.decode_step(9419, 0).expect("initial decode");
+    engine.reset().expect("reset model state");
+    let after: Vec<usize> = engine
+        .state_for_batch(0)
+        .layers
+        .iter()
+        .filter_map(|layer| {
+            layer
+                .recurrent_state
+                .as_ref()
+                .map(|buf| buf.as_ptr() as usize)
+        })
+        .collect();
+    assert_ne!(before, after, "reset should allocate fresh recurrent state");
+
+    let logits = engine.decode_step(9419, 0).expect("decode after reset");
+    assert!(logits.iter().all(|value| value.is_finite()));
+    assert!(logits.iter().map(|value| value * value).sum::<f32>() > 0.0);
+    drop(blockers);
 }

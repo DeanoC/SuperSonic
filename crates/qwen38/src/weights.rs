@@ -101,7 +101,7 @@ pub fn matmul_gqh(
 ) -> Result<(), GpuError> {
     let rung = kernel_ffi::gqh::rung_from_ggml_type(qtype as u32)
         .ok_or_else(|| GpuError::InvalidArg(format!("not a GQH qtype: {qtype}")))?;
-    let header = kernel_ffi::gqh::lookup_header(weight.as_ptr());
+    let header = kernel_ffi::gqh::lookup_header(ordinal, weight.as_ptr());
     if header.is_none() && qtype != LOWBIT_GQH2_C {
         return Err(GpuError::InvalidArg(
             "GQH header not registered for weight buffer".into(),
@@ -135,7 +135,7 @@ pub fn matmul_mix(
     qtype: i32,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    let mix = kernel_ffi::gqh::lookup_mix(weight.as_ptr()).ok_or_else(|| {
+    let mix = kernel_ffi::gqh::lookup_mix(ordinal, weight.as_ptr()).ok_or_else(|| {
         GpuError::InvalidArg("mix sidecar not registered for weight buffer".into())
     })?;
     kernel_ffi::prefill_ffi::matmul_rhs_transposed_mix(
@@ -147,8 +147,8 @@ pub fn matmul_mix(
 pub struct Qwen38Weights {
     pub config: TextConfig,
     pub weight_prefix: String,
-    pub embed_tokens: Arc<GpuBuffer>,
-    pub lm_head: Arc<GpuBuffer>,
+    pub(crate) embed_tokens: Arc<GpuBuffer>,
+    pub(crate) lm_head: Arc<GpuBuffer>,
     pub lm_head_scale: Option<GpuBuffer>,
     /// INT4 GPTQ scale tile for the lm_head when present in the baked package.
     /// Shape `[vocab/group_size, hidden/group_size]`, BF16. Implies `lm_head`
@@ -181,7 +181,7 @@ pub struct Qwen38Weights {
     pub mtp: Option<MtpWeights>,
     /// RAII guards for every packed tensor registered with the GQH bridge.
     /// Kept separate from the buffers so cleanup can run before `hipFree`.
-    pub(crate) gqh_registrations: Vec<kernel_ffi::gqh::Registration>,
+    pub(crate) gqh_registrations: kernel_ffi::gqh::RegistrationBatch,
 }
 
 /// DeepSeek-style NextN head: enorm/hnorm + eh_proj + one full-attn decoder
@@ -195,6 +195,18 @@ pub struct MtpWeights {
 }
 
 impl Qwen38Weights {
+    /// Borrow the shared embedding table without extending its allocation
+    /// lifetime past the model-owned GQH registrations.
+    pub fn embed_tokens(&self) -> &GpuBuffer {
+        self.embed_tokens.as_ref()
+    }
+
+    /// Borrow the shared output head without allowing an `Arc` clone to outlive
+    /// the model-owned GQH registration guard.
+    pub fn lm_head(&self) -> &GpuBuffer {
+        self.lm_head.as_ref()
+    }
+
     pub fn lm_head_lowbit_params(
         &self,
         logical_cols: usize,
@@ -343,8 +355,6 @@ impl Drop for Qwen38Weights {
         // Run before Rust drops the owned GpuBuffers. The bridge caches by raw
         // allocation address, so invalidation after hipFree would be too late
         // when HIP reuses that address for the next model.
-        for registration in &mut self.gqh_registrations {
-            registration.unregister();
-        }
+        self.gqh_registrations.clear();
     }
 }

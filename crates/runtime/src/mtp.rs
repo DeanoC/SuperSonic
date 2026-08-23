@@ -194,8 +194,12 @@ pub(crate) fn restore_linear_state(
 
 /// Ask the HIP bridge to restore its captured linear prefix, when available.
 /// The external symbol spelling remains stable at this boundary.
-pub(crate) fn restore_linear_prefix(commit_len: usize) -> Result<bool> {
-    kernel_ffi::mtp_restore_linear_prefix(commit_len)
+pub(crate) fn restore_linear_prefix(
+    ordinal: usize,
+    layers: &GpuBuffer,
+    commit_len: usize,
+) -> Result<bool> {
+    kernel_ffi::mtp_restore_linear_prefix(ordinal, layers, commit_len)
         .map_err(|e| anyhow::anyhow!("mtp restore linear prefix: {e}"))
 }
 

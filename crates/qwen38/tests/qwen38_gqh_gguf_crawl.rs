@@ -191,11 +191,11 @@ fn rung6_load_gguf_weights() {
     let config = load_text_config(&model_dir).expect("hf config");
     let weights = Qwen38Weights::load_gguf(&path, &config, ordinal).expect("load_gguf");
     assert_eq!(weights.layers.len(), 64);
-    assert_eq!(weights.embed_tokens.dtype(), ScalarType::BF16);
-    assert_eq!(weights.embed_tokens.shape(), &[248320, 5120]);
-    assert_eq!(weights.lm_head.dtype(), ScalarType::U8);
+    assert_eq!(weights.embed_tokens().dtype(), ScalarType::BF16);
+    assert_eq!(weights.embed_tokens().shape(), &[248320, 5120]);
+    assert_eq!(weights.lm_head().dtype(), ScalarType::U8);
     assert_eq!(
-        infer_lowbit_type(weights.lm_head.as_ref(), 5120, false),
+        infer_lowbit_type(weights.lm_head(), 5120, false),
         LOWBIT_GQH2_H
     );
     assert!(weights.gqh_header("lm_head.weight").is_some());
@@ -232,8 +232,8 @@ fn rung6_load_gguf_weights() {
     println!(
         "load_gguf: 64 layers, {} GQH headers, embed {:?}, lm_head {:?}",
         weights.gqh_headers.len(),
-        weights.embed_tokens.shape(),
-        weights.lm_head.shape()
+        weights.embed_tokens().shape(),
+        weights.lm_head().shape()
     );
 }
 
@@ -589,7 +589,7 @@ fn rung8_embed_row_then_prefill_gqh_qkv() {
     gpu_hal::copy_d2d(
         ordinal,
         hidden_bf16.as_mut_ptr(),
-        weights.embed_tokens.offset_ptr(token * hidden * 2),
+        weights.embed_tokens().offset_ptr(token * hidden * 2),
         hidden * 2,
     )
     .expect("embed gather");
@@ -691,7 +691,7 @@ fn gather_embed(ordinal: usize, weights: &Qwen38Weights, token: usize) -> GpuBuf
     gpu_hal::copy_d2d(
         ordinal,
         hidden_bf16.as_mut_ptr(),
-        weights.embed_tokens.offset_ptr(token * hidden * 2),
+        weights.embed_tokens().offset_ptr(token * hidden * 2),
         hidden * 2,
     )
     .expect("embed gather");
@@ -746,7 +746,8 @@ fn rung9_gqh_dispatch_and_ggml_k_kv() {
     let qkv = &weights.layers[0].linear.as_ref().unwrap().qkv_proj_w;
     let qkv_ty = infer_lowbit_type(qkv, hidden, false);
     assert!(is_gqh_qtype(qkv_ty), "qkv qtype {qkv_ty}");
-    let registered = kernel_ffi::gqh::lookup_header(qkv.as_ptr()).expect("qkv header registry");
+    let registered =
+        kernel_ffi::gqh::lookup_header(ordinal, qkv.as_ptr()).expect("qkv header registry");
     let stored = weights
         .gqh_header("layers.0.linear_attn.in_proj_qkv")
         .expect("qkv stored header");
@@ -996,7 +997,9 @@ fn mix105_onehot_matches_cpu_decode() {
     .expect("x");
     let w_buf =
         GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_b], packed).expect("w");
-    kernel_ffi::gqh::register_mix(w_buf.as_ptr(), 105, header.mode, header.lut);
+    let mut registration = kernel_ffi::gqh::RegistrationBatch::new();
+    registration.stage_mix(ordinal, w_buf.as_ptr(), 105, header.mode, header.lut);
+    registration.commit();
     let mut y = GpuBuffer::zeros(ordinal, ScalarType::F32, &[rows]).expect("y");
     kernel_ffi::gqh::mix_matvec(
         ordinal,
@@ -1070,4 +1073,5 @@ fn mix105_onehot_matches_cpu_decode() {
             (g - w).abs() / den
         );
     }
+    drop(registration);
 }

@@ -128,7 +128,11 @@ unsafe extern "C" {
     fn supersonic_qwen35_4b_hip_set_gqh_prepare_only(on: c_int);
 
     #[link_name = "supersonic_qwen35_hip_mtp_restore_linear_prefix"]
-    fn qwen38_mtp_restore_linear_prefix(commit_len: c_int) -> c_int;
+    fn qwen38_mtp_restore_linear_prefix(
+        device_ordinal: c_int,
+        layers: *const c_void,
+        commit_len: c_int,
+    ) -> c_int;
 }
 
 fn hip_error(what: &str, status: c_int) -> GpuError {
@@ -183,9 +187,15 @@ pub fn persistent_decode(
 }
 
 /// Restore the linear recurrent state after a fused speculative verification.
-pub fn mtp_restore_linear_prefix(commit_len: usize) -> Result<bool, GpuError> {
+pub fn mtp_restore_linear_prefix(
+    ordinal: usize,
+    layers: &GpuBuffer,
+    commit_len: usize,
+) -> Result<bool, GpuError> {
     {
-        let status = unsafe { qwen38_mtp_restore_linear_prefix(commit_len as c_int) };
+        let status = unsafe {
+            qwen38_mtp_restore_linear_prefix(ordinal as c_int, layers.as_ptr(), commit_len as c_int)
+        };
         return match status {
             0 => Ok(true),
             1 => Ok(false),

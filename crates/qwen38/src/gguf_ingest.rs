@@ -321,7 +321,7 @@ fn upload_packed(
     ordinal: usize,
     headers: &mut BTreeMap<String, GqhHeader>,
     mix_headers: &mut BTreeMap<String, model_store::dmix2::MixHeader>,
-    registrations: &mut Vec<kernel_ffi::gqh::Registration>,
+    registrations: &mut kernel_ffi::gqh::RegistrationBatch,
     header_key: &str,
 ) -> Result<GpuBuffer, model_store::Error> {
     let tensor = file
@@ -390,18 +390,20 @@ fn upload_packed(
     };
     let buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_bytes], &upload)
         .map_err(model_store::Error::from)?;
-    let mut registered = false;
-    if let Some(h) = headers.get(header_key) {
-        kernel_ffi::gqh::register_header(buf.as_ptr(), h.tensor_scale, h.grid_code);
-        registered = true;
-    }
-    if let Some(h) = mix_headers.get(header_key) {
-        kernel_ffi::gqh::register_mix(buf.as_ptr(), h.qtype as i32, h.mode, h.lut);
-        registered = true;
-    }
-    if registered {
-        registrations.push(kernel_ffi::gqh::Registration::new(buf.as_ptr()));
-    }
+    let header = headers
+        .get(header_key)
+        .map(|h| kernel_ffi::gqh::RegisteredHeader {
+            tensor_scale: h.tensor_scale,
+            grid_code: h.grid_code,
+        });
+    let mix = mix_headers
+        .get(header_key)
+        .map(|h| kernel_ffi::gqh::RegisteredMix {
+            qtype: h.qtype as i32,
+            mode: h.mode,
+            lut: h.lut,
+        });
+    registrations.stage(ordinal, buf.as_ptr(), header, mix);
     Ok(buf)
 }
 
@@ -512,7 +514,7 @@ pub fn load_weights(
     let hidden = config.hidden_size;
     let mut headers = BTreeMap::new();
     let mut mix_headers = BTreeMap::new();
-    let mut gqh_registrations = Vec::new();
+    let mut gqh_registrations = kernel_ffi::gqh::RegistrationBatch::new();
 
     let embed_tokens = Arc::new(load_qk_embed(file, ordinal, hidden, config.vocab_size)?);
     let lm_head = Arc::new(upload_packed(
@@ -788,7 +790,7 @@ pub fn load_weights(
         eprintln!("[qwen38-mtp] loaded NextN blk.64 (shared embed/lm_head)");
     }
 
-    Ok(Qwen38Weights {
+    let mut weights = Qwen38Weights {
         config,
         weight_prefix: "gguf".to_string(),
         embed_tokens,
@@ -809,7 +811,13 @@ pub fn load_weights(
         int8_outlier_threshold: 0.0,
         mtp,
         gqh_registrations,
-    })
+    };
+    // All packed buffers and sidecars are now owned by `weights`. Publishing
+    // the registry only at this point makes every earlier load error inert;
+    // if commit itself unwinds, `Qwen38Weights::drop` owns the committed guards
+    // and unregisters them before dropping its buffers.
+    weights.gqh_registrations.commit();
+    Ok(weights)
 }
 
 fn load_mtp_block(
@@ -818,7 +826,7 @@ fn load_mtp_block(
     ordinal: usize,
     headers: &mut BTreeMap<String, GqhHeader>,
     mix_headers: &mut BTreeMap<String, model_store::dmix2::MixHeader>,
-    registrations: &mut Vec<kernel_ffi::gqh::Registration>,
+    registrations: &mut kernel_ffi::gqh::RegistrationBatch,
 ) -> Result<Option<MtpWeights>, model_store::Error> {
     if file.tensor("blk.64.nextn.eh_proj.weight").is_none() {
         return Ok(None);

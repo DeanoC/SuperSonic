@@ -126,7 +126,7 @@ fn prefill_lm_head_lowbit(
             vocab_size,
             hidden_dim,
             lhs,
-            &*weights.lm_head,
+            weights.lm_head(),
             qtype,
             out,
         )
@@ -140,7 +140,7 @@ fn prefill_lm_head_lowbit(
             vocab_size,
             hidden_dim,
             lhs,
-            &*weights.lm_head,
+            weights.lm_head(),
             qtype,
             out,
         )
@@ -156,7 +156,7 @@ fn prefill_lm_head_lowbit(
         qtype,
         weights.lm_head_awq_inv_scale.as_ref(),
         lhs,
-        &*weights.lm_head,
+        weights.lm_head(),
         out,
     )? {
         prefill_ffi::matmul_rhs_transposed_int4(
@@ -166,7 +166,7 @@ fn prefill_lm_head_lowbit(
             vocab_size,
             hidden_dim,
             lhs,
-            &*weights.lm_head,
+            weights.lm_head(),
             scale,
             zero,
             weights.lm_head_awq_inv_scale.as_ref(),
@@ -865,7 +865,7 @@ pub fn compute_logits_for_range(
             vocab_size, // n
             hidden_dim, // k
             &normed,
-            &*weights.lm_head,
+            weights.lm_head(),
             &mut logits_buf,
         )
         .map_err(|e| anyhow::anyhow!("range lm_head tiled: {e}"))?;
@@ -877,7 +877,7 @@ pub fn compute_logits_for_range(
             ScalarType::BF16,
             &mut logits_buf,
             &normed,
-            &*weights.lm_head,
+            weights.lm_head(),
             hidden_dim,
             vocab_size,
             &mut counter,
@@ -1005,7 +1005,7 @@ fn compute_logits_for_range_f32_hidden(
             vocab_size,
             hidden_dim,
             &normed,
-            &*weights.lm_head,
+            weights.lm_head(),
             &mut logits_buf,
         )
         .map_err(|e| anyhow::anyhow!("range lm_head tiled: {e}"))?;
@@ -1017,7 +1017,7 @@ fn compute_logits_for_range_f32_hidden(
             ScalarType::BF16,
             &mut logits_buf,
             &normed,
-            &*weights.lm_head,
+            weights.lm_head(),
             hidden_dim,
             vocab_size,
             &mut counter,
@@ -1140,7 +1140,7 @@ pub fn compute_greedy_for_range(
                 qtype,
                 weights.lm_head_awq_inv_scale.as_ref(),
                 &normed,
-                &*weights.lm_head,
+                weights.lm_head(),
                 &mut block_best_vals,
                 &mut block_best_indices,
                 &mut out_index,
@@ -1176,7 +1176,7 @@ pub fn compute_greedy_for_range(
                 vocab_size,
                 hidden_dim,
                 &normed,
-                &*weights.lm_head,
+                weights.lm_head(),
                 &mut logits_buf,
             )
             .map_err(|e| anyhow::anyhow!("range greedy lm_head tiled: {e}"))?;
@@ -1188,7 +1188,7 @@ pub fn compute_greedy_for_range(
                 ScalarType::BF16,
                 &mut logits_buf,
                 &normed,
-                &*weights.lm_head,
+                weights.lm_head(),
                 hidden_dim,
                 vocab_size,
                 &mut counter,
@@ -2028,7 +2028,7 @@ fn prefill_inner(
             chunk_len,
             config.vocab_size,
             hidden_dim,
-            &weights.embed_tokens,
+            weights.embed_tokens(),
             &token_ids_gpu,
             &mut scratch.hidden,
         )?;
@@ -2578,7 +2578,7 @@ fn prefill_append_verify_impl(
         chunk_len,
         config.vocab_size,
         hidden_dim,
-        &weights.embed_tokens,
+        weights.embed_tokens(),
         token_ids_gpu,
         &mut scratch.hidden,
     )
@@ -2841,7 +2841,7 @@ fn mtp_decode_step_body(
         chunk_len,
         config.vocab_size,
         hidden_dim,
-        &weights.embed_tokens,
+        weights.embed_tokens(),
         &scratch.token_id_buf,
         &mut scratch.scratch.hidden,
     )?;
@@ -4932,7 +4932,7 @@ pub fn mtp_forward(
         1,
         config.vocab_size,
         hidden_dim,
-        &weights.embed_tokens,
+        weights.embed_tokens(),
         &scratch.token_id_buf,
         &mut scratch.scratch.hidden,
     )?;
@@ -5057,7 +5057,7 @@ pub fn mtp_forward(
             ScalarType::BF16,
             &mut scratch.mtp_logits,
             out_h,
-            &*weights.lm_head,
+            weights.lm_head(),
             hidden_dim,
             vocab_size,
             &mut scratch.mtp_counter,

@@ -7,18 +7,36 @@
 #include <cstdlib>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+#include <mutex>
 #include <stdint.h>
 #include <string.h>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
 namespace {
 bool g_gqh_allow_tight = false;
-std::unordered_set<const void*> g_gqh_tight;
-std::unordered_set<const void*> g_gqh_ileave;
-std::unordered_map<const void*, uint8_t*> g_gqh_padded;
-std::vector<uint8_t*> g_gqh_padded_allocs;
+std::recursive_mutex g_gqh_bridge_mutex;
+
+struct GqhWireKey {
+    int device_ordinal;
+    const void* wire;
+
+    bool operator==(const GqhWireKey& other) const {
+        return device_ordinal == other.device_ordinal && wire == other.wire;
+    }
+};
+
+struct GqhWireKeyHash {
+    size_t operator()(const GqhWireKey& key) const {
+        const size_t ptr_hash = std::hash<const void*>{}(key.wire);
+        return ptr_hash ^ (std::hash<int>{}(key.device_ordinal) +
+                           (ptr_hash << 6) + (ptr_hash >> 2));
+    }
+};
+
+std::unordered_set<GqhWireKey, GqhWireKeyHash> g_gqh_tight;
+std::unordered_set<GqhWireKey, GqhWireKeyHash> g_gqh_ileave;
+std::unordered_map<GqhWireKey, uint8_t*, GqhWireKeyHash> g_gqh_padded;
 int g_gqh_row_off = 0;
 
 // Defined with the gate/up fusion block below. Issues any launch that block is
@@ -26,12 +44,36 @@ int g_gqh_row_off = 0;
 int gqh_gemv_flush();
 }  // namespace
 
+extern "C" void supersonic_gqh_hip_lock() {
+    g_gqh_bridge_mutex.lock();
+}
+
+extern "C" void supersonic_gqh_hip_unlock() {
+    g_gqh_bridge_mutex.unlock();
+}
+
+namespace {
+
+struct GqhBridgeLockGuard {
+    GqhBridgeLockGuard() {
+        g_gqh_bridge_mutex.lock();
+    }
+
+    ~GqhBridgeLockGuard() {
+        g_gqh_bridge_mutex.unlock();
+    }
+};
+
+}  // namespace
+
 extern "C" void supersonic_gqh_hip_set_row_off(int off) {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     g_gqh_row_off = off < 0 ? 0 : off;
 }
 
 extern "C" void supersonic_gqh_hip_enable_tight_decode() {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     g_gqh_allow_tight = true;
 }
@@ -161,21 +203,24 @@ size_t gqh_x_lds_bytes(int in_dim, int out_dim) {
     return static_cast<size_t>(in_dim) * sizeof(float);
 }
 
-bool gqh_is_tight(const void* wire) {
-    return wire != nullptr && g_gqh_tight.find(wire) != g_gqh_tight.end();
+bool gqh_is_tight(int device_ordinal, const void* wire) {
+    return wire != nullptr &&
+        g_gqh_tight.find({device_ordinal, wire}) != g_gqh_tight.end();
 }
 
-bool gqh_is_ileave(const void* wire) {
-    return wire != nullptr && g_gqh_ileave.find(wire) != g_gqh_ileave.end();
+bool gqh_is_ileave(int device_ordinal, const void* wire) {
+    return wire != nullptr &&
+        g_gqh_ileave.find({device_ordinal, wire}) != g_gqh_ileave.end();
 }
 
-const uint8_t* gqh_decode_wire(const uint8_t* packed) {
-    auto it = g_gqh_padded.find(packed);
+const uint8_t* gqh_decode_wire(int device_ordinal, const uint8_t* packed) {
+    auto it = g_gqh_padded.find({device_ordinal, packed});
     return it != g_gqh_padded.end() ? it->second : packed;
 }
 
-bool gqh_is_padded(const void* wire) {
-    return wire != nullptr && g_gqh_padded.find(wire) != g_gqh_padded.end();
+bool gqh_is_padded(int device_ordinal, const void* wire) {
+    return wire != nullptr &&
+        g_gqh_padded.find({device_ordinal, wire}) != g_gqh_padded.end();
 }
 
 bool gqh_want_ileave(int out_dim, int stride) {
@@ -184,7 +229,12 @@ bool gqh_want_ileave(int out_dim, int stride) {
 }
 
 void gqh_ensure_tight(
-    uint8_t* wire, int in_dim, int out_dim, int rung, hipStream_t stream) {
+    int device_ordinal,
+    uint8_t* wire,
+    int in_dim,
+    int out_dim,
+    int rung,
+    hipStream_t stream) {
     if (!g_gqh_allow_tight || wire == nullptr) {
         return;
     }
@@ -194,7 +244,7 @@ void gqh_ensure_tight(
     if (in_dim <= 0 || out_dim <= 0 || (in_dim % GQH_SUPERBLOCK) != 0) {
         return;
     }
-    if (gqh_is_tight(wire)) {
+    if (gqh_is_tight(device_ordinal, wire)) {
         return;
     }
     const int nsb = in_dim / GQH_SUPERBLOCK;
@@ -226,11 +276,16 @@ void gqh_ensure_tight(
             nsb,
             out_dim);
     }
-    g_gqh_tight.insert(wire);
+    g_gqh_tight.insert({device_ordinal, wire});
 }
 
 void gqh_ensure_padded(
-    uint8_t* wire, int in_dim, int out_dim, int rung, hipStream_t stream) {
+    int device_ordinal,
+    uint8_t* wire,
+    int in_dim,
+    int out_dim,
+    int rung,
+    hipStream_t stream) {
     if (!g_gqh_allow_tight || wire == nullptr) {
         return;
     }
@@ -240,7 +295,7 @@ void gqh_ensure_padded(
     if (in_dim <= 0 || out_dim <= 0 || (in_dim % GQH_SUPERBLOCK) != 0) {
         return;
     }
-    if (g_gqh_padded.find(wire) != g_gqh_padded.end()) {
+    if (g_gqh_padded.find({device_ordinal, wire}) != g_gqh_padded.end()) {
         return;
     }
     const int nsb = in_dim / GQH_SUPERBLOCK;
@@ -255,10 +310,9 @@ void gqh_ensure_padded(
         static_cast<size_t>(pad_sb);
     uint8_t* dst = nullptr;
     if (bytes == 0 || hipMalloc(&dst, bytes) != hipSuccess || dst == nullptr) {
-        gqh_ensure_tight(wire, in_dim, out_dim, rung, stream);
+        gqh_ensure_tight(device_ordinal, wire, in_dim, out_dim, rung, stream);
         return;
     }
-    g_gqh_padded_allocs.push_back(dst);
     const dim3 threads(256, 1, 1);
     const dim3 blocks(static_cast<unsigned int>(out_dim));
     if (rung == GQH_RUNG_GQH3) {
@@ -284,8 +338,8 @@ void gqh_ensure_padded(
             nsb,
             out_dim);
     }
-    g_gqh_padded[wire] = dst;
-    g_gqh_tight.insert(wire);
+    g_gqh_padded[{device_ordinal, wire}] = dst;
+    g_gqh_tight.insert({device_ordinal, wire});
     static bool dumped_pad = false;
     if (!dumped_pad) {
         dumped_pad = true;
@@ -435,6 +489,7 @@ void launch_gqh12_tight(
 
 template <bool kAcc>
 void launch_gqh12_matvec(
+    int device_ordinal,
     int rung,
     dim3 blocks,
     dim3 threads,
@@ -514,10 +569,11 @@ void launch_gqh12_matvec(
         }
         return;
     }
-    gqh_ensure_tight(const_cast<uint8_t*>(packed), in_dim, out_dim, rung, stream);
-    if (gqh_is_tight(packed)) {
-        const bool pad = gqh_is_padded(packed);
-        packed = gqh_decode_wire(packed);
+    gqh_ensure_tight(
+        device_ordinal, const_cast<uint8_t*>(packed), in_dim, out_dim, rung, stream);
+    if (gqh_is_tight(device_ordinal, packed)) {
+        const bool pad = gqh_is_padded(device_ordinal, packed);
+        packed = gqh_decode_wire(device_ordinal, packed);
         const int nsb = in_dim / GQH_SUPERBLOCK;
         const int ncols_in = (int)blocks.y;
         // Fat-K / residual / inproj: 4-wave. Skinny B>1 down
@@ -532,7 +588,7 @@ void launch_gqh12_matvec(
                 (rung == GQH_RUNG_GQH2_H && nsb == 20 && out_dim >= 65536)
             ? 8
             : 4;
-        const int ileave = gqh_is_ileave(packed) ? 1 : 0;
+        const int ileave = gqh_is_ileave(device_ordinal, packed) ? 1 : 0;
         // kRows=2 shares one x float4 pair between two weight rows. That pays
         // on the fat-K arms (nsb=68: 467 vs 430 GB/s for kRows=1) but loses on
         // nsb=20, where halving the grid costs more than the x reuse buys.
@@ -808,6 +864,7 @@ extern "C" int supersonic_gqh_hip_decode(
     int cols,
     int dst_is_bf16,
     void* stream) {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     const int shape_status = validate_shape(rung, rows, cols, grid_code);
     if (shape_status != 0) {
@@ -948,6 +1005,7 @@ extern "C" int supersonic_gqh_hip_matvec(
     int64_t y_col_stride,
     float tensor_scale,
     int grid_code) {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     const int shape_status = validate_shape(rung, out_dim, in_dim, grid_code);
     if (shape_status != 0) {
@@ -980,6 +1038,7 @@ extern "C" int supersonic_gqh_hip_matvec(
         case GQH_RUNG_GQH2_H:
         case GQH_RUNG_GQH4:
             launch_gqh12_matvec<false>(
+                device_ordinal,
                 rung,
                 blocks,
                 threads,
@@ -1065,6 +1124,7 @@ int gqh_gemv_launch_single(
         case GQH_RUNG_GQH2_H:
         case GQH_RUNG_GQH4:
             launch_gqh12_matvec<false>(
+                device_ordinal,
                 rung,
                 blocks,
                 threads,
@@ -1149,7 +1209,7 @@ GqhGemvArgs g_gemv_prev{};
 bool g_gemv_prev_valid = false;
 GqhGemvArgs g_gemv_held{};
 bool g_gemv_held_valid = false;
-std::unordered_set<const void*> g_gemv_fusable;
+std::unordered_set<GqhWireKey, GqhWireKeyHash> g_gemv_fusable;
 
 int gqh_gemv_launch_args(const GqhGemvArgs& a) {
     return gqh_gemv_launch_single(
@@ -1208,13 +1268,17 @@ int gqh_gemv_launch_pair(const GqhGemvArgs& a, const GqhGemvArgs& b) {
     auto* pa = static_cast<const uint8_t*>(a.wire);
     auto* pb = static_cast<const uint8_t*>(b.wire);
     gqh_ensure_tight(
-        const_cast<uint8_t*>(pa), a.in_dim, a.out_dim, a.rung, hs);
+        a.device_ordinal, const_cast<uint8_t*>(pa), a.in_dim, a.out_dim, a.rung, hs);
     gqh_ensure_tight(
-        const_cast<uint8_t*>(pb), b.in_dim, b.out_dim, b.rung, hs);
+        b.device_ordinal, const_cast<uint8_t*>(pb), b.in_dim, b.out_dim, b.rung, hs);
     // The pair kernel is tight-only, has no padded-AoS or interleaved arm, and
     // !padded means gqh_decode_wire() is the identity here.
-    if (!gqh_is_tight(pa) || !gqh_is_tight(pb) || gqh_is_padded(pa) ||
-        gqh_is_padded(pb) || gqh_is_ileave(pa) || gqh_is_ileave(pb)) {
+    if (!gqh_is_tight(a.device_ordinal, pa) ||
+        !gqh_is_tight(b.device_ordinal, pb) ||
+        gqh_is_padded(a.device_ordinal, pa) ||
+        gqh_is_padded(b.device_ordinal, pb) ||
+        gqh_is_ileave(a.device_ordinal, pa) ||
+        gqh_is_ileave(b.device_ordinal, pb)) {
         return 1;
     }
     // Mirror the single path's wave count so a fused pair never launches at a
@@ -1300,34 +1364,49 @@ int gqh_gemv_flush() {
 }
 }  // namespace
 
-extern "C" void supersonic_gqh_hip_unregister_wire(const void* wire) {
+extern "C" void supersonic_gqh_hip_unregister_wire(int device_ordinal, const void* wire) {
+    GqhBridgeLockGuard guard;
     if (wire == nullptr) {
         return;
+    }
+
+    const GqhWireKey key{device_ordinal, wire};
+    const bool has_tight = g_gqh_tight.find(key) != g_gqh_tight.end();
+    const bool has_ileave = g_gqh_ileave.find(key) != g_gqh_ileave.end();
+    const auto padded = g_gqh_padded.find(key);
+    const bool has_padded = padded != g_gqh_padded.end();
+    const bool has_held = g_gemv_held_valid &&
+        g_gemv_held.device_ordinal == device_ordinal && g_gemv_held.wire == wire;
+    const bool has_prev = g_gemv_prev_valid &&
+        g_gemv_prev.device_ordinal == device_ordinal && g_gemv_prev.wire == wire;
+
+    // Metadata and padded allocations can be read by an already-launched
+    // kernel. Synchronize the owning device before removing or freeing them.
+    // Do not touch HIP for an untracked/fake pointer: registration cleanup is
+    // also used by CPU-only unwind tests.
+    if (has_tight || has_ileave || has_padded || has_held || has_prev) {
+        ScopedHipDevice scoped(device_ordinal);
+        (void)hipDeviceSynchronize();
     }
 
     // A held GEMV is deliberately not flushed here: its result is no longer
     // observable once the owning model is being destroyed, and launching it
     // would dereference a buffer that is about to be freed. Other owners'
     // held state remains intact.
-    if (g_gemv_held_valid && g_gemv_held.wire == wire) {
+    if (has_held) {
         g_gemv_held_valid = false;
     }
-    if (g_gemv_prev_valid && g_gemv_prev.wire == wire) {
+    if (has_prev) {
         g_gemv_prev_valid = false;
     }
-    g_gemv_fusable.erase(wire);
+    g_gemv_fusable.erase(key);
 
-    g_gqh_tight.erase(wire);
-    g_gqh_ileave.erase(wire);
-    auto padded = g_gqh_padded.find(wire);
-    if (padded != g_gqh_padded.end()) {
+    g_gqh_tight.erase(key);
+    g_gqh_ileave.erase(key);
+    if (has_padded) {
         uint8_t* padded_ptr = padded->second;
         (void)hipFree(padded_ptr);
         g_gqh_padded.erase(padded);
-        auto alloc = std::find(g_gqh_padded_allocs.begin(), g_gqh_padded_allocs.end(), padded_ptr);
-        if (alloc != g_gqh_padded_allocs.end()) {
-            g_gqh_padded_allocs.erase(alloc);
-        }
     }
 }
 
@@ -1345,6 +1424,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
     float tensor_scale,
     int grid_code,
     void* stream) {
+    GqhBridgeLockGuard guard;
     const GqhGemvArgs cur{device_ordinal, rung,          wire,
                           x,              y,             in_dim,
                           out_dim,        ncols,         x_col_stride,
@@ -1367,10 +1447,10 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
         }
     }
     if (g_gemv_prev_valid && gqh_gemv_pairable(g_gemv_prev, cur)) {
-        g_gemv_fusable.insert(g_gemv_prev.wire);
+        g_gemv_fusable.insert({g_gemv_prev.device_ordinal, g_gemv_prev.wire});
     }
     if (gqh_gemv_fusable(cur) &&
-        g_gemv_fusable.find(cur.wire) != g_gemv_fusable.end()) {
+        g_gemv_fusable.find({cur.device_ordinal, cur.wire}) != g_gemv_fusable.end()) {
         g_gemv_held = cur;
         g_gemv_held_valid = true;
         g_gemv_prev_valid = false;
@@ -1396,6 +1476,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
     float tensor_scale,
     int grid_code,
     void* stream) {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     const int shape_status = validate_shape(rung, out_dim, in_dim, grid_code);
     if (shape_status != 0) {
@@ -1428,6 +1509,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
         case GQH_RUNG_GQH2_H:
         case GQH_RUNG_GQH4:
             launch_gqh12_matvec<true>(
+                device_ordinal,
                 rung,
                 blocks,
                 threads,
@@ -1470,6 +1552,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
     int ncols,
     int64_t x_col_stride,
     int64_t y_col_stride) {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     const bool a_ok = rung_a == GQH_RUNG_GQH3 || rung_a == GQH_RUNG_GQH2_H ||
         rung_a == GQH_RUNG_GQH4;
@@ -1595,13 +1678,17 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
         }
         return launch_result(421, 422);
     }
-    gqh_ensure_tight(const_cast<uint8_t*>(pa), in_dim, out_dim, rung_a, hs);
-    gqh_ensure_tight(const_cast<uint8_t*>(pb), in_dim, out_b_eff, rung_b, hs);
-    const bool tight = gqh_is_tight(pa) && gqh_is_tight(pb);
-    const bool pad = gqh_is_padded(pa) && gqh_is_padded(pb);
+    gqh_ensure_tight(
+        device_ordinal, const_cast<uint8_t*>(pa), in_dim, out_dim, rung_a, hs);
+    gqh_ensure_tight(
+        device_ordinal, const_cast<uint8_t*>(pb), in_dim, out_b_eff, rung_b, hs);
+    const bool tight = gqh_is_tight(device_ordinal, pa) &&
+        gqh_is_tight(device_ordinal, pb);
+    const bool pad = gqh_is_padded(device_ordinal, pa) &&
+        gqh_is_padded(device_ordinal, pb);
     if (tight) {
-        pa = gqh_decode_wire(pa);
-        pb = gqh_decode_wire(pb);
+        pa = gqh_decode_wire(device_ordinal, pa);
+        pb = gqh_decode_wire(device_ordinal, pb);
     }
     const float4 mag_a = (rung_a == GQH_RUNG_GQH3) ? load_gqh3_mag(grid_a)
                                                    : load_gqh2h_mag(grid_a);
@@ -1611,7 +1698,8 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
         // llama.cpp: 4 waves/block, simple SB loop, no LDS.
         constexpr int kTightWarps = 4;
         const int ileave =
-            (gqh_is_ileave(pa) && gqh_is_ileave(pb)) ? 1 : 0;
+            (gqh_is_ileave(device_ordinal, pa) &&
+             gqh_is_ileave(device_ordinal, pb)) ? 1 : 0;
         const bool dual = false;
         dim3 tblocks = blocks;
         tblocks.x = static_cast<unsigned int>(
@@ -2010,6 +2098,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_ab(
     int grid_a,
     int grid_b,
     void* stream) {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     const bool a_ok = rung_a == GQH_RUNG_GQH3 || rung_a == GQH_RUNG_GQH2_H;
     const bool b_ok = rung_b == GQH_RUNG_GQH3 || rung_b == GQH_RUNG_GQH2_H;
@@ -2035,13 +2124,15 @@ extern "C" int supersonic_gqh_hip_matvec_stream_ab(
     hipStream_t hs = static_cast<hipStream_t>(stream);
     auto* pa = static_cast<const uint8_t*>(wire_a);
     auto* pb = static_cast<const uint8_t*>(wire_b);
-    gqh_ensure_tight(const_cast<uint8_t*>(pa), in_dim, out_a, rung_a, hs);
-    gqh_ensure_tight(const_cast<uint8_t*>(pb), in_dim, out_b, rung_b, hs);
-    if (!gqh_is_tight(pa) || !gqh_is_tight(pb)) {
+    gqh_ensure_tight(
+        device_ordinal, const_cast<uint8_t*>(pa), in_dim, out_a, rung_a, hs);
+    gqh_ensure_tight(
+        device_ordinal, const_cast<uint8_t*>(pb), in_dim, out_b, rung_b, hs);
+    if (!gqh_is_tight(device_ordinal, pa) || !gqh_is_tight(device_ordinal, pb)) {
         return 401;
     }
-    pa = gqh_decode_wire(pa);
-    pb = gqh_decode_wire(pb);
+    pa = gqh_decode_wire(device_ordinal, pa);
+    pb = gqh_decode_wire(device_ordinal, pb);
     constexpr int kWarps = 1;
     const int total = out_a + out_b;
     dim3 tblocks(static_cast<unsigned int>((total + kWarps - 1) / kWarps), 1, 1);
@@ -2050,7 +2141,8 @@ extern "C" int supersonic_gqh_hip_matvec_stream_ab(
     }
     const dim3 tthreads(GQH_WARP * kWarps, 1, 1);
     const int ileave =
-        (gqh_is_ileave(pa) && gqh_is_ileave(pb)) ? 1 : 0;
+        (gqh_is_ileave(device_ordinal, pa) &&
+         gqh_is_ileave(device_ordinal, pb)) ? 1 : 0;
     const float4 mag_a = (rung_a == GQH_RUNG_GQH3) ? load_gqh3_mag(grid_a)
                                                    : load_gqh2h_mag(grid_a);
     const float4 mag_b = (rung_b == GQH_RUNG_GQH3) ? load_gqh3_mag(grid_b)
@@ -2095,6 +2187,7 @@ extern "C" int supersonic_gqh_hip_mix_matvec_stream(
     int mode,
     const float* lut,
     void* stream) {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     if (wire == nullptr || x == nullptr || y == nullptr || lut == nullptr) {
         return 405;
@@ -2154,12 +2247,14 @@ extern "C" int supersonic_gqh_hip_ensure_tight(
     void* wire,
     int in_dim,
     int out_dim) {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     if (wire == nullptr) {
         return 405;
     }
     ScopedHipDevice scoped(device_ordinal);
-    gqh_ensure_tight(static_cast<uint8_t*>(wire), in_dim, out_dim, rung, 0);
+    gqh_ensure_tight(
+        device_ordinal, static_cast<uint8_t*>(wire), in_dim, out_dim, rung, 0);
     return 0;
 }
 
@@ -2169,11 +2264,13 @@ extern "C" int supersonic_gqh_hip_ensure_padded(
     void* wire,
     int in_dim,
     int out_dim) {
+    GqhBridgeLockGuard guard;
     (void)gqh_gemv_flush();
     if (wire == nullptr) {
         return 405;
     }
     ScopedHipDevice scoped(device_ordinal);
-    gqh_ensure_padded(static_cast<uint8_t*>(wire), in_dim, out_dim, rung, 0);
+    gqh_ensure_padded(
+        device_ordinal, static_cast<uint8_t*>(wire), in_dim, out_dim, rung, 0);
     return 0;
 }
