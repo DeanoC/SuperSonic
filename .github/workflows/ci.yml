@@ -1,0 +1,72 @@
+name: CPU CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/ci.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "kernels/**"
+      - "support/**"
+      - "tools/**"
+      - "tests/**"
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpu-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: CPU contract and compile gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      # The HIP build scripts need a deterministic code-generation target, but
+      # this job never selects or requires a GPU device.
+      - name: Compile every workspace target
+        run: HIP_ARCH=gfx1201 cargo check --workspace --all-targets
+
+      - name: GQH model-store tests
+        run: HIP_ARCH=gfx1201 cargo test -p model-store --lib 'gqh::tests::' -- --nocapture
+
+      - name: GQH kernel-FFI tests
+        run: |
+          HIP_ARCH=gfx1201 cargo test -p kernel-ffi --lib 'gqh::tests::maps_gguf_and_flm_ids' -- --nocapture
+          HIP_ARCH=gfx1201 cargo test -p kernel-ffi --lib 'gqh::tests::register_and_lookup_header_by_pointer' -- --nocapture
+
+      - name: MTP acceptance policy
+        run: HIP_ARCH=gfx1201 cargo test -p supersonic-runtime --lib mtp_accept_tests -- --nocapture
+
+      - name: CLI contract
+        run: HIP_ARCH=gfx1201 cargo test -p runner --test qwen38_cli_contract -- --nocapture
+
+      - name: Startup and artifact-role contract
+        run: HIP_ARCH=gfx1201 cargo test -p runner --test qwen38_startup_contract -- --nocapture
+
+      - name: Validate product manifests and retained source boundary
+        run: |
+          python3 tools/check-support-matrix.py
+          python3 tools/check-kernel-groups.py
+          python3 tools/check-tool-inventory.py
+          python3 tools/check-retained-source-terms.py
+
+      - name: Run CPU-safe Python validators
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v

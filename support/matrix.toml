@@ -1,23 +1,34 @@
-# Slim HIP/Qwen support matrix. CUDA/Metal/Gemma/Phi/Llama are out of this branch.
+# Active public product lanes.  Every row is the direct custom GQH GGUF
+# Qwen3.8-27B path; internal FLM foundations are not a support lane.
 
 version = 1
 
 [[entry]]
-id = "hip-gfx1100-qwen38-27b"
+id = "hip-gfx1100-qwen38-27b-gqh"
 backend = "hip"
 arch = "gfx1100"
 status = "experimental"
 models = ["qwen3.8-27b"]
+model_sources = ["gqh-gguf"]
 quants = ["gqh"]
+correctness_gate = "qwen38-gqh-correctness"
 support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
-notes = "Qwen3.8-27B custom GQH GGUF lane."
+gate_commands = [
+  "cargo test --release -p qwen38 --test qwen38_gqh_gguf_crawl -- --include-ignored --test-threads=1",
+]
+notes = "Qwen3.8-27B custom GQH GGUF lane on gfx1100."
 
 [[entry]]
-id = "hip-gfx1201-qwen38-27b"
+id = "hip-gfx1201-qwen38-27b-gqh"
 backend = "hip"
 arch = "gfx1201"
 status = "experimental"
 models = ["qwen3.8-27b"]
+model_sources = ["gqh-gguf"]
 quants = ["gqh"]
+correctness_gate = "qwen38-gqh-correctness"
 support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
-notes = "Qwen3.8-27B custom GQH GGUF lane on R9700."
+gate_commands = [
+  "cargo test --release -p qwen38 --test qwen38_gqh_gguf_crawl -- --include-ignored --test-threads=1",
+]
+notes = "Qwen3.8-27B custom GQH GGUF lane on the R9700 gfx1201 runner."

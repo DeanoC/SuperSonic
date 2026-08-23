@@ -1,0 +1,263 @@
+name: Qwen3.8 GQH gfx1201
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/qwen38-gfx1201.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "kernels/**"
+      - "support/**"
+      - "tools/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen38-gfx1201-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  r9700:
+    name: R9700 serial Qwen3.8 correctness gate
+    runs-on: [self-hosted, linux, rocm, gfx1201]
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      HIP_ARCH: gfx1201
+      # The runner may expose the R9700 at a non-zero physical ordinal.  The
+      # selection step below masks that ordinal so every test uses --device 0.
+      SUPERSONIC_R9700_GPU_ID: ${{ vars.SUPERSONIC_R9700_GPU_ID || '0' }}
+      HIP_VISIBLE_DEVICES: ${{ vars.SUPERSONIC_R9700_GPU_ID || '0' }}
+      SUPERSONIC_DEVICE: "0"
+      RUST_TEST_THREADS: "1"
+      SUPERSONIC_REQUIRE_GQH_ARTIFACTS: "1"
+      # These are the canonical self-hosted runner paths.  Repository or
+      # organization variables/secrets may point at an equivalent mounted
+      # location without changing the Rust artifact contract.
+      SUPERSONIC_GQH_GGUF: ${{ secrets.SUPERSONIC_GQH_GGUF || vars.SUPERSONIC_GQH_GGUF || '/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf' }}
+      SUPERSONIC_GQH_8192_GGUF: ${{ secrets.SUPERSONIC_GQH_8192_GGUF || vars.SUPERSONIC_GQH_8192_GGUF || '/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf' }}
+      SUPERSONIC_QWEN38_MODEL_DIR: ${{ secrets.SUPERSONIC_QWEN38_MODEL_DIR || vars.SUPERSONIC_QWEN38_MODEL_DIR || '/data/models/Qwen3.8-27B' }}
+      CI_OUTPUT_ROOT: target/ci/qwen38-gfx1201
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select R9700 and record machine state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CI_OUTPUT_ROOT"
+          gpu_id="${SUPERSONIC_R9700_GPU_ID:-0}"
+          if [[ ! "$gpu_id" =~ ^[0-9]+$ ]]; then
+            echo "SUPERSONIC_R9700_GPU_ID must be a numeric physical ROCm ordinal: $gpu_id" >&2
+            exit 1
+          fi
+          export HIP_VISIBLE_DEVICES="$gpu_id"
+          {
+            echo "HIP_VISIBLE_DEVICES=$gpu_id"
+            echo "SUPERSONIC_DEVICE=0"
+          } >> "$GITHUB_ENV"
+          echo "selected physical R9700 ordinal: $gpu_id (masked test ordinal: 0)" \
+            | tee "$CI_OUTPUT_ROOT/device-selection.log"
+          rocminfo | tee "$CI_OUTPUT_ROOT/rocminfo.txt"
+          grep -Eiq 'gfx1201|R9700' "$CI_OUTPUT_ROOT/rocminfo.txt"
+          rocm-smi --showproductname --showuse --showmemuse --showtemp \
+            | tee "$CI_OUTPUT_ROOT/rocm-smi-initial.txt"
+
+      - name: Wait for GPU idle
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_wait_seconds=900
+          interval_seconds=15
+          required_idle_samples=3
+          max_gpu_use_percent=10
+          max_vram_use_percent=20
+          idle_samples=0
+          elapsed=0
+          while true; do
+            rocm-smi --showuse --showmemuse --showtemp \
+              | tee "$CI_OUTPUT_ROOT/rocm-smi-idle-${elapsed}.txt"
+            gpu_use="$(awk -F': ' '/GPU use \(%\)/ {
+              gsub(/[^0-9.]/, "", $NF); print int($NF); exit
+            }' "$CI_OUTPUT_ROOT/rocm-smi-idle-${elapsed}.txt")"
+            vram_use="$(awk -F': ' '/GPU Memory Allocated \(VRAM%\)/ {
+              gsub(/[^0-9.]/, "", $NF); print int($NF); exit
+            }' "$CI_OUTPUT_ROOT/rocm-smi-idle-${elapsed}.txt")"
+            if [[ -z "$gpu_use" || -z "$vram_use" ]]; then
+              echo "failed to parse rocm-smi utilization output" >&2
+              exit 1
+            fi
+            if (( gpu_use <= max_gpu_use_percent && vram_use <= max_vram_use_percent )); then
+              idle_samples=$((idle_samples + 1))
+              echo "GPU idle sample ${idle_samples}/${required_idle_samples}: gpu=${gpu_use}% vram=${vram_use}%"
+            else
+              idle_samples=0
+              echo "GPU busy: gpu=${gpu_use}% vram=${vram_use}%; waiting ${interval_seconds}s"
+            fi
+            if (( idle_samples >= required_idle_samples )); then
+              echo "GPU has been idle for ${required_idle_samples} consecutive samples"
+              break
+            fi
+            if (( elapsed >= max_wait_seconds )); then
+              echo "timed out waiting for GPU idle after ${max_wait_seconds}s" >&2
+              exit 1
+            fi
+            sleep "$interval_seconds"
+            elapsed=$((elapsed + interval_seconds))
+          done
+
+      - name: Strict canonical artifact preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/check-qwen38-artifacts.py --require-8192 \
+            2>&1 | tee "$CI_OUTPUT_ROOT/artifact-preflight.log"
+
+      - name: Build release workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          HIP_ARCH=gfx1201 cargo build --release --workspace \
+            2>&1 | tee "$CI_OUTPUT_ROOT/release-build.log"
+
+      # A 10+ GiB artifact is resident during these tests.  Keep every cargo
+      # invocation serial and include ignored correctness gates explicitly.
+      - name: Focused GQH kernel tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_TEST_THREADS=1 cargo test --release -p kernel-ffi --lib 'gqh::tests::' \
+            -- --include-ignored --test-threads=1 --nocapture \
+            2>&1 | tee "$CI_OUTPUT_ROOT/gqh-kernel-tests.log"
+
+      - name: Full canonical GQH artifact crawl
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_TEST_THREADS=1 cargo test --release -p qwen38 --test qwen38_gqh_gguf_crawl \
+            -- --include-ignored --test-threads=1 --nocapture \
+            2>&1 | tee "$CI_OUTPUT_ROOT/gqh-artifact-crawl.log"
+
+      - name: Deterministic decode and chat generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_TEST_THREADS=1 cargo test --release -p supersonic-runtime --test qwen38_gqh_decode_rung11 \
+            -- --include-ignored --test-threads=1 --nocapture \
+            2>&1 | tee "$CI_OUTPUT_ROOT/decode-chat-tests.log"
+
+      - name: Ordinary versus MTP token equivalence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CI_OUTPUT_ROOT/token-equivalence"
+          common_args=(
+            --model qwen3.8-27b
+            --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR"
+            --gguf-file "$SUPERSONIC_GQH_GGUF"
+            --chat
+            --max-new-tokens 8
+            --ignore-eos
+            --emit-generated-json
+            --emit-stage-timings
+            --device 0
+          )
+          ./target/release/supersonic "${common_args[@]}" \
+            > "$CI_OUTPUT_ROOT/token-equivalence/ordinary.log" 2>&1
+          ./target/release/supersonic "${common_args[@]}" --speculative-decode \
+            > "$CI_OUTPUT_ROOT/token-equivalence/mtp.log" 2>&1
+          python3 - "$CI_OUTPUT_ROOT/token-equivalence/ordinary.log" \
+            "$CI_OUTPUT_ROOT/token-equivalence/mtp.log" \
+            "$CI_OUTPUT_ROOT/token-equivalence/comparison.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          def tokens(path: Path) -> list[int]:
+              for line in path.read_text(encoding="utf-8").splitlines():
+                  if line.startswith("[tokens] "):
+                      values = line.removeprefix("[tokens] ").split()
+                      return [int(value) for value in values]
+              raise SystemExit(f"missing structured token line in {path}")
+
+          ordinary = tokens(Path(sys.argv[1]))
+          mtp = tokens(Path(sys.argv[2]))
+          if ordinary != mtp:
+              raise SystemExit(f"ordinary/MTP token mismatch: {ordinary} != {mtp}")
+          Path(sys.argv[3]).write_text(
+              json.dumps({"ordinary": ordinary, "mtp": mtp}, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(f"ordinary/MTP token equivalence passed for {len(ordinary)} tokens")
+          PY
+
+      - name: Throughput telemetry (non-blocking)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          telemetry_root="$CI_OUTPUT_ROOT/throughput"
+          mkdir -p "$telemetry_root"
+          common_args=(
+            --model qwen3.8-27b
+            --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR"
+            --gguf-file "$SUPERSONIC_GQH_GGUF"
+            --prompt "Hello"
+            --max-new-tokens 8
+            --ignore-eos
+            --emit-generated-json
+            --emit-stage-timings
+            --device 0
+          )
+          for warmup in 1; do
+            ./target/release/supersonic "${common_args[@]}" \
+              > "$telemetry_root/warmup-${warmup}.log" 2>&1 || exit $?
+          done
+          for run in 1 2 3; do
+            ./target/release/supersonic "${common_args[@]}" \
+              > "$telemetry_root/run-${run}.log" 2>&1 || exit $?
+          done
+          python3 - "$telemetry_root" "$telemetry_root/summary.json" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          values = []
+          for path in sorted(root.glob("run-*.log")):
+              text = path.read_text(encoding="utf-8")
+              matches = re.findall(r"ms_per_tok=([0-9]+(?:\.[0-9]+)?)", text)
+              if not matches:
+                  raise SystemExit(f"no ms_per_tok telemetry in {path}")
+              values.append(float(matches[-1]))
+          values.sort()
+          median_ms = values[len(values) // 2]
+          summary = {
+              "warmup_runs": 1,
+              "measured_runs": len(values),
+              "ms_per_tok": values,
+              "median_ms_per_tok": median_ms,
+              "median_tok_per_s": 1000.0 / median_ms if median_ms > 0 else 0.0,
+              "blocking": False,
+          }
+          Path(sys.argv[2]).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(summary, sort_keys=True))
+          PY
+
+      - name: Upload structured R9700 logs and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen38-gfx1201-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/qwen38-gfx1201
+          if-no-files-found: warn

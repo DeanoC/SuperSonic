@@ -1,4 +1,4 @@
-# Slim HIP/Qwen runner binary inventory.
+# Current runner binary inventory for the narrowed Qwen3.8 product.
 
 version = 1
 
@@ -7,46 +7,4 @@ name = "supersonic"
 path = "crates/runner/src/main.rs"
 class = "stable"
 future_home = "crates/runner/src/main.rs"
-notes = "Primary user-facing CLI."
-
-[[runner_bin]]
-name = "bench_prefill_attn"
-path = "crates/runner/src/bin/bench_prefill_attn.rs"
-class = "microbench"
-future_home = "tools/microbench"
-notes = "Focused prefill attention benchmark."
-
-[[runner_bin]]
-name = "int4_real_test"
-path = "crates/runner/src/bin/int4_real_test.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "INT4 validation against real model artifacts."
-
-[[runner_bin]]
-name = "int4_test"
-path = "crates/runner/src/bin/int4_test.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "INT4 validation harness."
-
-[[runner_bin]]
-name = "qwen36_ffn_expert_microbench"
-path = "crates/runner/src/bin/qwen36_ffn_expert_microbench.rs"
-class = "microbench"
-future_home = "tools/microbench"
-notes = "Qwen3.6 MoE FFN expert focused benchmark."
-
-[[runner_bin]]
-name = "qwen36_flm_upload_probe"
-path = "crates/runner/src/bin/qwen36_flm_upload_probe.rs"
-class = "lab"
-future_home = "tools/lab"
-notes = "FLM upload/load probe."
-
-[[runner_bin]]
-name = "qwen36_q4km_manifest_audit"
-path = "crates/runner/src/bin/qwen36_q4km_manifest_audit.rs"
-class = "validation"
-future_home = "tools/validation"
-notes = "Qwen3.6 Q4_K_M manifest audit."
+notes = "Only public Qwen3.8-27B ROCm/HIP GQH CLI."

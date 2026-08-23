@@ -1,5 +1,5 @@
-# Retained HIP/Qwen3.8 kernel groups. Unsupported backends and model families
-# are intentionally absent from this manifest.
+# Authoritative HIP kernel inputs for the Qwen3.8-27B GQH product path.
+# Unsupported backends and model families are intentionally absent.
 
 version = 1
 
@@ -8,7 +8,7 @@ id = "hip-qwen38-dense"
 backend = "hip"
 model_family = "qwen3.8"
 default_compiled = true
-notes = "Retained Qwen3.8 dense attention, 4B geometry, and prefill helpers."
+notes = "Qwen3.8-27B dense attention, 4B geometry, and prefill helpers."
 kernel_sources = [
   "kernels/full_attention.hip",
   "kernels/full_attention_4b.hip",
@@ -37,9 +37,9 @@ object = "qwen35_prefill_helpers_hip.o"
 [[group]]
 id = "hip-gqh"
 backend = "hip"
-model_family = "qwen3.8-gqh"
+model_family = "qwen3.8-27b-gqh"
 default_compiled = true
-notes = "Qwen3.8 GQH decode and fused dequant-matvec."
+notes = "Qwen3.8-27B GQH decode and fused dequant-matvec."
 kernel_sources = [
   "kernels/gqh.hip",
   "kernels/gqh-tables.h",

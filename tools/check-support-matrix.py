@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the seed support matrix manifest."""
+"""Validate the active Qwen3.8 GQH support matrix manifest."""
 
 from __future__ import annotations
 
@@ -18,12 +18,15 @@ MANIFEST = ROOT / "support" / "matrix.toml"
 
 VALID_BACKENDS = {"hip"}
 VALID_STATUSES = {"validated", "tbm", "experimental", "inherited", "pending", "unsupported"}
-VALID_QUANTS = {"bf16", "int4", "fp8-runtime", "kv-fp8", "int8", "gqh"}
-VALID_MODEL_SOURCES = {"hf-snapshot", "flm"}
+VALID_MODELS = {"qwen3.8-27b"}
+VALID_QUANTS = {"gqh"}
+VALID_MODEL_SOURCES = {"gqh-gguf"}
 EXPECTED_ARCHES = {
     "gfx1100",
     "gfx1201",
 }
+EXPECTED_ENTRY_COUNT = len(EXPECTED_ARCHES)
+CORRECTNESS_GATE_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*")
 
 
 def rel(path: Path) -> str:
@@ -117,6 +120,11 @@ def main() -> int:
     if not isinstance(entries, list) or not entries:
         errors.append("entry must be a non-empty array of tables")
         entries = []
+    elif len(entries) != EXPECTED_ENTRY_COUNT:
+        errors.append(
+            f"active matrix must contain exactly {EXPECTED_ENTRY_COUNT} architecture rows, "
+            f"found {len(entries)}"
+        )
 
     seen_ids: set[str] = set()
     seen_arches: set[str] = set()
@@ -147,18 +155,40 @@ def main() -> int:
             errors.append(f"{entry_id}: arch must be a non-empty string")
         else:
             seen_arches.add(arch)
+            if arch not in EXPECTED_ARCHES:
+                errors.append(
+                    f"{entry_id}: arch must be one of {sorted(EXPECTED_ARCHES)}, got {arch!r}"
+                )
 
         status = entry.get("status")
         if status not in VALID_STATUSES:
             errors.append(f"{entry_id}: status must be one of {sorted(VALID_STATUSES)}")
 
         models = require_string_list(entry_id, entry, "models", errors)
+        if models != ["qwen3.8-27b"]:
+            errors.append(
+                f"{entry_id}: active model must be exactly ['qwen3.8-27b'], got {models!r}"
+            )
+        for model in models:
+            if model not in VALID_MODELS:
+                errors.append(f"{entry_id}: unsupported model {model!r}")
+
         quants = require_string_list(entry_id, entry, "quants", errors)
         for quant in quants:
             if quant not in VALID_QUANTS:
                 errors.append(f"{entry_id}: unknown quant {quant!r}")
+        if quants != ["gqh"]:
+            errors.append(
+                f"{entry_id}: active quant must be exactly ['gqh'], got {quants!r}"
+            )
 
         model_sources = model_sources_for_entry(entry_id, entry, errors)
+        if "model_sources" not in entry:
+            errors.append(f"{entry_id}: model_sources must explicitly name 'gqh-gguf'")
+        if model_sources != ["gqh-gguf"]:
+            errors.append(
+                f"{entry_id}: active source must be exactly ['gqh-gguf'], got {model_sources!r}"
+            )
 
         if isinstance(backend, str) and isinstance(arch, str) and models and quants:
             lane_key = lane_key_for_entry(
@@ -167,7 +197,7 @@ def main() -> int:
                     "arch": arch,
                     "models": models,
                     "quants": quants,
-                    "model_sources": model_sources or ["hf-snapshot"],
+                    "model_sources": model_sources or ["gqh-gguf"],
                 }
             )
             if lane_key in seen_lane_keys:
@@ -196,8 +226,18 @@ def main() -> int:
             errors.append(f"{entry_id}: gate_commands must be a string list when present")
             gate_commands = []
 
-        if status == "validated" and not gate_scripts and not gate_commands:
-            errors.append(f"{entry_id}: validated entries require gate_scripts or gate_commands")
+        correctness_gate = entry.get("correctness_gate")
+        if (
+            not isinstance(correctness_gate, str)
+            or not correctness_gate
+            or not CORRECTNESS_GATE_RE.fullmatch(correctness_gate)
+        ):
+            errors.append(
+                f"{entry_id}: correctness_gate must be a named lowercase gate identifier"
+            )
+
+        if not gate_scripts and not gate_commands:
+            errors.append(f"{entry_id}: entries require gate_scripts or gate_commands")
 
     missing_arches = EXPECTED_ARCHES - seen_arches
     if missing_arches:
