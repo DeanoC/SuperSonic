@@ -203,23 +203,25 @@ fn rung13_chat_hello_generate() {
         "unexpected prompt length {}",
         prompt_ids.len()
     );
+    assert!(
+        prompt_ids.len() > 8,
+        "canonical chat prefill must exercise the >8-token GQH GEMM path; got {}",
+        prompt_ids.len()
+    );
 
     let eos = tokenizer
         .token_to_id("<|im_end|>")
         .or_else(|| tokenizer.token_to_id("<|endoftext|>"));
 
     let prefill_start = std::time::Instant::now();
-    let mut logits = Vec::new();
-    for (pos, &id) in prompt_ids.iter().enumerate() {
-        logits = engine
-            .decode_step(id, pos)
-            .unwrap_or_else(|e| panic!("prefill pos={pos} token={id}: {e}"));
-        assert_eq!(logits.len(), config.vocab_size);
-        assert!(
-            logits.iter().all(|v| v.is_finite()),
-            "prefill logits at pos={pos} not finite"
-        );
-    }
+    let mut logits = engine
+        .prefill_native(&prompt_ids)
+        .unwrap_or_else(|e| panic!("canonical >8-token prefill failed: {e}"));
+    assert_eq!(logits.len(), config.vocab_size);
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "prefill logits are not finite"
+    );
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     println!(
         "rung13: prefill {} tokens in {prefill_ms:.0}ms",

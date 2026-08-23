@@ -11,7 +11,7 @@ pub use backend::{
     set_buffer_policy, set_memory_architecture, AllocStrategy, Backend, BufferKind, BufferPolicy,
     DeviceInfo, MemoryArchitecture,
 };
-pub use buffer::{GpuBuffer, HostBuffer};
+pub use buffer::{quarantine_buffer, GpuBuffer, HostBuffer};
 pub use error::{BackendApi, GpuError};
 pub use ops::{
     copy_d2d, copy_d2h, copy_h2d, copy_h2d_async, copy_storage_to_device, hal_profile_enabled,

@@ -298,6 +298,12 @@ mod typed_bridge_status_tests {
             } if message == "matmul_rhs_transposed failed with project status 272"
         ));
     }
+
+    #[test]
+    fn gqh_dequant_gemm_boundary_flushes_only_batched_path() {
+        assert!(!gqh_dequant_gemm_needs_flush(8));
+        assert!(gqh_dequant_gemm_needs_flush(9));
+    }
 }
 
 unsafe extern "C" {
@@ -1570,6 +1576,10 @@ fn matmul_rhs_transposed_int4_impl(
 const GQH_FUSED_MAX_COLS: usize = 8;
 const GQH_DEQUANT_GEMM_MAX_WEIGHT_BYTES: usize = 768 * 1024 * 1024;
 
+fn gqh_dequant_gemm_needs_flush(ncols: usize) -> bool {
+    ncols > GQH_FUSED_MAX_COLS
+}
+
 fn gqh_force_fused() -> bool {
     std::env::var_os("SUPERSONIC_GQH_FORCE_FUSED").is_some()
 }
@@ -1622,7 +1632,7 @@ pub fn matmul_rhs_transposed_gqh(
         && dequant_bytes > 0
         && dequant_bytes <= GQH_DEQUANT_GEMM_MAX_WEIGHT_BYTES
     {
-        return matmul_gqh_dequant_gemm(
+        matmul_gqh_dequant_gemm(
             ordinal,
             ncols,
             n,
@@ -1633,7 +1643,19 @@ pub fn matmul_rhs_transposed_gqh(
             grid_code,
             rung,
             out,
-        );
+        )?;
+        // The >8 path uses a HIP dequant stream and a separate GEMM stream.
+        // Publish a default-stream dependency before callers can issue raw
+        // D2D copies, host reads, argmax, or attention against `out`. This is
+        // an event wait, not a host synchronize; the <=8 fused matvec path
+        // remains on its existing stream and avoids this extra bridge call.
+        if gqh_dequant_gemm_needs_flush(ncols)
+            && lhs.dtype() == ScalarType::BF16
+            && out.dtype() == ScalarType::BF16
+        {
+            crate::gqh::gemm_flush(ordinal)?;
+        }
+        return Ok(());
     }
     thread_local! {
         static GQH_X: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };

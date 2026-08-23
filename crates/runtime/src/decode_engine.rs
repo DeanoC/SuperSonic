@@ -560,11 +560,21 @@ impl Drop for DecodeEngine {
             .as_ref()
             .map(|buffer| buffer.as_ptr())
             .unwrap_or(std::ptr::null());
-        kernel_ffi::gqh::invalidate_decode_cache(
+        if let Err(err) = kernel_ffi::gqh::invalidate_decode_cache(
             self.ordinal,
             self.scratch.desc_device.as_ptr(),
             int4,
-        );
+        ) {
+            // A failed owner-safe teardown must not let the subsequent field
+            // drops free descriptors that the process-global graph may still
+            // reference. Quarantine those allocations; the bridge bookkeeping
+            // remains intact for a later retry in this process.
+            eprintln!("decode cache invalidation deferred: {err}");
+            gpu_hal::quarantine_buffer(self.ordinal, self.scratch.desc_device.as_ptr());
+            if !int4.is_null() {
+                gpu_hal::quarantine_buffer(self.ordinal, int4);
+            }
+        }
     }
 }
 

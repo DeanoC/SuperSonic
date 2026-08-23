@@ -1,10 +1,42 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::{Mutex, OnceLock};
 
 use crate::backend::{Backend, BufferKind};
 use crate::error::{GpuError, Result};
 use crate::ops::{self, AllocatorKind};
 use crate::scalar_type::ScalarType;
+
+// A bridge that cannot prove that a process-global metadata entry is gone must
+// quarantine the allocation instead of allowing `GpuBuffer::drop` to free a
+// pointer that the bridge can still dereference.  Entries are intentionally
+// never removed: the allocation remains live, so HIP cannot hand the address
+// to a later model while stale metadata exists.
+fn quarantined_buffers() -> &'static Mutex<HashSet<(usize, usize)>> {
+    static BUFFERS: OnceLock<Mutex<HashSet<(usize, usize)>>> = OnceLock::new();
+    BUFFERS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Keep a GPU allocation live when an external metadata owner cannot be
+/// synchronously unregistered.  This is a safety fallback for destructor
+/// paths; successful unregisters do not add entries here.
+pub fn quarantine_buffer(ordinal: usize, ptr: *const c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    quarantined_buffers()
+        .lock()
+        .expect("quarantined buffer registry")
+        .insert((ordinal, ptr as usize));
+}
+
+fn is_quarantined(ordinal: usize, ptr: *const c_void) -> bool {
+    quarantined_buffers()
+        .lock()
+        .expect("quarantined buffer registry")
+        .contains(&(ordinal, ptr as usize))
+}
 
 /// Owned GPU device memory with shape and dtype metadata.
 ///
@@ -148,6 +180,9 @@ impl HostBuffer {
 
 impl Drop for GpuBuffer {
     fn drop(&mut self) {
+        if is_quarantined(self.device_ordinal, self.ptr.as_ptr()) {
+            return;
+        }
         ops::free(
             self.backend,
             self.device_ordinal,

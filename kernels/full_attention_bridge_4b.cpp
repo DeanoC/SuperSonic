@@ -257,10 +257,19 @@ struct ScopedHipDevice {
         }
     }
 
-    ~ScopedHipDevice() {
-        if (changed && previous >= 0) {
-            (void)hipSetDevice(previous);
+    hipError_t restore() {
+        if (!changed || previous < 0) {
+            return hipSuccess;
         }
+        const hipError_t err = hipSetDevice(previous);
+        if (err == hipSuccess) {
+            changed = false;
+        }
+        return err;
+    }
+
+    ~ScopedHipDevice() {
+        (void)restore();
     }
 
     bool ok() const { return status == hipSuccess; }
@@ -760,61 +769,86 @@ DecodeSideResources& decode_side_resources() {
     return s;
 }
 
-void reset_decode_side_resources(DecodeSideResources& s) {
+hipError_t reset_decode_side_resources(DecodeSideResources& s) {
     const int owner = s.device_ordinal;
-    int previous = -1;
-    if (owner >= 0) {
-        (void)hipGetDevice(&previous);
-        if (previous != owner) {
-            (void)hipSetDevice(owner);
+    if (owner < 0) {
+        return (s.stream == nullptr && s.events[0] == nullptr && s.events[1] == nullptr)
+            ? hipSuccess
+            : hipErrorInvalidDevice;
+    }
+    ScopedHipDevice scoped(owner);
+    if (!scoped.ok()) {
+        return scoped.status;
+    }
+    if (s.stream != nullptr || s.events[0] != nullptr || s.events[1] != nullptr) {
+        const hipError_t sync_err = hipDeviceSynchronize();
+        if (sync_err != hipSuccess) {
+            return sync_err;
         }
-        (void)hipDeviceSynchronize();
     }
     for (hipEvent_t& event : s.events) {
         if (event != nullptr) {
-            (void)hipEventDestroy(event);
+            const hipError_t err = hipEventDestroy(event);
+            if (err != hipSuccess) {
+                return err;
+            }
             event = nullptr;
         }
     }
     if (s.stream != nullptr) {
-        (void)hipStreamDestroy(s.stream);
+        const hipError_t err = hipStreamDestroy(s.stream);
+        if (err != hipSuccess) {
+            return err;
+        }
         s.stream = nullptr;
     }
-    if (previous >= 0 && previous != owner) {
-        (void)hipSetDevice(previous);
-    }
     s.device_ordinal = -1;
+    const hipError_t restore_err = scoped.restore();
+    if (restore_err != hipSuccess) {
+        return restore_err;
+    }
+    return hipSuccess;
 }
 
-bool ensure_decode_side_resources(int ordinal) {
+hipError_t ensure_decode_side_resources(int ordinal) {
     DecodeSideResources& s = decode_side_resources();
     if (s.device_ordinal >= 0 && s.device_ordinal != ordinal) {
-        reset_decode_side_resources(s);
+        const hipError_t err = reset_decode_side_resources(s);
+        if (err != hipSuccess) {
+            return err;
+        }
     }
     if (s.device_ordinal < 0) {
         s.device_ordinal = ordinal;
     }
-    if (s.stream == nullptr &&
-        hipStreamCreateWithFlags(&s.stream, hipStreamNonBlocking) != hipSuccess) {
-        reset_decode_side_resources(s);
-        return false;
-    }
-    for (hipEvent_t& event : s.events) {
-        if (event == nullptr &&
-            hipEventCreateWithFlags(&event, hipEventDisableTiming) != hipSuccess) {
-            reset_decode_side_resources(s);
-            return false;
+    if (s.stream == nullptr) {
+        const hipError_t err = hipStreamCreateWithFlags(&s.stream, hipStreamNonBlocking);
+        if (err != hipSuccess) {
+            const hipError_t reset_err = reset_decode_side_resources(s);
+            return reset_err != hipSuccess ? reset_err : err;
         }
     }
-    return true;
+    for (hipEvent_t& event : s.events) {
+        if (event == nullptr) {
+            const hipError_t err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
+            if (err != hipSuccess) {
+                const hipError_t reset_err = reset_decode_side_resources(s);
+                return reset_err != hipSuccess ? reset_err : err;
+            }
+        }
+    }
+    return hipSuccess;
 }
 
 hipStream_t decode_side_stream(int ordinal) {
-    return ensure_decode_side_resources(ordinal) ? decode_side_resources().stream : nullptr;
+    return ensure_decode_side_resources(ordinal) == hipSuccess
+        ? decode_side_resources().stream
+        : nullptr;
 }
 
 hipEvent_t decode_side_event(int ordinal, int which) {
-    if (which < 0 || which > 1 || !ensure_decode_side_resources(ordinal)) {
+    if (which < 0 || which > 1 ||
+        ensure_decode_side_resources(ordinal) != hipSuccess) {
         return nullptr;
     }
     return decode_side_resources().events[which];
@@ -1093,31 +1127,60 @@ MtpPrefixSnap& mtp_prefix_snap() {
     return s;
 }
 
+hipError_t release_mtp_prefix_slabs(
+    MtpPrefixSnap& s, bool release_rec, bool release_conv) {
+    if (s.rec_slab == nullptr && s.conv_slab == nullptr) {
+        return hipSuccess;
+    }
+    if (s.device_ordinal < 0) {
+        return hipErrorInvalidDevice;
+    }
+    ScopedHipDevice owner(s.device_ordinal);
+    if (!owner.ok()) {
+        return owner.status;
+    }
+    const hipError_t sync_err = hipDeviceSynchronize();
+    if (sync_err != hipSuccess) {
+        return sync_err;
+    }
+    if (release_rec && s.rec_slab != nullptr) {
+        const hipError_t err = hipFree(s.rec_slab);
+        if (err != hipSuccess) {
+            return err;
+        }
+        s.rec_slab = nullptr;
+        s.rec_slab_bytes = 0;
+    }
+    if (release_conv && s.conv_slab != nullptr) {
+        const hipError_t err = hipFree(s.conv_slab);
+        if (err != hipSuccess) {
+            return err;
+        }
+        s.conv_slab = nullptr;
+        s.conv_slab_bytes = 0;
+    }
+    s.ready = false;
+    return owner.restore();
+}
+
 hipError_t ensure_mtp_prefix_snap(
     const GqhMlpHdrs& hdrs, int n_layers, int n_b) {
     MtpPrefixSnap& s = mtp_prefix_snap();
-    if (s.device_ordinal >= 0 && s.device_ordinal != hdrs.device_ordinal) {
-        int previous = -1;
-        (void)hipGetDevice(&previous);
-        (void)hipSetDevice(s.device_ordinal);
-        (void)hipDeviceSynchronize();
-        if (s.rec_slab != nullptr) (void)hipFree(s.rec_slab);
-        if (s.conv_slab != nullptr) (void)hipFree(s.conv_slab);
-        s.rec_slab = nullptr;
-        s.conv_slab = nullptr;
-        s.rec_slab_bytes = 0;
-        s.conv_slab_bytes = 0;
-        s.ready = false;
-        if (previous >= 0) (void)hipSetDevice(previous);
-        s.device_ordinal = -1;
-    }
+
     if (n_layers <= 0 || n_layers > MtpPrefixSnap::kMaxLayers || n_b < 2 ||
         n_b > MtpPrefixSnap::kMaxB) {
         s.ready = false;
         return hipErrorInvalidValue;
     }
-    s.device_ordinal = hdrs.device_ordinal;
-    s.owner_layers = hdrs.layers;
+
+    if (s.device_ordinal >= 0 && s.device_ordinal != hdrs.device_ordinal) {
+        const hipError_t err = release_mtp_prefix_slabs(s, true, true);
+        if (err != hipSuccess) {
+            return err;
+        }
+        s = MtpPrefixSnap{};
+    }
+
     size_t rec_need = 0;
     size_t conv_need = 0;
     size_t rec_bytes[MtpPrefixSnap::kMaxLayers]{};
@@ -1151,34 +1214,38 @@ hipError_t ensure_mtp_prefix_snap(
     // allocation even when the ordinal is unchanged.
     if ((grow_rec || grow_conv) &&
         (s.rec_slab != nullptr || s.conv_slab != nullptr)) {
-        (void)hipDeviceSynchronize();
-    }
-    if (grow_rec) {
-        if (s.rec_slab != nullptr) {
-            (void)hipFree(s.rec_slab);
-            s.rec_slab = nullptr;
-            s.rec_slab_bytes = 0;
+        const hipError_t err = release_mtp_prefix_slabs(s, grow_rec, grow_conv);
+        if (err != hipSuccess) {
+            return err;
         }
+    }
+
+    ScopedHipDevice target(hdrs.device_ordinal);
+    if (!target.ok()) {
+        return target.status;
+    }
+    auto finish = [&](hipError_t err) {
+        const hipError_t restore_err = target.restore();
+        return err != hipSuccess ? err : restore_err;
+    };
+    s.device_ordinal = hdrs.device_ordinal;
+    s.owner_layers = hdrs.layers;
+    if (grow_rec) {
         float* p = nullptr;
-        hipError_t err = hipMalloc(&p, rec_need);
+        const hipError_t err = hipMalloc(&p, rec_need);
         if (err != hipSuccess) {
             s.ready = false;
-            return err;
+            return finish(err);
         }
         s.rec_slab = p;
         s.rec_slab_bytes = rec_need;
     }
     if (grow_conv) {
-        if (s.conv_slab != nullptr) {
-            (void)hipFree(s.conv_slab);
-            s.conv_slab = nullptr;
-            s.conv_slab_bytes = 0;
-        }
         hip_bfloat16* p = nullptr;
-        hipError_t err = hipMalloc(&p, conv_need);
+        const hipError_t err = hipMalloc(&p, conv_need);
         if (err != hipSuccess) {
             s.ready = false;
-            return err;
+            return finish(err);
         }
         s.conv_slab = p;
         s.conv_slab_bytes = conv_need;
@@ -1214,7 +1281,7 @@ hipError_t ensure_mtp_prefix_snap(
     s.n_layers = n_layers;
     s.n_b = n_b;
     s.ready = true;
-    return hipSuccess;
+    return finish(hipSuccess);
 }
 
 hipError_t ensure_decode_rec_scratch(int ordinal, int nv, int khd, int vhd) {
@@ -1248,6 +1315,10 @@ hipError_t ensure_decode_rec_scratch(int ordinal, int nv, int khd, int vhd) {
             return err;
         }
         s = DecodeRecScratch{};
+        err = old_owner.restore();
+        if (err != hipSuccess) {
+            return err;
+        }
     }
     ScopedHipDevice target(ordinal);
     if (!target.ok()) {
@@ -1256,7 +1327,8 @@ hipError_t ensure_decode_rec_scratch(int ordinal, int nv, int khd, int vhd) {
     float* base = nullptr;
     hipError_t err = hipMalloc(&base, need * sizeof(float));
     if (err != hipSuccess) {
-        return err;
+        const hipError_t restore_err = target.restore();
+        return err != hipSuccess ? err : restore_err;
     }
     s.q = base;
     s.k = s.q + qk;
@@ -1265,7 +1337,8 @@ hipError_t ensure_decode_rec_scratch(int ordinal, int nv, int khd, int vhd) {
     s.out = s.g + nv;
     s.device_ordinal = ordinal;
     s.cap = need;
-    return hipSuccess;
+    const hipError_t restore_err = target.restore();
+    return restore_err == hipSuccess ? hipSuccess : restore_err;
 }
 
 void launch_decode_pack_rec_inputs(
@@ -1565,6 +1638,10 @@ hipError_t ensure_decode_full_attn_scratch(
             return err;
         }
         s = DecodeFullAttnScratch{};
+        err = old_owner.restore();
+        if (err != hipSuccess) {
+            return err;
+        }
     }
     ScopedHipDevice target(ordinal);
     if (!target.ok()) {
@@ -1579,7 +1656,8 @@ hipError_t ensure_decode_full_attn_scratch(
     void* base = nullptr;
     hipError_t err = hipMalloc(&base, bytes);
     if (err != hipSuccess) {
-        return err;
+        const hipError_t restore_err = target.restore();
+        return err != hipSuccess ? err : restore_err;
     }
     auto* bf = static_cast<hip_bfloat16*>(base);
     s.q = bf;
@@ -1595,7 +1673,8 @@ hipError_t ensure_decode_full_attn_scratch(
     s.max_t = max_t;
     s.n_splits = kSplits;
     s.device_ordinal = ordinal;
-    return hipSuccess;
+    const hipError_t restore_err = target.restore();
+    return restore_err == hipSuccess ? hipSuccess : restore_err;
 }
 
 hipError_t launch_host_full_attn(
@@ -1755,27 +1834,54 @@ void launch_swiglu_f32(
     }
 }
 
-float* decode_rms_partials(int ordinal) {
+hipError_t ensure_decode_rms_partials(int ordinal, float** out) {
+    if (out == nullptr || ordinal < 0) {
+        return hipErrorInvalidValue;
+    }
     static float* p = nullptr;
     static int owner = -1;
     if (p != nullptr && owner != ordinal) {
-        int previous = -1;
-        (void)hipGetDevice(&previous);
-        (void)hipSetDevice(owner);
-        (void)hipDeviceSynchronize();
-        (void)hipFree(p);
+        if (owner < 0) {
+            return hipErrorInvalidDevice;
+        }
+        ScopedHipDevice old_owner(owner);
+        if (!old_owner.ok()) {
+            return old_owner.status;
+        }
+        hipError_t err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            return err;
+        }
+        err = hipFree(p);
+        if (err != hipSuccess) {
+            return err;
+        }
         p = nullptr;
-        if (previous >= 0) (void)hipSetDevice(previous);
         owner = -1;
-    }
-    if (p == nullptr) {
-        if (hipMalloc(&p, 256 * sizeof(float)) != hipSuccess) {
-            p = nullptr;
-        } else {
-            owner = ordinal;
+        err = old_owner.restore();
+        if (err != hipSuccess) {
+            return err;
         }
     }
-    return p;
+    if (p == nullptr) {
+        ScopedHipDevice target(ordinal);
+        if (!target.ok()) {
+            return target.status;
+        }
+        const hipError_t err = hipMalloc(&p, 256 * sizeof(float));
+        if (err != hipSuccess) {
+            p = nullptr;
+            const hipError_t restore_err = target.restore();
+            return err != hipSuccess ? err : restore_err;
+        }
+        owner = ordinal;
+        const hipError_t restore_err = target.restore();
+        if (restore_err != hipSuccess) {
+            return restore_err;
+        }
+    }
+    *out = p;
+    return hipSuccess;
 }
 
 hipError_t launch_decode_rms(
@@ -1791,7 +1897,11 @@ hipError_t launch_decode_rms(
     int ordinal,
     hipStream_t stream) {
     constexpr int kBs = 256;
-    float* partials = decode_rms_partials(ordinal);
+    float* partials = nullptr;
+    const hipError_t partials_err = ensure_decode_rms_partials(ordinal, &partials);
+    if (partials_err != hipSuccess) {
+        return partials_err;
+    }
     if (partials != nullptr && hidden_dim == 5120) {
         const int npartials = (hidden_dim + kBs - 1) / kBs;
         const int B = batch_size > 0 ? batch_size : 1;
@@ -1874,50 +1984,94 @@ int g_ggml_device_ordinal = -1;
 }  // namespace
 
 hipError_t ensure_ggml_k_gemv_scratch(int ordinal, int in_dim, int out_dim) {
-    if (g_ggml_device_ordinal >= 0 && g_ggml_device_ordinal != ordinal) {
-        int previous = -1;
-        (void)hipGetDevice(&previous);
-        (void)hipSetDevice(g_ggml_device_ordinal);
-        (void)hipDeviceSynchronize();
-        if (g_ggml_x_bf) (void)hipFree(g_ggml_x_bf);
-        if (g_ggml_y_bf) (void)hipFree(g_ggml_y_bf);
-        g_ggml_x_bf = nullptr;
-        g_ggml_y_bf = nullptr;
-        g_ggml_cap_in = 0;
-        g_ggml_cap_out = 0;
-        if (previous >= 0) (void)hipSetDevice(previous);
-        g_ggml_device_ordinal = -1;
+    if (g_ggml_device_ordinal < 0 &&
+        (g_ggml_x_bf != nullptr || g_ggml_y_bf != nullptr)) {
+        return hipErrorInvalidDevice;
     }
+    if (g_ggml_device_ordinal >= 0 && g_ggml_device_ordinal != ordinal) {
+        ScopedHipDevice old_owner(g_ggml_device_ordinal);
+        if (!old_owner.ok()) {
+            return old_owner.status;
+        }
+        hipError_t err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            return err;
+        }
+        if (g_ggml_x_bf != nullptr) {
+            err = hipFree(g_ggml_x_bf);
+            if (err != hipSuccess) {
+                return err;
+            }
+            g_ggml_x_bf = nullptr;
+            g_ggml_cap_in = 0;
+        }
+        if (g_ggml_y_bf != nullptr) {
+            err = hipFree(g_ggml_y_bf);
+            if (err != hipSuccess) {
+                return err;
+            }
+            g_ggml_y_bf = nullptr;
+            g_ggml_cap_out = 0;
+        }
+        g_ggml_device_ordinal = -1;
+        err = old_owner.restore();
+        if (err != hipSuccess) {
+            return err;
+        }
+    }
+
+    ScopedHipDevice target(ordinal);
+    if (!target.ok()) {
+        return target.status;
+    }
+    auto finish = [&](hipError_t err) {
+        const hipError_t restore_err = target.restore();
+        return err != hipSuccess ? err : restore_err;
+    };
     g_ggml_device_ordinal = ordinal;
     if (in_dim > g_ggml_cap_in) {
         if (g_ggml_x_bf) {
-            (void)hipDeviceSynchronize();
-            (void)hipFree(g_ggml_x_bf);
+            hipError_t err = hipDeviceSynchronize();
+            if (err != hipSuccess) {
+                return finish(err);
+            }
+            err = hipFree(g_ggml_x_bf);
+            if (err != hipSuccess) {
+                return finish(err);
+            }
             g_ggml_x_bf = nullptr;
+            g_ggml_cap_in = 0;
         }
-        if (hipMalloc(
-                &g_ggml_x_bf,
-                static_cast<size_t>(in_dim) * sizeof(hip_bfloat16)) !=
-            hipSuccess) {
-            return hipErrorMemoryAllocation;
+        const hipError_t err = hipMalloc(
+            &g_ggml_x_bf,
+            static_cast<size_t>(in_dim) * sizeof(hip_bfloat16));
+        if (err != hipSuccess) {
+            return finish(err);
         }
         g_ggml_cap_in = in_dim;
     }
     if (out_dim > g_ggml_cap_out) {
         if (g_ggml_y_bf) {
-            (void)hipDeviceSynchronize();
-            (void)hipFree(g_ggml_y_bf);
+            hipError_t err = hipDeviceSynchronize();
+            if (err != hipSuccess) {
+                return finish(err);
+            }
+            err = hipFree(g_ggml_y_bf);
+            if (err != hipSuccess) {
+                return finish(err);
+            }
             g_ggml_y_bf = nullptr;
+            g_ggml_cap_out = 0;
         }
-        if (hipMalloc(
-                &g_ggml_y_bf,
-                static_cast<size_t>(out_dim) * sizeof(hip_bfloat16)) !=
-            hipSuccess) {
-            return hipErrorMemoryAllocation;
+        const hipError_t err = hipMalloc(
+            &g_ggml_y_bf,
+            static_cast<size_t>(out_dim) * sizeof(hip_bfloat16));
+        if (err != hipSuccess) {
+            return finish(err);
         }
         g_ggml_cap_out = out_dim;
     }
-    return hipSuccess;
+    return finish(hipSuccess);
 }
 
 template <bool kAcc>
@@ -2200,45 +2354,63 @@ int prefill_backend_failure(int project_status, hipError_t native_status) {
         | (static_cast<uint32_t>(native_status) & 0xffffu));
 }
 
-void clear_split_graph_cache(SplitGraphCache& cache, bool destroy_stream) {
+hipError_t clear_split_graph_cache(SplitGraphCache& cache, bool destroy_stream) {
     const int owner = cache.device_ordinal;
     if (owner >= 0) {
         ScopedHipDevice scoped(owner);
+        if (!scoped.ok()) {
+            return scoped.status;
+        }
         if (cache.stream != nullptr) {
-            (void)hipStreamSynchronize(cache.stream);
+            const hipError_t err = hipStreamSynchronize(cache.stream);
+            if (err != hipSuccess) {
+                return err;
+            }
         }
         // Graph replay and the graph stream are process-global. Synchronize
         // the owning device before destroying either object, including when
         // invalidation is called from another device context.
-        (void)hipDeviceSynchronize();
+        const hipError_t sync_err = hipDeviceSynchronize();
+        if (sync_err != hipSuccess) {
+            return sync_err;
+        }
         if (cache.exec != nullptr) {
-            (void)hipGraphExecDestroy(cache.exec);
+            const hipError_t err = hipGraphExecDestroy(cache.exec);
+            if (err != hipSuccess) {
+                return err;
+            }
             cache.exec = nullptr;
         }
         if (cache.graph != nullptr) {
-            (void)hipGraphDestroy(cache.graph);
+            const hipError_t err = hipGraphDestroy(cache.graph);
+            if (err != hipSuccess) {
+                return err;
+            }
             cache.graph = nullptr;
         }
         if (destroy_stream && cache.stream != nullptr) {
-            (void)hipStreamDestroy(cache.stream);
+            const hipError_t err = hipStreamDestroy(cache.stream);
+            if (err != hipSuccess) {
+                return err;
+            }
             cache.stream = nullptr;
+        }
+        // Do not report success until the caller's current device has been
+        // restored. If restoration fails, leave the owner/bookkeeping for a
+        // later owner-safe retry.
+        const hipError_t restore_err = scoped.restore();
+        if (restore_err != hipSuccess) {
+            return restore_err;
         }
     } else {
-        if (cache.exec != nullptr) {
-            (void)hipGraphExecDestroy(cache.exec);
-            cache.exec = nullptr;
-        }
-        if (cache.graph != nullptr) {
-            (void)hipGraphDestroy(cache.graph);
-            cache.graph = nullptr;
-        }
-        if (destroy_stream && cache.stream != nullptr) {
-            (void)hipStreamDestroy(cache.stream);
-            cache.stream = nullptr;
+        if (cache.exec != nullptr || cache.graph != nullptr || cache.stream != nullptr) {
+            return hipErrorInvalidDevice;
         }
     }
+    if (destroy_stream || cache.stream == nullptr) {
+        cache.device_ordinal = -1;
+    }
     cache.num_layers = -1;
-    cache.device_ordinal = -1;
     cache.grid_in = cache.grid_mid = cache.grid_out = 0;
     cache.grid_gate = cache.grid_up = cache.grid_down = 0;
     cache.layers = nullptr;
@@ -2255,6 +2427,7 @@ void clear_split_graph_cache(SplitGraphCache& cache, bool destroy_stream) {
     cache.batch_descs = nullptr;
     cache.state_signature = 0;
     cache.batch_size = 0;
+    return hipSuccess;
 }
 
 int linear_prefill_block_override() {
@@ -5560,6 +5733,10 @@ extern "C" int supersonic_gqh_hip_gemm_flush(int device_ordinal) {
     if (!scoped.ok()) {
         return static_cast<int>(scoped.status);
     }
+    auto finish = [&](int status) {
+        const hipError_t restore_err = scoped.restore();
+        return status != 0 ? status : static_cast<int>(restore_err);
+    };
     // Enqueue a default-stream wait so later default-stream kernels see
     // GEMM output, without blocking the CPU (host EventSynchronize was
     // serializing the whole prefill around each consumer). Events are created
@@ -5569,11 +5746,11 @@ extern "C" int supersonic_gqh_hip_gemm_flush(int device_ordinal) {
         if (gqh_ev_gemm_recorded[i] && gqh_ev_gemm[i] != nullptr) {
             const hipError_t err = hipStreamWaitEvent(nullptr, gqh_ev_gemm[i], 0);
             if (err != hipSuccess) {
-                return static_cast<int>(err);
+                return finish(static_cast<int>(err));
             }
         }
     }
-    return 0;
+    return finish(0);
 }
 
 extern "C" int supersonic_gqh_hip_decode(
@@ -5610,81 +5787,148 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
     if (!scoped.ok()) {
         return 2;
     }
+    auto finish = [&](int status) {
+        const hipError_t restore_err = scoped.restore();
+        return status != 0 ? status : static_cast<int>(restore_err);
+    };
     hipblasHandle_t handle = hipblas_handle_for(device_ordinal);
     if (handle == nullptr) {
-        return 1;
+        return finish(1);
     }
     static hip_bfloat16* buf[2] = {nullptr, nullptr};
     static size_t cap[2] = {0, 0};
     static hipEvent_t ev_dq[2] = {nullptr, nullptr};
     static int phase = 0;
     static bool ready = false;
-    if (ready && gqh_resource_device != device_ordinal) {
-        int previous = -1;
-        (void)hipGetDevice(&previous);
-        if (hipSetDevice(gqh_resource_device) != hipSuccess) {
-            return 2;
+    auto destroy_resources = [&]() -> hipError_t {
+        ready = false;
+        if (gqh_s_dq == nullptr && gqh_s_gemm == nullptr &&
+            ev_dq[0] == nullptr && ev_dq[1] == nullptr &&
+            gqh_ev_gemm[0] == nullptr && gqh_ev_gemm[1] == nullptr &&
+            buf[0] == nullptr && buf[1] == nullptr) {
+            ready = false;
+            phase = 0;
+            gqh_resource_device = -1;
+            return hipSuccess;
         }
-        if (hipDeviceSynchronize() != hipSuccess) {
-            if (previous >= 0) (void)hipSetDevice(previous);
-            return 2;
+        hipError_t err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            return err;
         }
         for (int i = 0; i < 2; ++i) {
-            if (ev_dq[i] != nullptr) (void)hipEventDestroy(ev_dq[i]);
-            ev_dq[i] = nullptr;
-            if (gqh_ev_gemm[i] != nullptr) (void)hipEventDestroy(gqh_ev_gemm[i]);
-            gqh_ev_gemm[i] = nullptr;
+            if (ev_dq[i] != nullptr) {
+                err = hipEventDestroy(ev_dq[i]);
+                if (err != hipSuccess) return err;
+                ev_dq[i] = nullptr;
+            }
+            if (gqh_ev_gemm[i] != nullptr) {
+                err = hipEventDestroy(gqh_ev_gemm[i]);
+                if (err != hipSuccess) return err;
+                gqh_ev_gemm[i] = nullptr;
+            }
             gqh_ev_gemm_recorded[i] = false;
-            if (buf[i] != nullptr) (void)hipFree(buf[i]);
-            buf[i] = nullptr;
-            cap[i] = 0;
+            if (buf[i] != nullptr) {
+                err = hipFree(buf[i]);
+                if (err != hipSuccess) return err;
+                buf[i] = nullptr;
+                cap[i] = 0;
+            }
         }
-        if (gqh_s_dq != nullptr) (void)hipStreamDestroy(gqh_s_dq);
-        if (gqh_s_gemm != nullptr) (void)hipStreamDestroy(gqh_s_gemm);
-        gqh_s_dq = nullptr;
-        gqh_s_gemm = nullptr;
+        if (gqh_s_dq != nullptr) {
+            err = hipStreamDestroy(gqh_s_dq);
+            if (err != hipSuccess) return err;
+            gqh_s_dq = nullptr;
+        }
+        if (gqh_s_gemm != nullptr) {
+            err = hipStreamDestroy(gqh_s_gemm);
+            if (err != hipSuccess) return err;
+            gqh_s_gemm = nullptr;
+        }
         ready = false;
         phase = 0;
-        if (previous >= 0) (void)hipSetDevice(previous);
         gqh_resource_device = -1;
+        return hipSuccess;
+    };
+    if (gqh_resource_device >= 0 && gqh_resource_device != device_ordinal) {
+        ScopedHipDevice old_owner(gqh_resource_device);
+        if (!old_owner.ok()) {
+            return finish(static_cast<int>(old_owner.status));
+        }
+        const hipError_t err = destroy_resources();
+        if (err != hipSuccess) {
+            return finish(static_cast<int>(err));
+        }
+        const hipError_t restore_err = old_owner.restore();
+        if (restore_err != hipSuccess) {
+            return finish(static_cast<int>(restore_err));
+        }
+    }
+    if (!ready && gqh_resource_device == device_ordinal &&
+        (gqh_s_dq != nullptr || gqh_s_gemm != nullptr || ev_dq[0] != nullptr ||
+         ev_dq[1] != nullptr || gqh_ev_gemm[0] != nullptr ||
+         gqh_ev_gemm[1] != nullptr || buf[0] != nullptr || buf[1] != nullptr)) {
+        const hipError_t err = destroy_resources();
+        if (err != hipSuccess) {
+            return finish(static_cast<int>(err));
+        }
     }
     if (!ready) {
-        if (hipStreamCreateWithFlags(&gqh_s_dq, hipStreamNonBlocking) != hipSuccess) {
-            return 2;
+        gqh_resource_device = device_ordinal;
+        hipError_t err = hipStreamCreateWithFlags(&gqh_s_dq, hipStreamNonBlocking);
+        if (err != hipSuccess) {
+            const hipError_t cleanup_err = destroy_resources();
+            return finish(cleanup_err != hipSuccess ? static_cast<int>(cleanup_err)
+                                                     : static_cast<int>(err));
         }
-        if (hipStreamCreateWithFlags(&gqh_s_gemm, hipStreamNonBlocking) != hipSuccess) {
-            return 2;
+        err = hipStreamCreateWithFlags(&gqh_s_gemm, hipStreamNonBlocking);
+        if (err != hipSuccess) {
+            const hipError_t cleanup_err = destroy_resources();
+            return finish(cleanup_err != hipSuccess ? static_cast<int>(cleanup_err)
+                                                     : static_cast<int>(err));
         }
         for (int i = 0; i < 2; ++i) {
-            if (hipEventCreateWithFlags(&ev_dq[i], hipEventDisableTiming) != hipSuccess) {
-                return 2;
+            err = hipEventCreateWithFlags(&ev_dq[i], hipEventDisableTiming);
+            if (err != hipSuccess) {
+                const hipError_t cleanup_err = destroy_resources();
+                return finish(cleanup_err != hipSuccess ? static_cast<int>(cleanup_err)
+                                                         : static_cast<int>(err));
             }
-            if (hipEventCreateWithFlags(&gqh_ev_gemm[i], hipEventDisableTiming) !=
-                hipSuccess) {
-                return 2;
+            err = hipEventCreateWithFlags(&gqh_ev_gemm[i], hipEventDisableTiming);
+            if (err != hipSuccess) {
+                const hipError_t cleanup_err = destroy_resources();
+                return finish(cleanup_err != hipSuccess ? static_cast<int>(cleanup_err)
+                                                         : static_cast<int>(err));
             }
         }
         ready = true;
-        gqh_resource_device = device_ordinal;
     }
     const int p = phase & 1;
     const size_t need = static_cast<size_t>(n) * static_cast<size_t>(k);
     if (need > cap[p] || buf[p] == nullptr) {
         if (buf[p] != nullptr) {
-            (void)hipFree(buf[p]);
+            const hipError_t sync_err = hipDeviceSynchronize();
+            if (sync_err != hipSuccess) {
+                return finish(static_cast<int>(sync_err));
+            }
+            const hipError_t free_err = hipFree(buf[p]);
+            if (free_err != hipSuccess) {
+                return finish(static_cast<int>(free_err));
+            }
             buf[p] = nullptr;
             cap[p] = 0;
         }
-        if (hipMalloc(&buf[p], need * sizeof(hip_bfloat16)) != hipSuccess) {
+        const hipError_t alloc_err = hipMalloc(&buf[p], need * sizeof(hip_bfloat16));
+        if (alloc_err != hipSuccess) {
             buf[p] = nullptr;
-            return 3;
+            return finish(static_cast<int>(alloc_err));
         }
         cap[p] = need;
     }
     // Reuse of buf[p] must wait for the GEMM that last read it.
     if (gqh_ev_gemm_recorded[p]) {
-        if (hipEventSynchronize(gqh_ev_gemm[p]) != hipSuccess) {
-            return 4;
+        const hipError_t err = hipEventSynchronize(gqh_ev_gemm[p]);
+        if (err != hipSuccess) {
+            return finish(static_cast<int>(err));
         }
     }
     // Decode on the default stream — same launch path as the known-good
@@ -5702,16 +5946,22 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         1,
         nullptr);
     if (dec != 0) {
-        return dec;
+        return finish(dec);
     }
-    if (hipEventRecord(ev_dq[p], nullptr) != hipSuccess) {
-        return 5;
+    {
+        const hipError_t err = hipEventRecord(ev_dq[p], nullptr);
+        if (err != hipSuccess) {
+            return finish(static_cast<int>(err));
+        }
     }
-    if (hipStreamWaitEvent(gqh_s_gemm, ev_dq[p], 0) != hipSuccess) {
-        return 6;
+    {
+        const hipError_t err = hipStreamWaitEvent(gqh_s_gemm, ev_dq[p], 0);
+        if (err != hipSuccess) {
+            return finish(static_cast<int>(err));
+        }
     }
     if (hipblasSetStream(handle, gqh_s_gemm) != HIPBLAS_STATUS_SUCCESS) {
-        return 7;
+        return finish(7);
     }
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -5736,17 +5986,20 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         HIPBLAS_COMPUTE_32F,
         HIPBLAS_GEMM_DEFAULT);
     if (st != HIPBLAS_STATUS_SUCCESS) {
-        return 8;
+        (void)hipblasSetStream(handle, nullptr);
+        return finish(8);
     }
-    if (hipEventRecord(gqh_ev_gemm[p], gqh_s_gemm) != hipSuccess) {
-        return 9;
+    const hipError_t record_err = hipEventRecord(gqh_ev_gemm[p], gqh_s_gemm);
+    if (record_err != hipSuccess) {
+        (void)hipblasSetStream(handle, nullptr);
+        return finish(static_cast<int>(record_err));
     }
     gqh_ev_gemm_recorded[p] = true;
     if (hipblasSetStream(handle, nullptr) != HIPBLAS_STATUS_SUCCESS) {
-        return 10;
+        return finish(10);
     }
     phase = phase + 1;
-    return 0;
+    return finish(0);
 }
 
 extern "C" int supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
@@ -5762,6 +6015,10 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
     if (!scoped.ok()) {
         return prefill_backend_failure(268, scoped.status);
     }
+    auto finish = [&](int status) {
+        const hipError_t restore_err = scoped.restore();
+        return status != 0 ? status : static_cast<int>(restore_err);
+    };
     switch (dtype) {
     case 2:
         if (matmul_rhs_transposed_hipblas_bf16(
@@ -5773,24 +6030,24 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
                 lhs,
                 rhs,
                 out) == 0) {
-            return 0;
+            return finish(0);
         }
         if (device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
             const bool disable_small_m = false;
             if (!disable_small_m && m < 32) {
-                return matmul_rhs_transposed_wmma_small_m_bf16_device(
+                return finish(matmul_rhs_transposed_wmma_small_m_bf16_device(
                     static_cast<int>(device_ordinal), batch_elems, m, n, k,
-                    lhs, rhs, out);
+                    lhs, rhs, out));
             }
-            return matmul_rhs_transposed_tiled_wmma_bf16_device(
+            return finish(matmul_rhs_transposed_tiled_wmma_bf16_device(
                 static_cast<int>(device_ordinal), batch_elems, m, n, k,
-                lhs, rhs, out);
+                lhs, rhs, out));
         }
-        return matmul_rhs_transposed_tiled_device<hip_bfloat16>(
+        return finish(matmul_rhs_transposed_tiled_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, n, k,
-            lhs, rhs, out);
+            lhs, rhs, out));
     default:
-        return 272;
+        return finish(272);
     }
 }
 
@@ -8927,10 +9184,20 @@ int persistent_decode_device(
         }
         if (use_gqh_gemv) {
             supersonic_gqh_hip_enable_tight_decode();
-            (void)decode_side_stream(device_ordinal);
-            (void)decode_side_event(device_ordinal, 0);
-            (void)decode_side_event(device_ordinal, 1);
-            (void)decode_rms_partials(device_ordinal);
+            const hipError_t side_err = ensure_decode_side_resources(device_ordinal);
+            if (side_err != hipSuccess ||
+                decode_side_resources().stream == nullptr ||
+                decode_side_resources().events[0] == nullptr ||
+                decode_side_resources().events[1] == nullptr) {
+                return side_err != hipSuccess ? side_err : hipErrorUnknown;
+            }
+            float* rms_partials = nullptr;
+            const hipError_t rms_err =
+                ensure_decode_rms_partials(device_ordinal, &rms_partials);
+            if (rms_err != hipSuccess) {
+                return rms_err;
+            }
+            (void)rms_partials;
             auto conv_hdr = [&](const GqhProjHdr& h, int in_d, int out_d) {
                 if (h.rung < 0 || h.wire == nullptr || in_d <= 0 || out_d <= 0) {
                     return;
@@ -9089,7 +9356,11 @@ int persistent_decode_device(
         float* ws_attn = ws_proj + batch_size * proj_buf_floats;
         const int gemv_ncols = batch_size > 0 ? batch_size : 1;
         if (gemv_ncols > 1) {
-            (void)ensure_mtp_prefix_snap(mlp_hdrs, num_layers, gemv_ncols);
+            const hipError_t mtp_err =
+                ensure_mtp_prefix_snap(mlp_hdrs, num_layers, gemv_ncols);
+            if (mtp_err != hipSuccess) {
+                return mtp_err;
+            }
         } else {
             mtp_prefix_snap().ready = false;
         }
@@ -10034,7 +10305,10 @@ int persistent_decode_device(
                     (use_gqh_gemv ? mlp_hdrs.state_signature : 0)
                 && cache.batch_size == batch_size;
             if (!reuse) {
-                clear_split_graph_cache(cache, true);
+                const hipError_t clear_err = clear_split_graph_cache(cache, true);
+                if (clear_err != hipSuccess) {
+                    return clear_err;
+                }
                 if (cache.stream == nullptr) {
                     launch_err = hipStreamCreate(&cache.stream);
                     if (launch_err == hipSuccess) {
@@ -10097,7 +10371,10 @@ int persistent_decode_device(
                             "[hip-occ] gqh-split HIP graph capture failed: %s\n",
                             hipGetErrorString(launch_err));
                     }
-                    clear_split_graph_cache(cache, true);
+                    const hipError_t clear_err = clear_split_graph_cache(cache, true);
+                    if (clear_err != hipSuccess) {
+                        return clear_err;
+                    }
                 }
             }
             if (g_hip_gqh_prepare_only) {
@@ -10234,19 +10511,23 @@ extern "C" int supersonic_qwen35_hip_mtp_restore_linear_prefix(
     if (!scoped.ok()) {
         return static_cast<int>(scoped.status);
     }
+    auto finish = [&](int status) {
+        const hipError_t restore_err = scoped.restore();
+        return status != 0 ? status : static_cast<int>(restore_err);
+    };
     MtpPrefixSnap& s = mtp_prefix_snap();
     if (commit_len <= 0 || s.device_ordinal != device_ordinal ||
         s.owner_layers != layers) {
-        return 1;
+        return finish(1);
     }
     if (!s.ready || s.n_b < 2 || s.n_layers <= 0) {
-        return 1;
+        return finish(1);
     }
     if (commit_len == s.n_b) {
-        return 0;
+        return finish(0);
     }
     if (commit_len > s.n_b) {
-        return 1;
+        return finish(1);
     }
     const int b = commit_len - 1;
     for (int layer = 0; layer < s.n_layers; ++layer) {
@@ -10258,7 +10539,7 @@ extern "C" int supersonic_qwen35_hip_mtp_restore_linear_prefix(
                 s.rec_bytes[layer],
                 hipMemcpyDeviceToDevice);
             if (err != hipSuccess) {
-                return static_cast<int>(err);
+                return finish(static_cast<int>(err));
             }
         }
         if (s.conv_live[layer] != nullptr && s.conv[b][layer] != nullptr &&
@@ -10269,35 +10550,35 @@ extern "C" int supersonic_qwen35_hip_mtp_restore_linear_prefix(
                 s.conv_bytes[layer],
                 hipMemcpyDeviceToDevice);
             if (err != hipSuccess) {
-                return static_cast<int>(err);
+                return finish(static_cast<int>(err));
             }
         }
     }
-    return 0;
+    return finish(0);
 }
 
-static void clear_mtp_prefix_snap_if_owned(int device_ordinal, const void* layers) {
+static hipError_t clear_mtp_prefix_snap_if_owned(int device_ordinal, const void* layers) {
     MtpPrefixSnap& s = mtp_prefix_snap();
     if (layers == nullptr || s.owner_layers != layers ||
         s.device_ordinal != device_ordinal) {
-        return;
+        return hipSuccess;
     }
-    ScopedHipDevice scoped(device_ordinal);
-    if (s.rec_slab != nullptr || s.conv_slab != nullptr) {
-        (void)hipDeviceSynchronize();
+    const hipError_t err = release_mtp_prefix_slabs(
+        s, s.rec_slab != nullptr, s.conv_slab != nullptr);
+    if (err != hipSuccess) {
+        return err;
     }
-    if (s.rec_slab != nullptr) (void)hipFree(s.rec_slab);
-    if (s.conv_slab != nullptr) (void)hipFree(s.conv_slab);
     s = MtpPrefixSnap{};
+    return hipSuccess;
 }
 
-extern "C" void supersonic_qwen35_4b_hip_invalidate_decode_cache(
+extern "C" int supersonic_qwen35_4b_hip_invalidate_decode_cache(
     int device_ordinal,
     const void* layers,
     const void* int4) {
     DecodeBridgeLockGuard guard;
     if (layers == nullptr && int4 == nullptr) {
-        return;
+        return 0;
     }
 
     const bool mlp_owned = g_gqh_mlp_hdrs.ok &&
@@ -10305,9 +10586,9 @@ extern "C" void supersonic_qwen35_4b_hip_invalidate_decode_cache(
         ((layers != nullptr && g_gqh_mlp_hdrs.layers == layers) ||
          (int4 != nullptr && g_gqh_mlp_hdrs.int4 == int4));
     const void* owned_layers = mlp_owned ? g_gqh_mlp_hdrs.layers : layers;
-    clear_mtp_prefix_snap_if_owned(device_ordinal, owned_layers);
-    if (mlp_owned) {
-        g_gqh_mlp_hdrs = GqhMlpHdrs{};
+    const hipError_t mtp_err = clear_mtp_prefix_snap_if_owned(device_ordinal, owned_layers);
+    if (mtp_err != hipSuccess) {
+        return static_cast<int>(mtp_err);
     }
 
     SplitGraphCache& cache = g_split_graph_cache;
@@ -10315,9 +10596,19 @@ extern "C" void supersonic_qwen35_4b_hip_invalidate_decode_cache(
         ((layers != nullptr && cache.layers == layers) ||
          (int4 != nullptr && cache.int4 == int4));
     if (!graph_owned) {
-        return;
+        if (mlp_owned) {
+            g_gqh_mlp_hdrs = GqhMlpHdrs{};
+        }
+        return 0;
     }
-    clear_split_graph_cache(cache, true);
+    const hipError_t graph_err = clear_split_graph_cache(cache, true);
+    if (graph_err != hipSuccess) {
+        return static_cast<int>(graph_err);
+    }
+    if (mlp_owned) {
+        g_gqh_mlp_hdrs = GqhMlpHdrs{};
+    }
+    return 0;
 }
 
 extern "C" int supersonic_qwen35_4b_hip_persistent_decode(

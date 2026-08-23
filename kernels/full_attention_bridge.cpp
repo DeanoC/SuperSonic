@@ -50,10 +50,19 @@ struct ScopedHipDevice {
         }
     }
 
-    ~ScopedHipDevice() {
-        if (changed && previous >= 0) {
-            hipSetDevice(previous);
+    hipError_t restore() {
+        if (!changed || previous < 0) {
+            return hipSuccess;
         }
+        const hipError_t err = hipSetDevice(previous);
+        if (err == hipSuccess) {
+            changed = false;
+        }
+        return err;
+    }
+
+    ~ScopedHipDevice() {
+        (void)restore();
     }
 
     bool ok() const { return status == hipSuccess; }
@@ -99,23 +108,6 @@ hipblasHandle_t attn_hipblas(int device_ordinal) {
     return handles[device_ordinal];
 }
 
-float* attn_scratch_f32(size_t n, float** slot, size_t* cap) {
-    if (n <= *cap && *slot != nullptr) {
-        return *slot;
-    }
-    if (*slot != nullptr) {
-        (void)hipFree(*slot);
-        *slot = nullptr;
-        *cap = 0;
-    }
-    if (hipMalloc(slot, n * sizeof(float)) != hipSuccess) {
-        *slot = nullptr;
-        return nullptr;
-    }
-    *cap = n;
-    return *slot;
-}
-
 struct AttnScratchBf16 {
     hip_bfloat16* ptr = nullptr;
     size_t cap = 0;
@@ -133,24 +125,38 @@ hip_bfloat16* attn_scratch_bf16(
             return nullptr;
         }
         ScopedHipDevice old_owner(scratch->device_ordinal);
-        if (!old_owner.ok() || hipDeviceSynchronize() != hipSuccess) {
+        if (!old_owner.ok()) {
             return nullptr;
         }
-        if (hipFree(scratch->ptr) != hipSuccess) {
+        hipError_t err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            return nullptr;
+        }
+        err = hipFree(scratch->ptr);
+        if (err != hipSuccess) {
             return nullptr;
         }
         *scratch = AttnScratchBf16{};
+        err = old_owner.restore();
+        if (err != hipSuccess) {
+            return nullptr;
+        }
     }
     ScopedHipDevice target(device_ordinal);
     if (!target.ok()) {
         return nullptr;
     }
-    if (hipMalloc(&scratch->ptr, n * sizeof(hip_bfloat16)) != hipSuccess) {
+    const hipError_t err = hipMalloc(&scratch->ptr, n * sizeof(hip_bfloat16));
+    if (err != hipSuccess) {
         scratch->ptr = nullptr;
+        (void)target.restore();
         return nullptr;
     }
     scratch->cap = n;
     scratch->device_ordinal = device_ordinal;
+    if (target.restore() != hipSuccess) {
+        return nullptr;
+    }
     return scratch->ptr;
 }
 

@@ -121,10 +121,20 @@ struct ScopedHipDevice {
             }
         }
     }
-    ~ScopedHipDevice() {
-        if (changed && previous >= 0) {
-            hipSetDevice(previous);
+
+    hipError_t restore() {
+        if (!changed || previous < 0) {
+            return hipSuccess;
         }
+        const hipError_t err = hipSetDevice(previous);
+        if (err == hipSuccess) {
+            changed = false;
+        }
+        return err;
+    }
+
+    ~ScopedHipDevice() {
+        (void)restore();
     }
     bool ok() const { return status == hipSuccess; }
 };
@@ -1378,11 +1388,11 @@ int gqh_gemv_flush() {
 }
 }  // namespace
 
-extern "C" void supersonic_gqh_hip_unregister_wires(
+extern "C" int supersonic_gqh_hip_unregister_wires(
     int device_ordinal, const void* const* wires, size_t count) {
     GqhBridgeLockGuard guard;
     if (wires == nullptr || count == 0) {
-        return;
+        return 0;
     }
 
     std::vector<GqhWireKey> keys;
@@ -1399,7 +1409,7 @@ extern "C" void supersonic_gqh_hip_unregister_wires(
         }
     }
     if (keys.empty()) {
-        return;
+        return 0;
     }
 
     bool needs_sync = false;
@@ -1413,12 +1423,23 @@ extern "C" void supersonic_gqh_hip_unregister_wires(
              g_gemv_prev.wire == key.wire);
     }
 
-    auto remove_metadata = [&] {
+    auto remove_metadata = [&]() -> hipError_t {
         for (const GqhWireKey& key : keys) {
             // A held GEMV is deliberately not flushed here: its result is no
             // longer observable once the owning model is being destroyed, and
             // launching it would dereference a buffer that is about to be
             // freed.
+            const auto padded = g_gqh_padded.find(key);
+            if (padded != g_gqh_padded.end()) {
+                // Remove one allocation at a time, retaining the entry when
+                // HIP reports an error so a later owner-safe retry can make
+                // progress without double-freeing a successful earlier key.
+                const hipError_t err = hipFree(padded->second);
+                if (err != hipSuccess) {
+                    return err;
+                }
+                g_gqh_padded.erase(padded);
+            }
             if (g_gemv_held_valid && g_gemv_held.device_ordinal == device_ordinal &&
                 g_gemv_held.wire == key.wire) {
                 g_gemv_held_valid = false;
@@ -1430,12 +1451,8 @@ extern "C" void supersonic_gqh_hip_unregister_wires(
             g_gemv_fusable.erase(key);
             g_gqh_tight.erase(key);
             g_gqh_ileave.erase(key);
-            const auto padded = g_gqh_padded.find(key);
-            if (padded != g_gqh_padded.end()) {
-                (void)hipFree(padded->second);
-                g_gqh_padded.erase(padded);
-            }
         }
+        return hipSuccess;
     };
 
     // Metadata and padded allocations can be read by an already-launched
@@ -1447,20 +1464,33 @@ extern "C" void supersonic_gqh_hip_unregister_wires(
     if (needs_sync) {
         ScopedHipDevice scoped(device_ordinal);
         if (!scoped.ok()) {
-            return;
+            return static_cast<int>(scoped.status);
         }
-        if (hipDeviceSynchronize() != hipSuccess) {
-            return;
+        auto finish = [&](int status) {
+            const hipError_t restore_err = scoped.restore();
+            return status != 0 ? status : static_cast<int>(restore_err);
+        };
+        const hipError_t sync_err = hipDeviceSynchronize();
+        if (sync_err != hipSuccess) {
+            return finish(static_cast<int>(sync_err));
         }
-        remove_metadata();
+        const hipError_t remove_err = remove_metadata();
+        if (remove_err != hipSuccess) {
+            return finish(static_cast<int>(remove_err));
+        }
+        return finish(0);
     } else {
-        remove_metadata();
+        const hipError_t remove_err = remove_metadata();
+        if (remove_err != hipSuccess) {
+            return static_cast<int>(remove_err);
+        }
     }
+    return 0;
 }
 
-extern "C" void supersonic_gqh_hip_unregister_wire(int device_ordinal, const void* wire) {
+extern "C" int supersonic_gqh_hip_unregister_wire(int device_ordinal, const void* wire) {
     const void* wires[1] = {wire};
-    supersonic_gqh_hip_unregister_wires(device_ordinal, wires, 1);
+    return supersonic_gqh_hip_unregister_wires(device_ordinal, wires, 1);
 }
 
 extern "C" int supersonic_gqh_hip_matvec_stream(
