@@ -25,6 +25,11 @@ use qwen35::state::{
 use qwen35::weights::{LayerKind, Qwen35Weights};
 use serde::{Deserialize, Serialize};
 
+use crate::mtp::{
+    mtp_decode_step, mtp_decode_step_greedy, mtp_draft_greedy, mtp_forward,
+    prefill_append_verify_cached_with_gpu_taps, restore_linear_prefix, restore_linear_state,
+    MtpPrefillAppendCache, MtpVerifyCache, MtpVerifyScratch,
+};
 use crate::oracle::OracleOutput;
 use crate::prefill_engine;
 
@@ -1112,18 +1117,22 @@ pub struct DecodeEngine {
     /// tap_layers list. Avoids a per-call GpuBuffer::zeros + upload of
     /// a small i32 vec — ~100ms savings per call at 9B INT4.
     dflash_tap_cache: Option<(Vec<usize>, GpuBuffer, GpuBuffer)>,
-    /// Cached workspace for `verify_block_fused_decode` (DFlash M4.3).
+    /// Cached workspace for the outer DFlash tap verifier. This remains
+    /// separate from the retained MTP verification cache so the legacy tap
+    /// path keeps its own lifetime and naming boundary.
+    dflash_tap_verify_cache: Option<DFlashTapVerifyCache>,
+    /// Cached workspace for the Qwen3.8 MTP fused verifier.
     /// The fused verify path runs the persistent 4B megakernel with
     /// `batch_size = B` while the live engine is constructed with
     /// `batch_size = 1`; the cache owns a B-sized workspace + IO buffers
     /// + batch-seq desc table so the per-round allocation cost is paid
     /// only once per fused-verify call chain. Re-allocated if the block
     /// size changes between calls.
-    dflash_fused_verify_cache: Option<DFlashFusedVerifyCache>,
-    /// Cached scratch for the prefill-append DFlash verifier. The current
+    mtp_verify_cache: Option<MtpVerifyCache>,
+    /// Cached scratch for the prefill-append Qwen3.8 MTP verifier. The current
     /// Qwen3.6 path verifies in fixed B=8 chunks, so reusing this avoids
     /// re-allocating the prefill component scratch every segment.
-    dflash_prefill_append_cache: Option<prefill_engine::PrefillAppendVerifyCache>,
+    mtp_prefill_append_cache: Option<MtpPrefillAppendCache>,
     /// Cached scratch and metadata buffers for DDTree prefill verification.
     /// Reused across rounds with the same tree width to avoid per-round
     /// `PrefillScratch` allocation and small metadata GPU uploads.
@@ -1134,10 +1143,10 @@ pub struct DecodeEngine {
     component_full_attn_scratch: Option<ComponentFullAttentionScratch>,
     /// Reusable fixed-size scratch for component MLP decode.
     component_mlp_scratch: Option<ComponentMlpScratch>,
-    /// Reusable scratch for Metal v2 incremental decode. Lazily allocated on
-    /// the first Metal decode step; carries the BF16 inter-chunk linear-attention
+    /// Reusable scratch for the MTP component decode. Lazily allocated on
+    /// the first incremental decode step; carries the BF16 inter-chunk linear-attention
     /// buffers across decode steps.
-    metal_v2_scratch: Option<prefill_engine::MetalV2DecodeScratch>,
+    mtp_verify_scratch: Option<MtpVerifyScratch>,
     /// When true, run the Qwen3.8 NextN head after each greedy token and log
     /// draft vs next greedy. Does not change the emitted token stream.
     mtp_diag: bool,
@@ -1201,33 +1210,51 @@ impl DecodeEngineSnapshot {
     }
 }
 
-/// Per-call workspace for `DecodeEngine::verify_block_fused_decode`.
+/// Adapter for the outer DFlash tap verifier's workspace.
 ///
-/// The fused verify path needs a B-sized workspace (F32 projection +
-/// attention scratch, multi-row hidden_io / normed_buf / logits_buf) and
-/// a `BatchSeqDesc` table, sized independently from `DecodeEngine`'s
-/// `batch_size = 1` scratch. The cache is populated lazily on first
-/// fused-verify call and reused thereafter via the take/put pattern that
-/// `decode_step_with_taps_kernel` uses for `dflash_tap_cache`.
-struct DFlashFusedVerifyCache {
-    /// Block size the cache is sized for. A change in `--dflash-block`
-    /// between calls triggers a full re-allocation.
-    block_size: usize,
-    /// F32 scratch for projections + MLP + attention. Sized to the same
-    /// per-item layout as `PersistentDecodeScratch::workspace` at
-    /// `batch_size = block_size`.
-    workspace: GpuBuffer,
-    /// BF16 hidden I/O, shape `[block_size, 1, hidden_size]`.
-    hidden_io: GpuBuffer,
-    /// BF16 RMSNorm output, shape `[block_size, 1, hidden_size]`.
-    normed_buf: GpuBuffer,
-    /// BF16 logits output, shape `[block_size, 1, vocab_size]`.
-    logits_buf: GpuBuffer,
-    /// GPU argmax indices, shape `[block_size]` U32.
-    argmax_buf: GpuBuffer,
-    /// Device copy of `Vec<BatchSeqDesc>` (one per layer), re-uploaded
-    /// each fused-verify call.
-    batch_desc_device: GpuBuffer,
+/// The allocation layout is shared with the retained MTP verifier, but the
+/// tap path deliberately keeps a separate cache and remains owned by this
+/// module. That prevents the MTP extraction from changing tree/tap cache
+/// lifetime or acceptance behavior.
+struct DFlashTapVerifyCache(MtpVerifyCache);
+
+impl DFlashTapVerifyCache {
+    #[allow(clippy::too_many_arguments)]
+    fn alloc(
+        ordinal: usize,
+        block_size: usize,
+        hidden_dim: usize,
+        intermediate_size: usize,
+        vocab_size: usize,
+        num_layers: usize,
+        proj_buf_floats: usize,
+        attn_scratch_floats: usize,
+    ) -> Result<Self> {
+        Ok(Self(MtpVerifyCache::alloc(
+            ordinal,
+            block_size,
+            hidden_dim,
+            intermediate_size,
+            vocab_size,
+            num_layers,
+            proj_buf_floats,
+            attn_scratch_floats,
+        )?))
+    }
+}
+
+impl std::ops::Deref for DFlashTapVerifyCache {
+    type Target = MtpVerifyCache;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DFlashTapVerifyCache {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 struct ComponentFullAttentionScratch {
@@ -1382,55 +1409,6 @@ impl ComponentMlpScratch {
                 .map_err(|e| anyhow::anyhow!("component mlp act alloc: {e}"))?,
             down: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.hidden_size])
                 .map_err(|e| anyhow::anyhow!("component mlp down alloc: {e}"))?,
-        })
-    }
-}
-
-impl DFlashFusedVerifyCache {
-    #[allow(clippy::too_many_arguments)]
-    fn alloc(
-        ordinal: usize,
-        block_size: usize,
-        hidden_dim: usize,
-        intermediate_size: usize,
-        vocab_size: usize,
-        num_layers: usize,
-        proj_buf_floats: usize,
-        attn_scratch_floats: usize,
-    ) -> Result<Self> {
-        // Layout matches `PersistentDecodeScratch::new` — see
-        // crates/qwen35/src/scratch.rs. Per-item segments:
-        //   [hidden] input/output, [hidden] normed, [inter*2] gate+up,
-        //   [hidden] down-proj slab × 2, [proj_buf_floats] proj, and
-        //   [attn_scratch_floats] attention saved_q/gate/pre_gate/scores.
-        let per_item_floats = hidden_dim
-            + hidden_dim
-            + intermediate_size * 2
-            + hidden_dim
-            + hidden_dim
-            + proj_buf_floats
-            + attn_scratch_floats;
-        let workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[per_item_floats * block_size])
-            .map_err(|e| anyhow::anyhow!("fused verify workspace alloc: {e}"))?;
-        let hidden_io = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, hidden_dim])
-            .map_err(|e| anyhow::anyhow!("fused verify hidden_io alloc: {e}"))?;
-        let normed_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, hidden_dim])
-            .map_err(|e| anyhow::anyhow!("fused verify normed_buf alloc: {e}"))?;
-        let logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, vocab_size])
-            .map_err(|e| anyhow::anyhow!("fused verify logits_buf alloc: {e}"))?;
-        let argmax_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[block_size])
-            .map_err(|e| anyhow::anyhow!("fused verify argmax_buf alloc: {e}"))?;
-        let batch_desc_bytes = num_layers * std::mem::size_of::<kernel_ffi::BatchSeqDesc>();
-        let batch_desc_device = GpuBuffer::zeros(ordinal, ScalarType::U8, &[batch_desc_bytes])
-            .map_err(|e| anyhow::anyhow!("fused verify batch desc alloc: {e}"))?;
-        Ok(Self {
-            block_size,
-            workspace,
-            hidden_io,
-            normed_buf,
-            logits_buf,
-            argmax_buf,
-            batch_desc_device,
         })
     }
 }
@@ -4551,14 +4529,11 @@ impl DecodeEngine {
                 self.mtp_diag_total
             );
         }
-        let mut scratch = match self.metal_v2_scratch.take() {
+        let mut scratch = match self.mtp_verify_scratch.take() {
             Some(scratch) => scratch,
-            None => prefill_engine::MetalV2DecodeScratch::new(
-                &self.weights.config,
-                self.ordinal,
-            )?,
+            None => MtpVerifyScratch::new(&self.weights.config, self.ordinal)?,
         };
-        let draft = prefill_engine::qwen35_mtp_draft_greedy(
+        let draft = mtp_draft_greedy(
             &self.weights,
             &mut self.state,
             &self.rotary,
@@ -4569,7 +4544,7 @@ impl DecodeEngine {
             self.ordinal,
             self.kv_chunk_size,
         );
-        self.metal_v2_scratch = Some(scratch);
+        self.mtp_verify_scratch = Some(scratch);
         self.mtp_pending_draft = Some(draft?);
         Ok(())
     }
@@ -10669,12 +10644,13 @@ impl DecodeEngine {
             decode_context_limit: None,
             batch_size,
             dflash_tap_cache: None,
-            dflash_fused_verify_cache: None,
-            dflash_prefill_append_cache: None,
+            dflash_tap_verify_cache: None,
+            mtp_verify_cache: None,
+            mtp_prefill_append_cache: None,
             dflash_prefill_tree_cache: None,
             component_full_attn_scratch,
             component_mlp_scratch,
-            metal_v2_scratch: None,
+            mtp_verify_scratch: None,
             mtp_diag: env::var_os("SUPERSONIC_QWEN38_MTP").is_some(),
             mtp_spec: false,
             mtp_k: env::var("SUPERSONIC_QWEN38_MTP_K")
@@ -10993,7 +10969,7 @@ impl DecodeEngine {
         if commit_len == block.len() {
             return self.mtp_commit_prefix(block, greedy, commit_len, n_acc, pos, true);
         }
-        match kernel_ffi::mtp_restore_linear_prefix(commit_len) {
+        match restore_linear_prefix(commit_len) {
             Ok(true) => {
                 if env::var_os("SUPERSONIC_QWEN38_MTP_PROFILE").is_some() {
                     eprintln!(
@@ -11074,9 +11050,7 @@ impl DecodeEngine {
             .mtp_linear_snap
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("mtp replay missing linear snapshot"))?;
-        self.state
-            .restore_linear(snap, ordinal)
-            .map_err(|e| anyhow::anyhow!("mtp restore_linear: {e}"))?;
+        restore_linear_state(&mut self.state, snap, ordinal)?;
         self.rewind_full_kv_filled(pos);
 
         let mut next_token = committed[0];
@@ -11166,12 +11140,9 @@ impl DecodeEngine {
         abs_pos: usize,
         k: usize,
     ) -> Result<Vec<u32>> {
-        let mut scratch = match self.metal_v2_scratch.take() {
+        let mut scratch = match self.mtp_verify_scratch.take() {
             Some(scratch) => scratch,
-            None => prefill_engine::MetalV2DecodeScratch::new(
-                &self.weights.config,
-                self.ordinal,
-            )?,
+            None => MtpVerifyScratch::new(&self.weights.config, self.ordinal)?,
         };
         let mut src = self
             .mtp_h
@@ -11189,7 +11160,7 @@ impl DecodeEngine {
         let mut drafts = Vec::with_capacity(k);
         let mut err = None;
         for i in 0..k {
-            match prefill_engine::qwen35_mtp_forward(
+            match mtp_forward(
                 &self.weights,
                 &mut self.state,
                 &self.rotary,
@@ -11215,7 +11186,7 @@ impl DecodeEngine {
         }
         self.mtp_h = Some(src);
         self.mtp_h_tmp = Some(dst);
-        self.metal_v2_scratch = Some(scratch);
+        self.mtp_verify_scratch = Some(scratch);
         if let Some(e) = err {
             return Err(e);
         }
@@ -12037,7 +12008,7 @@ impl DecodeEngine {
     }
 
     /// Run one decode step. Returns logits as Vec<f32> on CPU.
-    /// Metal v2 incremental decode: one length-1 forward pass per generated
+    /// MTP component decode: one length-1 forward pass per generated
     /// token, mutating the engine's `state` in place. Replaces Metal v1's
     /// O(N²) replay-prefill path. Always returns logits and a host-computed
     /// argmax; sampling_mode and sync_for_timing in the caller are ignored
@@ -12056,17 +12027,17 @@ impl DecodeEngine {
             anyhow::bail!("decode_step_metal_fast_greedy requires the Metal backend");
         }
         let config = &self.weights.config;
-        if self.metal_v2_scratch.is_none() {
-            self.metal_v2_scratch = Some(prefill_engine::MetalV2DecodeScratch::new(
+        if self.mtp_verify_scratch.is_none() {
+            self.mtp_verify_scratch = Some(MtpVerifyScratch::new(
                 config,
                 self.ordinal,
             )?);
         }
         let scratch = self
-            .metal_v2_scratch
+            .mtp_verify_scratch
             .as_mut()
-            .expect("metal v2 scratch was just initialized");
-        prefill_engine::metal_v2_decode_step_greedy(
+            .expect("MTP verify scratch was just initialized");
+        mtp_decode_step_greedy(
             &self.weights,
             &mut self.state,
             &self.rotary,
@@ -12094,17 +12065,17 @@ impl DecodeEngine {
         seqlen_offset: usize,
     ) -> Result<DecodeStepOutput> {
         let config = &self.weights.config;
-        if self.metal_v2_scratch.is_none() {
-            self.metal_v2_scratch = Some(prefill_engine::MetalV2DecodeScratch::new(
+        if self.mtp_verify_scratch.is_none() {
+            self.mtp_verify_scratch = Some(MtpVerifyScratch::new(
                 config,
                 self.ordinal,
             )?);
         }
         let scratch = self
-            .metal_v2_scratch
+            .mtp_verify_scratch
             .as_mut()
-            .expect("metal v2 scratch was just initialized");
-        let logits = prefill_engine::metal_v2_decode_step(
+            .expect("MTP verify scratch was just initialized");
+        let logits = mtp_decode_step(
             &self.weights,
             &mut self.state,
             &self.rotary,
@@ -12144,12 +12115,9 @@ impl DecodeEngine {
         token_id: u32,
         seqlen_offset: usize,
     ) -> Result<(Vec<f32>, DecodeStageTimings)> {
-        let mut scratch = match self.metal_v2_scratch.take() {
+        let mut scratch = match self.mtp_verify_scratch.take() {
             Some(scratch) => scratch,
-            None => prefill_engine::MetalV2DecodeScratch::new(
-                &self.weights.config,
-                self.ordinal,
-            )?,
+            None => MtpVerifyScratch::new(&self.weights.config, self.ordinal)?,
         };
         maybe_dump_gqh_decode_state(
             &self.state,
@@ -12161,7 +12129,7 @@ impl DecodeEngine {
             "component",
         );
         let start = Instant::now();
-        let result = prefill_engine::metal_v2_decode_step(
+        let result = mtp_decode_step(
             &self.weights,
             &mut self.state,
             &self.rotary,
@@ -12172,7 +12140,7 @@ impl DecodeEngine {
             self.kv_chunk_size,
         );
         let copy = scratch.copy_last_residual_to(self.ordinal, &mut self.hidden_io);
-        self.metal_v2_scratch = Some(scratch);
+        self.mtp_verify_scratch = Some(scratch);
         copy?;
         let logits = result?;
         maybe_dump_gqh_decode_state(
@@ -12608,9 +12576,9 @@ impl DecodeEngine {
         }
         self.check_attn_scratch_budget()?;
 
-        let mut cache = match self.dflash_fused_verify_cache.take() {
+        let mut cache = match self.dflash_tap_verify_cache.take() {
             Some(c) if c.block_size == b => c,
-            _ => DFlashFusedVerifyCache::alloc(
+            _ => DFlashTapVerifyCache::alloc(
                 self.ordinal,
                 b,
                 hidden_dim,
@@ -12645,7 +12613,7 @@ impl DecodeEngine {
         };
         gpu_hal::copy_h2d(
             self.ordinal,
-            cache.batch_desc_device.as_mut_ptr(),
+            cache.0.batch_desc_device.as_mut_ptr(),
             desc_bytes.as_ptr() as *const c_void,
             desc_bytes.len(),
         )
@@ -12657,7 +12625,9 @@ impl DecodeEngine {
             let dst_offset = bi * row_bytes;
             gpu_hal::copy_d2d(
                 self.ordinal,
-                unsafe { (cache.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void },
+                unsafe {
+                    (cache.0.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void
+                },
                 self.weights.embed_tokens.offset_ptr(src_offset),
                 row_bytes,
             )
@@ -12680,8 +12650,8 @@ impl DecodeEngine {
 
         gpu_hal::memset_zeros(
             self.ordinal,
-            cache.workspace.as_mut_ptr(),
-            cache.workspace.len_bytes(),
+            cache.0.workspace.as_mut_ptr(),
+            cache.0.workspace.len_bytes(),
         )
         .map_err(|e| anyhow::anyhow!("dflash block-taps clear workspace: {e}"))?;
         self.scratch
@@ -12696,8 +12666,8 @@ impl DecodeEngine {
             intermediate_size,
             pos_offset,
             &self.scratch.desc_device,
-            &mut cache.hidden_io,
-            &mut cache.workspace,
+            &mut cache.0.hidden_io,
+            &mut cache.0.workspace,
             &mut self.scratch.sync_buf,
             &self.rotary.cos,
             &self.rotary.sin,
@@ -12707,7 +12677,7 @@ impl DecodeEngine {
             self.fp8_scale_device.as_ref(),
             None,
             b,
-            Some(&cache.batch_desc_device),
+            Some(&cache.0.batch_desc_device),
             self.int4_scale_device.as_ref(),
             false,
             false,
@@ -12732,7 +12702,7 @@ impl DecodeEngine {
                 self.ordinal,
                 self.hidden_io.as_ptr() as *mut c_void,
                 unsafe {
-                    (cache.hidden_io.as_ptr() as *const u8).add(last_offset) as *const c_void
+                    (cache.0.hidden_io.as_ptr() as *const u8).add(last_offset) as *const c_void
                 },
                 row_bytes,
             )
@@ -12796,7 +12766,7 @@ impl DecodeEngine {
             }
         }
 
-        self.dflash_fused_verify_cache = Some(cache);
+        self.dflash_tap_verify_cache = Some(cache);
         Ok((logits, per_position))
     }
 
@@ -13030,16 +13000,12 @@ impl DecodeEngine {
             }
         }
 
-        let mut cache = match self.dflash_prefill_append_cache.take() {
+        let mut cache = match self.mtp_prefill_append_cache.take() {
             Some(cache) => cache,
-            None => prefill_engine::PrefillAppendVerifyCache::new(
-                &self.weights.config,
-                tokens.len(),
-                self.ordinal,
-            )?,
+            None => MtpPrefillAppendCache::new(&self.weights.config, tokens.len(), self.ordinal)?,
         };
         let mut gpu_tap_sink = gpu_tap_sink;
-        let result = prefill_engine::prefill_append_verify_cached_with_gpu_taps(
+        let result = prefill_append_verify_cached_with_gpu_taps(
             &self.weights,
             &mut self.state,
             &self.rotary,
@@ -13055,7 +13021,7 @@ impl DecodeEngine {
             &mut cache,
             gpu_tap_sink.as_mut(),
         )?;
-        self.dflash_prefill_append_cache = Some(cache);
+        self.mtp_prefill_append_cache = Some(cache);
         self.scratch
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("reset sync after prefill append verify: {e}"))?;
@@ -13093,7 +13059,7 @@ impl DecodeEngine {
             self.ordinal,
         )?;
         if let (Some(cache), Some(rollback)) = (
-            self.dflash_prefill_append_cache.as_mut(),
+            self.mtp_prefill_append_cache.as_mut(),
             result.rollback.take(),
         ) {
             cache.recycle_rollback(rollback);
@@ -13139,7 +13105,7 @@ impl DecodeEngine {
             }
         }
         if let (Some(cache), Some(rollback)) = (
-            self.dflash_prefill_append_cache.as_mut(),
+            self.mtp_prefill_append_cache.as_mut(),
             result.rollback.take(),
         ) {
             cache.recycle_rollback(rollback);
@@ -13222,7 +13188,7 @@ impl DecodeEngine {
         Ok(())
     }
 
-    /// DFlash M4.3 fused verify: single `persistent_decode_4b` megakernel
+    /// Qwen3.8 MTP fused verify: single `persistent_decode_4b` megakernel
     /// launch over all `tokens.len()` consecutive positions starting at
     /// `pos_offset`. Returns per-position logits `[tokens.len()][vocab]`.
     ///
@@ -13243,7 +13209,7 @@ impl DecodeEngine {
     ///
     /// Semantics match `verify_block_prefill`: full-attention K/V is
     /// written at positions `[pos_offset, pos_offset + tokens.len())`
-    /// but `kv_filled` is NOT advanced on any layer — the DFlash engine
+    /// but `kv_filled` is NOT advanced on any layer — the MTP driver
     /// owns rollback via `rewind_full_kv_filled` + `restore_linear`.
     /// Linear-attention `conv_state` / `recurrent_state` are mutated in
     /// place (shared across all B slots via pointer aliasing), so the
@@ -13315,7 +13281,7 @@ impl DecodeEngine {
         // gfx1100/gfx115x cap LDS at 64 KiB per workgroup, or 16384 floats.
         // Reserve 512 floats for block_size + fp8_lut, leaving 15872 floats
         // for the input cache. Qwen3.6-27B (hidden=5120) therefore fits B=3.
-        // If a user passes a larger --dflash-block, fail before HIP returns a
+        // If a user passes a larger MTP block, fail before HIP returns a
         // less helpful launch error.
         const MAX_INPUT_CACHE_FLOATS: usize = 15872;
         let input_cache = (b * hidden_dim).max(2 * hidden_dim);
@@ -13355,9 +13321,9 @@ impl DecodeEngine {
 
         // Take the cached workspace if it matches the current block
         // size, otherwise allocate fresh. Put it back at the end.
-        let mut cache = match self.dflash_fused_verify_cache.take() {
+        let mut cache = match self.mtp_verify_cache.take() {
             Some(c) if c.block_size == b => c,
-            _ => DFlashFusedVerifyCache::alloc(
+            _ => MtpVerifyCache::alloc(
                 self.ordinal,
                 b,
                 hidden_dim,
@@ -13428,7 +13394,7 @@ impl DecodeEngine {
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("fused verify reset sync: {e}"))?;
 
-        let profile_verify = std::env::var_os("SUPERSONIC_DFLASH_PROFILE_VERIFY").is_some();
+        let profile_verify = std::env::var_os("SUPERSONIC_QWEN38_MTP_PROFILE_VERIFY").is_some();
 
         // Launch the fused megakernel. `pos_offset` as the kernel's
         // `seqlen_offset` arg is ignored because `batch_descs` is
@@ -13465,7 +13431,7 @@ impl DecodeEngine {
         let persistent_ms = persistent_start.elapsed().as_secs_f64() * 1000.0;
 
         // Deliberately do NOT advance `kv_filled` on any layer. The
-        // DFlash engine rolls the K/V cursor back via
+        // MTP rolls the K/V cursor back via
         // `rewind_full_kv_filled` and the linear state via
         // `restore_linear` after the accept decision.
 
@@ -13562,7 +13528,7 @@ impl DecodeEngine {
 
         if profile_verify {
             eprintln!(
-                "[dflash-profile] fused_verify B={b} pos={pos_offset} persistent={persistent_ms:.2}ms rms={rms_ms:.2}ms lm_head={lm_head_ms:.2}ms d2h={d2h_ms:.2}ms greedy_only={greedy_only}"
+                "[qwen38-mtp-profile] fused_verify B={b} pos={pos_offset} persistent={persistent_ms:.2}ms rms={rms_ms:.2}ms lm_head={lm_head_ms:.2}ms d2h={d2h_ms:.2}ms greedy_only={greedy_only}"
             );
         }
 
@@ -13572,7 +13538,7 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("fused verify normed D2H: {e}"))?;
         self.fused_last_normed = Some(normed_host);
 
-        self.dflash_fused_verify_cache = Some(cache);
+        self.mtp_verify_cache = Some(cache);
         Ok((logits_per_pos, greedy))
     }
 

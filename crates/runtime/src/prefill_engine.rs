@@ -14,6 +14,7 @@ use qwen35::rotary::RotaryTables;
 use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
 use qwen35::weights::Qwen35Weights;
 
+use crate::mtp::{MtpPrefillAppendCache, MtpVerifyScratch};
 use crate::tensor_bytes::{
     bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le,
     f32_to_bf16_bytes as encode_bf16_le, f32_to_f32_bytes as encode_f32_le,
@@ -25,7 +26,7 @@ use kernel_ffi::prefill_ffi;
 /// the cheap host memcpy path; with a batch open on Metal, uses a Metal blit
 /// encoded into the shared command buffer.
 ///
-/// Use this in any prefill helper that may run inside `metal_v2_decode_step`'s
+/// Use this in any prefill helper that may run inside `mtp_decode_step`'s
 /// `MetalBatchGuard` scope. Outside that scope, behavior is unchanged.
 fn copy_d2d_batched(
     ordinal: usize,
@@ -1270,7 +1271,7 @@ pub fn compute_logits_for_range(
         .map_err(|e| anyhow::anyhow!("range lm_head matvec: {e}"))?;
     }
 
-    // If a Metal batch is open (Metal v2 incremental decode wraps the entire
+    // If a Metal batch is open (the incremental MTP decode wraps the entire
     // step in one), commit + wait so the lm_head GPU work is visible to the
     // host memcpy below. No-op when no batch is active or on non-Metal builds.
     if prefill_ffi::metal_batch_is_active() {
@@ -1627,7 +1628,7 @@ fn compute_greedy_for_acceptance(
         return Ok(Vec::new());
     }
 
-    let scan_chunk = std::env::var("SUPERSONIC_DFLASH_GREEDY_SCAN_CHUNK")
+    let scan_chunk = std::env::var("SUPERSONIC_QWEN38_MTP_GREEDY_SCAN_CHUNK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
@@ -1789,7 +1790,7 @@ pub struct PrefillResult {
     pub target_nll: Option<PrefillTargetNll>,
 }
 
-/// Result from the DFlash prefill-append verifier.
+/// Result from the Qwen3.8 MTP prefill-append verifier.
 pub struct PrefillAppendVerifyResult {
     pub logits: Vec<Vec<f32>>,
     pub target_next: Option<Vec<u32>>,
@@ -1861,7 +1862,7 @@ pub struct LinearLayerDebugTrace {
 }
 
 /// Scratch buffers for prefill (larger than decode — seq_len > 1).
-struct PrefillScratch {
+pub(crate) struct PrefillScratch {
     /// [seq_len, hidden_dim] BF16 — main hidden state
     hidden: GpuBuffer,
     /// [seq_len, hidden_dim] F32 — optional residual source of truth for
@@ -1959,7 +1960,7 @@ struct PrefillScratch {
 }
 
 impl PrefillScratch {
-    fn new(config: &TextConfig, seq_len: usize, ordinal: usize) -> Result<Self> {
+    pub(crate) fn new(config: &TextConfig, seq_len: usize, ordinal: usize) -> Result<Self> {
         let hidden_dim = config.hidden_size;
         let intermediate = config.intermediate_size;
         let num_q_heads = config.num_attention_heads;
@@ -2134,6 +2135,12 @@ impl PrefillScratch {
             tree_tap_capture_row_bytes: 0,
             tree_tap_capture_rows: 0,
         })
+    }
+
+    pub(crate) fn copy_hidden_to(&self, ordinal: usize, dst: &mut GpuBuffer) -> Result<()> {
+        let bytes = self.hidden.len_bytes().min(dst.len_bytes());
+        gpu_hal::copy_d2d(ordinal, dst.as_mut_ptr(), self.hidden.as_ptr(), bytes)
+            .map_err(|e| anyhow::anyhow!("copy MTP residual: {e}"))
     }
 }
 
@@ -2458,15 +2465,6 @@ impl PrefillScratch {
         }
         Ok(())
     }
-}
-
-pub struct PrefillAppendVerifyCache {
-    chunk_len: usize,
-    ordinal: usize,
-    scratch: PrefillScratch,
-    chunk_conv_tail: Vec<Option<GpuBuffer>>,
-    token_ids_gpu: GpuBuffer,
-    rollback: Option<PrefillAppendRollback>,
 }
 
 pub struct PrefillTreeVerifyCache {
@@ -2794,64 +2792,6 @@ impl PrefillTreeVerifyCache {
     }
 }
 
-impl PrefillAppendVerifyCache {
-    pub fn new(config: &TextConfig, chunk_len: usize, ordinal: usize) -> Result<Self> {
-        let kern = config.linear_conv_kernel_dim;
-        let khd = config.linear_key_head_dim;
-        let vhd = config.linear_value_head_dim;
-        let qkv_dim = config.linear_num_key_heads * khd * 2 + config.linear_num_value_heads * vhd;
-        let scratch = PrefillScratch::new(config, chunk_len, ordinal)?;
-        let chunk_conv_tail: Vec<Option<GpuBuffer>> = (0..config.num_hidden_layers)
-            .map(|i| {
-                if config.is_full_attention(i) {
-                    Ok(None)
-                } else {
-                    GpuBuffer::alloc(ordinal, ScalarType::BF16, &[qkv_dim, kern - 1])
-                        .map(Some)
-                        .map_err(|e| anyhow::anyhow!("append cache conv_tail alloc: {e}"))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let token_ids_gpu = GpuBuffer::alloc(ordinal, ScalarType::U32, &[chunk_len])
-            .map_err(|e| anyhow::anyhow!("append cache token ids alloc: {e}"))?;
-
-        Ok(Self {
-            chunk_len,
-            ordinal,
-            scratch,
-            chunk_conv_tail,
-            token_ids_gpu,
-            rollback: None,
-        })
-    }
-
-    fn matches(&self, chunk_len: usize, ordinal: usize) -> bool {
-        self.chunk_len == chunk_len && self.ordinal == ordinal
-    }
-
-    fn take_rollback(
-        &mut self,
-        config: &TextConfig,
-        pos_offset: usize,
-        ordinal: usize,
-    ) -> Result<PrefillAppendRollback> {
-        if let Some(mut rollback) = self.rollback.take() {
-            if append_rollback_matches(config, &rollback, self.chunk_len, ordinal) {
-                rollback.pos_offset = pos_offset;
-                rollback.chunk_len = self.chunk_len;
-                return Ok(rollback);
-            }
-        }
-        alloc_append_rollback(config, self.chunk_len, pos_offset, ordinal)
-    }
-
-    pub fn recycle_rollback(&mut self, rollback: PrefillAppendRollback) {
-        if rollback.chunk_len == self.chunk_len {
-            self.rollback = Some(rollback);
-        }
-    }
-}
-
 fn alloc_tree_rollback(
     config: &TextConfig,
     tree_len: usize,
@@ -2974,7 +2914,7 @@ fn tree_rollback_matches(
     true
 }
 
-fn alloc_append_rollback(
+pub(crate) fn alloc_append_rollback(
     config: &TextConfig,
     chunk_len: usize,
     pos_offset: usize,
@@ -3025,7 +2965,7 @@ fn alloc_append_rollback(
     })
 }
 
-fn append_rollback_matches(
+pub(crate) fn append_rollback_matches(
     config: &TextConfig,
     rollback: &PrefillAppendRollback,
     chunk_len: usize,
@@ -4350,14 +4290,14 @@ pub fn gpu_reference_replay_step_with_taps(
     Ok((result.logits, taps))
 }
 
-/// Append a contiguous DFlash verify block to the live target state using the
-/// prefill component kernels, returning logits for every appended position.
+/// Append a contiguous Qwen3.8 MTP verify block to the live target state using
+/// the prefill component kernels, returning logits for every appended position.
 ///
 /// Unlike `prefill_with_taps`, this does not assume position zero. The caller
 /// supplies the absolute `pos_offset`; full-attention KV is written at
 /// `[pos_offset, pos_offset + token_ids.len())` without advancing `kv_filled`,
-/// while linear-attention state is mutated in place. The DFlash driver must
-/// snapshot/restore linear state around this call, just as it does for the
+/// while linear-attention state is mutated in place. The Qwen3.8 MTP driver
+/// snapshots/restores linear state around this call, just as it does for the
 /// persistent fused verifier.
 pub fn prefill_append_logits(
     weights: &Qwen35Weights,
@@ -4432,7 +4372,7 @@ pub fn prefill_append_verify_cached(
     capture_rollback: bool,
     greedy_only: bool,
     greedy_compare_tokens: Option<&[u32]>,
-    cache: &mut PrefillAppendVerifyCache,
+    cache: &mut MtpPrefillAppendCache,
 ) -> Result<PrefillAppendVerifyResult> {
     prefill_append_verify_impl(
         weights,
@@ -4466,7 +4406,7 @@ pub fn prefill_append_verify_cached_with_gpu_taps(
     capture_rollback: bool,
     greedy_only: bool,
     greedy_compare_tokens: Option<&[u32]>,
-    cache: &mut PrefillAppendVerifyCache,
+    cache: &mut MtpPrefillAppendCache,
     gpu_tap_sink: Option<&mut PrefillAppendGpuTapSink<'_>>,
 ) -> Result<PrefillAppendVerifyResult> {
     prefill_append_verify_impl(
@@ -4501,7 +4441,7 @@ fn prefill_append_verify_impl(
     capture_rollback: bool,
     greedy_only: bool,
     greedy_compare_tokens: Option<&[u32]>,
-    cache: Option<&mut PrefillAppendVerifyCache>,
+    cache: Option<&mut MtpPrefillAppendCache>,
     mut gpu_tap_sink: Option<&mut PrefillAppendGpuTapSink<'_>>,
 ) -> Result<PrefillAppendVerifyResult> {
     if token_ids.is_empty() {
@@ -4511,7 +4451,7 @@ fn prefill_append_verify_impl(
     let config = &weights.config;
     let chunk_len = token_ids.len();
     let hidden_dim = config.hidden_size;
-    let profile = std::env::var_os("SUPERSONIC_DFLASH_PROFILE_APPEND").is_some();
+    let profile = std::env::var_os("SUPERSONIC_QWEN38_MTP_PROFILE_APPEND").is_some();
     let mut ms_seed = 0.0_f64;
     let mut ms_embed = 0.0_f64;
     let mut ms_input_norm = 0.0_f64;
@@ -4530,7 +4470,7 @@ fn prefill_append_verify_impl(
     let cache = match cache {
         Some(cache) => cache,
         None => {
-            local_cache = PrefillAppendVerifyCache::new(config, chunk_len, ordinal)?;
+            local_cache = MtpPrefillAppendCache::new(config, chunk_len, ordinal)?;
             &mut local_cache
         }
     };
@@ -4539,7 +4479,7 @@ fn prefill_append_verify_impl(
             && cache.ordinal == ordinal
             && cache.chunk_len >= chunk_len;
         if !can_reuse_larger {
-            *cache = PrefillAppendVerifyCache::new(config, chunk_len, ordinal)?;
+            *cache = MtpPrefillAppendCache::new(config, chunk_len, ordinal)?;
         }
     }
     let mut rollback: Option<PrefillAppendRollback> = if capture_rollback {
@@ -4736,7 +4676,7 @@ fn prefill_append_verify_impl(
                     let hidden_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
                     let chunk_bytes = chunk_len * hidden_bytes;
                     let host = scratch.hidden.to_host_bytes().map_err(|e| {
-                        anyhow::anyhow!("append dflash tap history D2H layer {idx}: {e}")
+                        anyhow::anyhow!("append MTP tap history D2H layer {idx}: {e}")
                     })?;
                     out_all[slot].extend_from_slice(&host[..chunk_bytes]);
                 }
@@ -4802,7 +4742,7 @@ fn prefill_append_verify_impl(
     if profile {
         ms_logits += t_logits.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
-            "[dflash-profile] prefill_append B={} pos={} seed={:.2}ms embed={:.2}ms input_norm={:.2}ms full_attn={:.2}ms linear_attn={:.2}ms post_norm={:.2}ms mlp={:.2}ms logits={:.2}ms",
+            "[qwen38-mtp-profile] prefill_append B={} pos={} seed={:.2}ms embed={:.2}ms input_norm={:.2}ms full_attn={:.2}ms linear_attn={:.2}ms post_norm={:.2}ms mlp={:.2}ms logits={:.2}ms",
             chunk_len,
             pos_offset,
             ms_seed,
@@ -5533,91 +5473,16 @@ pub fn apply_prefill_tree_rollback(
     Ok(())
 }
 
-/// Reusable scratch for Metal v2 incremental decode. Sized for chunk_len=1 and
-/// allocated once on the engine; carries the BF16 inter-chunk linear-attention
-/// buffers across decode steps so we don't re-zero them each call.
-pub struct MetalV2DecodeScratch {
-    scratch: PrefillScratch,
-    chunk_conv_tail: Vec<Option<GpuBuffer>>,
-    token_id_buf: GpuBuffer,
-    mtp_residual: GpuBuffer,
-    mtp_logits: GpuBuffer,
-    mtp_argmax: GpuBuffer,
-    mtp_counter: GpuBuffer,
-}
-
-impl MetalV2DecodeScratch {
-    pub fn new(config: &TextConfig, ordinal: usize) -> Result<Self> {
-        let scratch = PrefillScratch::new(config, 1, ordinal)?;
-        let kern = config.linear_conv_kernel_dim;
-        let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
-            + config.linear_num_value_heads * config.linear_value_head_dim;
-
-        let chunk_conv_tail: Vec<Option<GpuBuffer>> = (0..config.num_hidden_layers)
-            .map(|i| {
-                if config.is_full_attention(i) {
-                    Ok(None)
-                } else {
-                    GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim, kern - 1])
-                        .map(Some)
-                        .map_err(|e| anyhow::anyhow!("metal v2 chunk conv tail alloc: {e}"))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let token_id_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-            .map_err(|e| anyhow::anyhow!("metal v2 token id buf: {e}"))?;
-        let mtp_residual = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[1, config.hidden_size],
-        )
-        .map_err(|e| anyhow::anyhow!("mtp residual scratch: {e}"))?;
-        let mtp_logits = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[1, config.vocab_size],
-        )
-        .map_err(|e| anyhow::anyhow!("mtp logits scratch: {e}"))?;
-        let mtp_argmax = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-            .map_err(|e| anyhow::anyhow!("mtp argmax scratch: {e}"))?;
-        let mtp_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-            .map_err(|e| anyhow::anyhow!("mtp counter scratch: {e}"))?;
-
-        Ok(Self {
-            scratch,
-            chunk_conv_tail,
-            token_id_buf,
-            mtp_residual,
-            mtp_logits,
-            mtp_argmax,
-            mtp_counter,
-        })
-    }
-
-    /// Last-layer residual after a metal-v2 decode body (`[1, hidden]` BF16).
-    pub fn copy_last_residual_to(&self, ordinal: usize, dst: &mut GpuBuffer) -> Result<()> {
-        let bytes = self.scratch.hidden.len_bytes().min(dst.len_bytes());
-        gpu_hal::copy_d2d(
-            ordinal,
-            dst.as_mut_ptr(),
-            self.scratch.hidden.as_ptr(),
-            bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("copy last residual: {e}"))
-    }
-}
-
-/// Per-token forward pass body shared by `metal_v2_decode_step` (full-logits)
-/// and `metal_v2_decode_step_greedy` (fused argmax). Performs token embed +
+/// Per-token forward pass body shared by `mtp_decode_step` (full-logits)
+/// and `mtp_decode_step_greedy` (fused argmax). Performs token embed +
 /// 24-layer transformer pass, leaving the post-final-layer hidden state in
 /// `scratch.scratch.hidden`. Caller is responsible for the final RMSNorm +
 /// lm_head and for owning a `MetalBatchGuard` around the call.
-fn metal_v2_decode_step_body(
+fn mtp_decode_step_body(
     weights: &Qwen35Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
-    scratch: &mut MetalV2DecodeScratch,
+    scratch: &mut MtpVerifyScratch,
     token_id: u32,
     seqlen_offset: usize,
     ordinal: usize,
@@ -5640,7 +5505,7 @@ fn metal_v2_decode_step_body(
         }
         let chunk_tail = scratch.chunk_conv_tail[idx]
             .as_mut()
-            .expect("metal v2 chunk conv tail missing for linear layer");
+            .expect("mtp chunk conv tail missing for linear layer");
         if let Some(conv_state) = state.layers[idx].conv_state.as_ref() {
             let bytes = qkv_dim * (kern - 1) * ScalarType::BF16.size_in_bytes();
             copy_d2d_batched(
@@ -5649,7 +5514,7 @@ fn metal_v2_decode_step_body(
                 conv_state.as_ptr(),
                 bytes,
             )
-            .map_err(|e| anyhow::anyhow!("metal v2 layer {idx} seed conv tail: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("mtp layer {idx} seed conv tail: {e}"))?;
         }
     }
 
@@ -5661,7 +5526,7 @@ fn metal_v2_decode_step_body(
         id_bytes.as_ptr() as *const c_void,
         4,
     )
-    .map_err(|e| anyhow::anyhow!("metal v2 token id upload: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("mtp token id upload: {e}"))?;
     prefill_ffi::embedding_lookup(
         ordinal,
         ScalarType::BF16,
@@ -5706,7 +5571,7 @@ fn metal_v2_decode_step_body(
                 ordinal,
                 kv_chunk_size,
                 /* commit_kv_filled */ true,
-                None, // NEW: metal v2 decode never sparsifies
+                None, // MTP decode never sparsifies
             )?;
         } else {
             let mut no_debug_trace = None;
@@ -5786,13 +5651,13 @@ fn metal_v2_decode_step_body(
 /// O(N²) replay-prefill path with O(N)-per-step proper incremental decode.
 ///
 /// Returns the full BF16→f32 logits row over the vocabulary. Use
-/// `metal_v2_decode_step_greedy` to skip the 250k-element D2H + host argmax
+/// `mtp_decode_step_greedy` to skip the 250k-element D2H + host argmax
 /// when only the sampled token is needed.
-pub fn metal_v2_decode_step(
+pub fn mtp_decode_step(
     weights: &Qwen35Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
-    scratch: &mut MetalV2DecodeScratch,
+    scratch: &mut MtpVerifyScratch,
     token_id: u32,
     seqlen_offset: usize,
     ordinal: usize,
@@ -5802,9 +5667,9 @@ pub fn metal_v2_decode_step(
     // ~800 kernel dispatches end up in a single command buffer rather than
     // committing and waiting individually.
     let _metal_batch = prefill_ffi::MetalBatchGuard::begin()
-        .map_err(|e| anyhow::anyhow!("metal v2 batch begin: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("mtp batch begin: {e}"))?;
 
-    metal_v2_decode_step_body(
+    mtp_decode_step_body(
         weights,
         state,
         rotary,
@@ -5831,25 +5696,25 @@ pub fn metal_v2_decode_step(
     Ok(logits)
 }
 
-/// Same forward pass as `metal_v2_decode_step`, but uses the fused
+/// Same forward pass as `mtp_decode_step`, but uses the fused
 /// lm_head + argmax kernel and returns just the sampled token id. Skips the
 /// per-token 250k-element BF16 D2H, the bf16→f32 conversion, and the host
 /// argmax loop. Use this when full logits aren't needed (no validation,
 /// no rescore, plain greedy decode).
-pub fn metal_v2_decode_step_greedy(
+pub fn mtp_decode_step_greedy(
     weights: &Qwen35Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
-    scratch: &mut MetalV2DecodeScratch,
+    scratch: &mut MtpVerifyScratch,
     token_id: u32,
     seqlen_offset: usize,
     ordinal: usize,
     kv_chunk_size: usize,
 ) -> Result<u32> {
     let _metal_batch = prefill_ffi::MetalBatchGuard::begin()
-        .map_err(|e| anyhow::anyhow!("metal v2 batch begin: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("mtp batch begin: {e}"))?;
 
-    metal_v2_decode_step_body(
+    mtp_decode_step_body(
         weights,
         state,
         rotary,
@@ -7286,7 +7151,7 @@ fn prefill_linear_attention_layer(
     // the conv1d, because the conv_input padding for this chunk reads from
     // `chunk_conv_tail` — that source must still be the PREVIOUS chunk's tail
     // when the conv1d runs. Updating in place here was a cross-platform bug
-    // exposed by chunk_len=1 incremental decode (Metal v2): the new tail
+    // exposed by chunk_len=1 incremental decode: the new tail
     // mixed with the current chunk's QKV got fed back into this same chunk's
     // conv1d window, shifting the inputs.
     let pad = kern - 1;
@@ -9487,11 +9352,11 @@ fn prefill_mlp_layer(
 /// `output_norm` first) or an embeddings_nextn / previous MTP `t_h_nextn`
 /// row (`h_is_nextn=true`). Compact MTP KV is written at `ls.kv_filled`;
 /// RoPE uses `abs_pos`. Writes shared-head hidden into `out_h`.
-pub fn qwen35_mtp_forward(
+pub fn mtp_forward(
     weights: &Qwen35Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
-    scratch: &mut MetalV2DecodeScratch,
+    scratch: &mut MtpVerifyScratch,
     h: &GpuBuffer,
     h_is_nextn: bool,
     token_id: u32,
@@ -9503,16 +9368,16 @@ pub fn qwen35_mtp_forward(
     let mtp = weights
         .mtp
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("qwen35 MTP: blk.64 weights were not loaded"))?;
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.8 MTP: blk.64 weights were not loaded"))?;
     let ls = state
         .mtp
         .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("qwen35 MTP: missing MTP KV state"))?;
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.8 MTP: missing MTP KV state"))?;
     let fw = mtp
         .layer
         .full
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("qwen35 MTP: expected a full-attention block"))?;
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.8 MTP: expected a full-attention block"))?;
     let config = &weights.config;
     let hidden_dim = config.hidden_size;
     let elem = ScalarType::BF16.size_in_bytes();
@@ -9734,11 +9599,11 @@ pub fn qwen35_mtp_forward(
 }
 
 /// Diagnostic wrapper: trunk residual in, greedy draft token out.
-pub fn qwen35_mtp_draft_greedy(
+pub fn mtp_draft_greedy(
     weights: &Qwen35Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
-    scratch: &mut MetalV2DecodeScratch,
+    scratch: &mut MtpVerifyScratch,
     h: &GpuBuffer,
     token_id: u32,
     seqlen_offset: usize,
@@ -9748,7 +9613,7 @@ pub fn qwen35_mtp_draft_greedy(
     let hidden_dim = weights.config.hidden_size;
     let mut out_h = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
         .map_err(|e| anyhow::anyhow!("mtp draft out_h alloc: {e}"))?;
-    qwen35_mtp_forward(
+    mtp_forward(
         weights,
         state,
         rotary,

@@ -421,21 +421,23 @@ pub fn persistent_decode_qwen08_sm86_specialized(
     Ok(())
 }
 
-/// Safe wrapper around the 4B persistent decode kernel (separate compilation).
-/// `fp8_scale_descs`: when Some, contains FP8ScaleDesc array on GPU for runtime FP8 dequant.
-/// `kv_fp8_descs`: when Some, contains KVCacheFp8Desc array on GPU for FP8 KV cache.
-/// `batch_size`: number of sequences (1 = single-sequence, default).
-/// `batch_descs`: when Some, contains BatchSeqDesc array on GPU for per-sequence state.
-/// `int4_scale_descs`: when Some, contains INT4ScaleDesc array on GPU for INT4 dequant.
-/// `tap_workspace` / `tap_layers`: DFlash hidden-state taps. When `tap_workspace` is Some,
-///   the kernel mirrors the per-layer post-MLP residual hidden state for each layer in
-///   `tap_layers` into `tap_workspace` at offset `i * hidden_dim` (i = tap index, not layer
-///   index). Both must be Some together or both None. The kernel body short-circuits the
-///   tap write when `tap_workspace` is null to preserve gfx1150 codegen on the hot path.
+// Safe wrapper around the 4B persistent decode kernel (separate compilation).
+// `fp8_scale_descs`: when Some, contains FP8ScaleDesc array on GPU for runtime FP8 dequant.
+// `kv_fp8_descs`: when Some, contains KVCacheFp8Desc array on GPU for FP8 KV cache.
+// `batch_size`: number of sequences (1 = single-sequence, default).
+// `batch_descs`: when Some, contains BatchSeqDesc array on GPU for per-sequence state.
+// `int4_scale_descs`: when Some, contains INT4ScaleDesc array on GPU for INT4 dequant.
+// `tap_workspace` / `tap_layers`: DFlash hidden-state taps. When `tap_workspace` is Some,
+//   the kernel mirrors the per-layer post-MLP residual hidden state for each layer in
+//   `tap_layers` into `tap_workspace` at offset `i * hidden_dim` (i = tap index, not layer
+//   index). Both must be Some together or both None. The kernel body short-circuits the
+//   tap write when `tap_workspace` is null to preserve gfx1150 codegen on the hot path.
 #[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
     fn supersonic_qwen35_4b_hip_set_gqh_prepare_only(on: c_int);
-    fn supersonic_qwen35_hip_mtp_restore_linear_prefix(commit_len: c_int) -> c_int;
+    // Keep the historical C symbol spelling: this is the external kernel ABI.
+    #[link_name = "supersonic_qwen35_hip_mtp_restore_linear_prefix"]
+    fn qwen38_mtp_restore_linear_prefix(commit_len: c_int) -> c_int;
 }
 
 pub fn set_hip_gqh_prepare_only(on: bool) {
@@ -453,9 +455,7 @@ pub fn set_hip_gqh_prepare_only(on: bool) {
 pub fn mtp_restore_linear_prefix(commit_len: usize) -> Result<bool, GpuError> {
     #[cfg(supersonic_backend_hip)]
     {
-        let status = unsafe {
-            supersonic_qwen35_hip_mtp_restore_linear_prefix(commit_len as c_int)
-        };
+        let status = unsafe { qwen38_mtp_restore_linear_prefix(commit_len as c_int) };
         if status == 0 {
             return Ok(true);
         }

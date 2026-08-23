@@ -146,6 +146,13 @@ impl Default for KVCacheFp8Desc {
 /// 108/109/110 are GQH3/GQH2_H/GQH2_C; `*_proj_scale` then points at an
 /// 8-byte `{f32 tensor_scale, i32 grid_code}` sidecar. Type codes 20/21/22
 /// are reserved for HIGGS4, QuIP# E8, and QTIP trellis runtime profiles.
+///
+/// The historical `INT4ScaleDesc` name is retained for the external kernel
+/// ABI. For GQH rows the `*_proj_scale` pointers carry GQH tensor-header
+/// sidecars, not GPTQ metadata; the C++ `Qwen35INT4ScaleDesc` mirror and
+/// `qwen35::desc_builder::build_int4_scale_descs` depend on this exact field
+/// order and tail layout. Do not reorder, remove, or repurpose these fields
+/// without changing both FFI mirrors together and updating the layout test.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct INT4ScaleDesc {
@@ -241,5 +248,31 @@ unsafe impl Sync for BatchSeqDesc {}
 impl Default for BatchSeqDesc {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::INT4ScaleDesc;
+    use std::ffi::{c_int, c_void};
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn gqh_sidecar_descriptor_matches_cpp_wire_layout() {
+        // Thirty pointer slots (three per projection) are followed by
+        // group_size and twelve low-bit type codes in the HIP mirror.
+        let pointer_bytes = 30 * size_of::<*const c_void>();
+        let scalar_bytes = 13 * size_of::<c_int>();
+        let alignment = align_of::<*const c_void>();
+        let raw_size = pointer_bytes + scalar_bytes;
+        let expected_size = (raw_size + alignment - 1) & !(alignment - 1);
+
+        assert_eq!(offset_of!(INT4ScaleDesc, group_size), pointer_bytes);
+        assert_eq!(
+            offset_of!(INT4ScaleDesc, b_proj_type),
+            pointer_bytes + 12 * size_of::<c_int>()
+        );
+        assert_eq!(size_of::<INT4ScaleDesc>(), expected_size);
+        assert_eq!(align_of::<INT4ScaleDesc>(), alignment);
     }
 }
