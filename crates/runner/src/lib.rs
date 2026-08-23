@@ -14,10 +14,6 @@
 pub mod cli;
 pub use cli::{parse_cli_from, Cli};
 
-#[cfg(feature = "bughunt")]
-pub mod backend_runtime;
-#[cfg(feature = "bughunt")]
-pub mod bughunt;
 pub mod decode_engine;
 pub mod dflash_ddtree;
 pub mod flm_model_source;

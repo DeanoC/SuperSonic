@@ -2,10 +2,10 @@
 name = "runner"
 version = "0.1.0"
 edition = "2021"
+autobins = false
 
 [features]
 default = []
-bughunt = []
 
 [[bin]]
 name = "supersonic"
@@ -18,11 +18,6 @@ path = "src/bin/int4_test.rs"
 [[bin]]
 name = "int4_real_test"
 path = "src/bin/int4_real_test.rs"
-
-[[bin]]
-name = "qwen35_bughunt"
-path = "src/bin/qwen35_bughunt.rs"
-required-features = ["bughunt"]
 
 [[bin]]
 name = "bench_prefill_attn"
