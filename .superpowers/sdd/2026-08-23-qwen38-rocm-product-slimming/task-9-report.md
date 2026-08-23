@@ -185,3 +185,5 @@ Fix-round implementation commit subject remains:
 ```text
 ci: gate Qwen3.8 GQH on CPU and R9700
 ```
+
+Fix-round implementation commit: `7a7cc23`.
