@@ -39,22 +39,31 @@ FORBIDDEN_PATTERNS = (
 FLM_RE = re.compile(r"\bFLM\b|--flm(?:-file)?\b|\bflm[_-]file\b", re.IGNORECASE)
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)\s]+)")
 INTERNAL_FLM_HEADING_RE = re.compile(r"^##\s+Internal FLM foundation\s*$", re.IGNORECASE)
-HEADING_RE = re.compile(r"^#{1,6}\s+")
 TOK_PER_SECOND_RE = re.compile(r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*tok/s\b", re.IGNORECASE)
 COMMIT_EVIDENCE_RE = re.compile(
-    r"\b(?:commit|revision)(?:\s+hash)?\s*[:=]?\s*`?([0-9a-f]{7,40})\b",
+    r"\b(?:commit|revision)(?:\s+hash)?\s*[:=]?\s*`?([0-9a-f]{7,64})\b",
     re.IGNORECASE,
 )
-ARTIFACT_EVIDENCE_RE = re.compile(
-    r"(?:\b[\w./-]+\.gguf\b|\b(?:artifact|gguf)\s*(?:path|id|identifier)?\s*[:=]\s*[\w./:@-]+)",
+ARTIFACT_PATH_RE = re.compile(r"(?<![\w<$])[\w./~:-]+\.gguf\b(?!>)", re.IGNORECASE)
+ARTIFACT_FIELD_RE = re.compile(
+    r"\b(?:artifact|gguf)\s*(?:path|id|identifier)?\s*[:=]\s*"
+    r"(?P<value>`[^`]+`|\"[^\"]+\"|'[^']+'|[^\s,;]+)",
+    re.IGNORECASE,
+)
+ARTIFACT_PLACEHOLDER_RE = re.compile(
+    r"(?:<[^>]+>|\$\{?[A-Z_][A-Z0-9_]*\}?|(?:^|[\s/_-])"
+    r"(?:path|to|your|example|placeholder|documented|elsewhere|unknown|tbd)"
+    r"(?:[\s/_.:-]|$))",
     re.IGNORECASE,
 )
 TARGET_EVIDENCE_RE = re.compile(r"\bgfx(?:1100|1201)\b", re.IGNORECASE)
 WORKLOAD_EVIDENCE_RE = re.compile(
-    r"(?:\bprompt\s*(?:[:=]\s*|[\"'])[^,\n.;]+"
+    r"(?:\bprompt\s*(?:[:=]\s*|[\"'])"
+    r"(?!documented\b|elsewhere\b|<|\$\{?)[^,\n.;]+"
     r"|\bworkload\s*[:=]\s*(?!documented\b|elsewhere\b)[^,\n.;]+"
     r"|\bcontext(?:[- ]size)?\s*[:=]\s*\d+"
-    r"|\bgenerated[- ]tokens?\s*[:=]\s*\d+"
+    r"|\b(?:generated[- ]tokens?|token[- ]count|max[- ]new[- ]tokens?)\s*[:=]\s*\d+"
+    r"|\bbatch(?:[- ]size)?\s*[:=]\s*\d+"
     r"|\binput\s*[:=]\s*(?!documented\b|elsewhere\b)[^,\n.;]+)",
     re.IGNORECASE,
 )
@@ -76,13 +85,48 @@ def slugify_heading(text: str) -> str:
     return text.strip("-")
 
 
+def _heading_texts(text: str) -> list[str]:
+    lines = text.splitlines()
+    headings: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        atx = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)[ \t]*|[ \t]*)$", line)
+        if atx:
+            heading = atx.group(2) or ""
+            heading = re.sub(r"[ \t]+#+[ \t]*$", "", heading).strip()
+            if heading:
+                headings.append(heading)
+            index += 1
+            continue
+
+        if (
+            index + 1 < len(lines)
+            and line.strip()
+            and len(line) - len(line.lstrip(" ")) <= 3
+            and re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index + 1])
+        ):
+            headings.append(line.strip())
+            index += 2
+            continue
+        index += 1
+    return headings
+
+
 def anchors_for(text: str) -> set[str]:
     anchors: set[str] = set()
-    for line in text.splitlines():
-        if line.startswith("#"):
-            heading = line.lstrip("#").strip()
-            if heading:
-                anchors.add(slugify_heading(heading))
+    counts: dict[str, int] = {}
+    for heading in _heading_texts(text):
+        slug = slugify_heading(heading)
+        if not slug:
+            continue
+        suffix = counts.get(slug, 0)
+        candidate = slug if suffix == 0 else f"{slug}-{suffix}"
+        while candidate in anchors:
+            suffix += 1
+            candidate = f"{slug}-{suffix}"
+        counts[slug] = suffix + 1
+        anchors.add(candidate)
     return anchors
 
 
@@ -99,6 +143,25 @@ def find_performance_violations(path: Path, text: str) -> list[str]:
     """Require colocated evidence for every numeric ``tok/s`` claim."""
 
     violations: list[str] = []
+    def artifact_evidence(value: str) -> bool:
+        candidates = [match.group(0) for match in ARTIFACT_PATH_RE.finditer(value)]
+        candidates.extend(match.group("value") for match in ARTIFACT_FIELD_RE.finditer(value))
+        for candidate in candidates:
+            candidate = candidate.strip("`\"'").lower()
+            if not candidate or ARTIFACT_PLACEHOLDER_RE.search(candidate):
+                continue
+            if candidate in {"artifact", "gguf", "path", "identifier"}:
+                continue
+            return True
+        return False
+
+    def evidence_for_claim(paragraph: str, claim_index: int, claims: list[re.Match[str]]) -> str:
+        if len(claims) == 1:
+            return paragraph
+        start = 0 if claim_index == 0 else claims[claim_index - 1].end()
+        end = claims[claim_index + 1].start() if claim_index + 1 < len(claims) else len(paragraph)
+        return paragraph[start:end]
+
     for match in TOK_PER_SECOND_RE.finditer(text):
         separator = text.rfind("\n\n", 0, match.start())
         paragraph_start = 0 if separator < 0 else separator + 2
@@ -106,16 +169,22 @@ def find_performance_violations(path: Path, text: str) -> list[str]:
         if paragraph_end < 0:
             paragraph_end = len(text)
         paragraph = text[paragraph_start:paragraph_end]
+        relative_start = match.start() - paragraph_start
+        claims = list(TOK_PER_SECOND_RE.finditer(paragraph))
+        claim_index = next(
+            index for index, claim in enumerate(claims) if claim.start() == relative_start
+        )
+        evidence = evidence_for_claim(paragraph, claim_index, claims)
         missing: list[str] = []
-        if not COMMIT_EVIDENCE_RE.search(paragraph):
+        if not COMMIT_EVIDENCE_RE.search(evidence):
             missing.append("exact commit hash")
-        if not ARTIFACT_EVIDENCE_RE.search(paragraph):
+        if not artifact_evidence(evidence):
             missing.append("exact GGUF artifact identifier/path")
-        if not TARGET_EVIDENCE_RE.search(paragraph):
+        if not TARGET_EVIDENCE_RE.search(evidence):
             missing.append("gfx1100/gfx1201 target")
-        if not WORKLOAD_EVIDENCE_RE.search(paragraph):
+        if not WORKLOAD_EVIDENCE_RE.search(evidence):
             missing.append("workload context")
-        if not MEASUREMENT_EVIDENCE_RE.search(paragraph):
+        if not MEASUREMENT_EVIDENCE_RE.search(evidence):
             missing.append("measurement context")
         if missing:
             line_number = text.count("\n", 0, match.start()) + 1
@@ -159,7 +228,7 @@ def find_text_violations(path: Path, text: str, root: Path | None = None) -> lis
                 if target.startswith(("http://", "https://", "mailto:")):
                     continue
                 if target.startswith("#"):
-                    if target[1:] not in document_anchors:
+                    if slugify_heading(target[1:]) not in document_anchors:
                         violations.append(
                             _format_violation(
                                 path,
@@ -177,7 +246,7 @@ def find_text_violations(path: Path, text: str, root: Path | None = None) -> lis
                     )
                 elif anchor:
                     target_anchors = anchors_for(target_path.read_text(encoding="utf-8"))
-                    if anchor not in target_anchors:
+                    if slugify_heading(anchor) not in target_anchors:
                         violations.append(
                             _format_violation(
                                 path,

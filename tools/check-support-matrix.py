@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -27,6 +28,9 @@ EXPECTED_ARCHES = {
 }
 EXPECTED_ENTRY_COUNT = len(EXPECTED_ARCHES)
 CORRECTNESS_GATE_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*")
+REQUIRED_CORRECTNESS_GATE = "qwen38-gqh-correctness"
+ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+CONTROL_TOKENS = {";", "|", "&&", "||", ">", ">>", "<", "2>", "2>>"}
 
 
 def rel(path: Path) -> str:
@@ -41,14 +45,132 @@ def slugify_heading(text: str) -> str:
 
 
 def anchors_for(path: Path) -> set[str]:
-    anchors: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.startswith("#"):
+    return anchors_from_text(path.read_text(encoding="utf-8"))
+
+
+def heading_texts(text: str) -> list[str]:
+    lines = text.splitlines()
+    headings: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        atx = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)[ \t]*|[ \t]*)$", line)
+        if atx:
+            heading = atx.group(2) or ""
+            heading = re.sub(r"[ \t]+#+[ \t]*$", "", heading).strip()
+            if heading:
+                headings.append(heading)
+            index += 1
             continue
-        heading = line.lstrip("#").strip()
-        if heading:
-            anchors.add(slugify_heading(heading))
+        if (
+            index + 1 < len(lines)
+            and line.strip()
+            and len(line) - len(line.lstrip(" ")) <= 3
+            and re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index + 1])
+        ):
+            headings.append(line.strip())
+            index += 2
+            continue
+        index += 1
+    return headings
+
+
+def anchors_from_text(text: str) -> set[str]:
+    anchors: set[str] = set()
+    counts: dict[str, int] = {}
+    for heading in heading_texts(text):
+        slug = slugify_heading(heading)
+        if not slug:
+            continue
+        suffix = counts.get(slug, 0)
+        candidate = slug if suffix == 0 else f"{slug}-{suffix}"
+        while candidate in anchors:
+            suffix += 1
+            candidate = f"{slug}-{suffix}"
+        counts[slug] = suffix + 1
+        anchors.add(candidate)
     return anchors
+
+
+def _parse_gate_command(command: object) -> tuple[dict[str, str], list[str]]:
+    if not isinstance(command, str):
+        return {}, []
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return {}, []
+    if not tokens or any(token in CONTROL_TOKENS for token in tokens):
+        return {}, []
+
+    assignments: dict[str, str] = {}
+    while tokens and ASSIGNMENT_RE.fullmatch(tokens[0]):
+        name, value = tokens.pop(0).split("=", 1)
+        assignments[name] = value
+    if tokens and tokens[0] == "env":
+        tokens.pop(0)
+        while tokens and ASSIGNMENT_RE.fullmatch(tokens[0]):
+            name, value = tokens.pop(0).split("=", 1)
+            assignments[name] = value
+    return assignments, tokens
+
+
+def _is_strict_preflight(command: object) -> bool:
+    assignments, tokens = _parse_gate_command(command)
+    return (
+        assignments.get("SUPERSONIC_REQUIRE_GQH_ARTIFACTS") == "1"
+        and tokens[:2] == ["python3", "tools/check-qwen38-artifacts.py"]
+        and "--require-8192" in tokens[2:]
+    )
+
+
+def _is_serial_crawl(command: object) -> bool:
+    assignments, tokens = _parse_gate_command(command)
+    required_prefix = [
+        "cargo",
+        "test",
+        "--release",
+        "-p",
+        "qwen38",
+        "--test",
+        "qwen38_gqh_gguf_crawl",
+        "--",
+        "--include-ignored",
+        "--test-threads=1",
+    ]
+    return (
+        assignments.get("SUPERSONIC_REQUIRE_GQH_ARTIFACTS") == "1"
+        and assignments.get("RUST_TEST_THREADS") == "1"
+        and tokens == required_prefix
+    )
+
+
+def validate_gate_commands(entry_id: str, gate_commands: object, errors: list[str]) -> None:
+    if (
+        not isinstance(gate_commands, list)
+        or not gate_commands
+        or not all(isinstance(value, str) and value.strip() for value in gate_commands)
+    ):
+        errors.append(f"{entry_id}: gate_commands must contain executable correctness steps")
+        return
+
+    preflight_indexes = [
+        index for index, command in enumerate(gate_commands) if _is_strict_preflight(command)
+    ]
+    crawl_indexes = [
+        index for index, command in enumerate(gate_commands) if _is_serial_crawl(command)
+    ]
+    if not preflight_indexes:
+        errors.append(
+            f"{entry_id}: gate_commands require SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 "
+            "python3 tools/check-qwen38-artifacts.py --require-8192"
+        )
+    if not crawl_indexes:
+        errors.append(
+            f"{entry_id}: gate_commands require the serial qwen38_gqh_gguf_crawl "
+            "with --include-ignored and --test-threads=1"
+        )
+    if preflight_indexes and crawl_indexes and min(preflight_indexes) >= min(crawl_indexes):
+        errors.append(f"{entry_id}: strict artifact preflight must precede the serial crawl")
 
 
 def validate_doc_ref(label: str, value: object, errors: list[str]) -> None:
@@ -60,7 +182,7 @@ def validate_doc_ref(label: str, value: object, errors: list[str]) -> None:
     if not path.is_file():
         errors.append(f"{label}: referenced doc does not exist: {path_text}")
         return
-    if anchor and anchor not in anchors_for(path):
+    if anchor and slugify_heading(anchor) not in anchors_for(path):
         errors.append(f"{label}: anchor #{anchor} not found in {path_text}")
 
 
@@ -235,9 +357,12 @@ def main() -> int:
             errors.append(
                 f"{entry_id}: correctness_gate must be a named lowercase gate identifier"
             )
+        elif correctness_gate != REQUIRED_CORRECTNESS_GATE:
+            errors.append(
+                f"{entry_id}: correctness_gate must be {REQUIRED_CORRECTNESS_GATE!r}"
+            )
 
-        if not gate_scripts and not gate_commands:
-            errors.append(f"{entry_id}: entries require gate_scripts or gate_commands")
+        validate_gate_commands(entry_id, gate_commands, errors)
 
     missing_arches = EXPECTED_ARCHES - seen_arches
     if missing_arches:

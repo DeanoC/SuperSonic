@@ -86,6 +86,63 @@ class SupportMatrixTests(unittest.TestCase):
             self.assertIn("`experimental`", rows[0])
             self.assertIn("`qwen38-gqh-correctness`", rows[0])
 
+    def test_validator_enforces_real_strict_preflight_and_serial_crawl_steps(self):
+        original_text = support_matrix.MANIFEST.read_text(encoding="utf-8")
+        preflight = "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 python3 tools/check-qwen38-artifacts.py --require-8192"
+        crawl = (
+            "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 RUST_TEST_THREADS=1 cargo test --release "
+            "-p qwen38 --test qwen38_gqh_gguf_crawl -- --include-ignored --test-threads=1"
+        )
+        mutations = {
+            "echo-only preflight": original_text.replace(preflight, f"echo {preflight}", 1),
+            "missing preflight": original_text.replace(
+                preflight,
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 python3 tools/check-qwen38-artifacts.py",
+                1,
+            ),
+            "reordered gate": original_text.replace(
+                f'  "{preflight}",\n  "{crawl}",',
+                f'  "{crawl}",\n  "{preflight}",',
+                1,
+            ),
+            "non-serial crawl": original_text.replace("--test-threads=1", "--test-threads=2", 1),
+            "wrong crawl test": original_text.replace(
+                "qwen38_gqh_gguf_crawl", "wrong_test", 1
+            ),
+            "echo-only crawl": original_text.replace(crawl, f"echo {crawl}", 1),
+        }
+
+        for label, manifest_text in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                manifest = Path(temporary) / "matrix.toml"
+                manifest.write_text(manifest_text, encoding="utf-8")
+                original_manifest = support_matrix.MANIFEST
+                stderr = io.StringIO()
+                support_matrix.MANIFEST = manifest
+                try:
+                    with contextlib.redirect_stderr(stderr):
+                        result = support_matrix.main()
+                finally:
+                    support_matrix.MANIFEST = original_manifest
+                self.assertNotEqual(result, 0, stderr.getvalue())
+
+    def test_markdown_anchor_parser_handles_github_heading_forms(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "doc.md"
+            path.write_text(
+                "## Repeat\n"
+                "## Repeat\n"
+                "Repeat\n"
+                "=======\n"
+                "   # Indented title\n"
+                "    # Code title\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                support_matrix.anchors_for(path),
+                {"repeat", "repeat-1", "repeat-2", "indented-title"},
+            )
+
     def test_validator_rejects_non_product_model_backend_and_source(self):
         invalid_manifest = """
 version = 1

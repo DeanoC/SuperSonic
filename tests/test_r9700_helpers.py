@@ -134,6 +134,15 @@ class R9700SelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.selector.select_device(self.devices + [unnamed])
 
+    def test_sole_unnamed_gfx1201_candidate_fails_closed(self):
+        unnamed = self.selector.Device(
+            physical_index=1,
+            gfx_arch="gfx1201",
+            market_name="",
+        )
+        with self.assertRaises(ValueError):
+            self.selector.select_device([unnamed])
+
     def test_duplicate_physical_ordinals_fail_closed(self):
         payload = {
             "gpu_data": [

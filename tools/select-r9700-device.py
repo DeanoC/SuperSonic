@@ -36,6 +36,7 @@ _ARCH_KEYS = (
 _MARKET_KEYS = ("market_name", "product_name", "device_name", "name")
 _GFX_RE = re.compile(r"\bgfx[0-9]+\b", re.IGNORECASE)
 _INDEX_RE = re.compile(r"(?:gpu\s*[\[(:#]?\s*)?([0-9]+)", re.IGNORECASE)
+_R9700_RE = re.compile(r"\br9700\b", re.IGNORECASE)
 
 
 def _as_index(value: object) -> int | None:
@@ -80,6 +81,10 @@ def _direct_market(node: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _is_named_r9700(device: Device) -> bool:
+    return bool(device.market_name.strip()) and bool(_R9700_RE.search(device.market_name))
 
 
 def parse_devices(output: str) -> list[Device]:
@@ -190,7 +195,7 @@ def select_device(devices: list[Device], override: str | None = None) -> Device:
                 f"R9700 override physical GPU {physical_index} reports {selected.gfx_arch}, "
                 "not gfx1201"
             )
-        if "r9700" not in selected.market_name.lower():
+        if not _is_named_r9700(selected):
             raise ValueError(
                 f"R9700 override physical GPU {physical_index} is not a named R9700 device"
             )
@@ -204,7 +209,7 @@ def select_device(devices: list[Device], override: str | None = None) -> Device:
             f"discovered candidates={indexes}"
         )
     selected = gfx1201[0]
-    if selected.market_name and "r9700" not in selected.market_name.lower():
+    if not _is_named_r9700(selected):
         raise ValueError(
             f"selected physical GPU {selected.physical_index} is not a named R9700 device"
         )

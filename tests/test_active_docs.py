@@ -263,6 +263,42 @@ class ActiveDocsTests(unittest.TestCase):
 
         self.assertTrue(any("#missing" in violation for violation in violations))
 
+    def test_github_anchor_parser_handles_duplicates_setext_and_indentation(self):
+        checker = load_checker()
+        markdown = (
+            "## Repeat\n"
+            "## Repeat\n"
+            "Repeat\n"
+            "=======\n"
+            "   # Indented title\n"
+            "    # Code title\n"
+        )
+        self.assertEqual(
+            checker.anchors_for(markdown),
+            {"repeat", "repeat-1", "repeat-2", "indented-title"},
+        )
+
+    def test_anchor_links_accept_github_duplicate_and_setext_ids_but_reject_missing(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative_path in checker.ACTIVE_DOCS:
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Product\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "## Repeat\n## Repeat\n"
+                "Setext\n=======\n"
+                "[first](#repeat) [second](#repeat-1) [setext](#setext) "
+                "[missing](#repeat-2)\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        self.assertEqual(1, len(violations))
+        self.assertIn("#repeat-2", violations[0])
+
     def test_public_positioning_is_measured_performance_first(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         performance = (ROOT / "docs" / "performance.md").read_text(encoding="utf-8")
@@ -321,6 +357,29 @@ class ActiveDocsTests(unittest.TestCase):
             "workload and measurement are documented elsewhere: 37.2 tok/s.\n"
         )
         self.assertTrue(checker.find_performance_violations(Path("README.md"), generic_context))
+
+        placeholder = (
+            "commit: abcdef1, artifact: /path/to/qwen38.gqh.gguf, target: gfx1201, "
+            "prompt=Hello, warmup=1, median decode measurement: 37.2 tok/s.\n"
+        )
+        self.assertTrue(checker.find_performance_violations(Path("README.md"), placeholder))
+
+        shared_evidence = (
+            "commit: abcdef1, artifact: /tmp/qwen38.gqh.gguf, target: gfx1201, "
+            "prompt=Hello, warmup=1, median decode measurement: "
+            "37.2 tok/s and 38.4 tok/s.\n"
+        )
+        self.assertTrue(checker.find_performance_violations(Path("README.md"), shared_evidence))
+
+        structured_records = (
+            "commit: abcdef1, artifact: /tmp/qwen38-a.gqh.gguf, target: gfx1201, "
+            "prompt=Hello, warmup=1, median decode measurement: 37.2 tok/s; "
+            "commit: abcdef2, artifact: /tmp/qwen38-b.gqh.gguf, target: gfx1100, "
+            "prompt=World, warmup=2, median decode measurement: 38.4 tok/s.\n"
+        )
+        self.assertEqual(
+            [], checker.find_performance_violations(Path("README.md"), structured_records)
+        )
 
     def test_testing_artifact_block_defines_and_propagates_strict_environment(self):
         document = (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")
