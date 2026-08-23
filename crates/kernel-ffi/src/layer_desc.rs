@@ -144,7 +144,7 @@ impl Default for KVCacheFp8Desc {
 /// Passed as a separate kernel argument (same pattern as FP8ScaleDesc).
 /// Type code 4 means native packed INT4 with scale/zero sidecars. Type codes
 /// 8/12/13/14 mean verbatim GGML Q8_0/Q4_K/Q5_K/Q6_K blocks. Type codes
-/// 108/109/110 are GQH3/GQH2_H/GQH2_C; `*_proj_scale` then points at an
+/// 108/109/110/111 are GQH3/GQH2_H/GQH2_C/GQH4; `*_proj_scale` then points at an
 /// 8-byte `{f32 tensor_scale, i32 grid_code}` sidecar. Type codes 20/21/22
 /// are reserved for HIGGS4, QuIP# E8, and QTIP trellis runtime profiles.
 ///

@@ -14,15 +14,13 @@ mod qwen38_startup;
 mod registry;
 
 use anyhow::Result;
-use clap::Parser;
-
 use backend_runtime::{install_arch_profile, lookup_registry_entry, query_gpu_info};
-use cli::Cli;
+use cli::{parse_cli_from, Cli};
 use model_files::validate_input_contract;
 use qwen38_runtime::run_qwen38;
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli: Cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
 
     // Keep all artifact/configuration errors on the host side. This must run
     // before HIP setup or any registry/engine path that can allocate buffers.

@@ -139,8 +139,12 @@ jobs:
 
       # The HIP build scripts need a deterministic code-generation target, but
       # this job never selects or requires a GPU device.
-      - name: Compile every workspace target
-        run: HIP_ARCH=gfx1201 cargo check --workspace --all-targets
+      # Keep the retained Rust warning inventory actionable.  The HIP build
+      # scripts select a deterministic arch above, and the all-target check
+      # is currently warning-free, so deny Rust warnings at this gate rather
+      # than hiding them with a global allow.
+      - name: Compile every workspace target (warnings are errors)
+        run: RUSTFLAGS="-D warnings" HIP_ARCH=gfx1201 cargo check --workspace --all-targets
 
       - name: GQH model-store tests
         run: HIP_ARCH=gfx1201 cargo test -p model-store --lib 'gqh::tests::' -- --nocapture

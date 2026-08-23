@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use gpu_hal::Backend;
 use qwen38::gguf_ingest::load_text_config;
 use qwen38::scratch::required_attn_scratch_floats;
 use qwen38::weights::Qwen38Weights;

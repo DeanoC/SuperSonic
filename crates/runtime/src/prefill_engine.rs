@@ -14,10 +14,7 @@ use qwen38::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_toke
 use qwen38::weights::Qwen38Weights;
 
 use crate::mtp::{MtpPrefillAppendCache, MtpVerifyScratch};
-use crate::tensor_bytes::{
-    bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le,
-    f32_to_bf16_bytes as encode_bf16_le, f32_to_f32_bytes as encode_f32_le,
-};
+use crate::tensor_bytes::{bf16_bytes_to_f32 as decode_bf16_le, f32_to_f32_bytes as encode_f32_le};
 use kernel_ffi::prefill_ffi;
 
 /// D2D copy helper shared by the retained component paths.
@@ -1391,8 +1388,6 @@ pub(crate) struct PrefillScratch {
     linear_gated_out: GpuBuffer,
     /// [seq_len, linear_value_dim] BF16
     linear_gated_s_first: GpuBuffer,
-    /// [linear_num_value_heads, linear_key_head_dim, linear_value_head_dim] F32
-    linear_dummy_state: GpuBuffer,
     /// Grow-only `[num_kv_heads, kv_len, head_dim]` assemble workspace so
     /// padded KV caches are compacted without a per-layer hipMalloc.
     kv_assemble_k: Option<GpuBuffer>,
@@ -1567,8 +1562,6 @@ impl PrefillScratch {
                 .map_err(|e| anyhow::anyhow!("prefill linear_gated_out: {e}"))?,
             linear_gated_s_first: GpuBuffer::alloc(ordinal, ScalarType::BF16, &[seq_len, val_dim])
                 .map_err(|e| anyhow::anyhow!("prefill linear_gated_s_first: {e}"))?,
-            linear_dummy_state: GpuBuffer::alloc(ordinal, ScalarType::F32, &[nv, khd, vhd])
-                .map_err(|e| anyhow::anyhow!("prefill linear_dummy_state: {e}"))?,
             kv_assemble_k: None,
             kv_assemble_v: None,
         })
@@ -4431,8 +4424,6 @@ fn prefill_linear_attention_layer(
     .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent: {e}"))?;
 
     // 12. Extract recurrent state and attention output from the F32 result.
-    let mut state_bytes_debug: Option<Vec<u8>> = None;
-    let mut attn_output_f32_debug: Option<Vec<u8>> = None;
     let state_f32 = GpuBuffer::alloc(ordinal, ScalarType::F32, &[nv, khd, vhd])
         .map_err(|e| anyhow::anyhow!("state_f32 alloc: {e}"))?;
     let state_bytes_per_head = khd * vhd * elem_bytes_f32;
@@ -4458,11 +4449,9 @@ fn prefill_linear_attention_layer(
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} recurrent state writeback: {e}"))?;
     }
-    state_bytes_debug = Some(
-        state_f32
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} debug state_f32 D2H: {e}"))?,
-    );
+    let state_bytes_debug = state_f32
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("layer {idx} debug state_f32 D2H: {e}"))?;
 
     let attn_output_f32 = GpuBuffer::alloc(ordinal, ScalarType::F32, &[nv, chunk_len, vhd])
         .map_err(|e| anyhow::anyhow!("attn_output_f32 alloc: {e}"))?;
@@ -4488,19 +4477,15 @@ fn prefill_linear_attention_layer(
         &mut scratch.linear_attn_output,
     )
     .map_err(|e| anyhow::anyhow!("layer {idx} attn output cast: {e}"))?;
-    attn_output_f32_debug = Some(
-        attn_output_f32
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} debug attn_output_f32 D2H: {e}"))?,
-    );
+    let attn_output_f32_debug = attn_output_f32
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("layer {idx} debug attn_output_f32 D2H: {e}"))?;
     let _ = is_last_chunk; // recurrent state is now always written; flag still gates conv_state above.
     if trace_linear_debug {
         let trace = linear_debug_trace
             .as_mut()
             .expect("linear debug trace missing");
-        let attn_out_bytes = attn_output_f32_debug
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing debug attn_output_f32 bytes"))?;
+        let attn_out_bytes = &attn_output_f32_debug;
         let mut rec_apply_equiv =
             Vec::with_capacity((val_dim + nv * khd * vhd) * ScalarType::F32.size_in_bytes());
         let elem_bytes = ScalarType::F32.size_in_bytes();
@@ -4511,9 +4496,7 @@ fn prefill_linear_attention_layer(
             let start = h * head_stride + tok_off;
             rec_apply_equiv.extend_from_slice(&attn_out_bytes[start..start + row_bytes]);
         }
-        let state_bytes = state_bytes_debug
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing debug state_f32 bytes"))?;
+        let state_bytes = &state_bytes_debug;
         rec_apply_equiv.extend_from_slice(state_bytes);
         trace.rec_apply = rec_apply_equiv;
     }
@@ -4879,7 +4862,7 @@ pub fn mtp_forward(
     h: &GpuBuffer,
     h_is_nextn: bool,
     token_id: u32,
-    abs_pos: usize,
+    _abs_pos: usize,
     out_h: &mut GpuBuffer,
     ordinal: usize,
     kv_chunk_size: usize,

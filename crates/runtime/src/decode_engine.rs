@@ -158,7 +158,7 @@ fn maybe_dump_gqh_decode_state(
     let hd = config.head_dim;
     let mut full_idx = None;
     let mut lin_idx = None;
-    for (i, ls) in state.layers.iter().enumerate() {
+    for (i, _ls) in state.layers.iter().enumerate() {
         if full_idx.is_none() && config.is_full_attention(i) {
             full_idx = Some(i);
         }

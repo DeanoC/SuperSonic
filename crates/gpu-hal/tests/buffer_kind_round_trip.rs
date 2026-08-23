@@ -24,7 +24,7 @@
 #![cfg(supersonic_backend_hip)]
 
 use gpu_hal::{
-    copy_d2d, set_buffer_policy, sync, AllocStrategy, Backend, BufferKind, BufferPolicy, GpuBuffer,
+    copy_d2d, set_buffer_policy, sync, AllocStrategy, BufferKind, BufferPolicy, GpuBuffer,
     ScalarType,
 };
 

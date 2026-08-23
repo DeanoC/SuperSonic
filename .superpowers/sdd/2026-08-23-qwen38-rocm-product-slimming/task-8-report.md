@@ -305,6 +305,16 @@ Fresh canonical R9700 GREEN evidence, run serially:
 ```text
 rung7_loaded_ffn_up_gqh_matvec       1 passed, 0 failed (36.97s)
 rung7b_batched_gqh_matvec_ncols4     1 passed, 0 failed (36.82s)
+```
+
+The full ignored-test crawl was run serially with `--include-ignored`:
+
+```bash
+RUST_TEST_THREADS=1 cargo test -p qwen38 --test qwen38_gqh_gguf_crawl -- \
+  --include-ignored --test-threads=1
+```
+
+```text
 full qwen38_gqh_gguf_crawl (11 tests) 11 passed, 0 failed (259.94s)
 ```
 

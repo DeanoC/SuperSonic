@@ -1,6 +1,6 @@
 use gpu_hal::{
-    copy_d2h, copy_h2d_async, current_backend, memset_zeros_async, GpuBuffer, GpuEvent, GpuStream,
-    PinnedHostBuffer, RegisteredHostBuffer, ScalarType,
+    copy_d2h, copy_h2d_async, memset_zeros_async, GpuBuffer, GpuEvent, GpuStream, PinnedHostBuffer,
+    RegisteredHostBuffer, ScalarType,
 };
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
