@@ -24,8 +24,8 @@
 #![cfg(supersonic_backend_hip)]
 
 use gpu_hal::{
-    copy_d2d, set_backend, set_buffer_policy, sync, AllocStrategy, Backend, BufferKind,
-    BufferPolicy, GpuBuffer, ScalarType,
+    copy_d2d, set_buffer_policy, sync, AllocStrategy, Backend, BufferKind, BufferPolicy, GpuBuffer,
+    ScalarType,
 };
 
 fn host_bf16_pattern(n: usize) -> Vec<u8> {
@@ -40,7 +40,6 @@ fn host_bf16_pattern(n: usize) -> Vec<u8> {
 }
 
 fn round_trip_under_policy(policy: BufferPolicy, src_kind: BufferKind, dst_kind: BufferKind) {
-    set_backend(Backend::Hip);
     set_buffer_policy(policy);
 
     let ordinal = 0usize;

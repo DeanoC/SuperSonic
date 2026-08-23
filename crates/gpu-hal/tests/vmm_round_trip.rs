@@ -2,8 +2,8 @@
 
 use gpu_hal::{
     copy_h2d, copy_storage_to_device, hal_profile_reset, hal_profile_set_enabled,
-    hal_profile_snapshot, set_backend, storage_to_device_is_supported, sync, vmm_is_supported,
-    Backend, ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking, VirtualBuffer,
+    hal_profile_snapshot, storage_to_device_is_supported, sync, vmm_is_supported, Backend,
+    ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking, VirtualBuffer,
 };
 use std::path::Path;
 
@@ -37,7 +37,6 @@ fn assert_bytes_eq(label: &str, got: &[u8], expected: &[u8]) {
 
 #[test]
 fn storage_direct_copy_rejects_unaligned_direct_io_ranges() {
-    set_backend(Backend::Hip);
     let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
 
     let err = copy_storage_to_device(
@@ -71,7 +70,6 @@ fn storage_direct_copy_rejects_unaligned_direct_io_ranges() {
 
 #[test]
 fn vmm_reserve_map_round_trip_stable_pointer() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -104,7 +102,6 @@ fn vmm_reserve_map_round_trip_stable_pointer() {
 
 #[test]
 fn vmm_sparse_range_round_trip_stable_pointer() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -175,7 +172,6 @@ fn vmm_sparse_range_round_trip_stable_pointer() {
 
 #[test]
 fn vmm_storage_direct_copy_is_explicit_without_pageable_fallback() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -222,7 +218,6 @@ fn vmm_storage_direct_copy_is_explicit_without_pageable_fallback() {
 
 #[test]
 fn vmm_large_single_map_round_trip() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -240,7 +235,6 @@ fn vmm_large_single_map_round_trip() {
 
 #[test]
 fn vmm_two_buffers_map_round_trip() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -267,7 +261,6 @@ fn vmm_two_buffers_map_round_trip() {
 
 #[test]
 fn vmm_many_kv_buffers_map_round_trip() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -302,7 +295,6 @@ fn vmm_many_kv_buffers_map_round_trip() {
 
 #[test]
 fn vmm_cpu_backup_restore_round_trip() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -326,7 +318,6 @@ fn vmm_cpu_backup_restore_round_trip() {
 
 #[test]
 fn vmm_cpu_evict_restore_packed_kv_round_trip() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -403,7 +394,6 @@ fn vmm_cpu_evict_restore_packed_kv_round_trip() {
 
 #[test]
 fn vmm_arena_tracks_allocation_residency() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -461,7 +451,6 @@ fn vmm_arena_tracks_allocation_residency() {
 
 #[test]
 fn vmm_arena_tags_weight_and_moe_allocations() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -501,7 +490,6 @@ fn vmm_arena_tags_weight_and_moe_allocations() {
 #[test]
 #[ignore = "HIP VMM repeated eviction is order-sensitive when mixed with other VMM tests"]
 fn vmm_split_kv_repeated_backup_restore_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -528,7 +516,6 @@ struct SplitKvBufferPair {
 #[test]
 #[ignore = "HIP VMM characterization: run explicitly to categorize split-KV remap/restore ordering"]
 fn vmm_split_kv_remap_restore_order_matrix() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -556,7 +543,6 @@ fn vmm_split_kv_remap_restore_order_matrix() {
 #[test]
 #[ignore = "HIP VMM characterization: production-like all-evict/all-restore split-KV stress"]
 fn vmm_split_kv_all_evict_restore_pairs_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -567,7 +553,6 @@ fn vmm_split_kv_all_evict_restore_pairs_stress() {
 #[test]
 #[ignore = "HIP VMM characterization: backup all split-KV buffers before unmapping any of them"]
 fn vmm_split_kv_two_phase_backup_unmap_restore_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -578,7 +563,6 @@ fn vmm_split_kv_two_phase_backup_unmap_restore_stress() {
 #[test]
 #[ignore = "HIP VMM characterization: backup all split-KV buffers and D2H-fence before unmapping"]
 fn vmm_split_kv_two_phase_backup_fence_unmap_restore_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -589,7 +573,6 @@ fn vmm_split_kv_two_phase_backup_fence_unmap_restore_stress() {
 #[test]
 #[ignore = "HIP VMM characterization: map all restore ranges before copying any backups"]
 fn vmm_split_kv_two_phase_map_all_then_copy_restore_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -599,7 +582,6 @@ fn vmm_split_kv_two_phase_map_all_then_copy_restore_stress() {
 
 #[test]
 fn vmm_split_kv_two_phase_map_all_then_copy_restore_regression() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -610,7 +592,6 @@ fn vmm_split_kv_two_phase_map_all_then_copy_restore_regression() {
 #[test]
 #[ignore = "HIP VMM characterization: verify whether many live split-KV VMM buffers corrupt before eviction"]
 fn vmm_split_kv_many_live_initial_fill_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -621,7 +602,6 @@ fn vmm_split_kv_many_live_initial_fill_stress() {
 #[test]
 #[ignore = "HIP VMM characterization: pairwise eviction with six live split-KV pairs"]
 fn vmm_split_kv_pairwise_six_live_pairs_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -632,7 +612,6 @@ fn vmm_split_kv_pairwise_six_live_pairs_stress() {
 #[test]
 #[ignore = "HIP VMM characterization: pairwise eviction with two live split-KV pairs"]
 fn vmm_split_kv_pairwise_two_live_pairs_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -643,7 +622,6 @@ fn vmm_split_kv_pairwise_two_live_pairs_stress() {
 #[test]
 #[ignore = "HIP VMM characterization: distinguish backup capture corruption from restore corruption"]
 fn vmm_split_kv_two_pair_backup_capture_diagnostic() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -698,7 +676,6 @@ fn vmm_split_kv_two_pair_backup_capture_diagnostic() {
 #[test]
 #[ignore = "HIP VMM characterization: inspect evict_to_host backup before restore"]
 fn vmm_split_kv_two_pair_evict_to_host_backup_diagnostic() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -743,7 +720,6 @@ fn vmm_split_kv_two_pair_evict_to_host_backup_diagnostic() {
 #[test]
 #[ignore = "HIP VMM characterization: manual backup followed immediately by discard-unmap"]
 fn vmm_split_kv_two_pair_manual_backup_immediate_unmap_diagnostic() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -754,7 +730,6 @@ fn vmm_split_kv_two_pair_manual_backup_immediate_unmap_diagnostic() {
 #[test]
 #[ignore = "HIP VMM characterization: manual backup plus D2H read fence before discard-unmap"]
 fn vmm_split_kv_two_pair_manual_backup_read_fence_unmap_diagnostic() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -765,7 +740,6 @@ fn vmm_split_kv_two_pair_manual_backup_read_fence_unmap_diagnostic() {
 #[test]
 #[ignore = "HIP VMM characterization: pairwise eviction with three live split-KV pairs"]
 fn vmm_split_kv_pairwise_three_live_pairs_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -776,7 +750,6 @@ fn vmm_split_kv_pairwise_three_live_pairs_stress() {
 #[test]
 #[ignore = "HIP VMM characterization: all K buffers restored before all V buffers"]
 fn vmm_split_kv_restore_all_k_then_all_v_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -787,7 +760,6 @@ fn vmm_split_kv_restore_all_k_then_all_v_stress() {
 #[test]
 #[ignore = "HIP VMM characterization: reverse-pair restore ordering"]
 fn vmm_split_kv_restore_reverse_pairs_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -798,7 +770,6 @@ fn vmm_split_kv_restore_reverse_pairs_stress() {
 #[test]
 #[ignore = "HIP VMM characterization: test whether later mappings corrupt restored split-KV buffers"]
 fn vmm_split_kv_post_restore_mapping_pressure_stress() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;
@@ -1299,7 +1270,6 @@ fn run_split_kv_restore_pattern(
 
 #[test]
 fn vmm_sparse_cpu_backup_restore_round_trip() {
-    set_backend(Backend::Hip);
     if !vmm_is_supported(Backend::Hip, 0) {
         eprintln!("skip: HIP VMM unsupported on this device/runtime");
         return;

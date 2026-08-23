@@ -274,24 +274,6 @@ pub(crate) fn with_device_impl<T>(
             #[cfg(not(supersonic_backend_hip))]
             return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
         }
-        Backend::Cuda => {
-            #[cfg(any())]
-            {
-                let status = unsafe { cudaGetDevice(&mut prev) };
-                if status != 0 {
-                    return Err(backend_error(Backend::Cuda, "cudaGetDevice", status));
-                }
-            }
-            #[cfg(not(any()))]
-            return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
-        }
-        Backend::Metal => {
-            if ordinal != 0 {
-                return Err(GpuError::InvalidArg(
-                    "Metal backend currently supports only device ordinal 0".into(),
-                ));
-            }
-        }
     }
     let restore = if prev != ordinal_i32 {
         let status = match backend {
@@ -303,21 +285,10 @@ pub(crate) fn with_device_impl<T>(
                 #[cfg(not(supersonic_backend_hip))]
                 1
             }
-            Backend::Cuda => {
-                #[cfg(any())]
-                unsafe {
-                    cudaSetDevice(ordinal_i32)
-                }
-                #[cfg(not(any()))]
-                1
-            }
-            Backend::Metal => 0,
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => backend_error(Backend::Hip, "hipSetDevice", status),
-                Backend::Cuda => backend_error(Backend::Cuda, "cudaSetDevice", status),
-                Backend::Metal => backend_error(Backend::Metal, "metalSetDevice", status),
             });
         }
         Some(prev)
@@ -336,21 +307,10 @@ pub(crate) fn with_device_impl<T>(
                 #[cfg(not(supersonic_backend_hip))]
                 1
             }
-            Backend::Cuda => {
-                #[cfg(any())]
-                unsafe {
-                    cudaSetDevice(prev)
-                }
-                #[cfg(not(any()))]
-                1
-            }
-            Backend::Metal => 0,
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => backend_error(Backend::Hip, "hipSetDevice(restore)", status),
-                Backend::Cuda => backend_error(Backend::Cuda, "cudaSetDevice(restore)", status),
-                Backend::Metal => backend_error(Backend::Metal, "metalSetDevice(restore)", status),
             });
         }
     }
@@ -371,29 +331,10 @@ pub fn set_device(ordinal: usize) -> Result<()> {
             #[cfg(not(supersonic_backend_hip))]
             1
         }
-        Backend::Cuda => {
-            #[cfg(any())]
-            unsafe {
-                cudaSetDevice(ordinal_i32)
-            }
-            #[cfg(not(any()))]
-            1
-        }
-        Backend::Metal => {
-            if ordinal == 0 {
-                0
-            } else {
-                1
-            }
-        }
     };
     if status != 0 {
         return Err(match backend {
             Backend::Hip => backend_error(Backend::Hip, "hipSetDevice", status),
-            Backend::Cuda => backend_error(Backend::Cuda, "cudaSetDevice", status),
-            Backend::Metal => GpuError::InvalidArg(
-                "Metal backend currently supports only device ordinal 0".into(),
-            ),
         });
     }
     Ok(())
@@ -410,8 +351,6 @@ pub fn set_device(ordinal: usize) -> Result<()> {
 /// kernel ops; the host pointer is what `hipHostFree` needs at drop time.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AllocatorKind {
-    /// Classic device-pointer allocation: `hipMalloc` / `cudaMalloc` /
-    /// `supersonic_metal_alloc`. Free with the matching `*Free` on the
     /// device pointer.
     Discrete,
     /// HIP host-mapped allocation (`hipHostMalloc` with
@@ -428,8 +367,6 @@ pub(crate) enum AllocatorKind {
 /// pointer plus the allocator kind that produced it. The active
 /// `BufferPolicy` resolves the supplied `BufferKind` to an `AllocStrategy`:
 ///
-/// - `AllocStrategy::Default` → `hipMalloc` / `cudaMalloc` /
-///   `supersonic_metal_alloc`. Device-resident, GPU-cacheable, classic.
 /// - `AllocStrategy::HostMapped` (HIP only) → `hipHostMalloc(MAPPED) +
 ///   hipHostGetDevicePointer`. System-RAM-resident, zero-copy from host,
 ///   but **bypasses GPU L2 on RDNA3.5 APUs** — only choose this for
@@ -503,38 +440,6 @@ pub(crate) fn alloc(
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => {
-                #[cfg(any())]
-                unsafe {
-                    let mut ptr = std::ptr::null_mut();
-                    let status = cudaMalloc(&mut ptr, len_bytes);
-                    if status != 0 {
-                        return Err(backend_error(Backend::Cuda, "cudaMalloc", status));
-                    }
-                    let nn = NonNull::new(ptr).ok_or_else(|| {
-                        GpuError::backend(Backend::Cuda, "cudaMalloc returned null".into())
-                    })?;
-                    Ok((nn, AllocatorKind::Discrete))
-                }
-                #[cfg(not(any()))]
-                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
-            }
-            Backend::Metal => {
-                #[cfg(any())]
-                unsafe {
-                    let mut ptr = std::ptr::null_mut();
-                    let status = supersonic_metal_alloc(len_bytes, &mut ptr);
-                    if status != 0 {
-                        return Err(backend_error(Backend::Metal, "metalAlloc", status));
-                    }
-                    let nn = NonNull::new(ptr).ok_or_else(|| {
-                        GpuError::backend(Backend::Metal, "metalAlloc returned null".into())
-                    })?;
-                    Ok((nn, AllocatorKind::Discrete))
-                }
-                #[cfg(not(any()))]
-                Err(GpuError::InvalidArg("Metal backend not compiled".into()))
-            }
         })
     })
 }
@@ -548,22 +453,6 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
         ));
     }
     match backend {
-        Backend::Cuda => with_device_impl(backend, ordinal, || {
-            #[cfg(any())]
-            {
-                let mut ptr = std::ptr::null_mut();
-                const CUDA_HOST_ALLOC_MAPPED: u32 = 0x02;
-                let status = unsafe { cudaHostAlloc(&mut ptr, len_bytes, CUDA_HOST_ALLOC_MAPPED) };
-                if status != 0 {
-                    return Err(backend_error(Backend::Cuda, "cudaHostAlloc", status));
-                }
-                NonNull::new(ptr).ok_or_else(|| {
-                    GpuError::backend(Backend::Cuda, "cudaHostAlloc returned null".into())
-                })
-            }
-            #[cfg(not(any()))]
-            Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
-        }),
         Backend::Hip => with_device_impl(backend, ordinal, || {
             #[cfg(supersonic_backend_hip)]
             {
@@ -579,14 +468,6 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
             #[cfg(not(supersonic_backend_hip))]
             Err(GpuError::InvalidArg("HIP backend not compiled".into()))
         }),
-        Backend::Metal => {
-            let layout = Layout::from_size_align(len_bytes, 64)
-                .map_err(|e| GpuError::InvalidArg(format!("host allocation layout failed: {e}")))?;
-            let ptr = unsafe { alloc_zeroed(layout) as *mut c_void };
-            NonNull::new(ptr).ok_or_else(|| {
-                GpuError::backend(Backend::Metal, "host allocation returned null".into())
-            })
-        }
     }
 }
 
@@ -602,29 +483,7 @@ pub fn host_pinned_device_ptr(
         ));
     }
     match backend {
-        Backend::Cuda => with_device_impl(backend, ordinal, || {
-            #[cfg(any())]
-            {
-                let mut device_ptr = std::ptr::null_mut();
-                let status = unsafe { cudaHostGetDevicePointer(&mut device_ptr, ptr, 0) };
-                if status != 0 {
-                    return Err(backend_error(
-                        Backend::Cuda,
-                        "cudaHostGetDevicePointer",
-                        status,
-                    ));
-                }
-                NonNull::new(device_ptr).ok_or_else(|| {
-                    GpuError::backend(
-                        Backend::Cuda,
-                        "cudaHostGetDevicePointer returned null".into(),
-                    )
-                })
-            }
-            #[cfg(not(any()))]
-            Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
-        }),
-        Backend::Hip | Backend::Metal => NonNull::new(ptr)
+        Backend::Hip => NonNull::new(ptr)
             .ok_or_else(|| GpuError::InvalidArg("host_pinned_device_ptr returned null".into())),
     }
 }
@@ -635,20 +494,6 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
         return;
     }
     match backend {
-        Backend::Cuda => {
-            let _: Result<()> = with_device_impl(backend, ordinal, || {
-                #[cfg(any())]
-                {
-                    let status = unsafe { cudaFreeHost(ptr) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Cuda, "cudaFreeHost", status));
-                    }
-                    Ok(())
-                }
-                #[cfg(not(any()))]
-                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
-            });
-        }
         Backend::Hip => {
             let _: Result<()> = with_device_impl(backend, ordinal, || {
                 #[cfg(supersonic_backend_hip)]
@@ -662,11 +507,6 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             });
-        }
-        Backend::Metal => {
-            if let Ok(layout) = Layout::from_size_align(len_bytes, 64) {
-                unsafe { dealloc(ptr as *mut u8, layout) };
-            }
         }
     }
 }
@@ -773,12 +613,6 @@ impl RegisteredHostBuffer {
                     #[cfg(not(supersonic_backend_hip))]
                     Err(GpuError::InvalidArg("HIP backend not compiled".into()))
                 }
-                Backend::Cuda => Err(GpuError::Unsupported(
-                    "RegisteredHostBuffer is not implemented for CUDA yet".into(),
-                )),
-                Backend::Metal => Err(GpuError::Unsupported(
-                    "RegisteredHostBuffer is not implemented for Metal".into(),
-                )),
             })
         })?;
         Ok(Self {
@@ -818,7 +652,6 @@ impl Drop for RegisteredHostBuffer {
                     #[cfg(not(supersonic_backend_hip))]
                     Err(GpuError::InvalidArg("HIP backend not compiled".into()))
                 }
-                Backend::Cuda | Backend::Metal => Ok(()),
             })
         });
     }
@@ -838,7 +671,6 @@ pub(crate) fn alloc_zeros(
 
 /// Free a buffer allocated by [`alloc`]. Dispatches based on the recorded
 /// allocator kind: `Discrete` frees the device pointer with `hipFree` /
-/// `cudaFree` / metal-free; `UnifiedHost` frees the original host pointer
 /// (carried in the kind) with `hipHostFree` and ignores the device-mapped
 /// pointer. No-op on null.
 pub(crate) fn free(
@@ -872,22 +704,6 @@ pub(crate) fn free(
                     #[cfg(not(supersonic_backend_hip))]
                     1
                 }
-                (Backend::Cuda, _) => {
-                    #[cfg(any())]
-                    unsafe {
-                        cudaFree(dev_ptr)
-                    }
-                    #[cfg(not(any()))]
-                    1
-                }
-                (Backend::Metal, _) => {
-                    #[cfg(any())]
-                    unsafe {
-                        supersonic_metal_free(dev_ptr)
-                    }
-                    #[cfg(not(any()))]
-                    1
-                }
             };
             if status != 0 {
                 return Err(match (backend, allocator) {
@@ -897,8 +713,6 @@ pub(crate) fn free(
                     (Backend::Hip, AllocatorKind::Discrete) => {
                         backend_error(Backend::Hip, "hipFree", status)
                     }
-                    (Backend::Cuda, _) => backend_error(Backend::Cuda, "cudaFree", status),
-                    (Backend::Metal, _) => backend_error(Backend::Metal, "metalFree", status),
                 });
             }
             Ok(())
@@ -925,26 +739,10 @@ pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                     #[cfg(not(supersonic_backend_hip))]
                     1
                 }
-                Backend::Cuda => {
-                    #[cfg(any())]
-                    unsafe {
-                        cudaMemcpy(dst, src, len, CUDA_MEMCPY_HOST_TO_DEVICE)
-                    }
-                    #[cfg(not(any()))]
-                    1
-                }
-                Backend::Metal => {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
-                    }
-                    0
-                }
             };
             if status != 0 {
                 return Err(match backend {
                     Backend::Hip => backend_error(Backend::Hip, "hipMemcpy(H2D)", status),
-                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMemcpy(H2D)", status),
-                    Backend::Metal => backend_error(Backend::Metal, "metalMemcpy(H2D)", status),
                 });
             }
             Ok(())
@@ -985,12 +783,6 @@ pub fn copy_h2d_async(
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::Unsupported(
-                "copy_h2d_async is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::Unsupported(
-                "copy_h2d_async is not implemented for Metal".into(),
-            )),
         })
     })
 }
@@ -998,7 +790,6 @@ pub fn copy_h2d_async(
 pub fn storage_to_device_is_supported(backend: Backend) -> bool {
     match backend {
         Backend::Hip => hipfile_is_compiled(),
-        Backend::Cuda | Backend::Metal => false,
     }
 }
 
@@ -1025,8 +816,6 @@ pub(crate) fn ensure_storage_to_device_supported(
         Backend::Hip => {
             "hipFile support is not compiled; ROCm >= 7.2 with hipfile.h and libhipfile is required"
         }
-        Backend::Cuda => "CUDA storage-to-device transfer is not implemented yet",
-        Backend::Metal => "Metal storage-to-device transfer is not implemented",
     };
     Err(GpuError::Unsupported(format!(
         "GPU-direct storage-to-device transfer is not available for {backend}: {reason} \
@@ -1071,12 +860,6 @@ pub fn copy_storage_to_device(
             Backend::Hip => {
                 copy_storage_to_device_hipfile(ordinal, dst, source_path, source_offset, len)
             }
-            Backend::Cuda => Err(GpuError::Unsupported(
-                "copy_storage_to_device is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::Unsupported(
-                "copy_storage_to_device is not implemented for Metal".into(),
-            )),
         })
     })
 }
@@ -1159,26 +942,10 @@ pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                     #[cfg(not(supersonic_backend_hip))]
                     1
                 }
-                Backend::Cuda => {
-                    #[cfg(any())]
-                    unsafe {
-                        cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_HOST)
-                    }
-                    #[cfg(not(any()))]
-                    1
-                }
-                Backend::Metal => {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
-                    }
-                    0
-                }
             };
             if status != 0 {
                 return Err(match backend {
                     Backend::Hip => backend_error(Backend::Hip, "hipMemcpy(D2H)", status),
-                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMemcpy(D2H)", status),
-                    Backend::Metal => backend_error(Backend::Metal, "metalMemcpy(D2H)", status),
                 });
             }
             Ok(())
@@ -1205,26 +972,10 @@ pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                     #[cfg(not(supersonic_backend_hip))]
                     1
                 }
-                Backend::Cuda => {
-                    #[cfg(any())]
-                    unsafe {
-                        cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_DEVICE)
-                    }
-                    #[cfg(not(any()))]
-                    1
-                }
-                Backend::Metal => {
-                    unsafe {
-                        std::ptr::copy(src as *const u8, dst as *mut u8, len);
-                    }
-                    0
-                }
             };
             if status != 0 {
                 return Err(match backend {
                     Backend::Hip => backend_error(Backend::Hip, "hipMemcpy(D2D)", status),
-                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMemcpy(D2D)", status),
-                    Backend::Metal => backend_error(Backend::Metal, "metalMemcpy(D2D)", status),
                 });
             }
             Ok(())
@@ -1251,26 +1002,10 @@ pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> 
                     #[cfg(not(supersonic_backend_hip))]
                     1
                 }
-                Backend::Cuda => {
-                    #[cfg(any())]
-                    unsafe {
-                        cudaMemset(dst, 0, len)
-                    }
-                    #[cfg(not(any()))]
-                    1
-                }
-                Backend::Metal => {
-                    unsafe {
-                        std::ptr::write_bytes(dst as *mut u8, 0, len);
-                    }
-                    0
-                }
             };
             if status != 0 {
                 return Err(match backend {
                     Backend::Hip => backend_error(Backend::Hip, "hipMemset", status),
-                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMemset", status),
-                    Backend::Metal => backend_error(Backend::Metal, "metalMemset", status),
                 });
             }
             Ok(())
@@ -1308,12 +1043,6 @@ pub fn memset_zeros_async(
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::Unsupported(
-                "memset_zeros_async is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::Unsupported(
-                "memset_zeros_async is not implemented for Metal".into(),
-            )),
         })
     })
 }
@@ -1332,23 +1061,10 @@ pub fn sync(ordinal: usize) -> Result<()> {
                     #[cfg(not(supersonic_backend_hip))]
                     1
                 }
-                Backend::Cuda => {
-                    #[cfg(any())]
-                    unsafe {
-                        cudaDeviceSynchronize()
-                    }
-                    #[cfg(not(any()))]
-                    1
-                }
-                Backend::Metal => 0,
             };
             if status != 0 {
                 return Err(match backend {
                     Backend::Hip => backend_error(Backend::Hip, "hipDeviceSynchronize", status),
-                    Backend::Cuda => backend_error(Backend::Cuda, "cudaDeviceSynchronize", status),
-                    Backend::Metal => {
-                        backend_error(Backend::Metal, "metalDeviceSynchronize", status)
-                    }
                 });
             }
             Ok(())
@@ -1358,7 +1074,6 @@ pub fn sync(ordinal: usize) -> Result<()> {
 
 /// RAII wrapper around a backend timing event.
 ///
-/// Timing events are currently implemented only for HIP. On CUDA builds this
 /// returns an explicit error until the matching runtime bindings are added.
 pub struct GpuEvent {
     backend: Backend,
@@ -1405,12 +1120,6 @@ impl GpuStream {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::Unsupported(
-                "GpuStream is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::Unsupported(
-                "GpuStream is not implemented for Metal".into(),
-            )),
         })?;
         Ok(Self {
             backend,
@@ -1433,12 +1142,6 @@ impl GpuStream {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::Unsupported(
-                "GpuStream is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::Unsupported(
-                "GpuStream is not implemented for Metal".into(),
-            )),
         })
     }
 
@@ -1461,12 +1164,6 @@ impl GpuStream {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::Unsupported(
-                "GpuStream::wait_event is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::Unsupported(
-                "GpuStream::wait_event is not implemented for Metal".into(),
-            )),
         })
     }
 }
@@ -1489,7 +1186,6 @@ impl Drop for GpuStream {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda | Backend::Metal => Ok(()),
         });
     }
 }
@@ -1512,12 +1208,6 @@ impl GpuEvent {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::InvalidArg(
-                "GpuEvent is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::InvalidArg(
-                "GpuEvent is not implemented for Metal yet".into(),
-            )),
         })?;
         Ok(Self {
             backend,
@@ -1540,12 +1230,6 @@ impl GpuEvent {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::InvalidArg(
-                "GpuEvent is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::InvalidArg(
-                "GpuEvent is not implemented for Metal yet".into(),
-            )),
         })
     }
 
@@ -1568,12 +1252,6 @@ impl GpuEvent {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::Unsupported(
-                "GpuEvent is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::Unsupported(
-                "GpuEvent is not implemented for Metal yet".into(),
-            )),
         })
     }
 
@@ -1594,12 +1272,6 @@ impl GpuEvent {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::Unsupported(
-                "GpuEvent is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::Unsupported(
-                "GpuEvent is not implemented for Metal yet".into(),
-            )),
         })
     }
 
@@ -1617,12 +1289,6 @@ impl GpuEvent {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::InvalidArg(
-                "GpuEvent is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::InvalidArg(
-                "GpuEvent is not implemented for Metal yet".into(),
-            )),
         })
     }
 
@@ -1649,12 +1315,6 @@ impl GpuEvent {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Err(GpuError::InvalidArg(
-                "GpuEvent is not implemented for CUDA yet".into(),
-            )),
-            Backend::Metal => Err(GpuError::InvalidArg(
-                "GpuEvent is not implemented for Metal yet".into(),
-            )),
         }
     }
 }
@@ -1677,8 +1337,6 @@ impl Drop for GpuEvent {
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Backend::Cuda => Ok(()),
-            Backend::Metal => Ok(()),
         });
     }
 }
@@ -1691,92 +1349,7 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
         Backend::Hip => Err(GpuError::InvalidArg(
             "HIP device query is provided by the HIP kernel bridge, not gpu-hal".into(),
         )),
-        Backend::Cuda => {
-            #[cfg(any())]
-            {
-                let mut props = unsafe { std::mem::zeroed::<CudaDeviceProp>() };
-                let status = unsafe { cudaGetDeviceProperties(&mut props, ordinal_i32) };
-                if status != 0 {
-                    return Err(backend_error(
-                        Backend::Cuda,
-                        "cudaGetDeviceProperties",
-                        status,
-                    ));
-                }
-                let arch_name = format!("sm{}{}", props.major, props.minor);
-                Ok(DeviceInfo {
-                    arch_name,
-                    total_vram_bytes: props.totalGlobalMem as u64,
-                    warp_size: props.warpSize as u32,
-                    clock_rate_khz: props.clockRate as u32,
-                })
-            }
-            #[cfg(not(any()))]
-            {
-                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
-            }
-        }
-        Backend::Metal => {
-            #[cfg(any())]
-            {
-                let mut arch_name = vec![0i8; 64];
-                let mut total_vram_bytes = 0u64;
-                let mut warp_size = 0u32;
-                let mut clock_rate_khz = 0u32;
-                let status = unsafe {
-                    supersonic_metal_query_device_info(
-                        ordinal,
-                        arch_name.as_mut_ptr(),
-                        arch_name.len(),
-                        &mut total_vram_bytes,
-                        &mut warp_size,
-                        &mut clock_rate_khz,
-                    )
-                };
-                if status != 0 {
-                    return Err(backend_error(
-                        Backend::Metal,
-                        "metalQueryDeviceInfo",
-                        status,
-                    ));
-                }
-                let nul_pos = arch_name
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(arch_name.len());
-                let arch_name = String::from_utf8_lossy(
-                    &arch_name[..nul_pos]
-                        .iter()
-                        .map(|&c| c as u8)
-                        .collect::<Vec<_>>(),
-                )
-                .to_string();
-                Ok(DeviceInfo {
-                    arch_name,
-                    total_vram_bytes,
-                    warp_size,
-                    clock_rate_khz,
-                })
-            }
-            #[cfg(not(any()))]
-            {
-                Err(GpuError::InvalidArg("Metal backend not compiled".into()))
-            }
-        }
     }
-}
-
-#[cfg(any())]
-fn metal_runtime_compile_smoke() -> Result<()> {
-    let status = unsafe { supersonic_metal_compile_shader_smoke() };
-    if status != 0 {
-        return Err(backend_error(
-            Backend::Metal,
-            "metalCompileShaderSmoke",
-            status,
-        ));
-    }
-    Ok(())
 }
 
 /// Dtype-aware element count from shape.
@@ -2084,70 +1657,5 @@ mod hal_profile_tests {
         assert_eq!(outer_h2d.total_ms, 11.0);
         assert_eq!(outer_h2d.max_ms, 10.0);
         assert_eq!(entry(&outer, "copy_d2h").max_ms, 2.0);
-    }
-}
-
-#[cfg(all(test, target_os = "macos", any()))]
-mod tests {
-    use super::*;
-    use crate::{set_backend, Backend, GpuBuffer, ScalarType};
-
-    fn use_metal_backend() {
-        set_backend(Backend::Metal);
-    }
-
-    #[test]
-    fn metal_device_info_reports_expected_shape() {
-        use_metal_backend();
-        let info = query_device_info(Backend::Metal, 0).expect("query metal device info");
-        assert!(
-            info.arch_name.contains("apple"),
-            "unexpected metal arch name: {}",
-            info.arch_name
-        );
-        assert!(info.total_vram_bytes > 0, "missing working set budget");
-        assert_eq!(info.warp_size, 32);
-    }
-
-    #[test]
-    fn metal_buffer_round_trip_copy_zero_and_sync() {
-        use_metal_backend();
-        let ordinal = 0usize;
-        let host = [1.0f32, -2.5, 3.25, 4.5];
-        let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let src = GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[host.len()], &host_bytes)
-            .expect("upload source buffer");
-        let mut dst = GpuBuffer::zeros(ordinal, ScalarType::F32, &[host.len()])
-            .expect("allocate zero destination");
-
-        copy_d2d(ordinal, dst.as_mut_ptr(), src.as_ptr(), src.len_bytes()).expect("copy_d2d");
-        sync(ordinal).expect("sync after copy_d2d");
-        let copied = dst.to_host_bytes().expect("download copied bytes");
-        assert_eq!(copied, host_bytes);
-
-        memset_zeros(ordinal, dst.as_mut_ptr(), dst.len_bytes()).expect("memset zeros");
-        sync(ordinal).expect("sync after memset");
-        let zeroed = dst.to_host_bytes().expect("download zeroed bytes");
-        assert!(
-            zeroed.iter().all(|&b| b == 0),
-            "destination buffer not zeroed"
-        );
-    }
-
-    #[test]
-    fn metal_runtime_shader_compile_smoke_succeeds() {
-        use_metal_backend();
-        metal_runtime_compile_smoke().expect("runtime Metal shader compilation should succeed");
-    }
-
-    #[test]
-    fn metal_rejects_nonzero_ordinal() {
-        use_metal_backend();
-        let err =
-            alloc(1, 16, BufferKind::Persistent).expect_err("metal ordinal 1 should be rejected");
-        assert!(
-            err.to_string().contains("ordinal 0"),
-            "unexpected error: {err}"
-        );
     }
 }

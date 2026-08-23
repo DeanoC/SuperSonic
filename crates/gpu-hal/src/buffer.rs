@@ -10,8 +10,8 @@ use crate::scalar_type::ScalarType;
 ///
 /// Allocation routes through `ops::alloc`, which dispatches based on the
 /// active `BufferPolicy`'s mapping for the supplied `BufferKind`:
-/// `AllocStrategy::Default` uses `hipMalloc` / `cudaMalloc` / metal device
-/// memory (always GPU-cacheable); `AllocStrategy::HostMapped` (HIP only)
+/// `AllocStrategy::Default` uses device memory (always GPU-cacheable);
+/// `AllocStrategy::HostMapped` uses
 /// uses `hipHostMalloc(MAPPED)` + `hipHostGetDevicePointer` so host and
 /// device share the same physical pages — saves the H2D copy, but
 /// bypasses GPU L2 on RDNA3.5 APUs. Each buffer remembers which
@@ -42,9 +42,9 @@ pub struct GpuBuffer {
 unsafe impl Send for GpuBuffer {}
 unsafe impl Sync for GpuBuffer {}
 
-/// Owned host memory used as the certified-KV Tier-2 store.
+/// Owned host memory used for pinned staging and host-side state.
 ///
-/// CUDA/HIP allocate pinned host pages so selected FP16 blocks can be paged
+/// HIP allocates pinned host pages so selected FP16 blocks can be copied
 /// back into device scratch without first staging through pageable memory.
 pub struct HostBuffer {
     ptr: NonNull<c_void>,

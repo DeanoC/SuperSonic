@@ -3,7 +3,7 @@
 // Bit-exact against geoquant/formats/gqh.py and crates/model-store/src/gqh.rs.
 // Superblock scale is d_real = e4m3(d) * tensor_scale, then
 // s_b = d_real * (ratio/15). Do not reassociate those products.
-// Ported from geo-lucebox ggml-cuda/gqh.cu (wave32, header as kernel args).
+// Ported from geo-lucebox's low-bit GQH kernel (wave32, header as kernel args).
 
 #include "gqh-stride.h"
 
@@ -118,7 +118,7 @@ static __device__ __forceinline__ uint16_t gqh_ld_u16(const uint8_t* p) {
 //
 // The control is a *backward* target -- prefetch a superblock this wave has
 // already consumed (`sb - 8`), so the instruction, the gate and the loop shape
-// are unchanged but there is provably zero lookahead. iteration 13, drv32,
+// are unchanged but there is provably zero speculative lookahead. iteration 13, drv32,
 // order-balanced B,C,C,B, 3 passes, distance 8:
 //     arm                  ahead    backward control   prefetching buys
 //     3,acc,68  o=5120     +0.69%   +0.13%             ~80% of it

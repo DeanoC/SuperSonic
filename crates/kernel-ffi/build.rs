@@ -109,54 +109,78 @@ fn archive(out_dir: &Path, lib_name: &str, objects: &[PathBuf], context: &str) {
     println!("cargo:rustc-link-lib=static={lib_name}");
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 struct KernelBridge {
-    src_name: &'static str,
-    obj_name: &'static str,
-    context: &'static str,
+    src_name: String,
+    obj_name: String,
 }
 
-const HIP_GROUPS: &[&str] = &["hip-qwen38-dense", "hip-gqh"];
+fn manifest_value(line: &str) -> Option<String> {
+    let start = line.find('"')? + 1;
+    let end = line[start..].find('"')? + start;
+    Some(line[start..end].to_owned())
+}
 
-// The product build has one HIP bridge archive. The object names retain the
-// historical ABI library identity; exported kernel symbols are unchanged.
-const HIP_BRIDGES: &[KernelBridge] = &[
-    KernelBridge {
-        src_name: "full_attention_bridge.cpp",
-        obj_name: "qwen35_megakernel_hip.o",
-        context: "building dense attention HIP bridge",
-    },
-    KernelBridge {
-        src_name: "full_attention_bridge_4b.cpp",
-        obj_name: "qwen35_4b_megakernel_hip.o",
-        context: "building dense 4B HIP bridge",
-    },
-    KernelBridge {
-        src_name: "prefill_helpers_bridge.cpp",
-        obj_name: "qwen35_prefill_helpers_hip.o",
-        context: "building prefill helpers HIP bridge",
-    },
-    KernelBridge {
-        src_name: "gqh_bridge.cpp",
-        obj_name: "gqh_hip.o",
-        context: "building GQH HIP bridge",
-    },
-];
+fn kernel_relative_path(path: String) -> String {
+    path.strip_prefix("kernels/").unwrap_or(&path).to_owned()
+}
 
-const KERNEL_RERUN_PATHS: &[&str] = &[
-    "full_attention.hip",
-    "full_attention_4b.hip",
-    "prefill_helpers.hip",
-    "full_attention_bridge.cpp",
-    "full_attention_bridge_4b.cpp",
-    "prefill_helpers_bridge.cpp",
-    "gqh.hip",
-    "gqh_bridge.cpp",
-    "gqh-tables.h",
-    "gqh-stride.h",
-];
+/// Read the build inputs from the same manifest used by the source validator.
+/// The manifest is deliberately parsed here without another build dependency:
+/// it contains only the small string fields needed by this build script.
+fn read_kernel_manifest(path: &Path) -> (Vec<KernelBridge>, Vec<String>) {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read kernel manifest {}: {error}", path.display()));
+    let mut bridges = Vec::new();
+    let mut rerun_paths = Vec::new();
+    let mut array = None::<&str>;
+    let mut pending_source = None::<String>;
 
-fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.starts_with("kernel_sources") {
+            array = Some("kernel_sources");
+            continue;
+        }
+        if array.is_some() {
+            if line == "]" {
+                array = None;
+            } else if let Some(value) = manifest_value(line) {
+                rerun_paths.push(kernel_relative_path(value));
+            }
+            continue;
+        }
+        if line.starts_with("source") {
+            pending_source = manifest_value(line).map(kernel_relative_path);
+            continue;
+        }
+        if line.starts_with("object") {
+            let source = pending_source
+                .take()
+                .unwrap_or_else(|| panic!("kernel manifest object without source: {line}"));
+            let object = manifest_value(line).expect("kernel manifest object value");
+            rerun_paths.push(source.clone());
+            bridges.push(KernelBridge {
+                src_name: source,
+                obj_name: object,
+            });
+        }
+    }
+
+    assert!(
+        !bridges.is_empty(),
+        "kernel manifest defines no HIP bridges"
+    );
+    assert!(
+        !rerun_paths.is_empty(),
+        "kernel manifest defines no HIP sources"
+    );
+    rerun_paths.sort();
+    rerun_paths.dedup();
+    (bridges, rerun_paths)
+}
+
+fn compile_hip(kernel_dir: &Path, out_dir: &Path, bridges: &[KernelBridge]) {
     let archs = detect_hip_archs();
     if archs.is_empty() {
         println!(
@@ -171,15 +195,15 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
 
     println!("cargo:rerun-if-env-changed=GQH_ALLOW_FMA");
     let allow_gqh_fma = env::var_os("GQH_ALLOW_FMA").is_some_and(|value| value != "0");
-    let mut objects = Vec::with_capacity(HIP_BRIDGES.len());
-    for bridge in HIP_BRIDGES {
-        let object = out_dir.join(bridge.obj_name);
+    let mut objects = Vec::with_capacity(bridges.len());
+    for bridge in bridges {
+        let object = out_dir.join(&bridge.obj_name);
         let mut command = Command::new("hipcc");
         command
             .args(["-std=c++17", "-O3", "-fPIC", "-I"])
             .arg(kernel_dir)
             .args(["-x", "hip", "-c"])
-            .arg(kernel_dir.join(bridge.src_name))
+            .arg(kernel_dir.join(&bridge.src_name))
             .args(["-o"])
             .arg(&object);
         if allow_gqh_fma {
@@ -188,7 +212,8 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
         for arch in &archs {
             command.arg(format!("--offload-arch={arch}"));
         }
-        run(&mut command, bridge.context);
+        let context = format!("building HIP bridge {}", bridge.src_name);
+        run(&mut command, &context);
         objects.push(object);
     }
 
@@ -221,12 +246,17 @@ fn main() {
         .and_then(|parent| parent.parent())
         .expect("cannot find workspace root")
         .join("kernels");
-    for path in KERNEL_RERUN_PATHS {
+    let manifest_path = manifest_dir.join("kernel-groups.toml");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+    let (bridges, rerun_paths) = read_kernel_manifest(&manifest_path);
+    for path in rerun_paths {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(path).display());
     }
 
-    assert!(command_exists("hipcc"), "No HIP toolchain found; install hipcc.");
-    let _ = HIP_GROUPS;
+    assert!(
+        command_exists("hipcc"),
+        "No HIP toolchain found; install hipcc."
+    );
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    compile_hip(&kernel_dir, &out_dir);
+    compile_hip(&kernel_dir, &out_dir, &bridges);
 }

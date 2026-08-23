@@ -1,7 +1,7 @@
 /// Optional host-side profiling for the retained Qwen3.8 prefill path.
 ///
-/// Profiling is intentionally opt-in and remains a narrow measurement aid;
-/// removed Metal and Qwen3.6 route scopes are not part of the product binary.
+/// Profiling is intentionally opt-in and remains a narrow measurement aid for
+/// the retained product path.
 pub(crate) struct PrefillProfileScope<'a> {
     active: bool,
     json_path: Option<&'a std::path::Path>,

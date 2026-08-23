@@ -3,16 +3,16 @@
 
 use std::path::PathBuf;
 
-use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use kernel_ffi::gqh::{self, RUNG_GQH2_H, RUNG_GQH3};
 use model_store::gguf::GgufFile;
 use model_store::gqh::GqhRung;
 use qwen35::desc_builder::build_int4_scale_descs;
 use qwen35::gguf_ingest::{check_mapping, load_text_config};
 use qwen35::weights::{
-    infer_lowbit_type, is_gqh_qtype, matmul_gqh, LayerKind, Qwen35Weights, LOWBIT_GQH2_H,
-    LOWBIT_GQH3, LOWBIT_GGML_Q2_K, LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K,
-    LOWBIT_GGML_Q8_0,
+    infer_lowbit_type, is_gqh_qtype, matmul_gqh, LayerKind, Qwen35Weights, LOWBIT_GGML_Q2_K,
+    LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K, LOWBIT_GGML_Q8_0, LOWBIT_GQH2_H,
+    LOWBIT_GQH3,
 };
 
 fn gguf_path() -> Option<PathBuf> {
@@ -42,9 +42,7 @@ fn require_gqh_artifacts() -> bool {
 fn qwen38_model_dir() -> Option<PathBuf> {
     let Some(value) = std::env::var_os("SUPERSONIC_QWEN38_MODEL_DIR") else {
         if require_gqh_artifacts() {
-            panic!(
-                "SUPERSONIC_QWEN38_MODEL_DIR is required for Qwen3.8 GQH artifact tests"
-            );
+            panic!("SUPERSONIC_QWEN38_MODEL_DIR is required for Qwen3.8 GQH artifact tests");
         }
         return None;
     };
@@ -135,7 +133,6 @@ fn rung5_upload_packed_mapped_tensors_to_device0() {
     let Some(model_dir) = qwen38_model_dir() else {
         return;
     };
-    set_backend(Backend::Hip);
     if kernel_ffi::query_gpu_info(0).is_err() {
         eprintln!("skip: no HIP device 0");
         return;
@@ -166,12 +163,14 @@ fn rung5_upload_packed_mapped_tensors_to_device0() {
         bytes as f64 / 1024.0 / 1024.0 / 1024.0
     );
     assert!(bytes > 8 * 1024 * 1024 * 1024, "expected >8 GiB packed");
-    assert!(bytes < 16 * 1024 * 1024 * 1024, "packed upload exceeded 16 GiB");
+    assert!(
+        bytes < 16 * 1024 * 1024 * 1024,
+        "packed upload exceeded 16 GiB"
+    );
     drop(buffers);
 }
 
 fn require_hip() -> Option<usize> {
-    set_backend(Backend::Hip);
     kernel_ffi::query_gpu_info(0).ok().map(|_| 0)
 }
 
@@ -471,7 +470,10 @@ fn rung7c_gqh_large_m_dequant_gemm_matches_fused() {
         .expect("up header");
     let w = &weights.layers[0].up_proj_w;
     let qtype = infer_lowbit_type(w, config.hidden_size, false);
-    assert!(qtype == LOWBIT_GQH3 || qtype == LOWBIT_GQH2_H, "up qtype {qtype}");
+    assert!(
+        qtype == LOWBIT_GQH3 || qtype == LOWBIT_GQH2_H,
+        "up qtype {qtype}"
+    );
     let k = config.hidden_size;
     let n = 64usize;
     let m = 16usize;
@@ -524,7 +526,11 @@ fn rung7c_gqh_large_m_dequant_gemm_matches_fused() {
         nb += (*y as f64) * (*y as f64);
         maxabs = maxabs.max((x - y).abs());
     }
-    assert!(n_finite > a.len() / 2, "too many non-finite pairs {n_finite}/{}", a.len());
+    assert!(
+        n_finite > a.len() / 2,
+        "too many non-finite pairs {n_finite}/{}",
+        a.len()
+    );
     let cos = dot / (na.sqrt() * nb.sqrt() + 1e-30);
     assert!(
         cos > 0.999,
@@ -585,9 +591,7 @@ fn rung8_embed_row_then_prefill_gqh_qkv() {
     let bytes = out.to_host_bytes().expect("d2h");
     let vals: Vec<f32> = bytes
         .chunks_exact(2)
-        .map(|c| {
-            half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()
-        })
+        .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
         .collect();
     assert_eq!(vals.len(), n);
     assert!(vals.iter().all(|v| v.is_finite()), "qkv out not finite");
@@ -750,16 +754,33 @@ fn rung9_gqh_dispatch_and_ggml_k_kv() {
 
     let kv_n = full.k_proj_w.shape()[0];
     let mut k_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_n]).expect("k out");
-    dispatch_proj(ordinal, kv_n, hidden, &hidden_bf16, &full.k_proj_w, &mut k_out);
+    dispatch_proj(
+        ordinal,
+        kv_n,
+        hidden,
+        &hidden_bf16,
+        &full.k_proj_w,
+        &mut k_out,
+    );
     assert_finite_energy(&bf16_vals(&k_out), "layer3 k_proj");
 
     let mut v_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_n]).expect("v out");
-    dispatch_proj(ordinal, kv_n, hidden, &hidden_bf16, &full.v_proj_w, &mut v_out);
+    dispatch_proj(
+        ordinal,
+        kv_n,
+        hidden,
+        &hidden_bf16,
+        &full.v_proj_w,
+        &mut v_out,
+    );
     assert_finite_energy(&bf16_vals(&v_out), "layer3 v_proj");
 
-    let ggml_k = [k_ty, v_ty, a_ty, b_ty]
-        .into_iter()
-        .any(|ty| matches!(ty, LOWBIT_GGML_Q8_0 | LOWBIT_GGML_Q4_K | LOWBIT_GGML_Q5_K | LOWBIT_GGML_Q6_K));
+    let ggml_k = [k_ty, v_ty, a_ty, b_ty].into_iter().any(|ty| {
+        matches!(
+            ty,
+            LOWBIT_GGML_Q8_0 | LOWBIT_GGML_Q4_K | LOWBIT_GGML_Q5_K | LOWBIT_GGML_Q6_K
+        )
+    });
     println!("rung9: ggml-K among k/v/a/b = {ggml_k}");
 }
 
@@ -845,14 +866,35 @@ fn rung10_linear_layer0_norm_projs_mlp() {
     let mut up = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[inter]).expect("up");
     let mut swiglu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[inter]).expect("swiglu");
     let mut down = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden]).expect("down");
-    dispatch_proj(ordinal, inter, hidden, &post, &weights.layers[0].gate_proj_w, &mut gate);
-    dispatch_proj(ordinal, inter, hidden, &post, &weights.layers[0].up_proj_w, &mut up);
+    dispatch_proj(
+        ordinal,
+        inter,
+        hidden,
+        &post,
+        &weights.layers[0].gate_proj_w,
+        &mut gate,
+    );
+    dispatch_proj(
+        ordinal,
+        inter,
+        hidden,
+        &post,
+        &weights.layers[0].up_proj_w,
+        &mut up,
+    );
     summarize(&bf16_vals(&gate), "layer0 gate");
     summarize(&bf16_vals(&up), "layer0 up");
     kernel_ffi::prefill_ffi::swiglu_mul(ordinal, ScalarType::BF16, inter, &gate, &up, &mut swiglu)
         .expect("swiglu");
     summarize(&bf16_vals(&swiglu), "layer0 swiglu");
-    dispatch_proj(ordinal, hidden, inter, &swiglu, &weights.layers[0].down_proj_w, &mut down);
+    dispatch_proj(
+        ordinal,
+        hidden,
+        inter,
+        &swiglu,
+        &weights.layers[0].down_proj_w,
+        &mut down,
+    );
     let down_vals = bf16_vals(&down);
     assert_finite_energy(&down_vals, "layer0 mlp down");
     println!(
@@ -921,8 +963,8 @@ fn mix105_onehot_matches_cpu_decode() {
         x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()
     })
     .expect("x");
-    let w_buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_b], packed)
-        .expect("w");
+    let w_buf =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_b], packed).expect("w");
     kernel_ffi::gqh::register_mix(w_buf.as_ptr(), 105, header.mode, header.lut);
     let mut y = GpuBuffer::zeros(ordinal, ScalarType::F32, &[rows]).expect("y");
     kernel_ffi::gqh::mix_matvec(
@@ -946,10 +988,7 @@ fn mix105_onehot_matches_cpu_decode() {
         .collect();
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         let den = w.abs().max(1e-6);
-        assert!(
-            (g - w).abs() / den < 1e-5,
-            "mix105 [{i}] got {g} want {w}"
-        );
+        assert!((g - w).abs() / den < 1e-5, "mix105 [{i}] got {g} want {w}");
     }
 
     // Full-row ones vector: stresses the warp-tree vs sequential fold.

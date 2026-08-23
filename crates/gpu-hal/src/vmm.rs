@@ -1,12 +1,8 @@
-#[cfg(any())]
-use std::ffi::c_int;
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::NonNull;
 
 use crate::backend::{current_backend, Backend};
-#[cfg(any())]
-use crate::error::backend_driver_error;
 use crate::error::{backend_error, GpuError, Result};
 #[cfg(supersonic_backend_hip)]
 use crate::hip_sys::*;
@@ -66,8 +62,6 @@ pub struct VirtualArenaStats {
 enum PhysicalHandle {
     #[cfg(supersonic_backend_hip)]
     Hip(Option<HipMemGenericAllocationHandle>),
-    #[cfg(any())]
-    Cuda(Option<CuMemGenericAllocationHandle>),
 }
 
 struct Mapping {
@@ -268,26 +262,6 @@ impl Drop for VirtualBuffer {
                     });
                 }
             }
-            Backend::Cuda => {
-                #[cfg(any())]
-                {
-                    let _ = ops::with_device_impl(self.backend, self.device_ordinal, || {
-                        ensure_cuda_driver(self.device_ordinal)?;
-                        let status = unsafe {
-                            cuMemAddressFree(self.ptr.as_ptr() as CuDevicePtr, self.reserved_bytes)
-                        };
-                        if status != 0 {
-                            return Err(backend_driver_error(
-                                Backend::Cuda,
-                                "cuMemAddressFree",
-                                status,
-                            ));
-                        }
-                        Ok(())
-                    });
-                }
-            }
-            Backend::Metal => {}
         }
     }
 }
@@ -888,7 +862,7 @@ pub fn vmm_is_supported(backend: Backend, ordinal: usize) -> bool {
             return false;
         }
     }
-    matches!(backend, Backend::Hip | Backend::Cuda) && vmm_granularity(backend, ordinal).is_ok()
+    backend == Backend::Hip && vmm_granularity(backend, ordinal).is_ok()
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
@@ -943,25 +917,6 @@ fn allocation_prop_hip(ordinal: usize) -> HipMemAllocationProp {
     }
 }
 
-#[cfg(any())]
-fn allocation_prop_cuda(ordinal: usize) -> CuMemAllocationProp {
-    CuMemAllocationProp {
-        type_: CUDA_MEM_ALLOCATION_TYPE_PINNED,
-        requested_handle_types: CUDA_MEM_HANDLE_TYPE_NONE,
-        location: CuMemLocation {
-            type_: CUDA_MEM_LOCATION_TYPE_DEVICE,
-            id: ordinal as i32,
-        },
-        win32_handle_meta_data: std::ptr::null_mut(),
-        alloc_flags: CuMemAllocationPropAllocFlags {
-            compression_type: 0,
-            gpu_direct_rdma_capable: 0,
-            usage: 0,
-            reserved: [0; 4],
-        },
-    }
-}
-
 fn vmm_granularity(backend: Backend, ordinal: usize) -> Result<usize> {
     match backend {
         Backend::Hip => {
@@ -995,39 +950,6 @@ fn vmm_granularity(backend: Backend, ordinal: usize) -> Result<usize> {
                 Err(GpuError::Unsupported("HIP backend not compiled".into()))
             }
         }
-        Backend::Cuda => {
-            #[cfg(any())]
-            {
-                ensure_cuda_driver(ordinal)?;
-                let prop = allocation_prop_cuda(ordinal);
-                let mut granularity = 0usize;
-                let status = unsafe {
-                    cuMemGetAllocationGranularity(
-                        &mut granularity,
-                        &prop,
-                        CUDA_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
-                    )
-                };
-                if status != 0 {
-                    return Err(backend_driver_error(
-                        Backend::Cuda,
-                        "cuMemGetAllocationGranularity",
-                        status,
-                    ));
-                }
-                if granularity == 0 {
-                    return Err(GpuError::Unsupported(
-                        "CUDA VMM returned zero allocation granularity".into(),
-                    ));
-                }
-                Ok(granularity)
-            }
-            #[cfg(not(any()))]
-            {
-                Err(GpuError::Unsupported("CUDA backend not compiled".into()))
-            }
-        }
-        Backend::Metal => Err(GpuError::Unsupported("Metal VMM is not implemented".into())),
     }
 }
 
@@ -1057,29 +979,6 @@ fn reserve_address_range(
                 Err(GpuError::Unsupported("HIP backend not compiled".into()))
             }
         }
-        Backend::Cuda => {
-            #[cfg(any())]
-            {
-                ensure_cuda_driver(ordinal)?;
-                let mut ptr = 0u64;
-                let status = unsafe { cuMemAddressReserve(&mut ptr, len, alignment, 0, 0) };
-                if status != 0 {
-                    return Err(backend_driver_error(
-                        Backend::Cuda,
-                        "cuMemAddressReserve",
-                        status,
-                    ));
-                }
-                NonNull::new(ptr as *mut c_void).ok_or_else(|| {
-                    GpuError::backend(Backend::Cuda, "cuMemAddressReserve returned null".into())
-                })
-            }
-            #[cfg(not(any()))]
-            {
-                Err(GpuError::Unsupported("CUDA backend not compiled".into()))
-            }
-        }
-        Backend::Metal => Err(GpuError::Unsupported("Metal VMM is not implemented".into())),
     })
 }
 
@@ -1139,57 +1038,6 @@ fn map_physical(
                 Err(GpuError::Unsupported("HIP backend not compiled".into()))
             }
         }
-        Backend::Cuda => {
-            #[cfg(any())]
-            {
-                ensure_cuda_driver(ordinal)?;
-                let prop = allocation_prop_cuda(ordinal);
-                let mut handle = 0u64;
-                let status = unsafe { cuMemCreate(&mut handle, len, &prop, 0) };
-                if status != 0 {
-                    return Err(backend_driver_error(Backend::Cuda, "cuMemCreate", status));
-                }
-                let ptr = base.as_ptr() as CuDevicePtr + offset as u64;
-                let status = unsafe { cuMemMap(ptr, len, 0, handle, 0) };
-                if status != 0 {
-                    let _ = unsafe { cuMemRelease(handle) };
-                    return Err(backend_driver_error(Backend::Cuda, "cuMemMap", status));
-                }
-                let access = CuMemAccessDesc {
-                    location: CuMemLocation {
-                        type_: CUDA_MEM_LOCATION_TYPE_DEVICE,
-                        id: ordinal as i32,
-                    },
-                    flags: CUDA_MEM_ACCESS_FLAGS_PROT_READ_WRITE,
-                };
-                let access_ptr = base.as_ptr() as CuDevicePtr + access_offset as u64;
-                let status = unsafe { cuMemSetAccess(access_ptr, access_len, &access, 1) };
-                if status != 0 {
-                    let _ = unsafe { cuMemUnmap(ptr, len) };
-                    let _ = unsafe { cuMemRelease(handle) };
-                    return Err(backend_driver_error(
-                        Backend::Cuda,
-                        "cuMemSetAccess",
-                        status,
-                    ));
-                }
-                let status = unsafe { cuMemRelease(handle) };
-                if status != 0 {
-                    let _ = unsafe { cuMemUnmap(ptr, len) };
-                    return Err(backend_driver_error(Backend::Cuda, "cuMemRelease", status));
-                }
-                Ok(Mapping {
-                    offset,
-                    len,
-                    handle: PhysicalHandle::Cuda(None),
-                })
-            }
-            #[cfg(not(any()))]
-            {
-                Err(GpuError::Unsupported("CUDA backend not compiled".into()))
-            }
-        }
-        Backend::Metal => Err(GpuError::Unsupported("Metal VMM is not implemented".into())),
     })
 }
 
@@ -1200,7 +1048,6 @@ fn unmap_and_release(
     mapping: Mapping,
 ) -> Result<()> {
     ops::with_device_impl(backend, ordinal, || match (backend, mapping.handle) {
-        #[cfg(supersonic_backend_hip)]
         (Backend::Hip, PhysicalHandle::Hip(handle)) => {
             let ptr = unsafe { (base.as_ptr() as *mut u8).add(mapping.offset) as *mut c_void };
             let status = unsafe { hipMemUnmap(ptr, mapping.len) };
@@ -1216,39 +1063,5 @@ fn unmap_and_release(
             ops::sync(ordinal)?;
             Ok(())
         }
-        #[cfg(any())]
-        (Backend::Cuda, PhysicalHandle::Cuda(handle)) => {
-            ensure_cuda_driver(ordinal)?;
-            let ptr = base.as_ptr() as CuDevicePtr + mapping.offset as u64;
-            let status = unsafe { cuMemUnmap(ptr, mapping.len) };
-            if status != 0 {
-                return Err(backend_driver_error(Backend::Cuda, "cuMemUnmap", status));
-            }
-            if let Some(handle) = handle {
-                let status = unsafe { cuMemRelease(handle) };
-                if status != 0 {
-                    return Err(backend_driver_error(Backend::Cuda, "cuMemRelease", status));
-                }
-            }
-            ops::sync(ordinal)?;
-            Ok(())
-        }
-        _ => Err(GpuError::Unsupported(format!(
-            "{backend} VMM mapping cannot be released by this build"
-        ))),
     })
-}
-
-#[cfg(any())]
-fn ensure_cuda_driver(ordinal: usize) -> Result<CuDevice> {
-    let status = unsafe { cuInit(0) };
-    if status != 0 {
-        return Err(backend_driver_error(Backend::Cuda, "cuInit", status));
-    }
-    let mut device = 0;
-    let status = unsafe { cuDeviceGet(&mut device, ordinal as c_int) };
-    if status != 0 {
-        return Err(backend_driver_error(Backend::Cuda, "cuDeviceGet", status));
-    }
-    Ok(device)
 }

@@ -384,7 +384,7 @@ pub fn run_qwen35_trace_oracle(
 /// Run the Phi-4 oracle (`oracle/phi4_oracle.py`) for a single prompt.
 /// Loads weights from either a local model directory or a HuggingFace model
 /// id, then tokenizes the prompt Python-side. Phi-4 oracle additionally
-/// accepts `--device` because it can run on CPU or CUDA depending on
+/// accepts `--device` because it can run on CPU or an accelerator depending on
 /// availability.
 pub fn run_phi4_oracle(
     oracle_script: &Path,

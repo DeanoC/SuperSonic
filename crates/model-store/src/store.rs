@@ -8949,7 +8949,6 @@ mod tests {
             );
             return;
         };
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         let store = BakedStore::open_flm_with_options(
             Path::new(&flm_path_str),
             FlmLoadOptions {
@@ -8989,7 +8988,6 @@ mod tests {
             );
             return;
         };
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         let store = BakedStore::open_flm_with_options(
             Path::new(&flm_path_str),
             FlmLoadOptions {
@@ -9032,7 +9030,6 @@ mod tests {
             );
             return;
         };
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         let store = BakedStore::open_flm_with_options(
             Path::new(&flm_path_str),
             FlmLoadOptions {
@@ -9069,7 +9066,6 @@ mod tests {
             );
             return;
         };
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         let store = BakedStore::open_flm_with_options(
             Path::new(&flm_path_str),
             FlmLoadOptions {
@@ -9106,7 +9102,6 @@ mod tests {
             );
             return;
         };
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         let store = BakedStore::open_flm_with_options(
             Path::new(&flm_path_str),
             FlmLoadOptions {
@@ -9143,7 +9138,6 @@ mod tests {
             );
             return;
         };
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         let store = BakedStore::open_flm_with_options(
             Path::new(&flm_path_str),
             FlmLoadOptions {
@@ -9183,7 +9177,6 @@ mod tests {
             );
             return;
         };
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         let store = BakedStore::open_flm_with_options(
             Path::new(&flm_path_str),
             FlmLoadOptions {
@@ -9223,7 +9216,6 @@ mod tests {
             );
             return;
         };
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         let store = BakedStore::open_flm_with_options(
             Path::new(&flm_path_str),
             FlmLoadOptions {
@@ -9278,7 +9270,6 @@ mod tests {
             );
             return;
         };
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         let store = BakedStore::open_flm_with_options(
             Path::new(&flm_path_str),
             FlmLoadOptions {
@@ -9311,7 +9302,6 @@ mod tests {
 
     #[test]
     fn virtual_arena_loads_baked_weight_and_expert_tensors() {
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
             eprintln!("skip: HIP VMM unsupported on this device/runtime");
             return;
@@ -9397,7 +9387,6 @@ mod tests {
 
     #[test]
     fn virtual_arena_load_initializes_mapped_pages_by_copy_without_clearing() {
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
             eprintln!("skip: HIP VMM unsupported on this device/runtime");
             return;
@@ -9475,7 +9464,6 @@ mod tests {
 
     #[test]
     fn virtual_arena_range_load_supports_explicit_pageable_backend() {
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
             eprintln!("skip: HIP VMM unsupported on this device/runtime");
             return;
@@ -9554,7 +9542,6 @@ mod tests {
 
     #[test]
     fn virtual_arena_range_load_names_gpu_direct_backend_without_fallback() {
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
             eprintln!("skip: HIP VMM unsupported on this device/runtime");
             return;
@@ -9629,7 +9616,6 @@ mod tests {
 
     #[test]
     fn virtual_arena_full_load_honors_explicit_gpu_direct_backend() {
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
             eprintln!("skip: HIP VMM unsupported on this device/runtime");
             return;
@@ -9698,7 +9684,6 @@ mod tests {
 
     #[test]
     fn virtual_arena_rejects_manifest_byte_len_mismatch() {
-        gpu_hal::set_backend(gpu_hal::Backend::Hip);
         if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
             eprintln!("skip: HIP VMM unsupported on this device/runtime");
             return;

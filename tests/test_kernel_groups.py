@@ -13,6 +13,29 @@ HAL_LIB = ROOT / "crates" / "gpu-hal" / "src" / "lib.rs"
 HAL_OPS = ROOT / "crates" / "gpu-hal" / "src" / "ops.rs"
 HAL_VMM = ROOT / "crates" / "gpu-hal" / "src" / "vmm.rs"
 KERNEL_FFI_SRC = ROOT / "crates" / "kernel-ffi" / "src"
+RETAINED_SOURCE_ROOTS = (
+    ROOT / "crates" / "core" / "src",
+    ROOT / "crates" / "gpu-hal" / "src",
+    ROOT / "crates" / "kernel-ffi" / "src",
+    ROOT / "crates" / "qwen35" / "src",
+    ROOT / "crates" / "runtime" / "src",
+    ROOT / "kernels",
+)
+
+
+LEGACY_CONTENT_RE = re.compile(
+    r"(?:certified[-_]kv|certifiedkv|dflash|specprefill|spec_prefill|"
+    r"metal|cuda|qwen3[.]6|qwen36)",
+    re.IGNORECASE,
+)
+
+
+def retained_source_text():
+    for root in RETAINED_SOURCE_ROOTS:
+        for path in root.rglob("*"):
+            if path.suffix not in {".rs", ".c", ".cc", ".cpp", ".h", ".hip"}:
+                continue
+            yield path, path.read_text(encoding="utf-8")
 
 
 def manifest_sources(group):
@@ -81,6 +104,44 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
             self.assertNotIn("supersonic_backend_cuda", text)
             self.assertNotIn("supersonic_backend_metal", text)
             self.assertNotRegex(text, r"\b(?:nvcc|CUDA|Metal|metal)\b")
+
+    def test_build_manifest_is_the_only_kernel_group_source_of_truth(self):
+        build = KERNEL_BUILD.read_text(encoding="utf-8")
+        self.assertIn("kernel-groups.toml", build)
+        self.assertNotRegex(
+            build,
+            r"\b(?:HIP_GROUPS|HIP_BRIDGES|KERNEL_RERUN_PATHS)\b",
+        )
+
+    def test_retained_sources_have_no_removed_implementation_content(self):
+        violations = []
+        for path, source in retained_source_text():
+            for line_number, line in enumerate(source.splitlines(), start=1):
+                match = LEGACY_CONTENT_RE.search(line)
+                if match:
+                    violations.append(f"{path}:{line_number}: {match.group(0)}")
+        self.assertEqual([], violations[:20], "legacy retained source content: " + "; ".join(violations[:20]))
+        self.assertEqual([], violations)
+
+    def test_public_ffi_and_backend_api_has_no_removed_surfaces(self):
+        api_files = (
+            ROOT / "crates" / "kernel-ffi" / "src" / "lib.rs",
+            ROOT / "crates" / "kernel-ffi" / "src" / "prefill_ffi.rs",
+            ROOT / "crates" / "kernel-ffi" / "src" / "qwen35.rs",
+            ROOT / "crates" / "gpu-hal" / "src" / "backend.rs",
+            ROOT / "crates" / "gpu-hal" / "src" / "lib.rs",
+        )
+        forbidden_public = re.compile(
+            r"\b(?:Backend::(?:Cuda|Metal)|(?:pub\s+)?(?:fn|struct|enum|type|const|static)\s+"
+            r"[^\n]*(?:certified|dflash|specprefill|metal|cuda|qwen36))",
+            re.IGNORECASE,
+        )
+        violations = []
+        for path in api_files:
+            for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                if forbidden_public.search(line):
+                    violations.append(f"{path}:{line_number}: {line.strip()}")
+        self.assertEqual([], violations)
 
     def test_gpu_hal_exposes_only_hip_backend_surfaces(self):
         backend = HAL_BACKEND.read_text(encoding="utf-8")

@@ -31,7 +31,6 @@ fn main() -> Result<()> {
 
     // HIP is implicit in the product contract; there is no backend argument
     // or environment fallback in public startup.
-    gpu_hal::set_backend(Backend::Hip);
     let gpu = query_gpu_info(cli.device)?;
     let entry = lookup_registry_entry(&gpu.gpu_arch)?;
     install_arch_profile(entry);

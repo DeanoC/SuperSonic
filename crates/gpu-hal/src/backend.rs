@@ -4,25 +4,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Hip,
-    Cuda,
-    Metal,
-}
-
-impl Backend {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "hip" => Some(Self::Hip),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Hip => write!(f, "HIP"),
-            Self::Cuda => write!(f, "CUDA"),
-            Self::Metal => write!(f, "Metal"),
         }
     }
 }
@@ -37,11 +24,9 @@ pub struct DeviceInfo {
 
 /// How a GPU's memory is wired relative to host RAM.
 ///
-/// Drives allocation/copy policy in `gpu-hal`. `Discrete` (default) keeps the
-/// classic `hipMalloc` / `cudaMalloc` device-pointer path. `Unified` switches
-/// HIP allocations to mapped+coherent host pages so host and device address
-/// the same physical bytes — the right shape for APUs (gfx1150) and Apple
-/// M-series, where there is no separate VRAM.
+/// Drives allocation/copy policy in `gpu-hal`. `Discrete` keeps classic HIP
+/// device-pointer allocation. `Unified` switches HIP allocations to mapped
+/// coherent host pages for integrated-memory devices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryArchitecture {
     Discrete,
@@ -93,8 +78,7 @@ pub enum BufferKind {
 
 /// Mechanism a `BufferPolicy` resolves a `BufferKind` to.
 ///
-/// `Default` is always-safe: classic `hipMalloc` / `cudaMalloc` / metal
-/// device memory. `HostMapped` is HIP-only and means
+/// `Default` is always-safe classic HIP device memory. `HostMapped` means
 /// `hipHostMalloc(MAPPED) + hipHostGetDevicePointer` — saves the H2D copy
 /// on APUs but bypasses GPU L2 on RDNA3.5 (see investigation doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -129,10 +113,7 @@ impl AllocStrategy {
 /// kind routes through the classic allocator. Platforms where a non-default
 /// strategy actually wins flip the relevant entry.
 ///
-/// Today's table:
-///   - gfx1150 (RDNA3.5 APU)            : `{Persistent: Default, Scratch: HostMapped}`
-///   - gfx1100 (RDNA3 dGPU), sm86       : `{Default, Default}` — no host-mapped path benefit
-///   - apple-m4 (Metal)                 : `{Default, Default}` — Metal owns the unified-memory wiring; HIP enums don't apply
+/// The active table is selected by the HIP device profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BufferPolicy {
     pub persistent: AllocStrategy,
@@ -159,25 +140,16 @@ static DEFAULT_MEMORY_ARCHITECTURE: AtomicU8 = AtomicU8::new(0);
 static POLICY_PERSISTENT: AtomicU8 = AtomicU8::new(0);
 static POLICY_SCRATCH: AtomicU8 = AtomicU8::new(0);
 
-pub fn compiled_backends() -> Vec<Backend> {
-    vec![Backend::Hip]
-}
-
-pub fn is_backend_compiled(backend: Backend) -> bool {
-    backend == Backend::Hip
-}
-
-/// Retained for callers that explicitly initialize the HAL. HIP is the only
-/// compiled backend, so a caller's legacy choice cannot change execution.
-pub fn set_backend(_backend: Backend) {
-}
-
 pub fn current_backend() -> Backend {
     Backend::Hip
 }
 
+pub fn compiled_backends() -> Vec<Backend> {
+    vec![Backend::Hip]
+}
+
 /// Set the active memory architecture. Called once at startup after
-/// `set_backend`, typically from `ArchProfile::for_arch(...).memory`.
+/// typically from `ArchProfile::for_arch(...).memory`.
 pub fn set_memory_architecture(arch: MemoryArchitecture) {
     DEFAULT_MEMORY_ARCHITECTURE.store(arch.code(), Ordering::Relaxed);
 }

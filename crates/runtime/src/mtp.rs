@@ -2,8 +2,8 @@
 //!
 //! This module owns the allocations that are shared by the retained MTP
 //! verify paths.  The decode engine still owns the surrounding acceptance
-//! policy and the legacy tree/tap rollback paths; only the reusable MTP
-//! buffers and the state-restore boundary live here.
+//! policy; only the reusable MTP buffers and the state-restore boundary live
+//! here.
 
 use anyhow::Result;
 use gpu_hal::{GpuBuffer, ScalarType};
@@ -12,10 +12,7 @@ use qwen35::rotary::RotaryTables;
 use qwen35::state::{LinearStateSnapshot, ModelState};
 use qwen35::weights::Qwen35Weights;
 
-use crate::prefill_engine::{
-    alloc_append_rollback, append_rollback_matches, PrefillAppendGpuTapSink, PrefillAppendRollback,
-    PrefillAppendVerifyResult, PrefillScratch,
-};
+use crate::prefill_engine::{PrefillAppendVerifyResult, PrefillScratch};
 
 /// Reusable workspace for fused multi-token MTP verification.
 ///
@@ -147,7 +144,6 @@ pub struct MtpPrefillAppendCache {
     pub(crate) scratch: PrefillScratch,
     pub(crate) chunk_conv_tail: Vec<Option<GpuBuffer>>,
     pub(crate) token_ids_gpu: GpuBuffer,
-    pub(crate) rollback: Option<PrefillAppendRollback>,
 }
 
 impl MtpPrefillAppendCache {
@@ -177,34 +173,11 @@ impl MtpPrefillAppendCache {
             scratch,
             chunk_conv_tail,
             token_ids_gpu,
-            rollback: None,
         })
     }
 
     pub(crate) fn matches(&self, chunk_len: usize, ordinal: usize) -> bool {
         self.chunk_len == chunk_len && self.ordinal == ordinal
-    }
-
-    pub(crate) fn take_rollback(
-        &mut self,
-        config: &TextConfig,
-        pos_offset: usize,
-        ordinal: usize,
-    ) -> Result<PrefillAppendRollback> {
-        if let Some(mut rollback) = self.rollback.take() {
-            if append_rollback_matches(config, &rollback, self.chunk_len, ordinal) {
-                rollback.pos_offset = pos_offset;
-                rollback.chunk_len = self.chunk_len;
-                return Ok(rollback);
-            }
-        }
-        alloc_append_rollback(config, self.chunk_len, pos_offset, ordinal)
-    }
-
-    pub(crate) fn recycle_rollback(&mut self, rollback: PrefillAppendRollback) {
-        if rollback.chunk_len == self.chunk_len {
-            self.rollback = Some(rollback);
-        }
     }
 }
 
@@ -220,20 +193,15 @@ pub(crate) fn restore_linear_state(
 }
 
 /// Ask the HIP bridge to restore its captured linear prefix, when available.
-/// The bridge's C symbol retains its historical ABI spelling; this Rust
-/// boundary is the Qwen3.8 MTP-facing name and fallback contract.
+/// The external symbol spelling remains stable at this boundary.
 pub(crate) fn restore_linear_prefix(commit_len: usize) -> Result<bool> {
     kernel_ffi::mtp_restore_linear_prefix(commit_len)
         .map_err(|e| anyhow::anyhow!("mtp restore linear prefix: {e}"))
 }
 
 /// MTP-owned entry point for the cached prefill-append verifier.
-///
-/// The numerical layer primitives remain implemented by `prefill_engine`; the
-/// retained product calls them through this module so cache ownership and the
-/// MTP acceptance boundary stay together.
 #[allow(clippy::too_many_arguments)]
-pub fn prefill_append_verify_cached_with_gpu_taps(
+pub fn prefill_append_verify_cached(
     weights: &Qwen35Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
@@ -242,14 +210,11 @@ pub fn prefill_append_verify_cached_with_gpu_taps(
     ordinal: usize,
     kv_chunk_size: usize,
     use_4b_kernel: bool,
-    tap_layers: Option<&[usize]>,
-    capture_rollback: bool,
     greedy_only: bool,
     greedy_compare_tokens: Option<&[u32]>,
     cache: &mut MtpPrefillAppendCache,
-    gpu_tap_sink: Option<&mut PrefillAppendGpuTapSink<'_>>,
 ) -> Result<PrefillAppendVerifyResult> {
-    crate::prefill_engine::prefill_append_verify_cached_with_gpu_taps(
+    crate::prefill_engine::prefill_append_verify_cached(
         weights,
         state,
         rotary,
@@ -258,12 +223,9 @@ pub fn prefill_append_verify_cached_with_gpu_taps(
         ordinal,
         kv_chunk_size,
         use_4b_kernel,
-        tap_layers,
-        capture_rollback,
         greedy_only,
         greedy_compare_tokens,
         cache,
-        gpu_tap_sink,
     )
 }
 

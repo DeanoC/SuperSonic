@@ -183,11 +183,11 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
     };
     let scale_or_gqh_sidecar =
         |role: &str, int4: &Option<gpu_hal::GpuBuffer>| -> *const std::ffi::c_void {
-        weights
-            .gqh_sidecars
-            .get(role)
-            .map(|buf| buf.as_ptr())
-            .unwrap_or_else(|| ptr(int4))
+            weights
+                .gqh_sidecars
+                .get(role)
+                .map(|buf| buf.as_ptr())
+                .unwrap_or_else(|| ptr(int4))
         };
 
     let mut descs = Vec::with_capacity(weights.layers.len());
@@ -267,16 +267,8 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
                     weights.config.linear_num_value_heads * weights.config.linear_value_head_dim,
                     lin.out_proj_int4_scale.is_some(),
                 );
-                d.a_proj_type = infer_lowbit_type(
-                    &lin.a_proj_w,
-                    weights.config.hidden_size,
-                    false,
-                );
-                d.b_proj_type = infer_lowbit_type(
-                    &lin.b_proj_w,
-                    weights.config.hidden_size,
-                    false,
-                );
+                d.a_proj_type = infer_lowbit_type(&lin.a_proj_w, weights.config.hidden_size, false);
+                d.b_proj_type = infer_lowbit_type(&lin.b_proj_w, weights.config.hidden_size, false);
             }
             LayerKind::Full => {
                 let fa = lw.full.as_ref().unwrap();

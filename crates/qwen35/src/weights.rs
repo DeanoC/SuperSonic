@@ -183,16 +183,12 @@ pub fn ggml_k_row_bytes(qtype: i32, cols: usize) -> Option<usize> {
         LOWBIT_GGML_Q4_K => Some(blocks * 144),
         LOWBIT_GGML_Q5_K => Some(blocks * 176),
         LOWBIT_GGML_Q6_K => Some(blocks * 210),
-        LOWBIT_ROCMFP3_MIX => model_store::dmix2::row_bytes(
-            model_store::dmix2::GGML_TYPE_Q3_1_ROCMFP3_MIX,
-            cols,
-        )
-        .ok(),
-        LOWBIT_ROCMFP2_MIX => model_store::dmix2::row_bytes(
-            model_store::dmix2::GGML_TYPE_Q2_1_ROCMFP2_MIX,
-            cols,
-        )
-        .ok(),
+        LOWBIT_ROCMFP3_MIX => {
+            model_store::dmix2::row_bytes(model_store::dmix2::GGML_TYPE_Q3_1_ROCMFP3_MIX, cols).ok()
+        }
+        LOWBIT_ROCMFP2_MIX => {
+            model_store::dmix2::row_bytes(model_store::dmix2::GGML_TYPE_Q2_1_ROCMFP2_MIX, cols).ok()
+        }
         LOWBIT_GQH3 => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh3, cols),
         LOWBIT_GQH2_H => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh2H, cols),
         LOWBIT_GQH2_C => model_store::gqh::device_row_bytes(model_store::gqh::GqhRung::Gqh2C, cols),
@@ -249,9 +245,8 @@ pub fn matmul_gqh(
     qtype: i32,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    let rung = kernel_ffi::gqh::rung_from_ggml_type(qtype as u32).ok_or_else(|| {
-        GpuError::InvalidArg(format!("not a GQH qtype: {qtype}"))
-    })?;
+    let rung = kernel_ffi::gqh::rung_from_ggml_type(qtype as u32)
+        .ok_or_else(|| GpuError::InvalidArg(format!("not a GQH qtype: {qtype}")))?;
     let header = kernel_ffi::gqh::lookup_header(weight.as_ptr());
     if header.is_none() && qtype != LOWBIT_GQH2_C {
         return Err(GpuError::InvalidArg(
@@ -290,16 +285,7 @@ pub fn matmul_mix(
         GpuError::InvalidArg("mix sidecar not registered for weight buffer".into())
     })?;
     kernel_ffi::prefill_ffi::matmul_rhs_transposed_mix(
-        ordinal,
-        m,
-        n,
-        k,
-        lhs,
-        weight,
-        mix.mode,
-        &mix.lut,
-        qtype,
-        out,
+        ordinal, m, n, k, lhs, weight, mix.mode, &mix.lut, qtype, out,
     )
 }
 

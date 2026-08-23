@@ -36,9 +36,8 @@ pub fn block_bytes(qtype: u32) -> Option<usize> {
 }
 
 pub fn row_bytes(qtype: u32, cols: usize) -> Result<usize, Error> {
-    let blk = block_bytes(qtype).ok_or_else(|| {
-        Error::Other(format!("not a mix qtype: {qtype}"))
-    })?;
+    let blk =
+        block_bytes(qtype).ok_or_else(|| Error::Other(format!("not a mix qtype: {qtype}")))?;
     if cols == 0 || cols % MIX_QK != 0 {
         return Err(Error::Other(format!(
             "mix qtype {qtype} cols {cols} is not a multiple of {MIX_QK}"
@@ -202,7 +201,9 @@ pub fn parse_dmix2_kv(blob: &[u8]) -> Result<BTreeMap<String, MixHeader>, Error>
             return Err(Error::Other(format!("{DMIX2_KV} duplicate '{name}'")));
         }
         if off + 16 > blob.len() {
-            return Err(Error::Other(format!("{DMIX2_KV} '{name}' truncated metadata")));
+            return Err(Error::Other(format!(
+                "{DMIX2_KV} '{name}' truncated metadata"
+            )));
         }
         let qtype = u32::from_le_bytes(blob[off..off + 4].try_into().unwrap());
         let c = u32::from_le_bytes(blob[off + 4..off + 8].try_into().unwrap());
@@ -219,7 +220,9 @@ pub fn parse_dmix2_kv(blob: &[u8]) -> Result<BTreeMap<String, MixHeader>, Error>
         }
         let cb_bytes = (c * k * 2) as usize;
         if off + cb_bytes > blob.len() {
-            return Err(Error::Other(format!("{DMIX2_KV} '{name}' truncated codebook")));
+            return Err(Error::Other(format!(
+                "{DMIX2_KV} '{name}' truncated codebook"
+            )));
         }
         let mut lut = [0.0f32; 16];
         for (i, chunk) in blob[off..off + cb_bytes].chunks_exact(2).enumerate() {

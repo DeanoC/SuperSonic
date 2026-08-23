@@ -40,6 +40,7 @@ notes = "Qwen3.8 GQH decode and fused dequant-matvec."
 kernel_sources = [
   "kernels/gqh.hip",
   "kernels/gqh-tables.h",
+  "kernels/gqh-stride.h",
 ]
 rust_modules = [
   "crates/kernel-ffi/src/gqh.rs",

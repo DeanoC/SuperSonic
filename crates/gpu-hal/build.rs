@@ -68,7 +68,10 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hip)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hipfile)");
 
-    assert!(command_exists("hipcc"), "No HIP toolchain found; install hipcc.");
+    assert!(
+        command_exists("hipcc"),
+        "No HIP toolchain found; install hipcc."
+    );
     println!("cargo:rustc-cfg=supersonic_backend_hip");
 
     let Some(hipfile_root) = detect_hipfile_root() else {
@@ -86,7 +89,10 @@ fn main() {
         .flag("-std=c++17")
         .define("__HIP_PLATFORM_AMD__", None);
     build.compile("gpu_hal_hipfile");
-    println!("cargo:rustc-link-search=native={}", hipfile_lib_dir.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        hipfile_lib_dir.display()
+    );
     println!("cargo:rustc-link-lib=hipfile");
     println!("cargo:rustc-cfg=supersonic_backend_hipfile");
 }

@@ -15,7 +15,7 @@ __device__ int qwen35_split_seqlen;
 // Legacy symbol; steal skip is now per-layer via io_flags bit 4.
 __device__ int qwen35_gemv_out_mask;
 
-// Per-section timing slot layout (mirrors the CUDA kernel's layout so the Rust
+// Per-section timing slot layout mirrors the host decoder's layout so the Rust
 // reader `decode_persistent_4b_timing_slots` is backend-agnostic). Each layer
 // owns QWEN35_4B_TIMING_COUNT u64 slots; per-batch-item sections (CORE/OUT)
 // reserve 8 slots each so batch_size up to 8 is covered.
@@ -1472,474 +1472,6 @@ __global__ void supersonic_qwen35_linear_prefill_conv_pack_kernel(
 
     const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
     out[tid] = supersonic_qwen35_from_float<T>(silu);
-}
-
-template <typename T>
-__global__ void supersonic_qwen35_linear_stateful_conv_kernel(
-    int batch_size,
-    int conv_dim,
-    int seq_len,
-    int state_len,
-    int kernel_size,
-    const T* mixed_qkv,
-    const T* prev_state,
-    const T* weights,
-    T* out
-) {
-    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    const size_t output_elems =
-        static_cast<size_t>(batch_size) * static_cast<size_t>(seq_len) * static_cast<size_t>(conv_dim);
-    if (tid >= output_elems) {
-        return;
-    }
-
-    const size_t b = tid / (static_cast<size_t>(seq_len) * static_cast<size_t>(conv_dim));
-    const size_t rem = tid - b * static_cast<size_t>(seq_len) * static_cast<size_t>(conv_dim);
-    const size_t t = rem / static_cast<size_t>(conv_dim);
-    const size_t c = rem - t * static_cast<size_t>(conv_dim);
-
-    const size_t mixed_b_offset =
-        b * static_cast<size_t>(conv_dim) * static_cast<size_t>(seq_len);
-    const size_t mixed_c_offset = mixed_b_offset + c * static_cast<size_t>(seq_len);
-    const size_t state_b_offset =
-        b * static_cast<size_t>(conv_dim) * static_cast<size_t>(state_len);
-    const size_t state_c_offset = state_b_offset + c * static_cast<size_t>(state_len);
-    const size_t weight_offset = c * static_cast<size_t>(kernel_size);
-
-    float acc = 0.0f;
-    const int history = kernel_size - 1;
-    for (int tap = 0; tap < kernel_size; ++tap) {
-        const int src = static_cast<int>(t) + tap - history;
-        float x = 0.0f;
-        if (src >= 0) {
-            x = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
-        } else {
-            const int state_idx = state_len + src;
-            if (state_idx >= 0) {
-                x = supersonic_qwen35_to_float(prev_state[state_c_offset + static_cast<size_t>(state_idx)]);
-            }
-        }
-        acc += x * supersonic_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
-    }
-
-    const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
-    out[tid] = supersonic_qwen35_from_float<T>(silu);
-}
-
-template <typename T>
-__global__ void supersonic_qwen35_linear_stateful_conv_value_decay_kernel(
-    int batch_size,
-    int conv_dim,
-    int seq_len,
-    int state_len,
-    int kernel_size,
-    int num_heads,
-    const T* mixed_qkv,
-    const T* prev_state,
-    const T* weights,
-    const T* a,
-    const T* dt_bias,
-    const T* a_log_exp,
-    T* out
-) {
-    const size_t out_width = static_cast<size_t>(conv_dim) + static_cast<size_t>(num_heads);
-    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    const size_t output_elems =
-        static_cast<size_t>(batch_size) * static_cast<size_t>(seq_len) * out_width;
-    if (tid >= output_elems) {
-        return;
-    }
-
-    const size_t b = tid / (static_cast<size_t>(seq_len) * out_width);
-    const size_t rem = tid - b * static_cast<size_t>(seq_len) * out_width;
-    const size_t t = rem / out_width;
-    const size_t c = rem - t * out_width;
-
-    if (c < static_cast<size_t>(conv_dim)) {
-        const size_t mixed_b_offset =
-            b * static_cast<size_t>(conv_dim) * static_cast<size_t>(seq_len);
-        const size_t mixed_c_offset = mixed_b_offset + c * static_cast<size_t>(seq_len);
-        const size_t state_b_offset =
-            b * static_cast<size_t>(conv_dim) * static_cast<size_t>(state_len);
-        const size_t state_c_offset = state_b_offset + c * static_cast<size_t>(state_len);
-        const size_t weight_offset = c * static_cast<size_t>(kernel_size);
-
-        float acc = 0.0f;
-        const int history = kernel_size - 1;
-        for (int tap = 0; tap < kernel_size; ++tap) {
-            const int src = static_cast<int>(t) + tap - history;
-            float x = 0.0f;
-            if (src >= 0) {
-                x = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
-            } else {
-                const int state_idx = state_len + src;
-                if (state_idx >= 0) {
-                    x = supersonic_qwen35_to_float(
-                        prev_state[state_c_offset + static_cast<size_t>(state_idx)]
-                    );
-                }
-            }
-            acc += x * supersonic_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
-        }
-
-        const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
-        out[tid] = supersonic_qwen35_from_float<T>(silu);
-        return;
-    }
-
-    const size_t head = c - static_cast<size_t>(conv_dim);
-    const size_t a_base =
-        b * static_cast<size_t>(seq_len) * static_cast<size_t>(num_heads) +
-        t * static_cast<size_t>(num_heads);
-    const float a_val = supersonic_qwen35_to_float(a[a_base + head]);
-    const float bias = supersonic_qwen35_to_float(dt_bias[head]);
-    const float decay = supersonic_qwen35_to_float(a_log_exp[head]);
-    const float softplus = logf(1.0f + expf(a_val + bias));
-    out[tid] = supersonic_qwen35_from_float<T>(-softplus * decay);
-}
-
-template <typename T>
-__global__ void supersonic_qwen35_linear_stateful_conv_value_decay_kernel_k4s3(
-    int batch_size,
-    int conv_dim,
-    int seq_len,
-    int num_heads,
-    const T* mixed_qkv,
-    const T* prev_state,
-    const T* weights,
-    const T* a,
-    const T* dt_bias,
-    const T* a_log_exp,
-    T* out
-) {
-    const size_t out_width = static_cast<size_t>(conv_dim) + static_cast<size_t>(num_heads);
-    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    const size_t output_elems =
-        static_cast<size_t>(batch_size) * static_cast<size_t>(seq_len) * out_width;
-    if (tid >= output_elems) {
-        return;
-    }
-
-    const size_t b = tid / (static_cast<size_t>(seq_len) * out_width);
-    const size_t rem = tid - b * static_cast<size_t>(seq_len) * out_width;
-    const size_t t = rem / out_width;
-    const size_t c = rem - t * out_width;
-
-    if (c < static_cast<size_t>(conv_dim)) {
-        const size_t mixed_b_offset =
-            b * static_cast<size_t>(conv_dim) * static_cast<size_t>(seq_len);
-        const size_t mixed_c_offset = mixed_b_offset + c * static_cast<size_t>(seq_len);
-        const size_t state_b_offset =
-            b * static_cast<size_t>(conv_dim) * 3u;
-        const size_t state_c_offset = state_b_offset + c * 3u;
-        const size_t weight_offset = c * 4u;
-
-        float acc;
-        if (t >= 3) {
-            acc = supersonic_qwen35_conv4_contiguous_t_ge3(
-                mixed_qkv, mixed_c_offset, t, weights, weight_offset);
-        } else if (t == 2) {
-            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
-            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x1 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x2 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
-            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 2]);
-            acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
-        } else if (t == 1) {
-            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
-            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x1 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x2 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
-            acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
-        } else {
-            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
-            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 0]);
-            const float x1 = supersonic_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x2 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
-        }
-        const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
-        out[tid] = supersonic_qwen35_from_float<T>(silu);
-        return;
-    }
-
-    const size_t head = c - static_cast<size_t>(conv_dim);
-    const size_t a_base =
-        b * static_cast<size_t>(seq_len) * static_cast<size_t>(num_heads) +
-        t * static_cast<size_t>(num_heads);
-    const float a_val = supersonic_qwen35_to_float(a[a_base + head]);
-    const float bias = supersonic_qwen35_to_float(dt_bias[head]);
-    const float decay = supersonic_qwen35_to_float(a_log_exp[head]);
-    const float softplus = logf(1.0f + expf(a_val + bias));
-    out[tid] = supersonic_qwen35_from_float<T>(-softplus * decay);
-}
-
-template <typename T>
-__global__ void supersonic_qwen35_linear_stateful_conv_value_decay_with_state_kernel_k4s3(
-    int batch_size,
-    int conv_dim,
-    int seq_len,
-    int num_heads,
-    const T* mixed_qkv,
-    const T* prev_state,
-    const T* weights,
-    const T* a,
-    const T* dt_bias,
-    const T* a_log_exp,
-    T* out
-) {
-    const size_t out_width = static_cast<size_t>(conv_dim) + static_cast<size_t>(num_heads);
-    const size_t packed_per_batch = static_cast<size_t>(seq_len) * out_width;
-    const size_t state_per_batch = static_cast<size_t>(conv_dim) * 3u;
-    const size_t total_per_batch = packed_per_batch + state_per_batch;
-    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    const size_t total_elems = static_cast<size_t>(batch_size) * total_per_batch;
-    if (tid >= total_elems) {
-        return;
-    }
-
-    const size_t b = tid / total_per_batch;
-    const size_t batch_offset = tid - b * total_per_batch;
-    const size_t mixed_b_offset =
-        b * static_cast<size_t>(conv_dim) * static_cast<size_t>(seq_len);
-    const size_t state_b_offset = b * static_cast<size_t>(conv_dim) * 3u;
-
-    if (batch_offset >= packed_per_batch) {
-        const size_t state_idx = batch_offset - packed_per_batch;
-        const size_t c = state_idx / 3u;
-        const size_t s = state_idx - c * 3u;
-        const size_t mixed_c_offset = mixed_b_offset + c * static_cast<size_t>(seq_len);
-        out[tid] = mixed_qkv[mixed_c_offset + static_cast<size_t>(seq_len - 3) + s];
-        return;
-    }
-
-    const size_t t = batch_offset / out_width;
-    const size_t c = batch_offset - t * out_width;
-
-    if (c < static_cast<size_t>(conv_dim)) {
-        const size_t mixed_c_offset = mixed_b_offset + c * static_cast<size_t>(seq_len);
-        const size_t state_c_offset = state_b_offset + c * 3u;
-        const size_t weight_offset = c * 4u;
-
-        float acc;
-        if (t >= 3) {
-            acc = supersonic_qwen35_conv4_contiguous_t_ge3(
-                mixed_qkv, mixed_c_offset, t, weights, weight_offset);
-        } else if (t == 2) {
-            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
-            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x1 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x2 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
-            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 2]);
-            acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
-        } else if (t == 1) {
-            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
-            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x1 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x2 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
-            acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
-        } else {
-            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
-            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 0]);
-            const float x1 = supersonic_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x2 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
-        }
-        const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
-        out[tid] = supersonic_qwen35_from_float<T>(silu);
-        return;
-    }
-
-    const size_t head = c - static_cast<size_t>(conv_dim);
-    const size_t a_base =
-        b * static_cast<size_t>(seq_len) * static_cast<size_t>(num_heads) +
-        t * static_cast<size_t>(num_heads);
-    const float a_val = supersonic_qwen35_to_float(a[a_base + head]);
-    const float bias = supersonic_qwen35_to_float(dt_bias[head]);
-    const float decay = supersonic_qwen35_to_float(a_log_exp[head]);
-    const float softplus = logf(1.0f + expf(a_val + bias));
-    out[tid] = supersonic_qwen35_from_float<T>(-softplus * decay);
-}
-
-template <typename T, int MAX_K = 256>
-__global__ void supersonic_qwen35_linear_decode_prepare_kernel(
-    int batch_size,
-    int num_v_heads,
-    int head_k_dim,
-    int head_v_dim,
-    int state_len,
-    int kernel_size,
-    int head_repeat,
-    const T* mixed_qkv,
-    const T* prev_conv_state,
-    const T* weights,
-    const T* a_beta_raw,
-    const T* dt_bias,
-    const T* a_log_exp,
-    float* out
-) {
-    const int pair = static_cast<int>(blockIdx.x);
-    const int tid = static_cast<int>(threadIdx.x);
-    const int total_pairs = batch_size * num_v_heads;
-    if (pair >= total_pairs || head_k_dim > MAX_K) {
-        return;
-    }
-
-    const int value_dim = num_v_heads * head_v_dim;
-    const int key_dim = (num_v_heads / head_repeat) * head_k_dim;
-    const int conv_dim = key_dim * 2 + value_dim;
-    const int packed_width = 2 * head_k_dim + head_v_dim + 2;
-
-    const int batch = pair / num_v_heads;
-    const int v_head = pair - batch * num_v_heads;
-    const int num_k_heads = num_v_heads / head_repeat;
-    const int k_head = v_head % num_k_heads;
-    const int mixed_batch_base = batch * conv_dim;
-    const int state_batch_base = batch * conv_dim * state_len;
-    const int pair_out_base = pair * packed_width;
-
-    auto conv_channel = [&](int channel) -> float {
-        const int weight_base = channel * kernel_size;
-        const int state_base = state_batch_base + channel * state_len;
-        float acc = 0.0f;
-        if (kernel_size == 4 && state_len == 3) {
-            acc = supersonic_qwen35_conv4_state3_decode(
-                mixed_qkv,
-                static_cast<size_t>(mixed_batch_base + channel),
-                prev_conv_state,
-                static_cast<size_t>(state_base),
-                weights,
-                static_cast<size_t>(weight_base));
-        } else {
-            for (int tap = 0; tap < kernel_size; ++tap) {
-                float x = 0.0f;
-                if (tap + 1 == kernel_size) {
-                    x = supersonic_qwen35_to_float(mixed_qkv[mixed_batch_base + channel]);
-                } else if (tap < state_len) {
-                    x = supersonic_qwen35_to_float(prev_conv_state[state_base + tap]);
-                }
-                acc += x * supersonic_qwen35_to_float(weights[weight_base + tap]);
-            }
-        }
-        const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
-        return supersonic_qwen35_to_float(supersonic_qwen35_from_float<T>(silu));
-    };
-
-    __shared__ float shared_q[MAX_K];
-    __shared__ float shared_k[MAX_K];
-    if (tid < head_k_dim) {
-        const int q_base = k_head * head_k_dim;
-        const int k_base = key_dim + k_head * head_k_dim;
-        shared_q[tid] = conv_channel(q_base + tid);
-        shared_k[tid] = conv_channel(k_base + tid);
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        float q_sq_sum = 0.0f;
-        float k_sq_sum = 0.0f;
-        for (int k_idx = 0; k_idx < head_k_dim; ++k_idx) {
-            q_sq_sum += shared_q[k_idx] * shared_q[k_idx];
-            k_sq_sum += shared_k[k_idx] * shared_k[k_idx];
-        }
-        const float q_inv = rsqrtf(q_sq_sum + 1e-6f);
-        const float k_inv = rsqrtf(k_sq_sum + 1e-6f);
-        for (int k_idx = 0; k_idx < head_k_dim; ++k_idx) {
-            out[pair_out_base + k_idx] = shared_q[k_idx] * q_inv * rsqrtf(static_cast<float>(head_k_dim));
-            out[pair_out_base + head_k_dim + k_idx] = shared_k[k_idx] * k_inv;
-        }
-        const int head_base = batch * (2 * num_v_heads) + v_head;
-        const float a_raw = supersonic_qwen35_to_float(a_beta_raw[head_base]);
-        const float beta_raw = supersonic_qwen35_to_float(a_beta_raw[head_base + num_v_heads]);
-        out[pair_out_base + 2 * head_k_dim + head_v_dim] =
-            1.0f / (1.0f + expf(-beta_raw));
-        const float bias = supersonic_qwen35_to_float(dt_bias[v_head]);
-        const float decay = supersonic_qwen35_to_float(a_log_exp[v_head]);
-        const float g = -logf(1.0f + expf(a_raw + bias)) * decay;
-        out[pair_out_base + 2 * head_k_dim + head_v_dim + 1] = expf(g);
-    }
-    if (tid < head_v_dim) {
-        const int value_channel = key_dim * 2 + v_head * head_v_dim + tid;
-        out[pair_out_base + 2 * head_k_dim + tid] = conv_channel(value_channel);
-    }
-}
-
-template <int MAX_K = 256>
-__global__ void supersonic_qwen35_linear_decode_apply_kernel(
-    int batch_size,
-    int num_v_heads,
-    int head_k_dim,
-    int head_v_dim,
-    const float* packed,
-    const float* initial_state,
-    float* out
-) {
-    const int pair = static_cast<int>(blockIdx.x);
-    const int tid = static_cast<int>(threadIdx.x);
-    const int total_pairs = batch_size * num_v_heads;
-    if (pair >= total_pairs || head_k_dim > MAX_K || tid >= head_v_dim) {
-        return;
-    }
-
-    const int value_dim = num_v_heads * head_v_dim;
-    const int packed_width = 2 * head_k_dim + head_v_dim + 2;
-    const int batch = pair / num_v_heads;
-    const int v_head = pair - batch * num_v_heads;
-    const int v_idx = tid;
-    const int pair_base = pair * packed_width;
-    const int state_head_base =
-        ((batch * num_v_heads + v_head) * head_k_dim) * head_v_dim + v_idx;
-    const int out_base =
-        batch * (value_dim + num_v_heads * head_k_dim * head_v_dim) + value_dim +
-        (v_head * head_k_dim) * head_v_dim + v_idx;
-
-    const float* q = packed + pair_base;
-    const float* k = packed + pair_base + head_k_dim;
-    const float* value = packed + pair_base + 2 * head_k_dim;
-    const float beta = packed[pair_base + 2 * head_k_dim + head_v_dim];
-    const float g_exp = packed[pair_base + 2 * head_k_dim + head_v_dim + 1];
-
-    float state[MAX_K];
-    for (int k_idx = 0; k_idx < head_k_dim; ++k_idx) {
-        state[k_idx] = initial_state[state_head_base + k_idx * head_v_dim] * g_exp;
-    }
-
-    float kv_mem = 0.0f;
-    for (int k_idx = 0; k_idx < head_k_dim; ++k_idx) {
-        kv_mem += state[k_idx] * k[k_idx];
-    }
-    const float delta = (value[v_idx] - kv_mem) * beta;
-
-    float out_value = 0.0f;
-    for (int k_idx = 0; k_idx < head_k_dim; ++k_idx) {
-        state[k_idx] += k[k_idx] * delta;
-        out_value += state[k_idx] * q[k_idx];
-        out[out_base + k_idx * head_v_dim] = state[k_idx];
-    }
-    out[batch * (value_dim + num_v_heads * head_k_dim * head_v_dim) + v_head * head_v_dim + v_idx] =
-        out_value;
 }
 
 template <typename T, int MAX_K = 256>
@@ -4133,7 +3665,7 @@ void supersonic_qwen35_matmul_rhs_transposed_tiled_wmma_kernel(
 
 // RDNA3 WMMA BF16 prefill matmul for small M, one wavefront per 16x16 tile.
 //
-// The 64x64 tiled BF16 kernel is efficient for long prefill, but for DFlash
+// The 64x64 tiled BF16 kernel is efficient for long prefill, but for
 // draft blocks (M=16) it computes mostly out-of-range row tiles. This path
 // keeps the same K-order and BF16 WMMA accumulate/output semantics while
 // matching the small-M tile geometry used by the INT4-dequant path below.
@@ -8910,7 +8442,7 @@ __device__ inline float ggml_q8_0_warp_dot(
         const int8_t q = reinterpret_cast<const int8_t*>(b + 2)[lane];
         const float term = (d * static_cast<float>(q)) * x[blk * 32 + lane];
         // Sequential 0..31 sum matches int4-dequant TILE_K inner loop
-        // (xor-reduce was 1 ULP off vs metal_v2 Q8_0).
+        // (the earlier xor reduction was 1 ULP off for Q8_0).
         float tile = 0.0f;
         for (int i = 0; i < 32; ++i) {
             tile += __shfl(term, i);
@@ -8923,7 +8455,7 @@ __device__ inline float ggml_q8_0_warp_dot(
 }
 
 #if defined(SUPERSONIC_HAS_WMMA_BF16)
-// One 16-column tile of the metal_v2 ggml-K small-m WMMA GEMV (m=1).
+// One 16-column tile of the ggml-K small-m WMMA GEMV (m=1).
 // x is BF16-aligned F32. 32-thread wave. Writes y[col0 .. col0+15].
 template <int kQtype>
 __device__ inline void ggml_k_wmma_m1_tile16(
@@ -10080,14 +9612,6 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
     int batch_size,                      // 1 for single-sequence, >1 for batched
     const BatchSeqDesc* __restrict__ batch_descs,  // nullptr for single, else [num_layers]
     const Qwen35INT4ScaleDesc* __restrict__ int4_scales,  // nullptr for non-INT4, else [num_layers]
-    // DFlash hidden-state taps (M1, currently plumbing-only): when tap_workspace != nullptr,
-    // the per-layer post-MLP residual hidden state for each layer in tap_layers[0..num_taps]
-    // is mirrored into tap_workspace at offset i * hidden_dim (i = tap index, not layer index).
-    // All three default to nullptr/0 from non-DFlash callers — the kernel body must treat
-    // them as no-op when tap_workspace == nullptr to preserve gfx1150 codegen on the hot path.
-    T* __restrict__ tap_workspace,       // nullptr disables; else [num_taps * hidden_dim]
-    const int* __restrict__ tap_layers,  // nullptr when tap_workspace is nullptr
-    int num_taps,                        // 0 when tap_workspace is nullptr
     int io_flags
 ) {
     const int tid = threadIdx.x;
@@ -11189,7 +10713,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     const int b_qt = int4_scales[layer].b_proj_type;
                     const int a_qt = int4_scales[layer].a_proj_type;
 #if defined(SUPERSONIC_HAS_WMMA_BF16)
-                    // Same 16-wide Q8_0 WMMA tiles as metal_v2 matmul_proj.
+                    // Same 16-wide Q8_0 WMMA tiles as the small-m matmul.
                     if (tid < 32 &&
                         static_cast<int>(blockIdx.x) * 16 < nv_heads) {
                         const int col0 = static_cast<int>(blockIdx.x) * 16;
@@ -11489,7 +11013,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                         __syncthreads();
                         // split_norm_transpose_qkv: inv = rsqrt(sumsq+eps),
                         // Q *= inv * (1/sqrt(hkd)), K *= inv. Pairwise tree
-                        // of 128 terms matches the 256-wide metal reduction.
+                        // of 128 terms matches the 256-wide reduction.
                         {
                             const float qv = (tid < hkd) ? q_s[tid] : 0.0f;
                             const float kv = (tid < hkd) ? k_s[tid] : 0.0f;
@@ -11594,7 +11118,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
                     if (head_local) {
                         // rms_norm_gated_sfirst: inv = rsqrt(mean(x^2)+eps),
                         // out = bf16(x * inv * w * silu(z)). Tree sum matches
-                        // the 256-wide metal reduction (upper half zero).
+                        // the 256-wide reduction (upper half zero).
                         const float xv = (tid < hvd) ? k_s[tid] : 0.0f;
                         if (tid < hvd) {
                             k_s[tid] = xv * xv;
@@ -12221,20 +11745,6 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
         }
         qwen35_4b_hip_record_timing(
             layer_timing_slots, QWEN35_4B_TIMING_MLP_DOWN, mlp_down_clock);
-        if (tap_workspace != nullptr) {
-            for (int t = 0; t < num_taps; ++t) {
-                if (tap_layers[t] == layer) {
-                    for (int b = 0; b < B; ++b) {
-                        for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
-                            tap_workspace[(t * B + b) * hidden_dim + c] =
-                                supersonic_qwen35_from_float<T>(hidden_f32[b * hidden_dim + c]);
-                        }
-                    }
-                }
-            }
-            __syncthreads();
-            grid_barrier(barrier_counter, barrier_flag, nb);
-        }
         } else if constexpr (kSplit == 0) {
         // === MLP down_proj (all blocks work-steal, per-sequence) ===
         // Process one batch item at a time: cache SwiGLU output in LDS, work-steal
@@ -12408,30 +11918,7 @@ __global__ __launch_bounds__(256, 2) void supersonic_qwen35_persistent_decode_ke
 
         // Residual add for MLP is fused into down_proj above.
 
-        // === DFlash hidden-state tap (M1.2) ===
-        // When the host requests it, mirror the post-MLP residual hidden state
-        // into tap_workspace for any tap layer matching `layer`. Layout is
-        // [num_taps, B, hidden_dim]. The branch is runtime-gated; we rely on
-        // the kernel never being launched with non-null tap params unless the
-        // workspace is sized for [num_taps * B * hidden_dim] T elements.
-        // hidden_f32 is settled at this point (last grid_barrier completed for
-        // the down_proj batch above); the new grid_barrier inside the if-branch
-        // serializes the tap write with the next layer's hidden_f32 mutations.
-        if (tap_workspace != nullptr) {
-            for (int t = 0; t < num_taps; ++t) {
-                if (tap_layers[t] == layer) {
-                    for (int b = 0; b < B; ++b) {
-                        for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
-                            tap_workspace[(t * B + b) * hidden_dim + c] =
-                                supersonic_qwen35_from_float<T>(hidden_f32[b * hidden_dim + c]);
-                        }
-                    }
-                }
-            }
-            __syncthreads();
-            grid_barrier(barrier_counter, barrier_flag, nb);
-        }
-        } // kSplit 0 fused down + taps
+        } // kSplit 0 fused down
     }
 
     // Write back F32 → BF16 for all batch items

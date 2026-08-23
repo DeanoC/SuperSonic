@@ -1,17 +1,9 @@
 use gpu_hal::{
-    copy_d2h, copy_h2d_async, current_backend, memset_zeros_async, set_backend, Backend, GpuBuffer,
-    GpuEvent, GpuStream, PinnedHostBuffer, RegisteredHostBuffer, ScalarType,
+    copy_d2h, copy_h2d_async, current_backend, memset_zeros_async, GpuBuffer, GpuEvent, GpuStream,
+    PinnedHostBuffer, RegisteredHostBuffer, ScalarType,
 };
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
-
-struct BackendRestore(Backend);
-
-impl Drop for BackendRestore {
-    fn drop(&mut self) {
-        set_backend(self.0);
-    }
-}
 
 struct AlignedHostPage {
     ptr: NonNull<u8>,
@@ -39,8 +31,6 @@ impl Drop for AlignedHostPage {
 
 #[test]
 fn pinned_host_buffer_smoke() {
-    let _restore = BackendRestore(current_backend());
-    set_backend(Backend::Hip);
     let mut pinned = match PinnedHostBuffer::new(0, 4096) {
         Ok(buffer) => buffer,
         Err(err) => {
@@ -56,8 +46,6 @@ fn pinned_host_buffer_smoke() {
 
 #[test]
 fn registered_host_buffer_smoke() {
-    let _restore = BackendRestore(current_backend());
-    set_backend(Backend::Hip);
     let mut page = AlignedHostPage::new(4096, 4096);
     let registered = match unsafe { RegisteredHostBuffer::new(0, page.as_mut_ptr().cast(), 4096) } {
         Ok(buffer) => buffer,
@@ -72,8 +60,6 @@ fn registered_host_buffer_smoke() {
 
 #[test]
 fn hip_stream_event_async_copy_smoke() {
-    let _restore = BackendRestore(current_backend());
-    set_backend(Backend::Hip);
     let stream = match GpuStream::new_nonblocking(0) {
         Ok(stream) => stream,
         Err(err) => {

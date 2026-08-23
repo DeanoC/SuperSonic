@@ -1,8 +1,6 @@
 use std::ffi::c_void;
 
-use gpu_hal::{
-    copy_h2d, sync, GpuBuffer, GpuError, HostBuffer, ScalarType, VirtualBacking, VirtualBuffer,
-};
+use gpu_hal::{copy_h2d, sync, GpuBuffer, GpuError, ScalarType, VirtualBacking, VirtualBuffer};
 use serde::{Deserialize, Serialize};
 
 use crate::config::TextConfig;
@@ -81,52 +79,6 @@ pub struct LayerState {
     pub kv_shadow_k: Option<GpuBuffer>,
     pub kv_shadow_v: Option<GpuBuffer>,
     pub kv_shadow_start: usize,
-    // Certified KV experimental decode cache: INT8 post-RoPE keys and per-block
-    // scales for the contiguous prefix covered by complete blocks.
-    pub certified_kv_key_i8: Option<GpuBuffer>,
-    pub certified_kv_key_scale: Option<GpuBuffer>,
-    pub certified_kv_key_zero: Option<GpuBuffer>,
-    pub certified_kv_key_tokens: usize,
-    pub certified_kv_value_i4: Option<GpuBuffer>,
-    pub certified_kv_value_scale: Option<GpuBuffer>,
-    pub certified_kv_value_zero: Option<GpuBuffer>,
-    pub certified_kv_value_error: Option<GpuBuffer>,
-    pub certified_kv_value_norm: Option<GpuBuffer>,
-    pub certified_kv_value_tokens: usize,
-    pub certified_kv_host_k: Option<HostBuffer>,
-    pub certified_kv_host_v: Option<HostBuffer>,
-    pub certified_kv_host_tokens: usize,
-    pub certified_kv_host_meta_blocks: usize,
-    pub certified_kv_host_meta_key_stride_tokens: usize,
-    pub certified_kv_host_meta_key_scale_stride_blocks: usize,
-    pub certified_kv_host_meta_value_error_stride_blocks: usize,
-    pub certified_kv_device_meta_key_scale_norm_blocks: usize,
-    pub certified_kv_device_meta_key_scale_stride_blocks: usize,
-    pub certified_kv_host_key_i8_cache: Vec<u8>,
-    pub certified_kv_host_key_scale_cache: Vec<f32>,
-    pub certified_kv_host_key_scale_channel_max_cache: Vec<f32>,
-    pub certified_kv_host_key_zero_cache: Vec<f32>,
-    pub certified_kv_host_value_error_cache: Vec<f32>,
-    pub certified_kv_host_value_norm_cache: Vec<f32>,
-    pub certified_kv_tail_k: Option<GpuBuffer>,
-    pub certified_kv_tail_v: Option<GpuBuffer>,
-    pub certified_kv_gpu_tail_only: bool,
-    pub certified_kv_promoted_key_cache: Option<GpuBuffer>,
-    pub certified_kv_promoted_key_cache_tags_gpu: Option<GpuBuffer>,
-    pub certified_kv_promoted_key_cache_lru_gpu: Option<GpuBuffer>,
-    pub certified_kv_promoted_key_cache_capacity: usize,
-    pub certified_kv_promoted_key_cache_tags: Vec<usize>,
-    pub certified_kv_promoted_key_cache_lru: Vec<u64>,
-    pub certified_kv_promoted_key_cache_tick: u64,
-    pub certified_kv_promoted_value_cache: Option<GpuBuffer>,
-    pub certified_kv_promoted_value_cache_capacity: usize,
-    pub certified_kv_promoted_value_cache_tags: Vec<usize>,
-    pub certified_kv_promoted_value_cache_lru: Vec<u64>,
-    pub certified_kv_promoted_value_cache_tick: u64,
-    pub certified_kv_ranking_prefix_k: Option<GpuBuffer>,
-    pub certified_kv_ranking_prefix_v: Option<GpuBuffer>,
-    pub certified_kv_ranking_prefix_tokens: usize,
-    pub certified_kv_ranking_prefix_kv_heads: Vec<usize>,
     // Linear attention
     pub conv_state: Option<GpuBuffer>,
     pub recurrent_state: Option<GpuBuffer>,
@@ -209,50 +161,6 @@ impl LayerState {
             kv_shadow_k: None,
             kv_shadow_v: None,
             kv_shadow_start: usize::MAX,
-            certified_kv_key_i8: None,
-            certified_kv_key_scale: None,
-            certified_kv_key_zero: None,
-            certified_kv_key_tokens: 0,
-            certified_kv_value_i4: None,
-            certified_kv_value_scale: None,
-            certified_kv_value_zero: None,
-            certified_kv_value_error: None,
-            certified_kv_value_norm: None,
-            certified_kv_value_tokens: 0,
-            certified_kv_host_k: None,
-            certified_kv_host_v: None,
-            certified_kv_host_tokens: 0,
-            certified_kv_host_meta_blocks: 0,
-            certified_kv_host_meta_key_stride_tokens: 0,
-            certified_kv_host_meta_key_scale_stride_blocks: 0,
-            certified_kv_host_meta_value_error_stride_blocks: 0,
-            certified_kv_device_meta_key_scale_norm_blocks: 0,
-            certified_kv_device_meta_key_scale_stride_blocks: 0,
-            certified_kv_host_key_i8_cache: Vec::new(),
-            certified_kv_host_key_scale_cache: Vec::new(),
-            certified_kv_host_key_scale_channel_max_cache: Vec::new(),
-            certified_kv_host_key_zero_cache: Vec::new(),
-            certified_kv_host_value_error_cache: Vec::new(),
-            certified_kv_host_value_norm_cache: Vec::new(),
-            certified_kv_tail_k: None,
-            certified_kv_tail_v: None,
-            certified_kv_gpu_tail_only: false,
-            certified_kv_promoted_key_cache: None,
-            certified_kv_promoted_key_cache_tags_gpu: None,
-            certified_kv_promoted_key_cache_lru_gpu: None,
-            certified_kv_promoted_key_cache_capacity: 0,
-            certified_kv_promoted_key_cache_tags: Vec::new(),
-            certified_kv_promoted_key_cache_lru: Vec::new(),
-            certified_kv_promoted_key_cache_tick: 0,
-            certified_kv_promoted_value_cache: None,
-            certified_kv_promoted_value_cache_capacity: 0,
-            certified_kv_promoted_value_cache_tags: Vec::new(),
-            certified_kv_promoted_value_cache_lru: Vec::new(),
-            certified_kv_promoted_value_cache_tick: 0,
-            certified_kv_ranking_prefix_k: None,
-            certified_kv_ranking_prefix_v: None,
-            certified_kv_ranking_prefix_tokens: 0,
-            certified_kv_ranking_prefix_kv_heads: Vec::new(),
             conv_state: Some(conv_state),
             recurrent_state: Some(recurrent_state),
         })
@@ -275,50 +183,6 @@ impl LayerState {
             kv_shadow_k: None,
             kv_shadow_v: None,
             kv_shadow_start: usize::MAX,
-            certified_kv_key_i8: None,
-            certified_kv_key_scale: None,
-            certified_kv_key_zero: None,
-            certified_kv_key_tokens: 0,
-            certified_kv_value_i4: None,
-            certified_kv_value_scale: None,
-            certified_kv_value_zero: None,
-            certified_kv_value_error: None,
-            certified_kv_value_norm: None,
-            certified_kv_value_tokens: 0,
-            certified_kv_host_k: None,
-            certified_kv_host_v: None,
-            certified_kv_host_tokens: 0,
-            certified_kv_host_meta_blocks: 0,
-            certified_kv_host_meta_key_stride_tokens: 0,
-            certified_kv_host_meta_key_scale_stride_blocks: 0,
-            certified_kv_host_meta_value_error_stride_blocks: 0,
-            certified_kv_device_meta_key_scale_norm_blocks: 0,
-            certified_kv_device_meta_key_scale_stride_blocks: 0,
-            certified_kv_host_key_i8_cache: Vec::new(),
-            certified_kv_host_key_scale_cache: Vec::new(),
-            certified_kv_host_key_scale_channel_max_cache: Vec::new(),
-            certified_kv_host_key_zero_cache: Vec::new(),
-            certified_kv_host_value_error_cache: Vec::new(),
-            certified_kv_host_value_norm_cache: Vec::new(),
-            certified_kv_tail_k: None,
-            certified_kv_tail_v: None,
-            certified_kv_gpu_tail_only: false,
-            certified_kv_promoted_key_cache: None,
-            certified_kv_promoted_key_cache_tags_gpu: None,
-            certified_kv_promoted_key_cache_lru_gpu: None,
-            certified_kv_promoted_key_cache_capacity: 0,
-            certified_kv_promoted_key_cache_tags: Vec::new(),
-            certified_kv_promoted_key_cache_lru: Vec::new(),
-            certified_kv_promoted_key_cache_tick: 0,
-            certified_kv_promoted_value_cache: None,
-            certified_kv_promoted_value_cache_capacity: 0,
-            certified_kv_promoted_value_cache_tags: Vec::new(),
-            certified_kv_promoted_value_cache_lru: Vec::new(),
-            certified_kv_promoted_value_cache_tick: 0,
-            certified_kv_ranking_prefix_k: None,
-            certified_kv_ranking_prefix_v: None,
-            certified_kv_ranking_prefix_tokens: 0,
-            certified_kv_ranking_prefix_kv_heads: Vec::new(),
             conv_state: None,
             recurrent_state: None,
         }
@@ -457,92 +321,6 @@ impl LayerState {
     /// Record actual filled KV length (no reallocation).
     pub fn set_kv_filled(&mut self, filled: usize) {
         self.kv_filled = filled;
-        if filled < self.certified_kv_key_tokens || filled < self.certified_kv_value_tokens {
-            self.certified_kv_key_tokens = 0;
-            self.certified_kv_value_tokens = 0;
-            self.certified_kv_host_meta_blocks = 0;
-            self.certified_kv_host_meta_key_stride_tokens = 0;
-            self.certified_kv_host_meta_key_scale_stride_blocks = 0;
-            self.certified_kv_host_meta_value_error_stride_blocks = 0;
-            self.certified_kv_device_meta_key_scale_norm_blocks = 0;
-            self.certified_kv_device_meta_key_scale_stride_blocks = 0;
-            self.certified_kv_host_key_i8_cache.clear();
-            self.certified_kv_host_key_scale_cache.clear();
-            self.certified_kv_host_key_scale_channel_max_cache.clear();
-            self.certified_kv_host_key_zero_cache.clear();
-            self.certified_kv_host_value_error_cache.clear();
-            self.certified_kv_host_value_norm_cache.clear();
-        }
-        if filled < self.certified_kv_host_tokens {
-            self.certified_kv_host_tokens = 0;
-        }
-        if filled == 0 {
-            self.certified_kv_promoted_key_cache = None;
-            self.certified_kv_promoted_key_cache_tags_gpu = None;
-            self.certified_kv_promoted_key_cache_lru_gpu = None;
-            self.certified_kv_promoted_key_cache_capacity = 0;
-            self.certified_kv_promoted_key_cache_tags.clear();
-            self.certified_kv_promoted_key_cache_lru.clear();
-            self.certified_kv_promoted_key_cache_tick = 0;
-        }
-        if filled == 0 {
-            self.certified_kv_promoted_value_cache = None;
-            self.certified_kv_promoted_value_cache_capacity = 0;
-            self.certified_kv_promoted_value_cache_tags.clear();
-            self.certified_kv_promoted_value_cache_lru.clear();
-            self.certified_kv_promoted_value_cache_tick = 0;
-        }
-        if filled < self.certified_kv_host_meta_blocks {
-            self.certified_kv_host_meta_blocks = 0;
-            self.certified_kv_host_meta_key_stride_tokens = 0;
-            self.certified_kv_host_meta_key_scale_stride_blocks = 0;
-            self.certified_kv_host_meta_value_error_stride_blocks = 0;
-            self.certified_kv_device_meta_key_scale_norm_blocks = 0;
-            self.certified_kv_device_meta_key_scale_stride_blocks = 0;
-            self.certified_kv_host_key_i8_cache.clear();
-            self.certified_kv_host_key_scale_cache.clear();
-            self.certified_kv_host_key_scale_channel_max_cache.clear();
-            self.certified_kv_host_key_zero_cache.clear();
-            self.certified_kv_host_value_error_cache.clear();
-            self.certified_kv_host_value_norm_cache.clear();
-        }
-        if filled < self.certified_kv_ranking_prefix_tokens {
-            self.certified_kv_ranking_prefix_k = None;
-            self.certified_kv_ranking_prefix_v = None;
-            self.certified_kv_ranking_prefix_tokens = 0;
-            self.certified_kv_ranking_prefix_kv_heads.clear();
-        }
-        if filled == 0 {
-            self.certified_kv_gpu_tail_only = false;
-            self.certified_kv_host_meta_blocks = 0;
-            self.certified_kv_host_meta_key_stride_tokens = 0;
-            self.certified_kv_host_meta_key_scale_stride_blocks = 0;
-            self.certified_kv_host_meta_value_error_stride_blocks = 0;
-            self.certified_kv_device_meta_key_scale_norm_blocks = 0;
-            self.certified_kv_device_meta_key_scale_stride_blocks = 0;
-            self.certified_kv_host_key_i8_cache.clear();
-            self.certified_kv_host_key_scale_cache.clear();
-            self.certified_kv_host_key_scale_channel_max_cache.clear();
-            self.certified_kv_host_key_zero_cache.clear();
-            self.certified_kv_host_value_error_cache.clear();
-            self.certified_kv_host_value_norm_cache.clear();
-            self.certified_kv_promoted_key_cache = None;
-            self.certified_kv_promoted_key_cache_tags_gpu = None;
-            self.certified_kv_promoted_key_cache_lru_gpu = None;
-            self.certified_kv_promoted_key_cache_capacity = 0;
-            self.certified_kv_promoted_key_cache_tags.clear();
-            self.certified_kv_promoted_key_cache_lru.clear();
-            self.certified_kv_promoted_key_cache_tick = 0;
-            self.certified_kv_promoted_value_cache = None;
-            self.certified_kv_promoted_value_cache_capacity = 0;
-            self.certified_kv_promoted_value_cache_tags.clear();
-            self.certified_kv_promoted_value_cache_lru.clear();
-            self.certified_kv_promoted_value_cache_tick = 0;
-            self.certified_kv_ranking_prefix_k = None;
-            self.certified_kv_ranking_prefix_v = None;
-            self.certified_kv_ranking_prefix_tokens = 0;
-            self.certified_kv_ranking_prefix_kv_heads.clear();
-        }
         if self.kv_shadow_k.is_some() && self.kv_shadow_v.is_some() {
             self.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
                 .map(|window| filled.saturating_sub(window))
@@ -1059,26 +837,7 @@ fn restore_virtual_kv_image_mapped(
 
 impl LayerState {
     pub fn to_disk_snapshot(&self) -> Result<LayerStateDiskSnapshot, GpuError> {
-        if self.has_virtual_kv_cache()
-            || self.certified_kv_host_k.is_some()
-            || self.certified_kv_host_v.is_some()
-            || self.certified_kv_key_i8.is_some()
-            || self.certified_kv_key_scale.is_some()
-            || self.certified_kv_key_zero.is_some()
-            || self.certified_kv_value_i4.is_some()
-            || self.certified_kv_value_scale.is_some()
-            || self.certified_kv_value_zero.is_some()
-            || self.certified_kv_value_error.is_some()
-            || self.certified_kv_value_norm.is_some()
-            || self.certified_kv_tail_k.is_some()
-            || self.certified_kv_tail_v.is_some()
-            || self.certified_kv_promoted_key_cache.is_some()
-            || self.certified_kv_promoted_key_cache_tags_gpu.is_some()
-            || self.certified_kv_promoted_key_cache_lru_gpu.is_some()
-            || self.certified_kv_promoted_value_cache.is_some()
-            || self.certified_kv_ranking_prefix_k.is_some()
-            || self.certified_kv_ranking_prefix_v.is_some()
-        {
+        if self.has_virtual_kv_cache() {
             return Err(GpuError::Unsupported(
                 "Qwen disk prefix snapshots only support standard KV/linear state".into(),
             ));
@@ -1145,22 +904,6 @@ impl LayerState {
         add(&self.kv_scale_v);
         add(&self.kv_shadow_k);
         add(&self.kv_shadow_v);
-        add(&self.certified_kv_key_i8);
-        add(&self.certified_kv_key_scale);
-        add(&self.certified_kv_key_zero);
-        add(&self.certified_kv_value_i4);
-        add(&self.certified_kv_value_scale);
-        add(&self.certified_kv_value_zero);
-        add(&self.certified_kv_value_error);
-        add(&self.certified_kv_value_norm);
-        add(&self.certified_kv_tail_k);
-        add(&self.certified_kv_tail_v);
-        add(&self.certified_kv_promoted_key_cache);
-        add(&self.certified_kv_promoted_key_cache_tags_gpu);
-        add(&self.certified_kv_promoted_key_cache_lru_gpu);
-        add(&self.certified_kv_promoted_value_cache);
-        add(&self.certified_kv_ranking_prefix_k);
-        add(&self.certified_kv_ranking_prefix_v);
         add(&self.conv_state);
         add(&self.recurrent_state);
         total
@@ -1171,12 +914,6 @@ impl LayerState {
         let clone_opt = |opt: &Option<GpuBuffer>| -> Result<Option<GpuBuffer>, GpuError> {
             match opt {
                 Some(buf) => Ok(Some(buf.clone_device()?)),
-                None => Ok(None),
-            }
-        };
-        let clone_host_opt = |opt: &Option<HostBuffer>| -> Result<Option<HostBuffer>, GpuError> {
-            match opt {
-                Some(buf) => Ok(Some(buf.clone_host()?)),
                 None => Ok(None),
             }
         };
@@ -1202,65 +939,6 @@ impl LayerState {
             kv_shadow_k: clone_opt(&self.kv_shadow_k)?,
             kv_shadow_v: clone_opt(&self.kv_shadow_v)?,
             kv_shadow_start: self.kv_shadow_start,
-            certified_kv_key_i8: clone_opt(&self.certified_kv_key_i8)?,
-            certified_kv_key_scale: clone_opt(&self.certified_kv_key_scale)?,
-            certified_kv_key_zero: clone_opt(&self.certified_kv_key_zero)?,
-            certified_kv_key_tokens: self.certified_kv_key_tokens,
-            certified_kv_value_i4: clone_opt(&self.certified_kv_value_i4)?,
-            certified_kv_value_scale: clone_opt(&self.certified_kv_value_scale)?,
-            certified_kv_value_zero: clone_opt(&self.certified_kv_value_zero)?,
-            certified_kv_value_error: clone_opt(&self.certified_kv_value_error)?,
-            certified_kv_value_norm: clone_opt(&self.certified_kv_value_norm)?,
-            certified_kv_value_tokens: self.certified_kv_value_tokens,
-            certified_kv_host_k: clone_host_opt(&self.certified_kv_host_k)?,
-            certified_kv_host_v: clone_host_opt(&self.certified_kv_host_v)?,
-            certified_kv_host_tokens: self.certified_kv_host_tokens,
-            certified_kv_host_meta_blocks: self.certified_kv_host_meta_blocks,
-            certified_kv_host_meta_key_stride_tokens: self.certified_kv_host_meta_key_stride_tokens,
-            certified_kv_host_meta_key_scale_stride_blocks: self
-                .certified_kv_host_meta_key_scale_stride_blocks,
-            certified_kv_host_meta_value_error_stride_blocks: self
-                .certified_kv_host_meta_value_error_stride_blocks,
-            certified_kv_device_meta_key_scale_norm_blocks: self
-                .certified_kv_device_meta_key_scale_norm_blocks,
-            certified_kv_device_meta_key_scale_stride_blocks: self
-                .certified_kv_device_meta_key_scale_stride_blocks,
-            certified_kv_host_key_i8_cache: self.certified_kv_host_key_i8_cache.clone(),
-            certified_kv_host_key_scale_cache: self.certified_kv_host_key_scale_cache.clone(),
-            certified_kv_host_key_scale_channel_max_cache: self
-                .certified_kv_host_key_scale_channel_max_cache
-                .clone(),
-            certified_kv_host_key_zero_cache: self.certified_kv_host_key_zero_cache.clone(),
-            certified_kv_host_value_error_cache: self.certified_kv_host_value_error_cache.clone(),
-            certified_kv_host_value_norm_cache: self.certified_kv_host_value_norm_cache.clone(),
-            certified_kv_tail_k: clone_opt(&self.certified_kv_tail_k)?,
-            certified_kv_tail_v: clone_opt(&self.certified_kv_tail_v)?,
-            certified_kv_gpu_tail_only: self.certified_kv_gpu_tail_only,
-            certified_kv_promoted_key_cache: clone_opt(&self.certified_kv_promoted_key_cache)?,
-            certified_kv_promoted_key_cache_tags_gpu: clone_opt(
-                &self.certified_kv_promoted_key_cache_tags_gpu,
-            )?,
-            certified_kv_promoted_key_cache_lru_gpu: clone_opt(
-                &self.certified_kv_promoted_key_cache_lru_gpu,
-            )?,
-            certified_kv_promoted_key_cache_capacity: self.certified_kv_promoted_key_cache_capacity,
-            certified_kv_promoted_key_cache_tags: self.certified_kv_promoted_key_cache_tags.clone(),
-            certified_kv_promoted_key_cache_lru: self.certified_kv_promoted_key_cache_lru.clone(),
-            certified_kv_promoted_key_cache_tick: self.certified_kv_promoted_key_cache_tick,
-            certified_kv_promoted_value_cache: clone_opt(&self.certified_kv_promoted_value_cache)?,
-            certified_kv_promoted_value_cache_capacity: self
-                .certified_kv_promoted_value_cache_capacity,
-            certified_kv_promoted_value_cache_tags: self
-                .certified_kv_promoted_value_cache_tags
-                .clone(),
-            certified_kv_promoted_value_cache_lru: self
-                .certified_kv_promoted_value_cache_lru
-                .clone(),
-            certified_kv_promoted_value_cache_tick: self.certified_kv_promoted_value_cache_tick,
-            certified_kv_ranking_prefix_k: clone_opt(&self.certified_kv_ranking_prefix_k)?,
-            certified_kv_ranking_prefix_v: clone_opt(&self.certified_kv_ranking_prefix_v)?,
-            certified_kv_ranking_prefix_tokens: self.certified_kv_ranking_prefix_tokens,
-            certified_kv_ranking_prefix_kv_heads: self.certified_kv_ranking_prefix_kv_heads.clone(),
             conv_state: clone_opt(&self.conv_state)?,
             recurrent_state: clone_opt(&self.recurrent_state)?,
         })
@@ -1527,10 +1205,9 @@ impl ModelState {
     /// layer into a sidecar. Full-attention slots carry `None` so the inner
     /// `Vec` is indexed 1:1 with `self.layers`.
     ///
-    /// Used by the DFlash speculative engine to roll back linear state after
-    /// a partial-acceptance verify — full-attention K/V uses the separate
-    /// counter-flip (commit_kv_filled=false) path, per docs/dflash.md §6.1.
-    /// Cost on Qwen3.5-9B: ~1 MiB/layer × 24 linear layers = ~25 MiB.
+    /// Capture linear state so a speculative verify can restore it after
+    /// partial acceptance. Full-attention K/V uses its separate counter-flip
+    /// path. The sidecar is proportional to the number of linear layers.
     pub fn snapshot_linear(&self) -> Result<LinearStateSnapshot, GpuError> {
         let mut per_layer = Vec::with_capacity(self.layers.len());
         for ls in &self.layers {
@@ -1721,7 +1398,7 @@ mod tests {
     /// Bit-exact roundtrip: fill linear state with bytes A, snapshot, overwrite
     /// with bytes B, restore, assert we read back bytes A everywhere.
     ///
-    /// `#[ignore]` because it needs a HIP/CUDA runtime. Run with:
+    /// `#[ignore]` because it needs a HIP runtime. Run with:
     ///   cargo test -p qwen35 -- --ignored linear_snapshot_roundtrip_bit_exact
     #[test]
     #[ignore = "requires a GPU runtime"]

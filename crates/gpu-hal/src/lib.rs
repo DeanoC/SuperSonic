@@ -7,10 +7,9 @@ mod scalar_type;
 mod vmm;
 
 pub use backend::{
-    compiled_backends, current_backend, current_buffer_policy, current_memory_architecture,
-    current_strategy_for, is_backend_compiled, set_backend, set_buffer_policy,
-    set_memory_architecture, AllocStrategy, Backend, BufferKind, BufferPolicy, DeviceInfo,
-    MemoryArchitecture,
+    current_backend, current_buffer_policy, current_memory_architecture, current_strategy_for,
+    set_buffer_policy, set_memory_architecture, AllocStrategy, Backend, BufferKind, BufferPolicy,
+    DeviceInfo, MemoryArchitecture,
 };
 pub use buffer::{GpuBuffer, HostBuffer};
 pub use error::{BackendApi, GpuError};

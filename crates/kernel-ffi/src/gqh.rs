@@ -3,8 +3,6 @@
 //! Decode is bit-exact against `model_store::gqh`. The fused matvec keeps the
 //! same scale product order (`e4m3(d) * tensor_scale`, then `* (ratio/15)`).
 
-#![cfg_attr(not(supersonic_backend_hip), allow(unused_variables, unreachable_code))]
-
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::sync::{Mutex, OnceLock};
@@ -61,16 +59,13 @@ pub fn register_header(ptr: *const c_void, tensor_scale: f32, grid_code: u8) {
     if ptr.is_null() {
         return;
     }
-    header_map()
-        .lock()
-        .expect("gqh header registry")
-        .insert(
-            ptr as usize,
-            RegisteredHeader {
-                tensor_scale,
-                grid_code,
-            },
-        );
+    header_map().lock().expect("gqh header registry").insert(
+        ptr as usize,
+        RegisteredHeader {
+            tensor_scale,
+            grid_code,
+        },
+    );
 }
 
 pub fn lookup_header(ptr: *const c_void) -> Option<RegisteredHeader> {
@@ -91,7 +86,6 @@ pub const RUNG_GQH4: i32 = 3;
 
 pub const SUPERBLOCK: usize = 256;
 
-#[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
     fn supersonic_gqh_hip_decode(
         device_ordinal: c_int,
@@ -217,34 +211,20 @@ pub fn decode(
             rows * cols
         )));
     }
-    let backend = dst.backend();
-    let status = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
-            unsafe {
-                supersonic_gqh_hip_decode(
-                    ordinal as c_int,
-                    rung as c_int,
-                    wire.as_ptr(),
-                    tensor_scale,
-                    grid_code as c_int,
-                    dst.as_mut_ptr(),
-                    rows as c_int,
-                    cols as c_int,
-                    dst_is_bf16,
-                    std::ptr::null_mut(),
-                )
-            }
-            #[cfg(not(supersonic_backend_hip))]
-            {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
-            }
-        }
-        other => {
-            return Err(GpuError::Unsupported(format!(
-                "gqh decode is HIP-only, got {other:?}"
-            )));
-        }
+    let backend = Backend::Hip;
+    let status = unsafe {
+        supersonic_gqh_hip_decode(
+            ordinal as c_int,
+            rung as c_int,
+            wire.as_ptr(),
+            tensor_scale,
+            grid_code as c_int,
+            dst.as_mut_ptr(),
+            rows as c_int,
+            cols as c_int,
+            dst_is_bf16,
+            std::ptr::null_mut(),
+        )
     };
     if status != 0 {
         return Err(backend_error(backend, "gqh decode", status));
@@ -283,34 +263,20 @@ pub fn dequant_gemm_bf16(
             "gqh dequant_gemm lhs/out too small".into(),
         ));
     }
-    let backend = out.backend();
-    let status = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
-            unsafe {
-                supersonic_gqh_hip_dequant_gemm_bf16(
-                    ordinal as c_int,
-                    rung as c_int,
-                    wire.as_ptr(),
-                    tensor_scale,
-                    grid_code as c_int,
-                    lhs.as_ptr(),
-                    out.as_mut_ptr(),
-                    m as c_int,
-                    n as c_int,
-                    k as c_int,
-                )
-            }
-            #[cfg(not(supersonic_backend_hip))]
-            {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
-            }
-        }
-        other => {
-            return Err(GpuError::Unsupported(format!(
-                "gqh dequant_gemm is HIP-only, got {other:?}"
-            )));
-        }
+    let backend = Backend::Hip;
+    let status = unsafe {
+        supersonic_gqh_hip_dequant_gemm_bf16(
+            ordinal as c_int,
+            rung as c_int,
+            wire.as_ptr(),
+            tensor_scale,
+            grid_code as c_int,
+            lhs.as_ptr(),
+            out.as_mut_ptr(),
+            m as c_int,
+            n as c_int,
+            k as c_int,
+        )
     };
     if status != 0 {
         return Err(backend_error(backend, "gqh dequant_gemm", status));
@@ -319,14 +285,12 @@ pub fn dequant_gemm_bf16(
 }
 
 pub fn gemm_flush() {
-    #[cfg(supersonic_backend_hip)]
     unsafe {
         supersonic_gqh_hip_gemm_flush();
     }
 }
 
 pub fn enable_tight_decode() {
-    #[cfg(supersonic_backend_hip)]
     unsafe {
         supersonic_gqh_hip_enable_tight_decode();
     }
@@ -339,31 +303,12 @@ pub fn ensure_tight(
     in_dim: i32,
     out_dim: i32,
 ) -> Result<(), GpuError> {
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = (ordinal, rung, wire, in_dim, out_dim);
-        return Ok(());
+    let status =
+        unsafe { supersonic_gqh_hip_ensure_tight(ordinal as c_int, rung, wire, in_dim, out_dim) };
+    if status != 0 {
+        return Err(backend_error(Backend::Hip, "gqh ensure_tight", status));
     }
-    #[cfg(supersonic_backend_hip)]
-    {
-        let status = unsafe {
-            supersonic_gqh_hip_ensure_tight(
-                ordinal as c_int,
-                rung,
-                wire,
-                in_dim,
-                out_dim,
-            )
-        };
-        if status != 0 {
-            return Err(backend_error(
-                Backend::Hip,
-                "gqh ensure_tight",
-                status,
-            ));
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Fused `y[ncols, out] = W[out, in] @ x[ncols, in]` with inline GQH decode.
@@ -393,36 +338,22 @@ pub fn matvec(
             y.dtype()
         )));
     }
-    let backend = y.backend();
-    let status = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
-            unsafe {
-                supersonic_gqh_hip_matvec(
-                    ordinal as c_int,
-                    rung as c_int,
-                    wire.as_ptr(),
-                    x.as_ptr(),
-                    y.as_mut_ptr(),
-                    in_dim as c_int,
-                    out_dim as c_int,
-                    ncols as c_int,
-                    x_col_stride as i64,
-                    y_col_stride as i64,
-                    tensor_scale,
-                    grid_code as c_int,
-                )
-            }
-            #[cfg(not(supersonic_backend_hip))]
-            {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
-            }
-        }
-        other => {
-            return Err(GpuError::Unsupported(format!(
-                "gqh matvec is HIP-only, got {other:?}"
-            )));
-        }
+    let backend = Backend::Hip;
+    let status = unsafe {
+        supersonic_gqh_hip_matvec(
+            ordinal as c_int,
+            rung as c_int,
+            wire.as_ptr(),
+            x.as_ptr(),
+            y.as_mut_ptr(),
+            in_dim as c_int,
+            out_dim as c_int,
+            ncols as c_int,
+            x_col_stride as i64,
+            y_col_stride as i64,
+            tensor_scale,
+            grid_code as c_int,
+        )
     };
     if status != 0 {
         return Err(backend_error(backend, "gqh matvec", status));
@@ -456,36 +387,22 @@ pub fn mix_matvec(
             y.dtype()
         )));
     }
-    let backend = y.backend();
-    let status = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
-            unsafe {
-                supersonic_gqh_hip_mix_matvec_stream(
-                    ordinal as c_int,
-                    qtype as c_int,
-                    wire.as_ptr(),
-                    x.as_ptr(),
-                    y.as_mut_ptr(),
-                    in_dim as c_int,
-                    out_dim as c_int,
-                    ncols as c_int,
-                    if acc { 1 } else { 0 },
-                    mode as c_int,
-                    lut.as_ptr(),
-                    std::ptr::null_mut(),
-                )
-            }
-            #[cfg(not(supersonic_backend_hip))]
-            {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
-            }
-        }
-        other => {
-            return Err(GpuError::Unsupported(format!(
-                "mix matvec is HIP-only, got {other:?}"
-            )));
-        }
+    let backend = Backend::Hip;
+    let status = unsafe {
+        supersonic_gqh_hip_mix_matvec_stream(
+            ordinal as c_int,
+            qtype as c_int,
+            wire.as_ptr(),
+            x.as_ptr(),
+            y.as_mut_ptr(),
+            in_dim as c_int,
+            out_dim as c_int,
+            ncols as c_int,
+            if acc { 1 } else { 0 },
+            mode as c_int,
+            lut.as_ptr(),
+            std::ptr::null_mut(),
+        )
     };
     if status != 0 {
         return Err(backend_error(backend, "mix matvec", status));
@@ -496,7 +413,6 @@ pub fn mix_matvec(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpu_hal::set_backend;
     use model_store::gqh::{decode_wire, GqhRung};
     use std::path::PathBuf;
 
@@ -584,7 +500,6 @@ mod tests {
     }
 
     fn require_hip() -> Option<usize> {
-        set_backend(Backend::Hip);
         match crate::query_gpu_info(0) {
             Ok(_) => Some(0),
             Err(err) => {
@@ -625,10 +540,9 @@ mod tests {
         let x = GpuBuffer::zeros(ordinal, ScalarType::F32, &[255]).expect("x");
         let mut dst = GpuBuffer::zeros(ordinal, ScalarType::F32, &[255]).expect("dst");
         assert!(decode(ordinal, RUNG_GQH3, &wire, 1.0, 0, &mut dst, 1, 255).is_err());
-        assert!(matvec(
-            ordinal, RUNG_GQH3, &wire, &x, &mut dst, 255, 1, 1, 255, 1, 1.0, 0
-        )
-        .is_err());
+        assert!(
+            matvec(ordinal, RUNG_GQH3, &wire, &x, &mut dst, 255, 1, 1, 255, 1, 1.0, 0).is_err()
+        );
     }
 
     #[test]
@@ -650,13 +564,9 @@ mod tests {
             assert_bits_eq(&cpu, &reference, &format!("{name} cpu {rows}x{cols}"));
             let (scale, grid_code, packed) = split_wire(cpu_rung, &wire);
             let packed = device_packed(cpu_rung, rows, cols, packed);
-            let packed_buf = GpuBuffer::from_host_bytes(
-                ordinal,
-                ScalarType::U8,
-                &[packed.len()],
-                &packed,
-            )
-            .expect("upload packed");
+            let packed_buf =
+                GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[packed.len()], &packed)
+                    .expect("upload packed");
             let mut dst =
                 GpuBuffer::zeros(ordinal, ScalarType::F32, &[rows * cols]).expect("alloc dst");
             decode(
@@ -718,7 +628,9 @@ mod tests {
             ("output.weight", GqhRung::Gqh2H, RUNG_GQH2_H, 2),
         ];
         for (name, cpu_rung, rung, rows) in cases {
-            let tensor = file.tensor(name).unwrap_or_else(|| panic!("missing {name}"));
+            let tensor = file
+                .tensor(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
             assert_eq!(tensor.tensor_type, cpu_rung.ggml_type());
             let cols = tensor.dims[0];
             let packed_all = file.tensor_bytes(name).expect("tensor bytes");
@@ -878,19 +790,13 @@ mod tests {
         for (name, cpu_rung, rung, rows, cols) in cases {
             let (wire, weights) = load_case(name, rows, cols);
             let (scale, grid_code, packed) = split_wire(cpu_rung, &wire);
-            let x: Vec<f32> = (0..cols)
-                .map(|i| ((i % 17) as f32 - 8.0) / 8.0)
-                .collect();
+            let x: Vec<f32> = (0..cols).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
             let want = kernel_order_matvec(&weights, &x, rows, cols);
 
             let device = device_packed(cpu_rung, rows, cols, packed);
-            let packed_buf = GpuBuffer::from_host_bytes(
-                ordinal,
-                ScalarType::U8,
-                &[device.len()],
-                &device,
-            )
-            .expect("upload packed");
+            let packed_buf =
+                GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[device.len()], &device)
+                    .expect("upload packed");
             let x_buf =
                 GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[cols], &f32_bytes(&x))
                     .expect("upload x");

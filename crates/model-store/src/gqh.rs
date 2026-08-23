@@ -227,16 +227,19 @@ pub fn decode_row(
     }
     match rung {
         GqhRung::Gqh3 => {
-            let h = header.ok_or_else(|| Error::Other("GQH3 requires a per-tensor header".into()))?;
+            let h =
+                header.ok_or_else(|| Error::Other("GQH3 requires a per-tensor header".into()))?;
             decode_gqh3(packed, nsb, h.tensor_scale, h.grid_code, out)?;
         }
         GqhRung::Gqh2H => {
-            let h = header.ok_or_else(|| Error::Other("GQH2-H requires a per-tensor header".into()))?;
+            let h =
+                header.ok_or_else(|| Error::Other("GQH2-H requires a per-tensor header".into()))?;
             decode_gqh2_h(packed, nsb, h.tensor_scale, h.grid_code, out)?;
         }
         GqhRung::Gqh2C => decode_gqh2_c(packed, nsb, out)?,
         GqhRung::Gqh4 => {
-            let h = header.ok_or_else(|| Error::Other("GQH4 requires a per-tensor header".into()))?;
+            let h =
+                header.ok_or_else(|| Error::Other("GQH4 requires a per-tensor header".into()))?;
             decode_gqh4(packed, nsb, h.tensor_scale, h.grid_code, out)?;
         }
     }
@@ -263,8 +266,7 @@ fn decode_gqh3(
                 let j = sub * tables::SUBBLOCK + t;
                 let lo = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
                 let hi = (b[73 + (j >> 3)] >> (j & 7)) & 0x01;
-                out[sb * tables::SUPERBLOCK + j] =
-                    bits_f32(grid[(lo | (hi << 2)) as usize]) * s_b;
+                out[sb * tables::SUPERBLOCK + j] = bits_f32(grid[(lo | (hi << 2)) as usize]) * s_b;
             }
         }
     }
@@ -336,7 +338,8 @@ fn decode_gqh2_c(packed: &[u8], nsb: usize, out: &mut [f32]) -> Result<(), Error
             for grp in 0..tables::GQH2C_GROUPS_PER_BLOCK {
                 let mask = tables::GQH2C_SIGN_MASK[((u >> (7 * grp)) & 0x7f) as usize];
                 let cb = tables::GQH2C_CODEBOOK[p[grp] as usize];
-                let base = sb * tables::SUPERBLOCK + blk * tables::GQH2C_BLOCK + grp * tables::GQH2C_GROUP;
+                let base =
+                    sb * tables::SUPERBLOCK + blk * tables::GQH2C_BLOCK + grp * tables::GQH2C_GROUP;
                 for e in 0..tables::GQH2C_GROUP {
                     let raw = bits_f32(cb[e]);
                     let mag = if (mask >> e) & 1 == 1 { -raw } else { raw };
@@ -357,7 +360,9 @@ pub fn parse_gqh_headers_kv(blob: &[u8]) -> Result<Vec<(String, GqhHeader)>, Err
         )));
     }
     if blob[..8] != GQH_MAGIC[..] {
-        return Err(Error::Other("GQH header KV bad magic (expected GQHh1)".into()));
+        return Err(Error::Other(
+            "GQH header KV bad magic (expected GQHh1)".into(),
+        ));
     }
     let count = u32::from_le_bytes(blob[8..12].try_into().unwrap());
     let reserved = u32::from_le_bytes(blob[12..16].try_into().unwrap());
@@ -385,16 +390,22 @@ pub fn parse_gqh_headers_kv(blob: &[u8]) -> Result<Vec<(String, GqhHeader)>, Err
             .to_string();
         off += name_len;
         if !seen.insert(name.clone()) {
-            return Err(Error::Other(format!("GQH header KV duplicate entry {name}")));
+            return Err(Error::Other(format!(
+                "GQH header KV duplicate entry {name}"
+            )));
         }
         if off + 12 > blob.len() {
-            return Err(Error::Other(format!("GQH header KV '{name}' truncated metadata")));
+            return Err(Error::Other(format!(
+                "GQH header KV '{name}' truncated metadata"
+            )));
         }
         let qtype = u32::from_le_bytes(blob[off..off + 4].try_into().unwrap());
         let tensor_scale = f32::from_le_bytes(blob[off + 4..off + 8].try_into().unwrap());
         let grid_code = blob[off + 8];
         if blob[off + 9] | blob[off + 10] | blob[off + 11] != 0 {
-            return Err(Error::Other(format!("GQH header KV '{name}' padding is not zero")));
+            return Err(Error::Other(format!(
+                "GQH header KV '{name}' padding is not zero"
+            )));
         }
         off += 12;
         if qtype != GGML_TYPE_GQH3 && qtype != GGML_TYPE_GQH2_H && qtype != GGML_TYPE_GQH4 {
@@ -431,7 +442,12 @@ pub fn parse_gqh_headers_kv(blob: &[u8]) -> Result<Vec<(String, GqhHeader)>, Err
 }
 
 /// Decode a lucebox-style wire: optional 5-byte header then packed superblocks.
-pub fn decode_wire(rung: GqhRung, rows: usize, cols: usize, wire: &[u8]) -> Result<Vec<f32>, Error> {
+pub fn decode_wire(
+    rung: GqhRung,
+    rows: usize,
+    cols: usize,
+    wire: &[u8],
+) -> Result<Vec<f32>, Error> {
     let header = if rung.has_header() {
         if wire.len() < tables::HEADER_BYTES {
             return Err(Error::Other("GQH wire missing 5-byte header".into()));
@@ -521,7 +537,8 @@ mod tests {
         ];
         for (name, rung, rows, cols) in cases {
             let (wire, reference) = load_case(name, rows, cols);
-            let got = decode_wire(rung, rows, cols, &wire).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let got =
+                decode_wire(rung, rows, cols, &wire).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_bits_eq(&got, &reference, &format!("{name} {rows}x{cols}"));
         }
     }
@@ -577,7 +594,8 @@ mod tests {
         };
         let mut out = vec![0.0f32; cols];
         decode_row(GqhRung::Gqh4, &packed, cols, Some(header), &mut out).unwrap();
-        let d_real = f32::from_bits(tables::E4M3_LUT[(0x38 >> 3) as usize][(0x38 & 7) as usize]) * 2.0;
+        let d_real =
+            f32::from_bits(tables::E4M3_LUT[(0x38 >> 3) as usize][(0x38 & 7) as usize]) * 2.0;
         let s_b = d_real * f32::from_bits(tables::RATIO_Q[15]);
         for j in 0..256 {
             let code = j & 15;

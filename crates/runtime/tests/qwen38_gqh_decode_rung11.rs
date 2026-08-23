@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use gpu_hal::{set_backend, Backend};
+use gpu_hal::Backend;
 use qwen35::gguf_ingest::load_text_config;
 use qwen35::scratch::required_attn_scratch_floats;
 use qwen35::weights::Qwen35Weights;
@@ -39,9 +39,7 @@ fn require_gqh_artifacts() -> bool {
 fn qwen38_model_dir() -> Option<PathBuf> {
     let Some(value) = std::env::var_os("SUPERSONIC_QWEN38_MODEL_DIR") else {
         if require_gqh_artifacts() {
-            panic!(
-                "SUPERSONIC_QWEN38_MODEL_DIR is required for Qwen3.8 GQH artifact tests"
-            );
+            panic!("SUPERSONIC_QWEN38_MODEL_DIR is required for Qwen3.8 GQH artifact tests");
         }
         return None;
     };
@@ -82,7 +80,6 @@ fn greedy_token(logits: &[f32]) -> u32 {
 fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen35::config::TextConfig)> {
     let path = gguf_path()?;
     let model_dir = qwen38_model_dir()?;
-    set_backend(Backend::Hip);
     if kernel_ffi::query_gpu_info(0).is_err() {
         eprintln!("skip: no HIP device 0");
         return None;
@@ -122,9 +119,7 @@ fn rung11_one_token_component_decode() {
 
     let token = 9419u32; // "Hello" in the Qwen3.8 tokenizer
     let started = std::time::Instant::now();
-    let logits = engine
-        .decode_step(token, 0)
-        .expect("decode_step");
+    let logits = engine.decode_step(token, 0).expect("decode_step");
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(logits.len(), config.vocab_size);
     assert!(
@@ -134,11 +129,7 @@ fn rung11_one_token_component_decode() {
     let energy: f32 = logits.iter().map(|v| v * v).sum();
     assert!(energy > 0.0, "logits are all zeros");
 
-    let mut ranked: Vec<(usize, f32)> = logits
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     let argmax = ranked[0].0 as u32;
     let top5: Vec<(u32, f32)> = ranked
@@ -193,8 +184,8 @@ fn rung13_chat_hello_generate() {
         return;
     };
     let model_dir = qwen38_model_dir().expect("model dir");
-    let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
-        .expect("tokenizer.json");
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("tokenizer.json");
     let template = ChatTemplate::try_load(&model_dir)
         .expect("load chat template")
         .expect("Qwen3.8 ships a chat template");
@@ -262,8 +253,5 @@ fn rung13_chat_hello_generate() {
 
     let reply = tokenizer.decode(&generated, false).expect("decode reply");
     println!("rung13 reply: {reply:?}");
-    assert!(
-        !generated.is_empty(),
-        "chat generate produced no tokens"
-    );
+    assert!(!generated.is_empty(), "chat generate produced no tokens");
 }

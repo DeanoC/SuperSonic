@@ -2034,247 +2034,6 @@ int linear_prefill_conv_pack_device(
 }
 
 template <typename T>
-int linear_stateful_conv_device(
-    int device_ordinal,
-    int batch_size,
-    int conv_dim,
-    int seq_len,
-    int state_len,
-    int kernel_size,
-    const void* mixed_qkv,
-    const void* prev_state,
-    const void* weights,
-    void* out
-) {
-    ScopedHipDevice scoped(device_ordinal);
-    constexpr int block = 256;
-    const size_t out_elems = static_cast<size_t>(batch_size) * static_cast<size_t>(seq_len) *
-        static_cast<size_t>(conv_dim);
-    const unsigned int grid = static_cast<unsigned int>((out_elems + block - 1) / block);
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(supersonic_qwen35_linear_stateful_conv_kernel<T>),
-        dim3(grid),
-        dim3(block),
-        0,
-        0,
-        batch_size,
-        conv_dim,
-        seq_len,
-        state_len,
-        kernel_size,
-        static_cast<const T*>(mixed_qkv),
-        static_cast<const T*>(prev_state),
-        static_cast<const T*>(weights),
-        static_cast<T*>(out));
-    if (hipGetLastError() != hipSuccess) return 62;
-    return 0;
-}
-
-template <typename T>
-int linear_stateful_conv_value_decay_device(
-    int device_ordinal,
-    int batch_size,
-    int conv_dim,
-    int seq_len,
-    int state_len,
-    int kernel_size,
-    int num_heads,
-    const void* mixed_qkv,
-    const void* prev_state,
-    const void* weights,
-    const void* a,
-    const void* dt_bias,
-    const void* a_log_exp,
-    void* out
-) {
-    ScopedHipDevice scoped(device_ordinal);
-    constexpr int block = 256;
-    const size_t out_width = static_cast<size_t>(conv_dim) + static_cast<size_t>(num_heads);
-    const size_t out_elems =
-        static_cast<size_t>(batch_size) * static_cast<size_t>(seq_len) * out_width;
-    const unsigned int grid = static_cast<unsigned int>((out_elems + block - 1) / block);
-    if (kernel_size == 4 && state_len == 3) {
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(supersonic_qwen35_linear_stateful_conv_value_decay_kernel_k4s3<T>),
-            dim3(grid),
-            dim3(block),
-            0,
-            0,
-            batch_size,
-            conv_dim,
-            seq_len,
-            num_heads,
-            static_cast<const T*>(mixed_qkv),
-            static_cast<const T*>(prev_state),
-            static_cast<const T*>(weights),
-            static_cast<const T*>(a),
-            static_cast<const T*>(dt_bias),
-            static_cast<const T*>(a_log_exp),
-            static_cast<T*>(out));
-    } else {
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(supersonic_qwen35_linear_stateful_conv_value_decay_kernel<T>),
-            dim3(grid),
-            dim3(block),
-            0,
-            0,
-            batch_size,
-            conv_dim,
-            seq_len,
-            state_len,
-            kernel_size,
-            num_heads,
-            static_cast<const T*>(mixed_qkv),
-            static_cast<const T*>(prev_state),
-            static_cast<const T*>(weights),
-            static_cast<const T*>(a),
-            static_cast<const T*>(dt_bias),
-            static_cast<const T*>(a_log_exp),
-            static_cast<T*>(out));
-    }
-    if (hipGetLastError() != hipSuccess) return 64;
-    return 0;
-}
-
-template <typename T>
-int linear_stateful_conv_value_decay_with_state_device(
-    int device_ordinal,
-    int batch_size,
-    int conv_dim,
-    int seq_len,
-    int state_len,
-    int kernel_size,
-    int num_heads,
-    const void* mixed_qkv,
-    const void* prev_state,
-    const void* weights,
-    const void* a,
-    const void* dt_bias,
-    const void* a_log_exp,
-    void* out
-) {
-    ScopedHipDevice scoped(device_ordinal);
-    const size_t out_width = static_cast<size_t>(conv_dim) + static_cast<size_t>(num_heads);
-    const size_t total_per_batch = static_cast<size_t>(seq_len) * out_width +
-        static_cast<size_t>(conv_dim) * static_cast<size_t>(state_len);
-    const size_t out_elems = static_cast<size_t>(batch_size) * total_per_batch;
-    const int default_block =
-        (kernel_size == 4 && state_len == 3) ? ((seq_len <= 4) ? 256 : 128) : 256;
-    const int override_block = linear_prefill_block_override();
-    const int block = override_block > 0 ? override_block : default_block;
-    const unsigned int grid = static_cast<unsigned int>((out_elems + block - 1) / block);
-    if (kernel_size == 4 && state_len == 3) {
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(supersonic_qwen35_linear_stateful_conv_value_decay_with_state_kernel_k4s3<T>),
-            dim3(grid),
-            dim3(block),
-            0,
-            0,
-            batch_size,
-            conv_dim,
-            seq_len,
-            num_heads,
-            static_cast<const T*>(mixed_qkv),
-            static_cast<const T*>(prev_state),
-            static_cast<const T*>(weights),
-            static_cast<const T*>(a),
-            static_cast<const T*>(dt_bias),
-            static_cast<const T*>(a_log_exp),
-            static_cast<T*>(out));
-    } else {
-        return 66;
-    }
-    if (hipGetLastError() != hipSuccess) return 67;
-    return 0;
-}
-
-template <typename T>
-int linear_decode_prepare_device(
-    int device_ordinal,
-    int batch_size,
-    int num_v_heads,
-    int head_k_dim,
-    int head_v_dim,
-    int state_len,
-    int kernel_size,
-    int head_repeat,
-    const void* mixed_qkv,
-    const void* prev_conv_state,
-    const void* weights,
-    const void* a_beta_raw,
-    const void* dt_bias,
-    const void* a_log_exp,
-    void* out
-) {
-    ScopedHipDevice scoped(device_ordinal);
-    const unsigned int grid =
-        static_cast<unsigned int>(batch_size) * static_cast<unsigned int>(num_v_heads);
-    unsigned int block = 64;
-    while (block < static_cast<unsigned int>(head_k_dim > head_v_dim ? head_k_dim : head_v_dim) &&
-           block < 256) {
-        block <<= 1;
-    }
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(supersonic_qwen35_linear_decode_prepare_kernel<T>),
-        dim3(grid),
-        dim3(block),
-        0,
-        0,
-        batch_size,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        state_len,
-        kernel_size,
-        head_repeat,
-        static_cast<const T*>(mixed_qkv),
-        static_cast<const T*>(prev_conv_state),
-        static_cast<const T*>(weights),
-        static_cast<const T*>(a_beta_raw),
-        static_cast<const T*>(dt_bias),
-        static_cast<const T*>(a_log_exp),
-        static_cast<float*>(out));
-    if (hipGetLastError() != hipSuccess) return 69;
-    if (maybe_sync() != hipSuccess) return 70;
-    return 0;
-}
-
-int linear_decode_apply_device(
-    int device_ordinal,
-    int batch_size,
-    int num_v_heads,
-    int head_k_dim,
-    int head_v_dim,
-    const void* packed,
-    const void* initial_state,
-    void* out
-) {
-    ScopedHipDevice scoped(device_ordinal);
-    const unsigned int grid =
-        static_cast<unsigned int>(batch_size) * static_cast<unsigned int>(num_v_heads);
-    unsigned int block = 64;
-    while (block < static_cast<unsigned int>(head_v_dim) && block < 256) {
-        block <<= 1;
-    }
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(supersonic_qwen35_linear_decode_apply_kernel<>),
-        dim3(grid),
-        dim3(block),
-        0,
-        0,
-        batch_size,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        static_cast<const float*>(packed),
-        static_cast<const float*>(initial_state),
-        static_cast<float*>(out));
-    if (hipGetLastError() != hipSuccess) return 71;
-    if (maybe_sync() != hipSuccess) return 72;
-    return 0;
-}
-
-template <typename T>
 int delta_recurrent_prefill_device(
     int device_ordinal,
     int batch_heads,
@@ -3881,60 +3640,6 @@ extern "C" int supersonic_qwen35_4b_hip_linear_prefill_conv_pack(
     }
 }
 
-extern "C" int supersonic_qwen35_4b_hip_linear_stateful_conv(
-    int dtype,
-    size_t device_ordinal,
-    size_t batch_size,
-    size_t conv_dim,
-    size_t seq_len,
-    size_t state_len,
-    size_t kernel_size,
-    const void* mixed_qkv,
-    const void* prev_state,
-    const void* weights,
-    void* out) {
-    switch (dtype) {
-    case 0:
-        return linear_stateful_conv_device<half>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(conv_dim),
-            static_cast<int>(seq_len),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            mixed_qkv,
-            prev_state,
-            weights,
-            out);
-    case 1:
-        return linear_stateful_conv_device<float>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(conv_dim),
-            static_cast<int>(seq_len),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            mixed_qkv,
-            prev_state,
-            weights,
-            out);
-    case 2:
-        return linear_stateful_conv_device<hip_bfloat16>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(conv_dim),
-            static_cast<int>(seq_len),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            mixed_qkv,
-            prev_state,
-            weights,
-            out);
-    default:
-        return 63;
-    }
-}
-
 extern "C" int supersonic_qwen35_4b_hip_delta_recurrent_prefill(
     int dtype,
     size_t device_ordinal,
@@ -3995,240 +3700,6 @@ extern "C" int supersonic_qwen35_4b_hip_delta_recurrent_prefill(
     default:
         return 66;
     }
-}
-
-extern "C" int supersonic_qwen35_4b_hip_linear_stateful_conv_value_decay(
-    int dtype,
-    size_t device_ordinal,
-    size_t batch_size,
-    size_t conv_dim,
-    size_t seq_len,
-    size_t state_len,
-    size_t kernel_size,
-    size_t num_heads,
-    const void* mixed_qkv,
-    const void* prev_state,
-    const void* weights,
-    const void* a,
-    const void* dt_bias,
-    const void* a_log_exp,
-    void* out) {
-    switch (dtype) {
-    case 0:
-        return linear_stateful_conv_value_decay_device<half>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(conv_dim),
-            static_cast<int>(seq_len),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(num_heads),
-            mixed_qkv,
-            prev_state,
-            weights,
-            a,
-            dt_bias,
-            a_log_exp,
-            out);
-    case 1:
-        return linear_stateful_conv_value_decay_device<float>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(conv_dim),
-            static_cast<int>(seq_len),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(num_heads),
-            mixed_qkv,
-            prev_state,
-            weights,
-            a,
-            dt_bias,
-            a_log_exp,
-            out);
-    case 2:
-        return linear_stateful_conv_value_decay_device<hip_bfloat16>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(conv_dim),
-            static_cast<int>(seq_len),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(num_heads),
-            mixed_qkv,
-            prev_state,
-            weights,
-            a,
-            dt_bias,
-            a_log_exp,
-            out);
-    default:
-        return 67;
-    }
-}
-
-extern "C" int supersonic_qwen35_4b_hip_linear_stateful_conv_value_decay_with_state(
-    int dtype,
-    size_t device_ordinal,
-    size_t batch_size,
-    size_t conv_dim,
-    size_t seq_len,
-    size_t state_len,
-    size_t kernel_size,
-    size_t num_heads,
-    const void* mixed_qkv,
-    const void* prev_state,
-    const void* weights,
-    const void* a,
-    const void* dt_bias,
-    const void* a_log_exp,
-    void* out) {
-    switch (dtype) {
-    case 0:
-        return linear_stateful_conv_value_decay_with_state_device<half>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(conv_dim),
-            static_cast<int>(seq_len),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(num_heads),
-            mixed_qkv,
-            prev_state,
-            weights,
-            a,
-            dt_bias,
-            a_log_exp,
-            out);
-    case 1:
-        return linear_stateful_conv_value_decay_with_state_device<float>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(conv_dim),
-            static_cast<int>(seq_len),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(num_heads),
-            mixed_qkv,
-            prev_state,
-            weights,
-            a,
-            dt_bias,
-            a_log_exp,
-            out);
-    case 2:
-        return linear_stateful_conv_value_decay_with_state_device<hip_bfloat16>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(conv_dim),
-            static_cast<int>(seq_len),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(num_heads),
-            mixed_qkv,
-            prev_state,
-            weights,
-            a,
-            dt_bias,
-            a_log_exp,
-            out);
-    default:
-        return 68;
-    }
-}
-
-extern "C" int supersonic_qwen35_4b_hip_linear_decode_prepare(
-    int dtype,
-    size_t device_ordinal,
-    size_t batch_size,
-    size_t num_v_heads,
-    size_t head_k_dim,
-    size_t head_v_dim,
-    size_t state_len,
-    size_t kernel_size,
-    size_t head_repeat,
-    const void* mixed_qkv,
-    const void* prev_conv_state,
-    const void* weights,
-    const void* a_beta_raw,
-    const void* dt_bias,
-    const void* a_log_exp,
-    void* out) {
-    switch (dtype) {
-    case 0:
-        return linear_decode_prepare_device<half>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(num_v_heads),
-            static_cast<int>(head_k_dim),
-            static_cast<int>(head_v_dim),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(head_repeat),
-            mixed_qkv,
-            prev_conv_state,
-            weights,
-            a_beta_raw,
-            dt_bias,
-            a_log_exp,
-            out);
-    case 1:
-        return linear_decode_prepare_device<float>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(num_v_heads),
-            static_cast<int>(head_k_dim),
-            static_cast<int>(head_v_dim),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(head_repeat),
-            mixed_qkv,
-            prev_conv_state,
-            weights,
-            a_beta_raw,
-            dt_bias,
-            a_log_exp,
-            out);
-    case 2:
-        return linear_decode_prepare_device<hip_bfloat16>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(num_v_heads),
-            static_cast<int>(head_k_dim),
-            static_cast<int>(head_v_dim),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(head_repeat),
-            mixed_qkv,
-            prev_conv_state,
-            weights,
-            a_beta_raw,
-            dt_bias,
-            a_log_exp,
-            out);
-    default:
-        return 73;
-    }
-}
-
-extern "C" int supersonic_qwen35_4b_hip_linear_decode_apply(
-    size_t device_ordinal,
-    size_t batch_size,
-    size_t num_v_heads,
-    size_t head_k_dim,
-    size_t head_v_dim,
-    const void* packed,
-    const void* initial_state,
-    void* out) {
-    return linear_decode_apply_device(
-        static_cast<int>(device_ordinal),
-        static_cast<int>(batch_size),
-        static_cast<int>(num_v_heads),
-        static_cast<int>(head_k_dim),
-        static_cast<int>(head_v_dim),
-        packed,
-        initial_state,
-        out);
 }
 
 extern "C" int supersonic_qwen35_4b_hip_delta_chunk_single_prefill(
@@ -5613,8 +5084,7 @@ static int matmul_rhs_transposed_wmma_small_m_bf16_device(
     const int grid_z = static_cast<int>(batch_elems);
     if (device_is_gfx12(device_ordinal)) {
         const bool hot_exact =
-            m == TILE_M && (n % TILE_N) == 0 && (k % 16) == 0 &&
-            std::getenv("SUPERSONIC_DFLASH_DISABLE_BF16_SMALL_M_HOT_EXACT") == nullptr;
+            m == TILE_M && (n % TILE_N) == 0 && (k % 16) == 0;
         if (hot_exact) {
             hipLaunchKernelGGL(
                 HIP_KERNEL_NAME(supersonic_qwen35_matmul_rhs_transposed_wmma_small_m_gfx12_kernel<true>),
@@ -5892,8 +5362,7 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
             return 0;
         }
         if (device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
-            const bool disable_small_m =
-                std::getenv("SUPERSONIC_DFLASH_DISABLE_BF16_SMALL_M") != nullptr;
+            const bool disable_small_m = false;
             if (!disable_small_m && m < 32) {
                 return matmul_rhs_transposed_wmma_small_m_bf16_device(
                     static_cast<int>(device_ordinal), batch_elems, m, n, k,
@@ -6087,8 +5556,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
         quant_type == QWEN35_LOWBIT_GGML_Q4_K ||
         quant_type == QWEN35_LOWBIT_GGML_Q5_K ||
         quant_type == QWEN35_LOWBIT_GGML_Q6_K;
-    const bool disable_ggml_small_m =
-        ggml_k && std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_SMALL_M") != nullptr;
+    const bool disable_ggml_small_m = false;
 
     // Tiled WMMA is a clear win when M is large enough to use most of the
     // 64-row block tile (long-ctx prefill). For small M (short prompts,
@@ -6099,8 +5567,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
     const bool raw_ggml_small_m =
         ggml_k && !disable_ggml_small_m;
     if ((native_int4 || raw_ggml_small_m) && m < TILED_M_THRESHOLD) {
-        const bool enable_ggml_small_m_n64 =
-            ggml_k && std::getenv("SUPERSONIC_DFLASH_ENABLE_GGML_SMALL_M_N64") != nullptr;
+        const bool enable_ggml_small_m_n64 = false;
         if (raw_ggml_small_m && enable_ggml_small_m_n64) {
             constexpr int TILE_M = 16;
             constexpr int TILE_N = 64;
@@ -6127,13 +5594,9 @@ static int matmul_int4_dequant_wmma_bf16_device(
             return 0;
         }
 
-        const bool disable_ggml_small_m_qtype =
-            raw_ggml_small_m &&
-            std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_SMALL_M_QTYPE") != nullptr;
+        const bool disable_ggml_small_m_qtype = false;
         if (raw_ggml_small_m && !disable_ggml_small_m_qtype) {
-            const bool trunc_dequant =
-                quant_type != QWEN35_LOWBIT_GGML_Q8_0 &&
-                std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_TRUNC_DEQUANT") == nullptr;
+            const bool trunc_dequant = quant_type != QWEN35_LOWBIT_GGML_Q8_0;
             constexpr int TILE_M = 16;
             constexpr int TILE_N = 16;
             const int grid_x = (n + TILE_N - 1) / TILE_N;
@@ -6142,11 +5605,9 @@ static int matmul_int4_dequant_wmma_bf16_device(
             const int threads = 32;
             const bool use_gfx12_acc = device_is_gfx12(device_ordinal);
             const bool enable_m8_block =
-                m == 8 && (n % TILE_N) == 0 && (k % 256) == 0 && awq_inv_scale == nullptr &&
-                std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_M8_BLOCK") == nullptr;
+                m == 8 && (n % TILE_N) == 0 && (k % 256) == 0 && awq_inv_scale == nullptr;
             const bool enable_m16_block =
-                m == 16 && (n % TILE_N) == 0 && (k % 256) == 0 && awq_inv_scale == nullptr &&
-                std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_M16_BLOCK") == nullptr;
+                m == 16 && (n % TILE_N) == 0 && (k % 256) == 0 && awq_inv_scale == nullptr;
             if (enable_m16_block) {
                 if (quant_type == QWEN35_LOWBIT_GGML_Q8_0) {
                     if (trunc_dequant) {
@@ -6324,9 +5785,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
                 return 0;
             }
             if (enable_m8_block) {
-                const bool use_m8_gfx12 =
-                    use_gfx12_acc &&
-                    std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_M8_GFX12_NATIVE") == nullptr;
+                const bool use_m8_gfx12 = use_gfx12_acc;
                 if (quant_type == QWEN35_LOWBIT_GGML_Q8_0) {
                     if (trunc_dequant) {
                         if (use_m8_gfx12) {
@@ -6611,8 +6070,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
         quant_type == QWEN35_LOWBIT_GGML_Q8_0 &&
         awq_inv_scale == nullptr &&
         (n % TILE_N) == 0 &&
-        (k % 64) == 0 &&
-        std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_Q8_LARGE_M_GFX12_NATIVE") == nullptr;
+        (k % 64) == 0;
     if (use_gfx12_large_q8) {
         hipLaunchKernelGGL(
             supersonic_qwen35_matmul_ggml_q8_0_wmma_gfx12_large_m_kernel,
@@ -6673,9 +6131,7 @@ static int matmul_int4_dequant_residual_add_bf16_device(
     if (m != 16 || n <= 0 || k <= 0 || (n % 16) != 0 || (k % 256) != 0) return 315;
     if (awq_inv_scale != nullptr) return 316;
 
-    const bool trunc_dequant =
-        quant_type != QWEN35_LOWBIT_GGML_Q8_0 &&
-        std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_TRUNC_DEQUANT") == nullptr;
+    const bool trunc_dequant = quant_type != QWEN35_LOWBIT_GGML_Q8_0;
     constexpr int TILE_N = 16;
     const int grid_x = (n + TILE_N - 1) / TILE_N;
     const int grid_z = static_cast<int>(batch_elems);
@@ -6841,17 +6297,14 @@ static int matmul_ggml_pair_wmma_bf16_device(
     constexpr int TILE_M = 16;
     constexpr int TILE_N = 16;
     const bool enable_m16_qtype =
-        m == TILE_M && (n_each % TILE_N) == 0 && (k % 256) == 0 &&
-        std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_PAIR_M16_QTYPE") == nullptr;
+        m == TILE_M && (n_each % TILE_N) == 0 && (k % 256) == 0;
     if (enable_m16_qtype) {
         const int n_out = n_each * 2;
         const int grid_x = (n_out + TILE_N - 1) / TILE_N;
         const int grid_z = static_cast<int>(batch_elems);
         const int threads = 32;
         const bool use_gfx12_acc = device_is_gfx12(device_ordinal);
-        const bool trunc_dequant =
-            quant_type != QWEN35_LOWBIT_GGML_Q8_0 &&
-            std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_TRUNC_DEQUANT") == nullptr;
+        const bool trunc_dequant = quant_type != QWEN35_LOWBIT_GGML_Q8_0;
         if (quant_type == QWEN35_LOWBIT_GGML_Q8_0) {
             hipLaunchKernelGGL(
                 HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q8_0, false>),
@@ -7024,9 +6477,7 @@ static int matmul_ggml_pair_swiglu_wmma_bf16_device(
     const int grid_x = (n_each + TILE_N - 1) / TILE_N;
     const int grid_z = static_cast<int>(batch_elems);
     const int threads = 32;
-    const bool trunc_dequant =
-        quant_type != QWEN35_LOWBIT_GGML_Q8_0 &&
-        std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_TRUNC_DEQUANT") == nullptr;
+    const bool trunc_dequant = quant_type != QWEN35_LOWBIT_GGML_Q8_0;
     const bool use_gfx12_acc = device_is_gfx12(device_ordinal);
     if (quant_type == QWEN35_LOWBIT_GGML_Q8_0) {
         if (use_gfx12_acc) {
@@ -7246,13 +6697,9 @@ static int matmul_mmq_q8_1_q6_k_device(
     const size_t shared_bytes =
         static_cast<size_t>(PADDED_TILE_Y_INTS + MMQ_Y * MMQ_MMA_TILE_X_K_Q6_K) *
         sizeof(int);
-    const bool hot_exact =
-        m == MMQ_X && (n % MMQ_Y) == 0 &&
-        std::getenv("SUPERSONIC_DFLASH_DISABLE_Q6_K_MMQ_HOT_EXACT") == nullptr;
+    const bool hot_exact = m == MMQ_X && (n % MMQ_Y) == 0;
     const bool use_gfx12_native =
-        hot_exact &&
-        device_is_gfx12(device_ordinal) &&
-        std::getenv("SUPERSONIC_DFLASH_DISABLE_Q6_K_MMQ_GFX12_NATIVE") == nullptr;
+        hot_exact && device_is_gfx12(device_ordinal);
     const bool has_residual = residual != nullptr;
 
     if (use_gfx12_native && has_residual) {
@@ -7373,8 +6820,7 @@ static int matmul_q6_k_m16_argmax_device(
 
     const int tiles = n / 16;
     const int grid_z = static_cast<int>(batch_elems);
-    const bool trunc_dequant =
-        std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_TRUNC_DEQUANT") == nullptr;
+    const bool trunc_dequant = true;
     const bool use_gfx12_acc = device_is_gfx12(device_ordinal);
     if (trunc_dequant) {
         if (use_gfx12_acc) {
@@ -8601,10 +8047,7 @@ int persistent_decode_device(
     const void* kv_fp8_descs,
     int batch_size,
     const void* batch_descs,
-    const void* int4_scales,
-    void* tap_workspace,
-    const int* tap_layers,
-    int num_taps
+    const void* int4_scales
 ) {
     ScopedHipDevice scoped(device_ordinal);
     supersonic_gqh_hip_gemm_flush();
@@ -8758,7 +8201,6 @@ int persistent_decode_device(
     int io_flags = 3;
     const bool use_gqh_split = int4_scales != nullptr
         && hidden_dim >= 5120
-        && tap_workspace == nullptr
         && std::getenv("SUPERSONIC_QWEN35_GQH_NOSPLIT") == nullptr
         && !coop_requested;
     hipError_t launch_err = hipSuccess;
@@ -8821,9 +8263,6 @@ int persistent_decode_device(
                     batch_size,
                     batch_ptr,
                     int4_ptr,
-                    static_cast<T*>(tap_workspace),
-                    tap_layers,
-                    0,
                     flags);
             } else if (split == 2) {
                 hipLaunchKernelGGL(
@@ -8854,9 +8293,6 @@ int persistent_decode_device(
                     batch_size,
                     batch_ptr,
                     int4_ptr,
-                    static_cast<T*>(tap_workspace),
-                    tap_layers,
-                    0,
                     flags);
             } else if (split == 3) {
                 hipLaunchKernelGGL(
@@ -8887,9 +8323,6 @@ int persistent_decode_device(
                     batch_size,
                     batch_ptr,
                     int4_ptr,
-                    static_cast<T*>(tap_workspace),
-                    tap_layers,
-                    0,
                     flags);
             } else if (split == 4) {
                 hipLaunchKernelGGL(
@@ -8920,9 +8353,6 @@ int persistent_decode_device(
                     batch_size,
                     batch_ptr,
                     int4_ptr,
-                    static_cast<T*>(tap_workspace),
-                    tap_layers,
-                    0,
                     flags);
             } else if (split == 5) {
                 hipLaunchKernelGGL(
@@ -8953,9 +8383,6 @@ int persistent_decode_device(
                     batch_size,
                     batch_ptr,
                     int4_ptr,
-                    static_cast<T*>(tap_workspace),
-                    tap_layers,
-                    0,
                     flags);
             } else {
                 hipLaunchKernelGGL(
@@ -8986,9 +8413,6 @@ int persistent_decode_device(
                     batch_size,
                     batch_ptr,
                     int4_ptr,
-                    static_cast<T*>(tap_workspace),
-                    tap_layers,
-                    0,
                     flags);
             }
             return hipGetLastError();
@@ -10308,8 +9732,6 @@ int persistent_decode_device(
             static_cast<const BatchSeqDesc*>(batch_descs);
         const Qwen35INT4ScaleDesc* int4_typed =
             static_cast<const Qwen35INT4ScaleDesc*>(int4_scales);
-        T* tap_ws_typed = static_cast<T*>(tap_workspace);
-
         void* args[] = {
             &num_layers, &hidden_dim, &intermediate_size, &seqlen_offset,
             &layers_typed, &hidden_io_typed, &workspace, &counters,
@@ -10318,8 +9740,7 @@ int persistent_decode_device(
             &cos_typed, &sin_typed, &rotary_dim,
             &proj_buf_floats, &attn_scratch_floats, &enable_attention_trace,
             &fp8_typed, &kv_fp8_typed, &batch_size,
-            &batch_descs_typed, &int4_typed,
-            &tap_ws_typed, &tap_layers, &num_taps, &io_flags,
+            &batch_descs_typed, &int4_typed, &io_flags,
         };
 
         launch_err = hipLaunchCooperativeKernel(
@@ -10358,9 +9779,6 @@ int persistent_decode_device(
             batch_size,
             static_cast<const BatchSeqDesc*>(batch_descs),
             static_cast<const Qwen35INT4ScaleDesc*>(int4_scales),
-            static_cast<T*>(tap_workspace),
-            tap_layers,
-            num_taps,
             io_flags);
         launch_err = hipGetLastError();
     }
@@ -10385,10 +9803,6 @@ int persistent_decode_device(
     return 0;
 }
 
-// tap_workspace/tap_layers/num_taps: DFlash hidden-state taps (M1 plumbing).
-//   tap_workspace = nullptr, tap_layers = nullptr, num_taps = 0 disables; the kernel body
-//   must short-circuit when tap_workspace is nullptr so existing decode callers see no
-//   change in observable behavior or runtime (gfx1150 codegen-sensitivity guard).
 // Restore conv+rec after fused B>1 verify to the prefix of `commit_len`
 // tokens (1-based). Returns 0 if live linear state matches that prefix
 // (including commit_len==B, already live). Returns 1 if no snapshot is
@@ -10459,10 +9873,7 @@ extern "C" int supersonic_qwen35_4b_hip_persistent_decode(
     const void* kv_fp8_descs,
     size_t batch_size,
     const void* batch_descs,
-    const void* int4_scales,
-    void* tap_workspace,
-    const int* tap_layers,
-    size_t num_taps) {
+    const void* int4_scales) {
     switch (dtype) {
     case 2:
         return persistent_decode_device<hip_bfloat16>(
@@ -10481,10 +9892,7 @@ extern "C" int supersonic_qwen35_4b_hip_persistent_decode(
             kv_fp8_descs,
             static_cast<int>(batch_size),
             batch_descs,
-            int4_scales,
-            tap_workspace,
-            tap_layers,
-            static_cast<int>(num_taps));
+            int4_scales);
     default:
         return 256;
     }
