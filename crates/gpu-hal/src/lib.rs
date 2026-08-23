@@ -1,12 +1,7 @@
 mod backend;
 mod buffer;
-#[cfg(supersonic_backend_cuda)]
-mod cuda_sys;
 mod error;
-#[cfg(supersonic_backend_hip)]
 mod hip_sys;
-#[cfg(supersonic_backend_metal)]
-mod metal_sys;
 mod ops;
 mod scalar_type;
 mod vmm;

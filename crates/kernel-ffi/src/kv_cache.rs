@@ -1,4 +1,4 @@
-use std::ffi::{c_int, c_void};
+use std::ffi::c_void;
 
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
@@ -10,7 +10,7 @@ fn certified_kv_error(backend: Backend, msg: String) -> GpuError {
     }
 }
 
-#[cfg(supersonic_backend_cuda)]
+#[cfg(any())]
 unsafe extern "C" {
     fn supersonic_llama31_certified_kv_copy_step_bf16(
         device_ordinal: usize,
@@ -692,7 +692,7 @@ pub fn copy_step_bf16(
 
     match backend {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 let status = supersonic_llama31_certified_kv_copy_step_bf16(
                     ordinal,
@@ -713,7 +713,7 @@ pub fn copy_step_bf16(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -830,7 +830,7 @@ pub fn copy_token_range_bf16(
         )));
     }
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_copy_token_range_bf16(
             ordinal,
@@ -854,7 +854,7 @@ pub fn copy_token_range_bf16(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }
@@ -1019,7 +1019,7 @@ pub fn quantize_bf16_cache(
     let backend = key_bf16.backend();
     match backend {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 let status = unsafe {
                     supersonic_llama31_certified_kv_quantize_bf16(
@@ -1050,7 +1050,7 @@ pub fn quantize_bf16_cache(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -1130,7 +1130,7 @@ pub fn quantize_bf16_keys(
 
     match key_bf16.backend() {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 let status = supersonic_llama31_certified_kv_quantize_keys_bf16(
                     ordinal,
@@ -1152,7 +1152,7 @@ pub fn quantize_bf16_keys(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -1247,7 +1247,7 @@ pub fn quantize_bf16_keys_range(
 
     match key_bf16.backend() {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 let status = supersonic_llama31_certified_kv_quantize_keys_bf16_range(
                     ordinal,
@@ -1272,7 +1272,7 @@ pub fn quantize_bf16_keys_range(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -1396,7 +1396,7 @@ pub fn quantize_bf16_values_range(
 
     match value_bf16.backend() {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 let status = supersonic_llama31_certified_kv_quantize_values_bf16_range(
                     ordinal,
@@ -1424,7 +1424,7 @@ pub fn quantize_bf16_values_range(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -1563,7 +1563,7 @@ pub fn score_blocks_int8(
     let backend = query_bf16.backend();
     match backend {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 let status = unsafe {
                     supersonic_llama31_certified_kv_score_blocks_int8(
@@ -1593,7 +1593,7 @@ pub fn score_blocks_int8(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -1643,7 +1643,7 @@ pub fn key_scale_norms(
             key_scale_norm.shape()
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_key_scale_norms(
             ordinal,
@@ -1662,7 +1662,7 @@ pub fn key_scale_norms(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (ordinal, key_scale, key_scale_norm, num_blocks);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -1749,7 +1749,7 @@ pub fn score_consistency(
             violation_flags.shape()
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_score_consistency(
             ordinal,
@@ -1780,7 +1780,7 @@ pub fn score_consistency(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -1877,7 +1877,7 @@ pub fn gather_promoted_bf16_from_tier2(
             promote_shape, value_promote_shape, promoted_key_shape, promoted_value_shape
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_gather_promoted_bf16(
             ordinal,
@@ -1906,7 +1906,7 @@ pub fn gather_promoted_bf16_from_tier2(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -1949,7 +1949,7 @@ pub fn init_key_page_cache(
             cache_lru.shape()
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_init_key_cache(
             ordinal,
@@ -1966,7 +1966,7 @@ pub fn init_key_page_cache(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (ordinal, cache_tags, cache_lru);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -2026,7 +2026,7 @@ pub fn resolve_key_page_cache(
             counters.shape()
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_resolve_key_cache(
             ordinal,
@@ -2051,7 +2051,7 @@ pub fn resolve_key_page_cache(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -2125,7 +2125,7 @@ pub fn gather_promoted_values_bf16_from_tier2(
             value_promote_shape, promoted_value_shape
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_gather_promoted_values_bf16(
             ordinal,
@@ -2148,7 +2148,7 @@ pub fn gather_promoted_values_bf16_from_tier2(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -2218,7 +2218,7 @@ pub fn selected_fp16_log_masses(
             out_log_masses.shape()
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_selected_fp16_log_masses(
             ordinal,
@@ -2241,7 +2241,7 @@ pub fn selected_fp16_log_masses(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -2356,7 +2356,7 @@ pub fn attend_int8_int4(
     let backend = query_bf16.backend();
     match backend {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 let status = unsafe {
                     supersonic_llama31_certified_kv_attend_int8_int4(
@@ -2388,7 +2388,7 @@ pub fn attend_int8_int4(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -2535,7 +2535,7 @@ pub fn attend_int8_int4_with_bf16_tail(
     let backend = query_bf16.backend();
     match backend {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 let status = unsafe {
                     supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail(
@@ -2570,7 +2570,7 @@ pub fn attend_int8_int4_with_bf16_tail(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -2753,7 +2753,7 @@ pub fn attend_int8_int4_with_bf16_tail_strided(
 
     match query_bf16.backend() {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 let status = if output_f32.dtype() == ScalarType::BF16 {
                     supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_out_bf16(
@@ -2828,7 +2828,7 @@ pub fn attend_int8_int4_with_bf16_tail_strided(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -3057,7 +3057,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
         (key_start, key_stride, value_start, value_stride)
     };
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status =
             supersonic_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_strided_out_bf16(
@@ -3107,7 +3107,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }
@@ -3284,7 +3284,7 @@ pub fn attend_all_promoted_int4_with_bf16_tail(
         (key_start, key_stride, value_start, value_stride)
     };
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_out_bf16(
             ordinal,
@@ -3326,7 +3326,7 @@ pub fn attend_all_promoted_int4_with_bf16_tail(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -3458,7 +3458,7 @@ pub fn score_all_promoted_bf16_keys(
         }
     };
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_score_all_promoted_bf16_keys(
             ordinal,
@@ -3487,7 +3487,7 @@ pub fn score_all_promoted_bf16_keys(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -3635,7 +3635,7 @@ pub fn apply_all_promoted_values_from_probs(
         }
     };
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_apply_all_promoted_values_from_probs(
             ordinal,
@@ -3669,7 +3669,7 @@ pub fn apply_all_promoted_values_from_probs(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -3768,7 +3768,7 @@ pub fn block_masses_from_token_probs(
         )));
     }
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_block_masses_from_probs(
             ordinal,
@@ -3788,7 +3788,7 @@ pub fn block_masses_from_token_probs(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (ordinal, score_scratch, block_mass, block_size);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -3904,7 +3904,7 @@ pub fn select_blocks_device(
             delta_blocks.shape()
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_select_blocks(
             ordinal,
@@ -3949,7 +3949,7 @@ pub fn select_blocks_device(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -4024,7 +4024,7 @@ pub fn ranking_flags_device(
             fallback_flags.shape()
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_ranking_flags(
             ordinal,
@@ -4046,7 +4046,7 @@ pub fn ranking_flags_device(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -4150,7 +4150,7 @@ pub fn value_promotions_from_block_masses(
         }
     }
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_value_promotions_from_block_masses(
             ordinal,
@@ -4180,7 +4180,7 @@ pub fn value_promotions_from_block_masses(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -4235,7 +4235,7 @@ pub fn init_all_promoted_indices(
         )));
     }
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_init_all_promoted_indices(
             ordinal,
@@ -4253,7 +4253,7 @@ pub fn init_all_promoted_indices(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (ordinal, promote_index, value_promote_index);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -4391,7 +4391,7 @@ pub fn dense_selected_heads_out_bf16(
     let tail_key_stride = tail_key_bf16.map(|buf| buf.shape()[1]).unwrap_or(0);
     let tail_value_stride = tail_value_bf16.map(|buf| buf.shape()[1]).unwrap_or(0);
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_dense_selected_heads_out_bf16(
             ordinal,
@@ -4425,7 +4425,7 @@ pub fn dense_selected_heads_out_bf16(
             ));
         }
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -4567,7 +4567,7 @@ pub fn dense_flagged_heads_out_bf16(
     let tail_value_stride = tail_value_bf16.map(|buf| buf.shape()[1]).unwrap_or(0);
     let gqa_group = q_heads / kv_heads;
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_llama31_certified_kv_dense_flagged_heads_out_bf16(
             ordinal,
@@ -4600,7 +4600,7 @@ pub fn dense_flagged_heads_out_bf16(
             ));
         }
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -4794,7 +4794,7 @@ pub fn attend_int8_bf16_values_strided(
     let backend = query_bf16.backend();
     match backend {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 let tail_key_ptr = tail_key_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr);
                 let status = unsafe {
@@ -4862,7 +4862,7 @@ pub fn attend_int8_bf16_values_strided(
                 }
                 Ok(())
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
@@ -4873,7 +4873,7 @@ pub fn attend_int8_bf16_values_strided(
     }
 }
 
-#[cfg(all(test, supersonic_backend_cuda))]
+#[cfg(any())]
 mod tests {
     use super::*;
     use gpu_hal::{set_backend, Backend};

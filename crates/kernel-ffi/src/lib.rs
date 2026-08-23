@@ -1,13 +1,10 @@
-pub mod certified_kv;
-pub mod dflash;
 pub mod gqh;
 mod layer_desc;
-mod metal_host;
-mod metal_native;
+mod host_fallback;
+mod native_fallback;
+pub mod kv_cache;
 pub mod prefill_ffi;
 mod qwen35;
-#[path = "qwen36_moe/mod.rs"]
-pub mod qwen36_moe;
 
 pub use layer_desc::{
     BatchSeqDesc, DecodeLayerDesc, FP8ScaleDesc, INT4ScaleDesc, KVCacheFp8Desc, MAX_BATCH_SIZE,

@@ -16,8 +16,15 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "crates" / "kernel-ffi" / "kernel-groups.toml"
 BUILD_RS = ROOT / "crates" / "kernel-ffi" / "build.rs"
-VALID_BACKENDS = {"hip", "cuda", "metal"}
+VALID_BACKENDS = {"hip"}
 GROUP_ID_RE = re.compile(r"[a-z0-9][a-z0-9.-]*")
+FORBIDDEN_SOURCE_RE = re.compile(r"(?:_cuda|metal|gemma|phi|dflash|moe)", re.IGNORECASE)
+REQUIRED_SOURCES = {
+    "kernels/full_attention.hip",
+    "kernels/full_attention_4b.hip",
+    "kernels/prefill_helpers.hip",
+    "kernels/gqh.hip",
+}
 
 
 def rel(path: Path) -> str:
@@ -72,16 +79,12 @@ def main() -> int:
     if not isinstance(groups, list) or not groups:
         errors.append("group must be a non-empty array of tables")
         groups = []
+    elif len(groups) != 2:
+        errors.append(f"expected exactly two retained HIP groups, found {len(groups)}")
 
     build_text = BUILD_RS.read_text(encoding="utf-8")
-    build_bridge_sources = (
-        field_values_from_build_rs("HIP_BRIDGES", "src_name", build_text)
-        | field_values_from_build_rs("CUDA_BRIDGES", "src_name", build_text)
-    )
-    build_bridge_objects = (
-        field_values_from_build_rs("HIP_BRIDGES", "obj_name", build_text)
-        | field_values_from_build_rs("CUDA_BRIDGES", "obj_name", build_text)
-    )
+    build_bridge_sources = field_values_from_build_rs("HIP_BRIDGES", "src_name", build_text)
+    build_bridge_objects = field_values_from_build_rs("HIP_BRIDGES", "obj_name", build_text)
     build_rerun_paths = string_values_from_build_rs("KERNEL_RERUN_PATHS", build_text)
 
     seen_ids: set[str] = set()
@@ -135,6 +138,8 @@ def main() -> int:
             if not isinstance(source, str) or not source:
                 errors.append(f"{group_id}.bridge #{bridge_index}: missing string source")
             else:
+                if FORBIDDEN_SOURCE_RE.search(source):
+                    errors.append(f"{group_id}: removed source name is forbidden: {source}")
                 if not (ROOT / source).is_file():
                     errors.append(f"{group_id}: bridge source does not exist: {source}")
                 if source in seen_bridge_sources:
@@ -158,31 +163,42 @@ def main() -> int:
 
         for source in kernel_sources:
             manifest_kernel_sources.add(source)
+            if FORBIDDEN_SOURCE_RE.search(source):
+                errors.append(f"{group_id}: removed source name is forbidden: {source}")
             if not (ROOT / source).is_file():
                 errors.append(f"{group_id}: kernel source does not exist: {source}")
             if Path(source).name not in build_rerun_paths and source.replace("kernels/", "") not in build_rerun_paths:
                 errors.append(f"{group_id}: kernel source is not tracked by build.rs: {source}")
         for source in native_sources:
             manifest_native_sources.add(source)
+            if FORBIDDEN_SOURCE_RE.search(source):
+                errors.append(f"{group_id}: removed source name is forbidden: {source}")
             if not (ROOT / source).is_file():
                 errors.append(f"{group_id}: native source does not exist: {source}")
             build_rs_relative = source.replace("crates/kernel-ffi/", "")
             if build_rs_relative not in build_text and source not in build_text:
                 errors.append(f"{group_id}: native source is not tracked by build.rs: {source}")
         for source in rust_modules:
+            if FORBIDDEN_SOURCE_RE.search(source):
+                errors.append(f"{group_id}: removed source name is forbidden: {source}")
             if not (ROOT / source).is_file():
                 errors.append(f"{group_id}: rust module does not exist: {source}")
 
-        if backend in {"hip", "cuda"} and not bridges:
-            errors.append(f"{group_id}: {backend} groups require at least one bridge")
-        if backend == "metal" and bridges:
-            errors.append(f"{group_id}: metal groups should use native_sources, not bridge tables")
+        if backend == "hip" and not bridges:
+            errors.append(f"{group_id}: HIP groups require at least one bridge")
 
     missing_from_manifest = build_bridge_sources - manifest_bridge_sources
     if missing_from_manifest:
         errors.append(
             "build.rs bridge source(s) missing from manifest: "
             + ", ".join(sorted(missing_from_manifest))
+        )
+
+    missing_required_sources = REQUIRED_SOURCES - manifest_kernel_sources
+    if missing_required_sources:
+        errors.append(
+            "retained kernel source(s) missing from manifest: "
+            + ", ".join(sorted(missing_required_sources))
         )
 
     if errors:

@@ -1,13 +1,14 @@
-# Slim HIP/Qwen kernel groups. CUDA/Metal/Gemma/Phi/Llama are out of this branch.
+# Retained HIP/Qwen3.8 kernel groups. Unsupported backends and model families
+# are intentionally absent from this manifest.
 
 version = 1
 
 [[group]]
-id = "hip-qwen35"
+id = "hip-qwen38-dense"
 backend = "hip"
-model_family = "qwen3.5"
+model_family = "qwen3.8"
 default_compiled = true
-notes = "Dense Qwen3.5 / Qwen3.6-27B / Qwen3.8-27B HIP attention and prefill."
+notes = "Retained Qwen3.8 dense attention, 4B geometry, and prefill helpers."
 kernel_sources = [
   "kernels/full_attention.hip",
   "kernels/full_attention_4b.hip",
@@ -31,56 +32,11 @@ source = "kernels/prefill_helpers_bridge.cpp"
 object = "qwen35_prefill_helpers_hip.o"
 
 [[group]]
-id = "hip-dflash"
-backend = "hip"
-model_family = "qwen3.5-dflash"
-default_compiled = true
-notes = "DFlash draft HIP bridge family."
-kernel_sources = ["kernels/dflash_draft.hip"]
-rust_modules = ["crates/kernel-ffi/src/dflash.rs"]
-
-[[group.bridge]]
-source = "kernels/dflash_draft_bridge.cpp"
-object = "dflash_draft_hip.o"
-
-[[group]]
-id = "hip-qwen36-moe"
-backend = "hip"
-model_family = "qwen3.6-moe"
-default_compiled = true
-notes = "Qwen3.6 MoE HIP bridge, persistent decode, and batched prefill family."
-kernel_sources = [
-  "kernels/qwen36_moe.hip",
-  "kernels/qwen36_moe_persistent/helpers.cuh",
-  "kernels/qwen36_moe_persistent/full_attn_phase.cuh",
-  "kernels/qwen36_moe_persistent/linear_attn_phase.cuh",
-  "kernels/qwen36_moe_persistent/ffn_phase.cuh",
-  "kernels/qwen36_moe_persistent/lm_head_phase.cuh",
-  "kernels/qwen36_moe_persistent/persistent_decode.hip",
-  "kernels/qwen36_moe_persistent/batched_prefill_attn_full.cuh",
-  "kernels/qwen36_moe_persistent/batched_prefill_grouped_expert.cuh",
-  "kernels/qwen36_moe_persistent/batched_prefill_router_permute.cuh",
-  "kernels/qwen36_moe_persistent/batched_prefill_unpermute_combine.cuh",
-]
-rust_modules = [
-  "crates/kernel-ffi/src/qwen36_moe/mod.rs",
-  "crates/kernel-ffi/src/qwen36_moe/profile.rs",
-  "crates/kernel-ffi/src/qwen36_moe/descriptors.rs",
-  "crates/kernel-ffi/src/qwen36_moe/launch.rs",
-  "crates/kernel-ffi/src/qwen36_moe/persistent.rs",
-  "crates/kernel-ffi/src/qwen36_moe/prefill.rs",
-]
-
-[[group.bridge]]
-source = "kernels/qwen36_moe_bridge.cpp"
-object = "qwen36_moe_hip.o"
-
-[[group]]
 id = "hip-gqh"
 backend = "hip"
-model_family = "gqh"
+model_family = "qwen3.8-gqh"
 default_compiled = true
-notes = "GQH (Geo-Quant Hierarchical) HIP decode and fused dequant-matvec."
+notes = "Qwen3.8 GQH decode and fused dequant-matvec."
 kernel_sources = [
   "kernels/gqh.hip",
   "kernels/gqh-tables.h",

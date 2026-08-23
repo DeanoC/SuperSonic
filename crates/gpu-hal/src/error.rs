@@ -103,7 +103,7 @@ pub(crate) fn backend_error(backend: Backend, op: &str, status: i32) -> GpuError
     GpuError::backend_status(backend, op, status)
 }
 
-#[cfg(supersonic_backend_cuda)]
+#[cfg(any())]
 pub(crate) fn backend_driver_error(backend: Backend, op: &str, status: i32) -> GpuError {
     GpuError::backend_status_in(backend, BackendApi::Driver, op, status)
 }

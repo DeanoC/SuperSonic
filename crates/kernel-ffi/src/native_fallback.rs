@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 use std::ffi::{c_char, c_int, CString};
 
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
@@ -8,7 +8,7 @@ pub(crate) fn disabled_by_env() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_some()
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 unsafe extern "C" {
     fn supersonic_metal_batch_begin() -> c_int;
     fn supersonic_metal_batch_flush() -> c_int;
@@ -999,7 +999,7 @@ pub(crate) struct MetalBatchGuard {
     active: bool,
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 impl MetalBatchGuard {
     pub(crate) fn begin() -> Result<Self, GpuError> {
         if std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_some() {
@@ -1031,7 +1031,7 @@ impl MetalBatchGuard {
     }
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 impl Drop for MetalBatchGuard {
     fn drop(&mut self) {
         if self.active {
@@ -1041,7 +1041,7 @@ impl Drop for MetalBatchGuard {
     }
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn flush_batch() -> Result<(), GpuError> {
     let status = unsafe { supersonic_metal_batch_flush() };
     if status != 0 {
@@ -1053,7 +1053,7 @@ pub(crate) fn flush_batch() -> Result<(), GpuError> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn queue_sync() -> Result<(), GpuError> {
     let status = unsafe { supersonic_metal_queue_sync() };
     if status != 0 {
@@ -1065,12 +1065,12 @@ pub(crate) fn queue_sync() -> Result<(), GpuError> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn batch_is_active() -> bool {
     unsafe { supersonic_metal_batch_is_active() != 0 }
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn set_batch_label(label: &str) -> Result<(), GpuError> {
     let label = CString::new(label).map_err(|_| {
         GpuError::backend(
@@ -1088,7 +1088,7 @@ pub(crate) fn set_batch_label(label: &str) -> Result<(), GpuError> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn commit_batch_current(label: &str) -> Result<(), GpuError> {
     let label = CString::new(label).map_err(|_| {
         GpuError::backend(
@@ -1106,7 +1106,7 @@ pub(crate) fn commit_batch_current(label: &str) -> Result<(), GpuError> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Result<(), GpuError> {
     if src.is_null() || dst.is_null() || bytes == 0 {
         return Err(GpuError::InvalidArg(
@@ -1123,7 +1123,7 @@ pub(crate) fn copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Re
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn lm_head_argmax_bf16(
     hidden: &GpuBuffer,
     weight: &GpuBuffer,
@@ -1134,7 +1134,7 @@ pub(crate) fn lm_head_argmax_bf16(
     lm_head_argmax_bf16_with_partials(hidden, weight, out_index, None, None, in_dim, vocab_size)
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn lm_head_argmax_bf16_with_partials(
     hidden: &GpuBuffer,
     weight: &GpuBuffer,
@@ -1206,7 +1206,7 @@ pub(crate) fn lm_head_argmax_bf16_with_partials(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn argmax_bf16(
     logits: &GpuBuffer,
     out_index: &mut GpuBuffer,
@@ -1239,7 +1239,7 @@ pub(crate) fn argmax_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn embedding_lookup_bf16(
     token_count: usize,
     vocab_size: usize,
@@ -1286,7 +1286,7 @@ pub(crate) fn embedding_lookup_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn matmul_rhs_transposed_bf16(
     batch_elems: usize,
     m: usize,
@@ -1331,7 +1331,7 @@ pub(crate) fn matmul_rhs_transposed_bf16(
 /// but with `lhs` cached in threadgroup memory and reused across 32 output cols.
 /// Caller must ensure K * 4 bytes fits in the device's threadgroup memory
 /// limit (~32KB on Apple Silicon → K <= 8192).
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
     n: usize,
     k: usize,
@@ -1373,7 +1373,7 @@ pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
 /// SIMD-group cooperative GEMV for the M=1, batch=1 case. Each output column
 /// is handled by 32 threads cooperating on the K reduction; ~5–10× faster
 /// than the per-cell sequential-K kernel on Apple GPUs.
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
     n: usize,
     k: usize,
@@ -1410,7 +1410,7 @@ pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn matmul_rhs_transposed_residual_bf16(
     batch_elems: usize,
     m: usize,
@@ -1455,7 +1455,7 @@ pub(crate) fn matmul_rhs_transposed_residual_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_rhs_transposed_int4_bf16(
     batch_elems: usize,
@@ -1515,7 +1515,7 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16(
 /// (32 threads) per output column; lanes stride through K with kk += 32,
 /// dequant nibbles on the fly, simd_sum reduces. ~5x faster than the per-cell
 /// INT4 matmul kernel on Apple GPUs.
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1(
     n: usize,
@@ -1572,7 +1572,7 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1(
 /// Tiled SIMD-group INT4 GEMV: caches `lhs` (K floats) in threadgroup memory
 /// and reuses it across 32 output cols per threadgroup. Caller must ensure
 /// `K * 4 bytes` fits within the device threadgroup memory limit (~K <= 4096).
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
     n: usize,
@@ -1626,7 +1626,7 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
     n: usize,
@@ -1667,7 +1667,7 @@ pub(crate) unsafe fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_linear_int4_stage5(
     hidden: usize,
@@ -1782,7 +1782,7 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_full_attn_int4_stage5(
     hidden: usize,
@@ -1903,7 +1903,7 @@ pub(crate) unsafe fn qwen36_full_attn_int4_stage5(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_gate_up_tiled(
     hidden: usize,
@@ -1957,7 +1957,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_gate_up_tiled(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_gate_up_down_finalize_tiled(
     hidden: usize,
@@ -2036,7 +2036,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_gate_up_down_finalize_tiled(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_f16(
     hidden: usize,
@@ -2102,7 +2102,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_f16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_indexed_f16(
     hidden: usize,
@@ -2175,7 +2175,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_indexed_f16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
     hidden: usize,
@@ -2251,7 +2251,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
     hidden: usize,
@@ -2346,7 +2346,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_direct_gather_stage5(
     hidden: usize,
@@ -2423,7 +2423,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_direct_gather_stage5(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct(
     n_tokens: usize,
@@ -2497,7 +2497,7 @@ pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct_with_options(
     n_tokens: usize,
@@ -2575,7 +2575,7 @@ pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct_with_options(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn qwen36_router_softmax_topk_bf16(
     n_tokens: usize,
     num_experts: usize,
@@ -2630,7 +2630,7 @@ pub(crate) fn qwen36_router_softmax_topk_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_int4_stage5(
     hidden: usize,
@@ -2716,7 +2716,7 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_int4_stage5_with_router(
     hidden: usize,
@@ -2811,7 +2811,7 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5_with_router(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn matmul_rhs_transposed_f32(
     batch_elems: usize,
     m: usize,
@@ -2852,7 +2852,7 @@ pub(crate) fn matmul_rhs_transposed_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn mpp_tile_gemm_f16_tflops(size: u32, iterations: u32) -> Result<f64, GpuError> {
     if size == 0 || iterations == 0 || size % 64 != 0 {
         return Err(GpuError::InvalidArg(format!(
@@ -2877,7 +2877,7 @@ pub(crate) struct Qwen36MpsExpertF16Probe {
     pub down_tflops: f64,
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn qwen36_mps_expert_f16_probe(
     hidden: usize,
     moe_intermediate: usize,
@@ -2931,7 +2931,7 @@ pub(crate) fn qwen36_mps_expert_f16_probe(
     })
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_projections_bf16(
     hidden_dim: usize,
@@ -2995,7 +2995,7 @@ pub(crate) fn qwen_linear_projections_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_mlp_gate_up_bf16(
     hidden_dim: usize,
@@ -3043,7 +3043,7 @@ pub(crate) fn qwen_mlp_gate_up_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_mlp_gate_up_swiglu_bf16(
     hidden_dim: usize,
@@ -3088,7 +3088,7 @@ pub(crate) fn qwen_mlp_gate_up_swiglu_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_mlp_down_residual_bf16(
     hidden_dim: usize,
@@ -3136,7 +3136,7 @@ pub(crate) fn qwen_mlp_down_residual_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_out_residual_f32_bf16(
     hidden_dim: usize,
@@ -3200,7 +3200,7 @@ pub(crate) fn qwen_linear_out_residual_f32_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_out_residual_bf16_bf16(
     hidden_dim: usize,
@@ -3264,7 +3264,7 @@ pub(crate) fn qwen_linear_out_residual_bf16_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_full_projections_bf16(
     hidden_dim: usize,
@@ -3320,7 +3320,7 @@ pub(crate) fn qwen_full_projections_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn full_attention_prefill_bf16_f32(
     q_heads: usize,
     kv_heads: usize,
@@ -3350,7 +3350,7 @@ pub(crate) fn full_attention_prefill_bf16_f32(
     )
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn full_attention_prefill_strided_bf16_f32(
     q_heads: usize,
@@ -3413,7 +3413,7 @@ pub(crate) fn full_attention_prefill_strided_bf16_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn full_attention_prefill_tmajor_bf16_f32(
     q_heads: usize,
@@ -3479,7 +3479,7 @@ pub(crate) unsafe fn full_attention_prefill_tmajor_bf16_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn full_attention_prefill_tmajor_vec_bf16_f32(
     q_heads: usize,
@@ -3546,7 +3546,7 @@ pub(crate) unsafe fn full_attention_prefill_tmajor_vec_bf16_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn full_attention_decode_bf16_f32(
     q_heads: usize,
@@ -3610,7 +3610,7 @@ pub(crate) fn full_attention_decode_bf16_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn rms_norm_rows_bf16(
     n_rows: usize,
     n_cols: usize,
@@ -3651,7 +3651,7 @@ pub(crate) fn rms_norm_rows_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rms_norm_rope_rows_bf16(
     n_rows: usize,
@@ -3703,7 +3703,7 @@ pub(crate) fn rms_norm_rope_rows_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn rms_norm_rows_f32(
     n_rows: usize,
     n_cols: usize,
@@ -3756,7 +3756,7 @@ pub(crate) fn rms_norm_rows_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn rms_norm_gated_bf16(
     n_rows: usize,
     n_cols: usize,
@@ -3799,7 +3799,7 @@ pub(crate) fn rms_norm_gated_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn rms_norm_gated_f32(
     n_rows: usize,
     n_cols: usize,
@@ -3856,7 +3856,7 @@ pub(crate) fn rms_norm_gated_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn linear_prefill_conv_pack_bf16(
     conv_dim: usize,
     total_len: usize,
@@ -3897,7 +3897,7 @@ pub(crate) fn linear_prefill_conv_pack_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn l2norm(
     dtype: ScalarType,
     n_rows: usize,
@@ -3948,7 +3948,7 @@ pub(crate) fn l2norm(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn element_add(
     dtype: ScalarType,
     total_elems: usize,
@@ -4000,7 +4000,7 @@ pub(crate) fn element_add(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn qwen36_ffn_residual_add_bf16(
     total_elems: usize,
     residual: &mut GpuBuffer,
@@ -4041,7 +4041,7 @@ pub(crate) fn qwen36_ffn_residual_add_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn sigmoid_mul(
     dtype: ScalarType,
     total_elems: usize,
@@ -4093,7 +4093,7 @@ pub(crate) fn sigmoid_mul(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn sigmoid_mul_row_scalar_bf16(
     rows: usize,
     cols: usize,
@@ -4141,7 +4141,7 @@ pub(crate) fn sigmoid_mul_row_scalar_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn full_attention_gate_bf16(
     total_elems: usize,
     attn_f32: &GpuBuffer,
@@ -4182,7 +4182,7 @@ pub(crate) fn full_attention_gate_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn swiglu_mul(
     dtype: ScalarType,
     total_elems: usize,
@@ -4234,7 +4234,7 @@ pub(crate) fn swiglu_mul(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn cast(
     input_dtype: ScalarType,
     output_dtype: ScalarType,
@@ -4289,7 +4289,7 @@ pub(crate) fn cast(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn mul_scalar(
     dtype: ScalarType,
     total_elems: usize,
@@ -4341,7 +4341,7 @@ pub(crate) fn mul_scalar(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn transpose_shd_hsd(
     dtype: ScalarType,
     s: usize,
@@ -4399,7 +4399,7 @@ pub(crate) fn transpose_shd_hsd(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn apply_rope_prefill(
     dtype: ScalarType,
     seq_len: usize,
@@ -4460,7 +4460,7 @@ pub(crate) fn apply_rope_prefill(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn transpose_pad_conv(
     dtype: ScalarType,
     s: usize,
@@ -4500,7 +4500,7 @@ pub(crate) fn transpose_pad_conv(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn extract_conv_state(
     dtype: ScalarType,
     s: usize,
@@ -4548,7 +4548,7 @@ pub(crate) fn extract_conv_state(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn split_qkv(
     dtype: ScalarType,
     s: usize,
@@ -4628,7 +4628,7 @@ pub(crate) fn split_qkv(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn split_qgate(
     dtype: ScalarType,
     s: usize,
@@ -4698,7 +4698,7 @@ pub(crate) fn split_qgate(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn repeat_interleave_heads(
     dtype: ScalarType,
     s: usize,
@@ -4773,7 +4773,7 @@ pub(crate) fn repeat_interleave_heads(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn compute_beta_g_f32(
     seq_len: usize,
     nv: usize,
@@ -4833,7 +4833,7 @@ pub(crate) fn compute_beta_g_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn delta_recurrent_prefill_f32(
     batch_heads: usize,
     seq_len: usize,
@@ -4906,7 +4906,7 @@ pub(crate) fn delta_recurrent_prefill_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn linear_decode_apply_parts_f32(
     num_v_heads: usize,
     num_k_heads: usize,
@@ -4976,7 +4976,7 @@ pub(crate) fn linear_decode_apply_parts_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_prep_bf16_f32(
     key_dim: usize,
@@ -5052,7 +5052,7 @@ pub(crate) fn qwen_linear_prep_bf16_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
     num_v_heads: usize,
@@ -5122,7 +5122,7 @@ pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_decode_apply_inplace_bf16(
     num_v_heads: usize,
@@ -5192,7 +5192,7 @@ pub(crate) fn qwen_linear_decode_apply_inplace_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn conv_state_update_bf16(
     channels: usize,
     state_len: usize,
@@ -5228,7 +5228,7 @@ pub(crate) fn conv_state_update_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 pub(crate) fn linear_conv_value_decay_bf16(
     conv_dim: usize,
     state_len: usize,
@@ -5290,7 +5290,7 @@ pub(crate) fn linear_conv_value_decay_bf16(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn linear_conv_value_decay_update_bf16(
     conv_dim: usize,
@@ -5353,7 +5353,7 @@ pub(crate) fn linear_conv_value_decay_update_bf16(
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 impl MetalBatchGuard {
     pub(crate) fn begin() -> Result<Self, GpuError> {
         Ok(Self { active: false })
@@ -5365,32 +5365,32 @@ impl MetalBatchGuard {
     }
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn flush_batch() -> Result<(), GpuError> {
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn queue_sync() -> Result<(), GpuError> {
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn batch_is_active() -> bool {
     false
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn set_batch_label(_label: &str) -> Result<(), GpuError> {
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn commit_batch_current(_label: &str) -> Result<(), GpuError> {
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn copy_d2d(
     _src: *const c_void,
     _dst: *mut c_void,
@@ -5402,7 +5402,7 @@ pub(crate) fn copy_d2d(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn linear_decode_apply_parts_f32(
     _num_v_heads: usize,
     _num_k_heads: usize,
@@ -5424,7 +5424,7 @@ pub(crate) fn linear_decode_apply_parts_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_prep_bf16_f32(
     _key_dim: usize,
@@ -5448,7 +5448,7 @@ pub(crate) fn qwen_linear_prep_bf16_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
     _num_v_heads: usize,
@@ -5469,7 +5469,7 @@ pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_decode_apply_inplace_bf16(
     _num_v_heads: usize,
@@ -5490,7 +5490,7 @@ pub(crate) fn qwen_linear_decode_apply_inplace_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn conv_state_update_bf16(
     _channels: usize,
     _state_len: usize,
@@ -5503,7 +5503,7 @@ pub(crate) fn conv_state_update_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn linear_conv_value_decay_bf16(
     _conv_dim: usize,
     _state_len: usize,
@@ -5523,7 +5523,7 @@ pub(crate) fn linear_conv_value_decay_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn linear_conv_value_decay_update_bf16(
     _conv_dim: usize,
@@ -5544,7 +5544,7 @@ pub(crate) fn linear_conv_value_decay_update_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn embedding_lookup_bf16(
     _token_count: usize,
     _vocab_size: usize,
@@ -5559,7 +5559,7 @@ pub(crate) fn embedding_lookup_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
     _m: usize,
@@ -5575,7 +5575,7 @@ pub(crate) fn matmul_rhs_transposed_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
     _n: usize,
     _k: usize,
@@ -5589,7 +5589,7 @@ pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
     _n: usize,
     _k: usize,
@@ -5603,7 +5603,7 @@ pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn matmul_rhs_transposed_residual_bf16(
     _batch_elems: usize,
     _m: usize,
@@ -5620,7 +5620,7 @@ pub(crate) fn matmul_rhs_transposed_residual_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_rhs_transposed_int4_bf16(
     _batch_elems: usize,
@@ -5640,7 +5640,7 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1(
     _n: usize,
@@ -5658,7 +5658,7 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
     _n: usize,
@@ -5676,7 +5676,7 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
     _n: usize,
@@ -5694,7 +5694,7 @@ pub(crate) unsafe fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_linear_int4_stage5(
     _hidden: usize,
@@ -5736,7 +5736,7 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_full_attn_int4_stage5(
     _hidden: usize,
@@ -5782,7 +5782,7 @@ pub(crate) unsafe fn qwen36_full_attn_int4_stage5(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_gate_up_tiled(
     _hidden: usize,
@@ -5804,7 +5804,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_gate_up_tiled(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_gate_up_down_finalize_tiled(
     _hidden: usize,
@@ -5835,7 +5835,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_gate_up_down_finalize_tiled(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
     _hidden: usize,
@@ -5872,7 +5872,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_direct_gather_stage5(
     _hidden: usize,
@@ -5902,7 +5902,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_direct_gather_stage5(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct(
     _n_tokens: usize,
@@ -5929,7 +5929,7 @@ pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct_with_options(
     _n_tokens: usize,
@@ -5959,7 +5959,7 @@ pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct_with_options(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn qwen36_router_softmax_topk_bf16(
     _n_tokens: usize,
     _num_experts: usize,
@@ -5974,7 +5974,7 @@ pub(crate) fn qwen36_router_softmax_topk_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_f16(
     _hidden: usize,
@@ -6000,7 +6000,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_f16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_indexed_f16(
     _hidden: usize,
@@ -6028,7 +6028,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_indexed_f16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
     _hidden: usize,
@@ -6057,7 +6057,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_int4_stage5(
     _hidden: usize,
@@ -6095,7 +6095,7 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn matmul_rhs_transposed_f32(
     _batch_elems: usize,
     _m: usize,
@@ -6111,7 +6111,7 @@ pub(crate) fn matmul_rhs_transposed_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn mpp_tile_gemm_f16_tflops(_size: u32, _iterations: u32) -> Result<f64, GpuError> {
     Err(GpuError::backend(
         Backend::Metal,
@@ -6119,7 +6119,7 @@ pub(crate) fn mpp_tile_gemm_f16_tflops(_size: u32, _iterations: u32) -> Result<f
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn qwen36_mps_expert_f16_probe(
     _hidden: usize,
     _moe_intermediate: usize,
@@ -6132,7 +6132,7 @@ pub(crate) fn qwen36_mps_expert_f16_probe(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_projections_bf16(
     _hidden_dim: usize,
@@ -6155,7 +6155,7 @@ pub(crate) fn qwen_linear_projections_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_mlp_gate_up_bf16(
     _hidden_dim: usize,
@@ -6172,7 +6172,7 @@ pub(crate) fn qwen_mlp_gate_up_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_mlp_gate_up_swiglu_bf16(
     _hidden_dim: usize,
@@ -6188,7 +6188,7 @@ pub(crate) fn qwen_mlp_gate_up_swiglu_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_mlp_down_residual_bf16(
     _hidden_dim: usize,
@@ -6205,7 +6205,7 @@ pub(crate) fn qwen_mlp_down_residual_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_out_residual_f32_bf16(
     _hidden_dim: usize,
@@ -6225,7 +6225,7 @@ pub(crate) fn qwen_linear_out_residual_f32_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_out_residual_bf16_bf16(
     _hidden_dim: usize,
@@ -6245,7 +6245,7 @@ pub(crate) fn qwen_linear_out_residual_bf16_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_full_projections_bf16(
     _hidden_dim: usize,
@@ -6265,7 +6265,7 @@ pub(crate) fn qwen_full_projections_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(dead_code)]
 pub(crate) fn lm_head_argmax_bf16(
     _hidden: &GpuBuffer,
@@ -6280,7 +6280,7 @@ pub(crate) fn lm_head_argmax_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(dead_code)]
 pub(crate) fn argmax_bf16(
     _logits: &GpuBuffer,
@@ -6293,7 +6293,7 @@ pub(crate) fn argmax_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn full_attention_prefill_bf16_f32(
     _q_heads: usize,
     _kv_heads: usize,
@@ -6313,7 +6313,7 @@ pub(crate) fn full_attention_prefill_bf16_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn full_attention_prefill_strided_bf16_f32(
     _q_heads: usize,
@@ -6335,7 +6335,7 @@ pub(crate) fn full_attention_prefill_strided_bf16_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn full_attention_prefill_tmajor_bf16_f32(
     _q_heads: usize,
@@ -6356,7 +6356,7 @@ pub(crate) unsafe fn full_attention_prefill_tmajor_bf16_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn full_attention_prefill_tmajor_vec_bf16_f32(
     _q_heads: usize,
@@ -6377,7 +6377,7 @@ pub(crate) unsafe fn full_attention_prefill_tmajor_vec_bf16_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn full_attention_decode_bf16_f32(
     _q_heads: usize,
@@ -6397,7 +6397,7 @@ pub(crate) fn full_attention_decode_bf16_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn rms_norm_rows_bf16(
     _n_rows: usize,
     _n_cols: usize,
@@ -6413,7 +6413,7 @@ pub(crate) fn rms_norm_rows_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rms_norm_rope_rows_bf16(
     _n_rows: usize,
@@ -6433,7 +6433,7 @@ pub(crate) fn rms_norm_rope_rows_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn rms_norm_rows_f32(
     _n_rows: usize,
     _n_cols: usize,
@@ -6449,7 +6449,7 @@ pub(crate) fn rms_norm_rows_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn rms_norm_gated_bf16(
     _n_rows: usize,
     _n_cols: usize,
@@ -6465,7 +6465,7 @@ pub(crate) fn rms_norm_gated_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn rms_norm_gated_f32(
     _n_rows: usize,
     _n_cols: usize,
@@ -6481,7 +6481,7 @@ pub(crate) fn rms_norm_gated_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn linear_prefill_conv_pack_bf16(
     _conv_dim: usize,
     _total_len: usize,
@@ -6497,7 +6497,7 @@ pub(crate) fn linear_prefill_conv_pack_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn l2norm(
     _dtype: ScalarType,
     _n_rows: usize,
@@ -6512,7 +6512,7 @@ pub(crate) fn l2norm(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn element_add(
     _dtype: ScalarType,
     _total_elems: usize,
@@ -6526,7 +6526,7 @@ pub(crate) fn element_add(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_int4_stage5_with_router(
     _hidden: usize,
@@ -6568,7 +6568,7 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5_with_router(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn qwen36_ffn_residual_add_bf16(
     _total_elems: usize,
     _residual: &mut GpuBuffer,
@@ -6581,7 +6581,7 @@ pub(crate) fn qwen36_ffn_residual_add_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn sigmoid_mul(
     _dtype: ScalarType,
     _total_elems: usize,
@@ -6595,7 +6595,7 @@ pub(crate) fn sigmoid_mul(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn sigmoid_mul_row_scalar_bf16(
     _rows: usize,
     _cols: usize,
@@ -6609,7 +6609,7 @@ pub(crate) fn sigmoid_mul_row_scalar_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn full_attention_gate_bf16(
     _total_elems: usize,
     _attn_f32: &GpuBuffer,
@@ -6622,7 +6622,7 @@ pub(crate) fn full_attention_gate_bf16(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn swiglu_mul(
     _dtype: ScalarType,
     _total_elems: usize,
@@ -6636,7 +6636,7 @@ pub(crate) fn swiglu_mul(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn cast(
     _input_dtype: ScalarType,
     _output_dtype: ScalarType,
@@ -6650,7 +6650,7 @@ pub(crate) fn cast(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn mul_scalar(
     _dtype: ScalarType,
     _total_elems: usize,
@@ -6664,7 +6664,7 @@ pub(crate) fn mul_scalar(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn transpose_shd_hsd(
     _dtype: ScalarType,
     _s: usize,
@@ -6679,7 +6679,7 @@ pub(crate) fn transpose_shd_hsd(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn apply_rope_prefill(
     _dtype: ScalarType,
     _seq_len: usize,
@@ -6697,7 +6697,7 @@ pub(crate) fn apply_rope_prefill(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn transpose_pad_conv(
     _dtype: ScalarType,
     _s: usize,
@@ -6712,7 +6712,7 @@ pub(crate) fn transpose_pad_conv(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn extract_conv_state(
     _dtype: ScalarType,
     _s: usize,
@@ -6727,7 +6727,7 @@ pub(crate) fn extract_conv_state(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn split_qkv(
     _dtype: ScalarType,
     _s: usize,
@@ -6744,7 +6744,7 @@ pub(crate) fn split_qkv(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn split_qgate(
     _dtype: ScalarType,
     _s: usize,
@@ -6760,7 +6760,7 @@ pub(crate) fn split_qgate(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn repeat_interleave_heads(
     _dtype: ScalarType,
     _s: usize,
@@ -6776,7 +6776,7 @@ pub(crate) fn repeat_interleave_heads(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn compute_beta_g_f32(
     _seq_len: usize,
     _nv: usize,
@@ -6793,7 +6793,7 @@ pub(crate) fn compute_beta_g_f32(
     ))
 }
 
-#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[cfg(not(any()))]
 pub(crate) fn delta_recurrent_prefill_f32(
     _batch_heads: usize,
     _seq_len: usize,
@@ -6813,7 +6813,7 @@ pub(crate) fn delta_recurrent_prefill_f32(
     ))
 }
 
-#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 mod tests {
     use super::*;
     use gpu_hal::{set_backend, Backend};
@@ -6870,7 +6870,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_embedding_lookup_matches_reference() {
+    fn native_fallback_embedding_lookup_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let embeddings_vals = [
@@ -6891,7 +6891,7 @@ mod tests {
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[3, 3]).expect("allocate ref out");
 
-        crate::metal_host::embedding_lookup(3, 4, 3, &embeddings, &indexes, &mut out_ref)
+        crate::host_fallback::embedding_lookup(3, 4, 3, &embeddings, &indexes, &mut out_ref)
             .expect("host embedding lookup");
         embedding_lookup_bf16(3, 4, 3, &embeddings, &indexes, &mut out_native)
             .expect("native embedding lookup");
@@ -6900,7 +6900,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_matmul_rhs_transposed_matches_reference() {
+    fn native_fallback_matmul_rhs_transposed_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let lhs = GpuBuffer::from_host_bytes(
@@ -6934,7 +6934,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_matmul_rhs_transposed_bf16_gemv_m1_tiled_matches_reference() {
+    fn native_fallback_matmul_rhs_transposed_bf16_gemv_m1_tiled_matches_reference() {
         // K=128 (covers 4 chunks per SIMD lane), N=70 (multiple threadgroups
         // since 70 > 32 cols/tg, and last tg is partial).
         set_backend(Backend::Metal);
@@ -6980,7 +6980,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_matmul_rhs_transposed_bf16_gemv_m1_matches_reference() {
+    fn native_fallback_matmul_rhs_transposed_bf16_gemv_m1_matches_reference() {
         // K=64 spans multiple SIMD lanes (32 threads × 2 chunks per thread).
         // N=3 keeps the threadgroup count small but exercises multiple cols.
         set_backend(Backend::Metal);
@@ -7023,7 +7023,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_matmul_rhs_transposed_residual_matches_reference() {
+    fn native_fallback_matmul_rhs_transposed_residual_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let lhs = GpuBuffer::from_host_bytes(
@@ -7065,7 +7065,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_matmul_rhs_transposed_int4_matches_reference() {
+    fn native_fallback_matmul_rhs_transposed_int4_matches_reference() {
         // GPTQ INT4: m=1, n=4, k=4, group_size=2.
         // Scale grid is [n/gs, k/gs] = [2, 2]: cols 0-1 use scale row 0;
         // cols 2-3 use scale row 1. Each row has two K-direction tiles
@@ -7147,7 +7147,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_matches_reference() {
+    fn native_fallback_matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_matches_reference() {
         // m=1, n=70 (>32 cols → multiple threadgroups, last partial),
         // k=128, group_size=128 (one scale tile per scale_row).
         set_backend(Backend::Metal);
@@ -7249,7 +7249,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_matmul_rhs_transposed_int4_bf16_gemv_m1_matches_reference() {
+    fn native_fallback_matmul_rhs_transposed_int4_bf16_gemv_m1_matches_reference() {
         // m=1, n=4, k=4, group_size=2 — same scale layout as the per-cell
         // INT4 test so the references line up.
         set_backend(Backend::Metal);
@@ -7328,7 +7328,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_qwen_linear_projections_matches_reference() {
+    fn native_fallback_qwen_linear_projections_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let input = GpuBuffer::from_host_bytes(
@@ -7394,7 +7394,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_qwen_full_projections_matches_reference() {
+    fn native_fallback_qwen_full_projections_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let hidden_dim = 3usize;
@@ -7458,7 +7458,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_qwen_mlp_fusions_match_reference() {
+    fn native_fallback_qwen_mlp_fusions_match_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let hidden_dim = 3usize;
@@ -7520,7 +7520,7 @@ mod tests {
         let mut mlp = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("mlp");
         let mut out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim]).expect("out");
 
-        crate::metal_host::matmul_rhs_transposed(
+        crate::host_fallback::matmul_rhs_transposed(
             ScalarType::BF16,
             1,
             1,
@@ -7531,7 +7531,7 @@ mod tests {
             &mut gate_ref,
         )
         .expect("host gate");
-        crate::metal_host::matmul_rhs_transposed(
+        crate::host_fallback::matmul_rhs_transposed(
             ScalarType::BF16,
             1,
             1,
@@ -7542,7 +7542,7 @@ mod tests {
             &mut up_ref,
         )
         .expect("host up");
-        crate::metal_host::swiglu_mul(
+        crate::host_fallback::swiglu_mul(
             ScalarType::BF16,
             intermediate,
             &gate_ref,
@@ -7550,7 +7550,7 @@ mod tests {
             &mut mlp_ref,
         )
         .expect("host swiglu");
-        crate::metal_host::matmul_rhs_transposed(
+        crate::host_fallback::matmul_rhs_transposed(
             ScalarType::BF16,
             1,
             1,
@@ -7561,7 +7561,7 @@ mod tests {
             &mut down_ref,
         )
         .expect("host down");
-        crate::metal_host::element_add(
+        crate::host_fallback::element_add(
             ScalarType::BF16,
             hidden_dim,
             &residual,
@@ -7610,7 +7610,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_qwen_linear_prep_matches_reference() {
+    fn native_fallback_qwen_linear_prep_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let conv_pack = GpuBuffer::from_host_bytes(
@@ -7686,7 +7686,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_linear_conv_value_decay_update_matches_two_step_path() {
+    fn native_fallback_linear_conv_value_decay_update_matches_two_step_path() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let conv_dim = 4usize;
@@ -7786,7 +7786,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_qwen_linear_decode_apply_inplace_matches_out_buffer_path() {
+    fn native_fallback_qwen_linear_decode_apply_inplace_matches_out_buffer_path() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let num_v_heads = 2usize;
@@ -7908,7 +7908,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_matmul_rhs_transposed_f32_matches_reference() {
+    fn native_fallback_matmul_rhs_transposed_f32_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let lhs = GpuBuffer::from_host_bytes(
@@ -7941,7 +7941,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_lm_head_argmax_matches_reference() {
+    fn native_fallback_lm_head_argmax_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let hidden_vals = [1.0f32, -2.0, 0.5];
@@ -7975,7 +7975,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_full_attention_prefill_matches_reference() {
+    fn native_fallback_full_attention_prefill_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let query = GpuBuffer::from_host_bytes(
@@ -8023,7 +8023,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_full_attention_strided_matches_contiguous() {
+    fn native_fallback_full_attention_strided_matches_contiguous() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let query = GpuBuffer::from_host_bytes(
@@ -8110,7 +8110,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_rms_norm_rows_matches_reference() {
+    fn native_fallback_rms_norm_rows_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let input = GpuBuffer::from_host_bytes(
@@ -8153,7 +8153,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_rms_norm_rows_f32_matches_reference() {
+    fn native_fallback_rms_norm_rows_f32_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let input = GpuBuffer::from_host_bytes(
@@ -8175,7 +8175,7 @@ mod tests {
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("allocate ref out");
 
-        crate::metal_host::rms_norm_rows(
+        crate::host_fallback::rms_norm_rows(
             ScalarType::F32,
             2,
             3,
@@ -8203,7 +8203,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_rms_norm_gated_matches_reference() {
+    fn native_fallback_rms_norm_gated_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let hidden_vals = [1.0f32, 2.0, 2.0, 2.0, 0.0, 2.0];
@@ -8230,7 +8230,7 @@ mod tests {
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 3]).expect("allocate ref out");
 
-        crate::metal_host::rms_norm_gated(
+        crate::host_fallback::rms_norm_gated(
             ScalarType::BF16,
             2,
             3,
@@ -8258,7 +8258,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_rms_norm_gated_f32_matches_reference() {
+    fn native_fallback_rms_norm_gated_f32_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let hidden_vals = [1.0f32, 2.0, 2.0, 2.0, 0.0, 2.0];
@@ -8281,7 +8281,7 @@ mod tests {
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("allocate ref out");
 
-        crate::metal_host::rms_norm_gated(
+        crate::host_fallback::rms_norm_gated(
             ScalarType::F32,
             2,
             3,
@@ -8309,7 +8309,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_linear_prefill_conv_pack_matches_reference() {
+    fn native_fallback_linear_prefill_conv_pack_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let cases = [
@@ -8363,7 +8363,7 @@ mod tests {
             let mut out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, conv_dim])
                 .expect("allocate out");
 
-            crate::metal_host::linear_prefill_conv_pack(
+            crate::host_fallback::linear_prefill_conv_pack(
                 ScalarType::BF16,
                 1,
                 conv_dim,
@@ -8400,7 +8400,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_element_add_matches_reference() {
+    fn native_fallback_element_add_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8450,7 +8450,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_sigmoid_mul_matches_reference() {
+    fn native_fallback_sigmoid_mul_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8466,7 +8466,7 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate native bf16 out");
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate ref bf16 out");
-        crate::metal_host::sigmoid_mul(ScalarType::BF16, 4, &data, &gate, &mut out_ref)
+        crate::host_fallback::sigmoid_mul(ScalarType::BF16, 4, &data, &gate, &mut out_ref)
             .expect("host bf16 sigmoid_mul");
         sigmoid_mul(ScalarType::BF16, 4, &data, &gate, &mut out_native)
             .expect("native bf16 sigmoid_mul");
@@ -8492,7 +8492,7 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate native f32 out");
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate ref f32 out");
-        crate::metal_host::sigmoid_mul(ScalarType::F32, 4, &data, &gate, &mut out_ref)
+        crate::host_fallback::sigmoid_mul(ScalarType::F32, 4, &data, &gate, &mut out_ref)
             .expect("host f32 sigmoid_mul");
         sigmoid_mul(ScalarType::F32, 4, &data, &gate, &mut out_native)
             .expect("native f32 sigmoid_mul");
@@ -8510,7 +8510,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_full_attention_gate_matches_reference() {
+    fn native_fallback_full_attention_gate_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8529,9 +8529,9 @@ mod tests {
         let mut out_native =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[5]).expect("allocate native out");
 
-        crate::metal_host::cast(ScalarType::F32, ScalarType::BF16, 5, &attn, &mut attn_bf16)
+        crate::host_fallback::cast(ScalarType::F32, ScalarType::BF16, 5, &attn, &mut attn_bf16)
             .expect("host cast attention");
-        crate::metal_host::sigmoid_mul(ScalarType::BF16, 5, &attn_bf16, &gate, &mut out_ref)
+        crate::host_fallback::sigmoid_mul(ScalarType::BF16, 5, &attn_bf16, &gate, &mut out_ref)
             .expect("host gate attention");
         full_attention_gate_bf16(5, &attn, &gate, &mut out_native)
             .expect("native full attention gate");
@@ -8550,7 +8550,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_swiglu_mul_matches_reference() {
+    fn native_fallback_swiglu_mul_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8565,7 +8565,7 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate native bf16 out");
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate ref bf16 out");
-        crate::metal_host::swiglu_mul(ScalarType::BF16, 4, &gate, &up, &mut out_ref)
+        crate::host_fallback::swiglu_mul(ScalarType::BF16, 4, &gate, &up, &mut out_ref)
             .expect("host bf16 swiglu_mul");
         swiglu_mul(ScalarType::BF16, 4, &gate, &up, &mut out_native)
             .expect("native bf16 swiglu_mul");
@@ -8590,7 +8590,7 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate native f32 out");
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate ref f32 out");
-        crate::metal_host::swiglu_mul(ScalarType::F32, 4, &gate, &up, &mut out_ref)
+        crate::host_fallback::swiglu_mul(ScalarType::F32, 4, &gate, &up, &mut out_ref)
             .expect("host f32 swiglu_mul");
         swiglu_mul(ScalarType::F32, 4, &gate, &up, &mut out_native).expect("native f32 swiglu_mul");
         for (idx, (a, e)) in read_f32(&out_native)
@@ -8607,7 +8607,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_cast_matches_reference() {
+    fn native_fallback_cast_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8653,7 +8653,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_mul_scalar_matches_reference() {
+    fn native_fallback_mul_scalar_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8689,7 +8689,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_transpose_shd_hsd_matches_reference() {
+    fn native_fallback_transpose_shd_hsd_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8723,7 +8723,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_apply_rope_prefill_matches_reference() {
+    fn native_fallback_apply_rope_prefill_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let input_vals = [1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -3.0];
@@ -8750,7 +8750,7 @@ mod tests {
             GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[3, 2], &bf16_bytes(&sin_vals))
                 .expect("upload sin");
 
-        crate::metal_host::apply_rope_prefill(
+        crate::host_fallback::apply_rope_prefill(
             ScalarType::F32,
             2,
             1,
@@ -8779,7 +8779,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_conv_layout_helpers_match_reference() {
+    fn native_fallback_conv_layout_helpers_match_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
         let input = GpuBuffer::from_host_bytes(
@@ -8794,7 +8794,7 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 5]).expect("allocate pad native");
         let mut pad_ref =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 5]).expect("allocate pad ref");
-        crate::metal_host::transpose_pad_conv(ScalarType::F32, 3, 2, 2, &input, &mut pad_ref)
+        crate::host_fallback::transpose_pad_conv(ScalarType::F32, 3, 2, 2, &input, &mut pad_ref)
             .expect("host transpose_pad_conv");
         transpose_pad_conv(ScalarType::F32, 3, 2, 2, &input, &mut pad_native)
             .expect("native transpose_pad_conv");
@@ -8804,7 +8804,7 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 4]).expect("allocate state native");
         let mut state_ref =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 4]).expect("allocate state ref");
-        crate::metal_host::extract_conv_state(ScalarType::F32, 3, 2, 4, &input, &mut state_ref)
+        crate::host_fallback::extract_conv_state(ScalarType::F32, 3, 2, 4, &input, &mut state_ref)
             .expect("host extract_conv_state");
         extract_conv_state(ScalarType::F32, 3, 2, 4, &input, &mut state_native)
             .expect("native extract_conv_state");
@@ -8812,7 +8812,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_split_qkv_matches_reference() {
+    fn native_fallback_split_qkv_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8852,7 +8852,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_split_qgate_matches_reference() {
+    fn native_fallback_split_qgate_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8899,7 +8899,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_repeat_interleave_heads_matches_reference() {
+    fn native_fallback_repeat_interleave_heads_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8924,7 +8924,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_compute_beta_g_f32_matches_reference() {
+    fn native_fallback_compute_beta_g_f32_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -8968,7 +8968,7 @@ mod tests {
         let mut g_ref =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, seq_len]).expect("alloc g ref");
 
-        crate::metal_host::compute_beta_g(
+        crate::host_fallback::compute_beta_g(
             ScalarType::F32,
             seq_len,
             nv,
@@ -9017,7 +9017,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_l2norm_matches_reference() {
+    fn native_fallback_l2norm_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -9032,7 +9032,7 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("alloc f32 out");
         let mut ref_f32 =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("alloc f32 ref");
-        crate::metal_host::l2norm(ScalarType::F32, 2, 3, 1e-6, &input_f32, &mut ref_f32)
+        crate::host_fallback::l2norm(ScalarType::F32, 2, 3, 1e-6, &input_f32, &mut ref_f32)
             .expect("host f32 l2norm");
         l2norm(ScalarType::F32, 2, 3, 1e-6, &input_f32, &mut out_f32).expect("native f32 l2norm");
         let actual_f32 = read_f32(&out_f32);
@@ -9056,7 +9056,7 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 3]).expect("alloc bf16 out");
         let mut ref_bf16 =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 3]).expect("alloc bf16 ref");
-        crate::metal_host::l2norm(ScalarType::BF16, 2, 3, 1e-6, &input_bf16, &mut ref_bf16)
+        crate::host_fallback::l2norm(ScalarType::BF16, 2, 3, 1e-6, &input_bf16, &mut ref_bf16)
             .expect("host bf16 l2norm");
         l2norm(ScalarType::BF16, 2, 3, 1e-6, &input_bf16, &mut out_bf16)
             .expect("native bf16 l2norm");
@@ -9072,7 +9072,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_delta_recurrent_prefill_f32_matches_reference() {
+    fn native_fallback_delta_recurrent_prefill_f32_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
 
@@ -9157,7 +9157,7 @@ mod tests {
         )
         .expect("alloc ref out");
 
-        crate::metal_host::delta_recurrent_prefill(
+        crate::host_fallback::delta_recurrent_prefill(
             ScalarType::F32,
             batch_heads,
             seq_len,

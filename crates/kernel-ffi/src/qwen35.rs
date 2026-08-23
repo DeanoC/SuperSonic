@@ -1,9 +1,9 @@
 use std::ffi::{c_int, c_uint, c_void};
 
-use crate::{metal_host, metal_native};
+use crate::{host_fallback, native_fallback};
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
-#[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+#[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
     fn supersonic_qwen35_hip_persistent_decode(
         dtype: c_int,
@@ -184,7 +184,7 @@ unsafe extern "C" {
     fn supersonic_qwen35_4b_hip_set_launch_preset(blocks: c_int, coop: c_int);
 }
 
-#[cfg(supersonic_backend_cuda)]
+#[cfg(any())]
 unsafe extern "C" {
     fn supersonic_qwen35_cuda_argmax_bf16(
         device_ordinal: usize,
@@ -315,7 +315,7 @@ pub fn persistent_decode(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_hip_persistent_decode(
                     dtype.kernel_dtype_code(),
@@ -335,7 +335,7 @@ pub fn persistent_decode(
                     rotary_dim,
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -374,7 +374,7 @@ pub fn persistent_decode_qwen08_sm86_specialized(
 
     let status = match backend {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_cuda_persistent_decode_qwen08_sm86_specialized(
                     dtype.kernel_dtype_code(),
@@ -394,7 +394,7 @@ pub fn persistent_decode_qwen08_sm86_specialized(
                     rotary_dim,
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -577,7 +577,7 @@ pub fn persistent_decode_4b(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_4b_hip_persistent_decode(
                     dtype.kernel_dtype_code(),
@@ -609,7 +609,7 @@ pub fn persistent_decode_4b(
                     num_taps,
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -682,7 +682,7 @@ pub fn persistent_decode_4b_qwen35_sm86_specialized(
 
     let status = match backend {
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
                     dtype.kernel_dtype_code(),
@@ -711,7 +711,7 @@ pub fn persistent_decode_4b_qwen35_sm86_specialized(
                     int4_scales_ptr,
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -760,7 +760,7 @@ pub fn cuda_argmax_bf16(
             "cuda_argmax_bf16 requires a U32[1] output buffer".into(),
         ));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status =
             supersonic_qwen35_cuda_argmax_bf16(ordinal, n, logits.as_ptr(), out_index.as_mut_ptr());
@@ -772,7 +772,7 @@ pub fn cuda_argmax_bf16(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (ordinal, logits, out_index, n);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -821,7 +821,7 @@ pub fn cuda_lm_head_argmax_bf16(
             "cuda_lm_head_argmax_bf16 requires a U32[1] output buffer".into(),
         ));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_qwen35_cuda_lm_head_argmax_bf16(
             ordinal,
@@ -841,7 +841,7 @@ pub fn cuda_lm_head_argmax_bf16(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (
             ordinal,
@@ -899,7 +899,7 @@ pub fn cuda_lm_head_argmax_bf16_f32accum(
             "cuda_lm_head_argmax_bf16_f32accum requires a U32[1] output buffer".into(),
         ));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_qwen35_cuda_lm_head_argmax_bf16_f32accum(
             ordinal,
@@ -919,7 +919,7 @@ pub fn cuda_lm_head_argmax_bf16_f32accum(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }
@@ -957,7 +957,7 @@ pub fn cuda_target_nll_bf16(
             "cuda_target_nll_bf16 requires F32 out_nll with at least rows elements".into(),
         ));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_qwen35_cuda_target_nll_bf16(
             ordinal,
@@ -975,7 +975,7 @@ pub fn cuda_target_nll_bf16(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (ordinal, logits, targets, out_nll, rows, vocab_size);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -1010,7 +1010,7 @@ pub fn cuda_accumulate_target_nll_bf16(
             "target token {target} outside vocab size {vocab_size}"
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_qwen35_cuda_accumulate_target_nll_bf16(
             ordinal,
@@ -1027,7 +1027,7 @@ pub fn cuda_accumulate_target_nll_bf16(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (ordinal, logits, target, out_sum, vocab_size);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -1043,7 +1043,7 @@ pub fn metal_lm_head_argmax_bf16(
 ) -> Result<u32, GpuError> {
     let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])?;
     metal_lm_head_argmax_bf16_into(hidden, weight, &mut out_index, hidden_dim, vocab_size)?;
-    crate::metal_native::flush_batch()?;
+    crate::native_fallback::flush_batch()?;
     let bytes = out_index.to_host_bytes()?;
     let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     Ok(token)
@@ -1076,15 +1076,15 @@ pub fn metal_lm_head_argmax_bf16_into(
             "metal_lm_head_argmax_bf16_into requires a U32[1] output buffer".into(),
         ));
     }
-    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[cfg(any())]
     {
         crate::prefill_ffi::metal_profile_time("lm_head_argmax", "native", || {
-            crate::metal_native::lm_head_argmax_bf16(
+            crate::native_fallback::lm_head_argmax_bf16(
                 hidden, weight, out_index, hidden_dim, vocab_size,
             )
         })
     }
-    #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+    #[cfg(not(any()))]
     {
         let _ = (hidden, weight, out_index, hidden_dim, vocab_size);
         Err(GpuError::InvalidArg("Metal backend not compiled".into()))
@@ -1138,10 +1138,10 @@ pub fn metal_lm_head_argmax_bf16_with_partials_into(
             "metal_lm_head_argmax_bf16_with_partials_into requires a U32[1] output buffer".into(),
         ));
     }
-    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[cfg(any())]
     {
         crate::prefill_ffi::metal_profile_time("lm_head_argmax", "native", || {
-            crate::metal_native::lm_head_argmax_bf16_with_partials(
+            crate::native_fallback::lm_head_argmax_bf16_with_partials(
                 hidden,
                 weight,
                 out_index,
@@ -1152,7 +1152,7 @@ pub fn metal_lm_head_argmax_bf16_with_partials_into(
             )
         })
     }
-    #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+    #[cfg(not(any()))]
     {
         let _ = (
             hidden,
@@ -1188,13 +1188,13 @@ pub fn metal_argmax_bf16_into(
             "metal_argmax_bf16_into requires a U32[1] output buffer".into(),
         ));
     }
-    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[cfg(any())]
     {
         crate::prefill_ffi::metal_profile_time("argmax_bf16", "native", || {
-            crate::metal_native::argmax_bf16(logits, out_index, n)
+            crate::native_fallback::argmax_bf16(logits, out_index, n)
         })
     }
-    #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+    #[cfg(not(any()))]
     {
         let _ = (logits, out_index, n);
         Err(GpuError::InvalidArg("Metal backend not compiled".into()))
@@ -1234,7 +1234,7 @@ pub fn rms_norm_4b(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_4b_hip_rms_norm(
                     dtype.kernel_dtype_code(),
@@ -1248,7 +1248,7 @@ pub fn rms_norm_4b(
                     output.as_mut_ptr(),
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -1320,7 +1320,7 @@ pub fn standalone_matvec_4b(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_4b_hip_standalone_matvec(
                     dtype.kernel_dtype_code(),
@@ -1333,7 +1333,7 @@ pub fn standalone_matvec_4b(
                     counter_buf.as_mut_ptr() as *mut c_uint,
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -1390,7 +1390,7 @@ pub fn cuda_lm_head_bf16_gemm_4b(
             weight.elem_count()
         )));
     }
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     unsafe {
         let status = supersonic_qwen35_4b_cuda_lm_head_bf16_gemm(
             ordinal,
@@ -1409,7 +1409,7 @@ pub fn cuda_lm_head_bf16_gemm_4b(
         }
         Ok(())
     }
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         let _ = (ordinal, output, input, weight, in_dim, out_dim);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -1455,7 +1455,7 @@ pub fn rms_norm_4b_multirow(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_4b_hip_rms_norm(
                     dtype.kernel_dtype_code(),
@@ -1469,7 +1469,7 @@ pub fn rms_norm_4b_multirow(
                     out.as_mut_ptr(),
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -1538,7 +1538,7 @@ pub fn matmul_rhs_transposed_4b(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
                     dtype.kernel_dtype_code(),
@@ -1552,7 +1552,7 @@ pub fn matmul_rhs_transposed_4b(
                     out.as_mut_ptr(),
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -1582,14 +1582,14 @@ pub fn rms_norm(
     let backend = output.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16 && !metal_native::disabled_by_env() {
-            if metal_native::rms_norm_rows_bf16(1, hidden_dim, eps, true, input, weight, output)
+        if dtype == ScalarType::BF16 && !native_fallback::disabled_by_env() {
+            if native_fallback::rms_norm_rows_bf16(1, hidden_dim, eps, true, input, weight, output)
                 .is_ok()
             {
                 return Ok(());
             }
         }
-        return metal_host::rms_norm_rows(dtype, 1, hidden_dim, eps, true, input, weight, output);
+        return host_fallback::rms_norm_rows(dtype, 1, hidden_dim, eps, true, input, weight, output);
     }
     let status = match backend {
         Backend::Hip => {
@@ -1613,7 +1613,7 @@ pub fn rms_norm(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_hip_rms_norm(
                     dtype.kernel_dtype_code(),
@@ -1627,7 +1627,7 @@ pub fn rms_norm(
                     output.as_mut_ptr(),
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -1640,7 +1640,7 @@ pub fn rms_norm(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 mod tests {
     use super::*;
     use gpu_hal::{set_backend, Backend};
@@ -1765,22 +1765,22 @@ pub fn standalone_matvec(
     let backend = output.backend();
     if backend == Backend::Metal {
         let _ = (ordinal, counter_buf);
-        if crate::metal_native::disabled_by_env()
+        if crate::native_fallback::disabled_by_env()
             || std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_STANDALONE_MATVEC").is_some()
         {
-            crate::metal_native::flush_batch()?;
+            crate::native_fallback::flush_batch()?;
             return crate::prefill_ffi::metal_profile_time("standalone_matvec", "host", || {
-                metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim)
+                host_fallback::standalone_matvec(dtype, input, weight, output, in_dim, out_dim)
             });
         }
         return crate::prefill_ffi::metal_profile_time(
             "standalone_matvec",
             "native",
             || match dtype {
-                ScalarType::BF16 => crate::metal_native::matmul_rhs_transposed_bf16(
+                ScalarType::BF16 => crate::native_fallback::matmul_rhs_transposed_bf16(
                     1, 1, out_dim, in_dim, input, weight, output,
                 ),
-                ScalarType::F32 => crate::metal_native::matmul_rhs_transposed_f32(
+                ScalarType::F32 => crate::native_fallback::matmul_rhs_transposed_f32(
                     1, 1, out_dim, in_dim, input, weight, output,
                 ),
                 other => Err(GpuError::InvalidArg(format!(
@@ -1813,7 +1813,7 @@ pub fn standalone_matvec(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 supersonic_qwen35_hip_standalone_matvec(
                     dtype.kernel_dtype_code(),
@@ -1826,7 +1826,7 @@ pub fn standalone_matvec(
                     counter_buf.as_mut_ptr() as *mut c_uint,
                 )
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
@@ -1850,11 +1850,11 @@ pub fn standalone_matvec_host_f32(
     let backend = input.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
-        crate::metal_native::flush_batch()?;
+        crate::native_fallback::flush_batch()?;
         return crate::prefill_ffi::metal_profile_time(
             "standalone_matvec_host_f32",
             "host",
-            || metal_host::standalone_matvec_host_f32(dtype, input, weight, in_dim, out_dim),
+            || host_fallback::standalone_matvec_host_f32(dtype, input, weight, in_dim, out_dim),
         );
     }
 
@@ -1899,12 +1899,12 @@ pub fn qwen_rms_norm_standalone_matvec_host_f32(
     let backend = input.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
-        crate::metal_native::flush_batch()?;
+        crate::native_fallback::flush_batch()?;
         return crate::prefill_ffi::metal_profile_time(
             "qwen_rms_norm_standalone_matvec_host_f32",
             "host",
             || {
-                metal_host::qwen_rms_norm_standalone_matvec_host_f32(
+                host_fallback::qwen_rms_norm_standalone_matvec_host_f32(
                     dtype,
                     input,
                     norm_weight,

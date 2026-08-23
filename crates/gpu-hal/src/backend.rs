@@ -12,25 +12,6 @@ impl Backend {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "hip" => Some(Self::Hip),
-            "cuda" => Some(Self::Cuda),
-            "metal" => Some(Self::Metal),
-            _ => None,
-        }
-    }
-
-    fn code(self) -> u8 {
-        match self {
-            Self::Hip => 1,
-            Self::Cuda => 2,
-            Self::Metal => 3,
-        }
-    }
-
-    fn from_code(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::Hip),
-            2 => Some(Self::Cuda),
-            3 => Some(Self::Metal),
             _ => None,
         }
     }
@@ -174,38 +155,25 @@ impl BufferPolicy {
     }
 }
 
-static DEFAULT_BACKEND: AtomicU8 = AtomicU8::new(0);
 static DEFAULT_MEMORY_ARCHITECTURE: AtomicU8 = AtomicU8::new(0);
 static POLICY_PERSISTENT: AtomicU8 = AtomicU8::new(0);
 static POLICY_SCRATCH: AtomicU8 = AtomicU8::new(0);
 
 pub fn compiled_backends() -> Vec<Backend> {
-    let mut backends = Vec::new();
-    #[cfg(supersonic_backend_hip)]
-    backends.push(Backend::Hip);
-    #[cfg(supersonic_backend_cuda)]
-    backends.push(Backend::Cuda);
-    #[cfg(supersonic_backend_metal)]
-    backends.push(Backend::Metal);
-    backends
+    vec![Backend::Hip]
 }
 
 pub fn is_backend_compiled(backend: Backend) -> bool {
-    compiled_backends().contains(&backend)
+    backend == Backend::Hip
 }
 
-pub fn set_backend(backend: Backend) {
-    DEFAULT_BACKEND.store(backend.code(), Ordering::Relaxed);
+/// Retained for callers that explicitly initialize the HAL. HIP is the only
+/// compiled backend, so a caller's legacy choice cannot change execution.
+pub fn set_backend(_backend: Backend) {
 }
 
 pub fn current_backend() -> Backend {
-    if let Some(backend) = Backend::from_code(DEFAULT_BACKEND.load(Ordering::Relaxed)) {
-        return backend;
-    }
-    compiled_backends()
-        .into_iter()
-        .next()
-        .expect("no GPU backends compiled")
+    Backend::Hip
 }
 
 /// Set the active memory architecture. Called once at startup after

@@ -1,13 +1,11 @@
-#[cfg(supersonic_backend_cuda)]
+#[cfg(any())]
 use std::ffi::c_int;
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::NonNull;
 
 use crate::backend::{current_backend, Backend};
-#[cfg(supersonic_backend_cuda)]
-use crate::cuda_sys::*;
-#[cfg(supersonic_backend_cuda)]
+#[cfg(any())]
 use crate::error::backend_driver_error;
 use crate::error::{backend_error, GpuError, Result};
 #[cfg(supersonic_backend_hip)]
@@ -68,7 +66,7 @@ pub struct VirtualArenaStats {
 enum PhysicalHandle {
     #[cfg(supersonic_backend_hip)]
     Hip(Option<HipMemGenericAllocationHandle>),
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     Cuda(Option<CuMemGenericAllocationHandle>),
 }
 
@@ -271,7 +269,7 @@ impl Drop for VirtualBuffer {
                 }
             }
             Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
+                #[cfg(any())]
                 {
                     let _ = ops::with_device_impl(self.backend, self.device_ordinal, || {
                         ensure_cuda_driver(self.device_ordinal)?;
@@ -945,7 +943,7 @@ fn allocation_prop_hip(ordinal: usize) -> HipMemAllocationProp {
     }
 }
 
-#[cfg(supersonic_backend_cuda)]
+#[cfg(any())]
 fn allocation_prop_cuda(ordinal: usize) -> CuMemAllocationProp {
     CuMemAllocationProp {
         type_: CUDA_MEM_ALLOCATION_TYPE_PINNED,
@@ -998,7 +996,7 @@ fn vmm_granularity(backend: Backend, ordinal: usize) -> Result<usize> {
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 ensure_cuda_driver(ordinal)?;
                 let prop = allocation_prop_cuda(ordinal);
@@ -1024,7 +1022,7 @@ fn vmm_granularity(backend: Backend, ordinal: usize) -> Result<usize> {
                 }
                 Ok(granularity)
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::Unsupported("CUDA backend not compiled".into()))
             }
@@ -1060,7 +1058,7 @@ fn reserve_address_range(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 ensure_cuda_driver(ordinal)?;
                 let mut ptr = 0u64;
@@ -1076,7 +1074,7 @@ fn reserve_address_range(
                     GpuError::backend(Backend::Cuda, "cuMemAddressReserve returned null".into())
                 })
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::Unsupported("CUDA backend not compiled".into()))
             }
@@ -1142,7 +1140,7 @@ fn map_physical(
             }
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 ensure_cuda_driver(ordinal)?;
                 let prop = allocation_prop_cuda(ordinal);
@@ -1186,7 +1184,7 @@ fn map_physical(
                     handle: PhysicalHandle::Cuda(None),
                 })
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::Unsupported("CUDA backend not compiled".into()))
             }
@@ -1218,7 +1216,7 @@ fn unmap_and_release(
             ops::sync(ordinal)?;
             Ok(())
         }
-        #[cfg(supersonic_backend_cuda)]
+        #[cfg(any())]
         (Backend::Cuda, PhysicalHandle::Cuda(handle)) => {
             ensure_cuda_driver(ordinal)?;
             let ptr = base.as_ptr() as CuDevicePtr + mapping.offset as u64;
@@ -1241,7 +1239,7 @@ fn unmap_and_release(
     })
 }
 
-#[cfg(supersonic_backend_cuda)]
+#[cfg(any())]
 fn ensure_cuda_driver(ordinal: usize) -> Result<CuDevice> {
     let status = unsafe { cuInit(0) };
     if status != 0 {

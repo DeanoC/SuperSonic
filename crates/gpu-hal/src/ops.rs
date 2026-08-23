@@ -14,13 +14,9 @@ use std::time::Instant;
 #[cfg(supersonic_backend_hip)]
 use crate::backend::AllocStrategy;
 use crate::backend::{current_backend, current_strategy_for, Backend, BufferKind, DeviceInfo};
-#[cfg(supersonic_backend_cuda)]
-use crate::cuda_sys::*;
 use crate::error::{backend_error, GpuError, Result};
 #[cfg(supersonic_backend_hip)]
 use crate::hip_sys::*;
-#[cfg(supersonic_backend_metal)]
-use crate::metal_sys::*;
 use crate::scalar_type::ScalarType;
 
 #[cfg(supersonic_backend_hipfile)]
@@ -279,14 +275,14 @@ pub(crate) fn with_device_impl<T>(
             return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 let status = unsafe { cudaGetDevice(&mut prev) };
                 if status != 0 {
                     return Err(backend_error(Backend::Cuda, "cudaGetDevice", status));
                 }
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
         }
         Backend::Metal => {
@@ -308,11 +304,11 @@ pub(crate) fn with_device_impl<T>(
                 1
             }
             Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
+                #[cfg(any())]
                 unsafe {
                     cudaSetDevice(ordinal_i32)
                 }
-                #[cfg(not(supersonic_backend_cuda))]
+                #[cfg(not(any()))]
                 1
             }
             Backend::Metal => 0,
@@ -341,11 +337,11 @@ pub(crate) fn with_device_impl<T>(
                 1
             }
             Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
+                #[cfg(any())]
                 unsafe {
                     cudaSetDevice(prev)
                 }
-                #[cfg(not(supersonic_backend_cuda))]
+                #[cfg(not(any()))]
                 1
             }
             Backend::Metal => 0,
@@ -376,11 +372,11 @@ pub fn set_device(ordinal: usize) -> Result<()> {
             1
         }
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             unsafe {
                 cudaSetDevice(ordinal_i32)
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             1
         }
         Backend::Metal => {
@@ -508,7 +504,7 @@ pub(crate) fn alloc(
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
             Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
+                #[cfg(any())]
                 unsafe {
                     let mut ptr = std::ptr::null_mut();
                     let status = cudaMalloc(&mut ptr, len_bytes);
@@ -520,11 +516,11 @@ pub(crate) fn alloc(
                     })?;
                     Ok((nn, AllocatorKind::Discrete))
                 }
-                #[cfg(not(supersonic_backend_cuda))]
+                #[cfg(not(any()))]
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
             Backend::Metal => {
-                #[cfg(supersonic_backend_metal)]
+                #[cfg(any())]
                 unsafe {
                     let mut ptr = std::ptr::null_mut();
                     let status = supersonic_metal_alloc(len_bytes, &mut ptr);
@@ -536,7 +532,7 @@ pub(crate) fn alloc(
                     })?;
                     Ok((nn, AllocatorKind::Discrete))
                 }
-                #[cfg(not(supersonic_backend_metal))]
+                #[cfg(not(any()))]
                 Err(GpuError::InvalidArg("Metal backend not compiled".into()))
             }
         })
@@ -553,7 +549,7 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
     }
     match backend {
         Backend::Cuda => with_device_impl(backend, ordinal, || {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 let mut ptr = std::ptr::null_mut();
                 const CUDA_HOST_ALLOC_MAPPED: u32 = 0x02;
@@ -565,7 +561,7 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
                     GpuError::backend(Backend::Cuda, "cudaHostAlloc returned null".into())
                 })
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
         }),
         Backend::Hip => with_device_impl(backend, ordinal, || {
@@ -607,7 +603,7 @@ pub fn host_pinned_device_ptr(
     }
     match backend {
         Backend::Cuda => with_device_impl(backend, ordinal, || {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 let mut device_ptr = std::ptr::null_mut();
                 let status = unsafe { cudaHostGetDevicePointer(&mut device_ptr, ptr, 0) };
@@ -625,7 +621,7 @@ pub fn host_pinned_device_ptr(
                     )
                 })
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
         }),
         Backend::Hip | Backend::Metal => NonNull::new(ptr)
@@ -641,7 +637,7 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
     match backend {
         Backend::Cuda => {
             let _: Result<()> = with_device_impl(backend, ordinal, || {
-                #[cfg(supersonic_backend_cuda)]
+                #[cfg(any())]
                 {
                     let status = unsafe { cudaFreeHost(ptr) };
                     if status != 0 {
@@ -649,7 +645,7 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
                     }
                     Ok(())
                 }
-                #[cfg(not(supersonic_backend_cuda))]
+                #[cfg(not(any()))]
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             });
         }
@@ -877,19 +873,19 @@ pub(crate) fn free(
                     1
                 }
                 (Backend::Cuda, _) => {
-                    #[cfg(supersonic_backend_cuda)]
+                    #[cfg(any())]
                     unsafe {
                         cudaFree(dev_ptr)
                     }
-                    #[cfg(not(supersonic_backend_cuda))]
+                    #[cfg(not(any()))]
                     1
                 }
                 (Backend::Metal, _) => {
-                    #[cfg(supersonic_backend_metal)]
+                    #[cfg(any())]
                     unsafe {
                         supersonic_metal_free(dev_ptr)
                     }
-                    #[cfg(not(supersonic_backend_metal))]
+                    #[cfg(not(any()))]
                     1
                 }
             };
@@ -930,11 +926,11 @@ pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                     1
                 }
                 Backend::Cuda => {
-                    #[cfg(supersonic_backend_cuda)]
+                    #[cfg(any())]
                     unsafe {
                         cudaMemcpy(dst, src, len, CUDA_MEMCPY_HOST_TO_DEVICE)
                     }
-                    #[cfg(not(supersonic_backend_cuda))]
+                    #[cfg(not(any()))]
                     1
                 }
                 Backend::Metal => {
@@ -1164,11 +1160,11 @@ pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                     1
                 }
                 Backend::Cuda => {
-                    #[cfg(supersonic_backend_cuda)]
+                    #[cfg(any())]
                     unsafe {
                         cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_HOST)
                     }
-                    #[cfg(not(supersonic_backend_cuda))]
+                    #[cfg(not(any()))]
                     1
                 }
                 Backend::Metal => {
@@ -1210,11 +1206,11 @@ pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                     1
                 }
                 Backend::Cuda => {
-                    #[cfg(supersonic_backend_cuda)]
+                    #[cfg(any())]
                     unsafe {
                         cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_DEVICE)
                     }
-                    #[cfg(not(supersonic_backend_cuda))]
+                    #[cfg(not(any()))]
                     1
                 }
                 Backend::Metal => {
@@ -1256,11 +1252,11 @@ pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> 
                     1
                 }
                 Backend::Cuda => {
-                    #[cfg(supersonic_backend_cuda)]
+                    #[cfg(any())]
                     unsafe {
                         cudaMemset(dst, 0, len)
                     }
-                    #[cfg(not(supersonic_backend_cuda))]
+                    #[cfg(not(any()))]
                     1
                 }
                 Backend::Metal => {
@@ -1337,11 +1333,11 @@ pub fn sync(ordinal: usize) -> Result<()> {
                     1
                 }
                 Backend::Cuda => {
-                    #[cfg(supersonic_backend_cuda)]
+                    #[cfg(any())]
                     unsafe {
                         cudaDeviceSynchronize()
                     }
-                    #[cfg(not(supersonic_backend_cuda))]
+                    #[cfg(not(any()))]
                     1
                 }
                 Backend::Metal => 0,
@@ -1696,7 +1692,7 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
             "HIP device query is provided by the HIP kernel bridge, not gpu-hal".into(),
         )),
         Backend::Cuda => {
-            #[cfg(supersonic_backend_cuda)]
+            #[cfg(any())]
             {
                 let mut props = unsafe { std::mem::zeroed::<CudaDeviceProp>() };
                 let status = unsafe { cudaGetDeviceProperties(&mut props, ordinal_i32) };
@@ -1715,13 +1711,13 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
                     clock_rate_khz: props.clockRate as u32,
                 })
             }
-            #[cfg(not(supersonic_backend_cuda))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
         }
         Backend::Metal => {
-            #[cfg(supersonic_backend_metal)]
+            #[cfg(any())]
             {
                 let mut arch_name = vec![0i8; 64];
                 let mut total_vram_bytes = 0u64;
@@ -1762,7 +1758,7 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
                     clock_rate_khz,
                 })
             }
-            #[cfg(not(supersonic_backend_metal))]
+            #[cfg(not(any()))]
             {
                 Err(GpuError::InvalidArg("Metal backend not compiled".into()))
             }
@@ -1770,7 +1766,7 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
     }
 }
 
-#[cfg(supersonic_backend_metal)]
+#[cfg(any())]
 fn metal_runtime_compile_smoke() -> Result<()> {
     let status = unsafe { supersonic_metal_compile_shader_smoke() };
     if status != 0 {
@@ -2091,7 +2087,7 @@ mod hal_profile_tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+#[cfg(all(test, target_os = "macos", any()))]
 mod tests {
     use super::*;
     use crate::{set_backend, Backend, GpuBuffer, ScalarType};

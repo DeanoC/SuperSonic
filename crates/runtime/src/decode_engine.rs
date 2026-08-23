@@ -2131,7 +2131,7 @@ impl DecodeEngine {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V cache"))?;
             let aligned =
-                kernel_ffi::certified_kv::aligned_tokens(layer_state.kv_filled, block_size);
+                kernel_ffi::kv_cache::aligned_tokens(layer_state.kv_filled, block_size);
             if aligned == 0 {
                 continue;
             }
@@ -2143,7 +2143,7 @@ impl DecodeEngine {
                 value_i4_shape,
                 value_meta_shape,
                 value_error_shape,
-            ) = kernel_ffi::certified_kv::quantized_shapes(
+            ) = kernel_ffi::kv_cache::quantized_shapes(
                 num_kv_heads,
                 layer_state.kv_filled,
                 head_dim,
@@ -2184,7 +2184,7 @@ impl DecodeEngine {
                 )?;
 
             let start = Instant::now();
-            kernel_ffi::certified_kv::quantize_bf16_cache(
+            kernel_ffi::kv_cache::quantize_bf16_cache(
                 self.ordinal,
                 cache_k,
                 cache_v,
@@ -2262,7 +2262,7 @@ impl DecodeEngine {
                         anyhow::anyhow!("layer {layer_idx} certified KV block_sum alloc: {e}")
                     })?;
             let score_start = Instant::now();
-            kernel_ffi::certified_kv::score_blocks_int8(
+            kernel_ffi::kv_cache::score_blocks_int8(
                 self.ordinal,
                 &query,
                 &key_i8,
@@ -2339,7 +2339,7 @@ impl DecodeEngine {
                     |e| anyhow::anyhow!("layer {layer_idx} certified KV attend output alloc: {e}"),
                 )?;
             let attend_start = Instant::now();
-            kernel_ffi::certified_kv::attend_int8_int4(
+            kernel_ffi::kv_cache::attend_int8_int4(
                 self.ordinal,
                 &query,
                 &key_i8,
@@ -2402,7 +2402,7 @@ impl DecodeEngine {
                 anyhow::anyhow!("layer {layer_idx} certified KV BF16-value output alloc: {e}")
             })?;
             let bf16_value_start = Instant::now();
-            kernel_ffi::certified_kv::attend_int8_bf16_values(
+            kernel_ffi::kv_cache::attend_int8_bf16_values(
                 self.ordinal,
                 &query,
                 &key_i8,
@@ -3257,7 +3257,7 @@ impl DecodeEngine {
             let block_size = certified_kv.block_size;
             let value_group_size = certified_kv.value_group_size;
             let bf16_values = certified_kv.bf16_values;
-            let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
+            let aligned = kernel_ffi::kv_cache::aligned_tokens(kv_len, block_size);
             let tail_len = kv_len - aligned;
             anyhow::ensure!(
                 aligned > 0,
@@ -3283,7 +3283,7 @@ impl DecodeEngine {
                 value_i4_shape,
                 value_meta_shape,
                 value_error_shape,
-            ) = kernel_ffi::certified_kv::quantized_shapes(
+            ) = kernel_ffi::kv_cache::quantized_shapes(
                 num_kv_heads,
                 kv_len,
                 head_dim,
@@ -3321,7 +3321,7 @@ impl DecodeEngine {
                 GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape).map_err(
                     |e| anyhow::anyhow!("layer {idx} trace certified KV value_norm alloc: {e}"),
                 )?;
-            kernel_ffi::certified_kv::quantize_bf16_cache(
+            kernel_ffi::kv_cache::quantize_bf16_cache(
                 self.ordinal,
                 &kv_k_cert,
                 &kv_v_cert,
@@ -3476,7 +3476,7 @@ impl DecodeEngine {
                         anyhow::anyhow!("layer {idx} trace certified KV BF16-value attn alloc: {e}")
                     },
                 )?;
-            kernel_ffi::certified_kv::attend_int8_bf16_values(
+            kernel_ffi::kv_cache::attend_int8_bf16_values(
                 self.ordinal,
                 &query_cert,
                 &key_i8,
@@ -3538,7 +3538,7 @@ impl DecodeEngine {
                     &tail_v_bytes,
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV tail V H2D: {e}"))?;
-                kernel_ffi::certified_kv::attend_int8_int4_with_bf16_tail(
+                kernel_ffi::kv_cache::attend_int8_int4_with_bf16_tail(
                     self.ordinal,
                     &query_cert,
                     &key_i8,
@@ -3560,7 +3560,7 @@ impl DecodeEngine {
                     anyhow::anyhow!("layer {idx} trace certified KV hybrid attention: {e}")
                 })?;
             } else {
-                kernel_ffi::certified_kv::attend_int8_int4(
+                kernel_ffi::kv_cache::attend_int8_int4(
                     self.ordinal,
                     &query_cert,
                     &key_i8,
@@ -5492,7 +5492,7 @@ impl DecodeEngine {
 
             let ls = &mut self.state.layers[idx];
             let use_certified_cuda = certified_kv_decode
-                .map(|cfg| kernel_ffi::certified_kv::aligned_tokens(kv_len, cfg.block_size) > 0)
+                .map(|cfg| kernel_ffi::kv_cache::aligned_tokens(kv_len, cfg.block_size) > 0)
                 .unwrap_or(false);
             let capacity_offset = if use_certified_cuda {
                 self.decode_context_limit
@@ -5514,7 +5514,7 @@ impl DecodeEngine {
                 if let (Some(cache_k), Some(cache_v)) =
                     (ls.kv_cache_k.as_mut(), ls.kv_cache_v.as_mut())
                 {
-                    kernel_ffi::certified_kv::copy_step_bf16(
+                    kernel_ffi::kv_cache::copy_step_bf16(
                         self.ordinal,
                         attn_k_step,
                         attn_v_step,
@@ -5532,7 +5532,7 @@ impl DecodeEngine {
                 let tail_v = ls.certified_kv_tail_v.as_mut().ok_or_else(|| {
                     anyhow::anyhow!("layer {idx} certified tail value buffer missing")
                 })?;
-                kernel_ffi::certified_kv::copy_step_bf16(
+                kernel_ffi::kv_cache::copy_step_bf16(
                     self.ordinal,
                     attn_k_step,
                     attn_v_step,
@@ -5562,9 +5562,9 @@ impl DecodeEngine {
                 let block_size = cfg.block_size;
                 let value_group_size = cfg.value_group_size;
                 let bf16_values = cfg.bf16_values;
-                let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
+                let aligned = kernel_ffi::kv_cache::aligned_tokens(kv_len, block_size);
                 let tail_len = kv_len - aligned;
-                let cap_aligned = kernel_ffi::certified_kv::aligned_tokens(cap, block_size);
+                let cap_aligned = kernel_ffi::kv_cache::aligned_tokens(cap, block_size);
                 let key_i8_shape = [num_kv_heads, cap_aligned, head_dim];
                 let key_scale_shape = [num_kv_heads, cap_aligned / block_size, head_dim];
                 let needs_key_alloc = ls
@@ -5624,7 +5624,7 @@ impl DecodeEngine {
                     let key_quantize_start = Instant::now();
                     if !ls.certified_kv_gpu_tail_only {
                         let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
-                        kernel_ffi::certified_kv::quantize_bf16_keys_range(
+                        kernel_ffi::kv_cache::quantize_bf16_keys_range(
                             self.ordinal,
                             cache_k_ref,
                             start_block,
@@ -5683,7 +5683,7 @@ impl DecodeEngine {
                         .map_err(|e| {
                             anyhow::anyhow!("layer {idx} certified tmp key_zero alloc: {e}")
                         })?;
-                        kernel_ffi::certified_kv::quantize_bf16_keys(
+                        kernel_ffi::kv_cache::quantize_bf16_keys(
                             self.ordinal,
                             &quant_k,
                             block_size,
@@ -5964,7 +5964,7 @@ impl DecodeEngine {
                             })?;
                         }
                         let value_quantize_start = Instant::now();
-                        kernel_ffi::certified_kv::quantize_bf16_values_range(
+                        kernel_ffi::kv_cache::quantize_bf16_values_range(
                             self.ordinal,
                             ls.kv_cache_v.as_ref().unwrap(),
                             start_block,
@@ -6020,7 +6020,7 @@ impl DecodeEngine {
                         let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
                         let tail_k = ls.certified_kv_tail_k.as_mut().unwrap();
                         let tail_v = ls.certified_kv_tail_v.as_mut().unwrap();
-                        kernel_ffi::certified_kv::copy_token_range_bf16(
+                        kernel_ffi::kv_cache::copy_token_range_bf16(
                             self.ordinal,
                             cache_k_ref,
                             cache_v_ref,
@@ -6185,7 +6185,7 @@ impl DecodeEngine {
                         })?;
                     }
                     let attend_start = Instant::now();
-                    kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
+                    kernel_ffi::kv_cache::attend_int8_bf16_values_strided(
                         self.ordinal,
                         attn_q,
                         key_i8,
@@ -6294,7 +6294,7 @@ impl DecodeEngine {
                         let value_quantize_start = Instant::now();
                         if !ls.certified_kv_gpu_tail_only {
                             let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
-                            kernel_ffi::certified_kv::quantize_bf16_values_range(
+                            kernel_ffi::kv_cache::quantize_bf16_values_range(
                                 self.ordinal,
                                 cache_v_ref,
                                 start_block,
@@ -6377,7 +6377,7 @@ impl DecodeEngine {
                                             "layer {idx} certified tmp value_norm alloc: {e}"
                                         )
                                     })?;
-                            kernel_ffi::certified_kv::quantize_bf16_values_range(
+                            kernel_ffi::kv_cache::quantize_bf16_values_range(
                                 self.ordinal,
                                 &quant_v,
                                 0,
@@ -6536,7 +6536,7 @@ impl DecodeEngine {
                         );
                     }
                     let cert_score_start = Instant::now();
-                    kernel_ffi::certified_kv::score_blocks_int8(
+                    kernel_ffi::kv_cache::score_blocks_int8(
                         self.ordinal,
                         attn_q,
                         key_i8,
@@ -6790,7 +6790,7 @@ impl DecodeEngine {
                                 || ls.certified_kv_device_meta_key_scale_stride_blocks
                                     != key_scale_stride_blocks;
                         if refresh_key_scale_norm {
-                            kernel_ffi::certified_kv::key_scale_norms(
+                            kernel_ffi::kv_cache::key_scale_norms(
                                 self.ordinal,
                                 key_scale,
                                 scratch.certified_key_scale_norm.as_mut().unwrap(),
@@ -6826,7 +6826,7 @@ impl DecodeEngine {
                                 );
                             }
                         }
-                        kernel_ffi::certified_kv::select_blocks_device(
+                        kernel_ffi::kv_cache::select_blocks_device(
                             self.ordinal,
                             attn_q,
                             scratch.certified_key_scale_norm.as_ref().unwrap(),
@@ -7296,7 +7296,7 @@ impl DecodeEngine {
                                     )
                                 })?,
                             );
-                            kernel_ffi::certified_kv::init_key_page_cache(
+                            kernel_ffi::kv_cache::init_key_page_cache(
                                 self.ordinal,
                                 ls.certified_kv_promoted_key_cache_tags_gpu
                                     .as_mut()
@@ -7352,7 +7352,7 @@ impl DecodeEngine {
                             ls.certified_kv_promoted_key_cache_tick = ls
                                 .certified_kv_promoted_key_cache_tick
                                 .wrapping_add(max_promoted_blocks as u64 + 1);
-                            kernel_ffi::certified_kv::resolve_key_page_cache(
+                            kernel_ffi::kv_cache::resolve_key_page_cache(
                                 self.ordinal,
                                 scratch.certified_selected_blocks.as_ref().unwrap(),
                                 scratch.certified_selected_counts.as_ref().unwrap(),
@@ -7738,7 +7738,7 @@ impl DecodeEngine {
                             } else {
                                 scratch.certified_promote_index.as_ref().unwrap()
                             };
-                            kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
+                            kernel_ffi::kv_cache::gather_promoted_bf16_from_tier2(
                                 self.ordinal,
                                 tier2_key_device_ptr,
                                 tier2_value_device_ptr,
@@ -7789,7 +7789,7 @@ impl DecodeEngine {
                             } else {
                                 scratch.certified_promote_index.as_ref().unwrap()
                             };
-                            kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
+                            kernel_ffi::kv_cache::gather_promoted_bf16_from_tier2(
                                 self.ordinal,
                                 tier2_key_device_ptr,
                                 tier2_value_device_ptr,
@@ -7875,7 +7875,7 @@ impl DecodeEngine {
                     } else {
                         scratch.certified_score_consistency_flags.as_mut().unwrap()
                     };
-                    kernel_ffi::certified_kv::score_consistency(
+                    kernel_ffi::kv_cache::score_consistency(
                         self.ordinal,
                         attn_q,
                         key_i8,
@@ -7947,7 +7947,7 @@ impl DecodeEngine {
                             );
                         }
                         let cert_rank_log_start = Instant::now();
-                        kernel_ffi::certified_kv::selected_fp16_log_masses(
+                        kernel_ffi::kv_cache::selected_fp16_log_masses(
                             self.ordinal,
                             attn_q,
                             if use_key_page_cache {
@@ -7970,7 +7970,7 @@ impl DecodeEngine {
                             eprintln!("cert-kv layer {idx}: selected fp16 log masses done");
                         }
                         if use_device_selector {
-                            kernel_ffi::certified_kv::ranking_flags_device(
+                            kernel_ffi::kv_cache::ranking_flags_device(
                                 self.ordinal,
                                 scratch.certified_block_max.as_ref().unwrap(),
                                 scratch.certified_block_sum.as_ref().unwrap(),
@@ -8253,7 +8253,7 @@ impl DecodeEngine {
                         } else {
                             scratch.certified_promoted_value_bf16.as_ref().unwrap()
                         };
-                        kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
+                        kernel_ffi::kv_cache::attend_mixed_key_int4_with_bf16_tail_strided(
                             self.ordinal,
                             attn_q,
                             key_i8,
@@ -8294,7 +8294,7 @@ impl DecodeEngine {
                             })?;
                             eprintln!("cert-kv layer {idx}: initial attend done");
                         }
-                        kernel_ffi::certified_kv::block_masses_from_token_probs(
+                        kernel_ffi::kv_cache::block_masses_from_token_probs(
                             self.ordinal,
                             score_scratch,
                             scratch.certified_final_block_mass.as_mut().unwrap(),
@@ -8361,7 +8361,7 @@ impl DecodeEngine {
                             })?;
                             scratch.certified_ranking_fallback_head_flags.as_ref()
                         };
-                        kernel_ffi::certified_kv::value_promotions_from_block_masses(
+                        kernel_ffi::kv_cache::value_promotions_from_block_masses(
                             self.ordinal,
                             scratch.certified_final_block_mass.as_ref().unwrap(),
                             ls.certified_kv_value_error.as_ref().unwrap(),
@@ -8553,7 +8553,7 @@ impl DecodeEngine {
                                         "layer {idx} certified KV final value cache gather index H2D: {e}"
                                     )
                                 })?;
-                                kernel_ffi::certified_kv::gather_promoted_values_bf16_from_tier2(
+                                kernel_ffi::kv_cache::gather_promoted_values_bf16_from_tier2(
                                     self.ordinal,
                                     tier2_value_device_ptr,
                                     scratch.certified_value_promote_index.as_ref().unwrap(),
@@ -8628,7 +8628,7 @@ impl DecodeEngine {
                                         })?,
                                     );
                                 }
-                                kernel_ffi::certified_kv::gather_promoted_values_bf16_from_tier2(
+                                kernel_ffi::kv_cache::gather_promoted_values_bf16_from_tier2(
                                     self.ordinal,
                                     tier2_value_device_ptr,
                                     scratch.certified_value_promote_index.as_ref().unwrap(),
@@ -8671,7 +8671,7 @@ impl DecodeEngine {
                                 final_promoted_value_ref =
                                     scratch.certified_promoted_value_bf16.as_ref().unwrap();
                             }
-                            kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
+                            kernel_ffi::kv_cache::attend_mixed_key_int4_with_bf16_tail_strided(
                                 self.ordinal,
                                 attn_q,
                                 key_i8,
@@ -8704,7 +8704,7 @@ impl DecodeEngine {
                                     "layer {idx} certified KV exact mixed-key INT4 attention: {e}"
                                 )
                             })?;
-                            kernel_ffi::certified_kv::block_masses_from_token_probs(
+                            kernel_ffi::kv_cache::block_masses_from_token_probs(
                                 self.ordinal,
                                 score_scratch,
                                 scratch.certified_final_block_mass.as_mut().unwrap(),
@@ -8716,7 +8716,7 @@ impl DecodeEngine {
                                     "layer {idx} certified KV exact final block mass reduction: {e}"
                                 )
                             })?;
-                            kernel_ffi::certified_kv::value_promotions_from_block_masses(
+                            kernel_ffi::kv_cache::value_promotions_from_block_masses(
                                 self.ordinal,
                                 scratch.certified_final_block_mass.as_ref().unwrap(),
                                 ls.certified_kv_value_error.as_ref().unwrap(),
@@ -8948,7 +8948,7 @@ impl DecodeEngine {
                                     })?,
                                 );
                             }
-                            kernel_ffi::certified_kv::dense_flagged_heads_out_bf16(
+                            kernel_ffi::kv_cache::dense_flagged_heads_out_bf16(
                                 self.ordinal,
                                 attn_q,
                                 scratch
@@ -9245,7 +9245,7 @@ impl DecodeEngine {
                                 }
                             }
 
-                            kernel_ffi::certified_kv::dense_selected_heads_out_bf16(
+                            kernel_ffi::kv_cache::dense_selected_heads_out_bf16(
                                 self.ordinal,
                                 attn_q,
                                 scratch.certified_ranking_fallback_heads.as_ref().unwrap(),

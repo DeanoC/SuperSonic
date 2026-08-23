@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::{metal_host, metal_native};
+use crate::{host_fallback, native_fallback};
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 static METAL_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -153,7 +153,7 @@ mod explicit_options_tests {
 fn prefill_native_disabled(options: Option<&PrefillFfiLaunchOptions>) -> bool {
     options
         .map(|options| options.force_host_native)
-        .unwrap_or_else(metal_native::disabled_by_env)
+        .unwrap_or_else(native_fallback::disabled_by_env)
 }
 
 fn prefill_launch_flag(
@@ -490,7 +490,7 @@ fn metal_profile_host_time<T, F>(op: &'static str, f: F) -> Result<T, GpuError>
 where
     F: FnOnce() -> Result<T, GpuError>,
 {
-    metal_native::flush_batch()?;
+    native_fallback::flush_batch()?;
     metal_profile_time(op, "host", f)
 }
 
@@ -502,27 +502,27 @@ fn prefill_metal_profile_host_time<T, F>(
 where
     F: FnOnce() -> Result<T, GpuError>,
 {
-    metal_native::flush_batch()?;
+    native_fallback::flush_batch()?;
     prefill_metal_profile_time(options, op, "host", f)
 }
 
 pub fn flush_metal_batch() -> Result<(), GpuError> {
-    metal_native::flush_batch()
+    native_fallback::flush_batch()
 }
 
 pub fn sync_metal_queue() -> Result<(), GpuError> {
-    metal_native::queue_sync()
+    native_fallback::queue_sync()
 }
 
 /// True when a Metal batch is currently open (i.e. ops will be accumulated
 /// into the shared command buffer rather than committing one-by-one).
 /// Always false on non-Metal builds.
 pub fn metal_batch_is_active() -> bool {
-    metal_native::batch_is_active()
+    native_fallback::batch_is_active()
 }
 
 pub fn set_metal_batch_label(label: &str) -> Result<(), GpuError> {
-    metal_native::set_batch_label(label)
+    native_fallback::set_batch_label(label)
 }
 
 pub fn record_metal_profile_sample(op: &str, path: &str, elapsed_ms: f64) -> Result<(), GpuError> {
@@ -535,11 +535,11 @@ pub fn record_metal_profile_sample(op: &str, path: &str, elapsed_ms: f64) -> Res
 }
 
 pub fn commit_metal_batch_current(label: &str) -> Result<(), GpuError> {
-    metal_native::commit_batch_current(label)
+    native_fallback::commit_batch_current(label)
 }
 
 pub fn metal_copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Result<(), GpuError> {
-    metal_native::copy_d2d(src, dst, bytes)
+    native_fallback::copy_d2d(src, dst, bytes)
 }
 
 pub fn metal_linear_decode_apply_parts_f32(
@@ -557,7 +557,7 @@ pub fn metal_linear_decode_apply_parts_f32(
     initial_state: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    metal_native::linear_decode_apply_parts_f32(
+    native_fallback::linear_decode_apply_parts_f32(
         num_v_heads,
         num_k_heads,
         head_k_dim,
@@ -592,7 +592,7 @@ pub fn metal_qwen_linear_prep_bf16_f32(
     k_normed: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_linear_prep", "native", || {
-        metal_native::qwen_linear_prep_bf16_f32(
+        native_fallback::qwen_linear_prep_bf16_f32(
             key_dim,
             val_dim,
             num_key_heads,
@@ -626,7 +626,7 @@ pub fn metal_qwen_linear_prep_decode_apply_bf16_f32(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_linear_prep_decode_apply", "native", || {
-        metal_native::qwen_linear_prep_decode_apply_bf16_f32(
+        native_fallback::qwen_linear_prep_decode_apply_bf16_f32(
             num_v_heads,
             num_k_heads,
             head_k_dim,
@@ -657,7 +657,7 @@ pub fn metal_qwen_linear_decode_apply_inplace_bf16(
     attn_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_linear_decode_apply_inplace", "native", || {
-        metal_native::qwen_linear_decode_apply_inplace_bf16(
+        native_fallback::qwen_linear_decode_apply_inplace_bf16(
             num_v_heads,
             num_k_heads,
             head_k_dim,
@@ -679,7 +679,7 @@ pub fn metal_conv_state_update_bf16(
     qkv: &GpuBuffer,
     state: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    metal_native::conv_state_update_bf16(channels, state_len, qkv, state)
+    native_fallback::conv_state_update_bf16(channels, state_len, qkv, state)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -697,7 +697,7 @@ pub fn metal_linear_conv_value_decay_update_bf16(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("linear_conv_value_decay_update", "native", || {
-        metal_native::linear_conv_value_decay_update_bf16(
+        native_fallback::linear_conv_value_decay_update_bf16(
             conv_dim,
             state_len,
             kernel_size,
@@ -730,7 +730,7 @@ pub fn metal_qwen_linear_projections_bf16(
     b_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_linear_projections", "native", || {
-        metal_native::qwen_linear_projections_bf16(
+        native_fallback::qwen_linear_projections_bf16(
             hidden_dim,
             qkv_dim,
             val_dim,
@@ -759,7 +759,7 @@ pub fn metal_qwen_mlp_gate_up_bf16(
     up_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_mlp_gate_up", "native", || {
-        metal_native::qwen_mlp_gate_up_bf16(
+        native_fallback::qwen_mlp_gate_up_bf16(
             hidden_dim,
             intermediate_dim,
             input,
@@ -781,7 +781,7 @@ pub fn metal_qwen_mlp_gate_up_swiglu_bf16(
     mlp_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_mlp_gate_up_swiglu", "native", || {
-        metal_native::qwen_mlp_gate_up_swiglu_bf16(
+        native_fallback::qwen_mlp_gate_up_swiglu_bf16(
             hidden_dim,
             intermediate_dim,
             input,
@@ -799,7 +799,7 @@ pub fn metal_full_attention_gate_bf16(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("full_attention_gate", "native", || {
-        metal_native::full_attention_gate_bf16(total_elems, attn_f32, gate, out)
+        native_fallback::full_attention_gate_bf16(total_elems, attn_f32, gate, out)
     })
 }
 
@@ -814,7 +814,7 @@ pub fn metal_qwen_mlp_down_residual_bf16(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_mlp_down_residual", "native", || {
-        metal_native::qwen_mlp_down_residual_bf16(
+        native_fallback::qwen_mlp_down_residual_bf16(
             hidden_dim,
             intermediate_dim,
             gate,
@@ -840,7 +840,7 @@ pub fn metal_qwen_linear_out_residual_f32_bf16(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_linear_out_residual", "native", || {
-        metal_native::qwen_linear_out_residual_f32_bf16(
+        native_fallback::qwen_linear_out_residual_f32_bf16(
             hidden_dim, num_rows, row_dim, eps, attn, gate, weight, out_proj, residual, out,
         )
     })
@@ -860,7 +860,7 @@ pub fn metal_qwen_linear_out_residual_bf16_bf16(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_linear_out_residual_bf16", "native", || {
-        metal_native::qwen_linear_out_residual_bf16_bf16(
+        native_fallback::qwen_linear_out_residual_bf16_bf16(
             hidden_dim, num_rows, row_dim, eps, attn, gate, weight, out_proj, residual, out,
         )
     })
@@ -880,7 +880,7 @@ pub fn metal_rms_norm_rope_rows_bf16(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("rms_norm_rope_rows", "native", || {
-        metal_native::rms_norm_rope_rows_bf16(
+        native_fallback::rms_norm_rope_rows_bf16(
             n_rows, n_cols, rotary_dim, eps, pos_offset, input, weight, cos, sin, out,
         )
     })
@@ -900,7 +900,7 @@ pub fn metal_qwen_full_projections_bf16(
     v_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_full_projections", "native", || {
-        metal_native::qwen_full_projections_bf16(
+        native_fallback::qwen_full_projections_bf16(
             hidden_dim, q_proj_dim, kv_dim, input, q_weight, k_weight, v_weight, q_out, k_out,
             v_out,
         )
@@ -908,13 +908,13 @@ pub fn metal_qwen_full_projections_bf16(
 }
 
 pub struct MetalBatchGuard {
-    inner: Option<metal_native::MetalBatchGuard>,
+    inner: Option<native_fallback::MetalBatchGuard>,
 }
 
 impl MetalBatchGuard {
     pub fn begin() -> Result<Self, GpuError> {
         Ok(Self {
-            inner: Some(metal_native::MetalBatchGuard::begin()?),
+            inner: Some(native_fallback::MetalBatchGuard::begin()?),
         })
     }
 
@@ -1628,7 +1628,7 @@ unsafe extern "C" {
         out_supported: *mut c_int,
     ) -> c_int;
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     fn supersonic_qwen35_4b_hip_matmul_int8(
         dtype: c_int,
         device_ordinal: usize,
@@ -1642,7 +1642,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     fn supersonic_qwen35_4b_hip_int8_outlier_add(
         dtype: c_int,
         device_ordinal: usize,
@@ -1789,7 +1789,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     fn supersonic_qwen35_hip_full_attention_decode_flat_strided(
         dtype: c_int,
         device_ordinal: usize,
@@ -2288,9 +2288,9 @@ pub fn embedding_lookup(
 ) -> Result<(), GpuError> {
     if embeddings.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16 && !metal_native::disabled_by_env() {
+        if dtype == ScalarType::BF16 && !native_fallback::disabled_by_env() {
             let result = metal_profile_time("embedding_lookup", "native", || {
-                metal_native::embedding_lookup_bf16(
+                native_fallback::embedding_lookup_bf16(
                     token_count,
                     vocab_size,
                     hidden_size,
@@ -2304,7 +2304,7 @@ pub fn embedding_lookup(
             }
         }
         return metal_profile_host_time("embedding_lookup", || {
-            metal_host::embedding_lookup(
+            host_fallback::embedding_lookup(
                 token_count,
                 vocab_size,
                 hidden_size,
@@ -2351,7 +2351,7 @@ pub fn batched_matmul(
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         return metal_profile_host_time("batched_matmul", || {
-            metal_host::batched_matmul(dtype, batch_elems, m, n, k, lhs, rhs, out)
+            host_fallback::batched_matmul(dtype, batch_elems, m, n, k, lhs, rhs, out)
         });
     }
     // Simple rank-1 batch (no broadcasting)
@@ -2403,11 +2403,11 @@ pub fn full_attention_prefill(
         let _ = ordinal;
         if dtype == ScalarType::BF16
             && batch_size == 1
-            && !metal_native::disabled_by_env()
+            && !native_fallback::disabled_by_env()
             && !metal_force_host_full_attention()
         {
             let result = metal_profile_time("full_attention_prefill", "native", || {
-                metal_native::full_attention_prefill_bf16_f32(
+                native_fallback::full_attention_prefill_bf16_f32(
                     q_heads,
                     kv_heads,
                     q_len,
@@ -2426,7 +2426,7 @@ pub fn full_attention_prefill(
             }
         }
         return metal_profile_host_time("full_attention_prefill", || {
-            metal_host::full_attention_prefill(
+            host_fallback::full_attention_prefill(
                 dtype,
                 batch_size,
                 q_heads,
@@ -2627,7 +2627,7 @@ pub fn metal_full_attention_prefill_strided_bf16_f32(
         ));
     }
     metal_profile_time("full_attention_prefill_strided", "native", || {
-        metal_native::full_attention_prefill_strided_bf16_f32(
+        native_fallback::full_attention_prefill_strided_bf16_f32(
             q_heads,
             kv_heads,
             q_len,
@@ -2664,7 +2664,7 @@ pub unsafe fn metal_full_attention_prefill_tmajor_bf16_f32(
         ));
     }
     metal_profile_time("full_attention_prefill_tmajor", "native", || unsafe {
-        metal_native::full_attention_prefill_tmajor_bf16_f32(
+        native_fallback::full_attention_prefill_tmajor_bf16_f32(
             q_heads,
             kv_heads,
             q_len,
@@ -2706,7 +2706,7 @@ pub unsafe fn metal_full_attention_prefill_tmajor_bf16_f32_with_options(
         "full_attention_prefill_tmajor",
         "native",
         || unsafe {
-            metal_native::full_attention_prefill_tmajor_bf16_f32(
+            native_fallback::full_attention_prefill_tmajor_bf16_f32(
                 q_heads,
                 kv_heads,
                 q_len,
@@ -2744,7 +2744,7 @@ pub unsafe fn metal_full_attention_prefill_tmajor_vec_bf16_f32(
         ));
     }
     metal_profile_time("full_attention_prefill_tmajor_vec", "native", || unsafe {
-        metal_native::full_attention_prefill_tmajor_vec_bf16_f32(
+        native_fallback::full_attention_prefill_tmajor_vec_bf16_f32(
             q_heads,
             kv_heads,
             q_len,
@@ -2786,7 +2786,7 @@ pub unsafe fn metal_full_attention_prefill_tmajor_vec_bf16_f32_with_options(
         "full_attention_prefill_tmajor_vec",
         "native",
         || unsafe {
-            metal_native::full_attention_prefill_tmajor_vec_bf16_f32(
+            native_fallback::full_attention_prefill_tmajor_vec_bf16_f32(
                 q_heads,
                 kv_heads,
                 q_len,
@@ -2817,7 +2817,7 @@ pub fn metal_full_attention_decode_bf16_f32(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("full_attention_decode", "native", || {
-        metal_native::full_attention_decode_bf16_f32(
+        native_fallback::full_attention_decode_bf16_f32(
             q_heads, kv_heads, kv_len, kv_stride, head_dim, scale, query, key, value, out,
         )
     })
@@ -2882,14 +2882,14 @@ pub fn full_attention_decode_flat_strided(
     value: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         return Err(ffi_error(
             "full_attention_decode_flat_strided requires the CUDA backend".to_string(),
         ));
     }
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     {
         if gpu_hal::current_backend() != Backend::Cuda {
             return Err(ffi_error(
@@ -2943,11 +2943,11 @@ pub fn linear_prefill_conv_pack(
         let _ = ordinal;
         if dtype == ScalarType::BF16
             && batch_size == 1
-            && !metal_native::disabled_by_env()
+            && !native_fallback::disabled_by_env()
             && !metal_force_host_linear_conv_pack()
         {
             let result = metal_profile_time("linear_prefill_conv_pack", "native", || {
-                metal_native::linear_prefill_conv_pack_bf16(
+                native_fallback::linear_prefill_conv_pack_bf16(
                     conv_dim,
                     total_len,
                     seq_len,
@@ -2962,7 +2962,7 @@ pub fn linear_prefill_conv_pack(
             }
         }
         return metal_profile_host_time("linear_prefill_conv_pack", || {
-            metal_host::linear_prefill_conv_pack(
+            host_fallback::linear_prefill_conv_pack(
                 dtype,
                 batch_size,
                 conv_dim,
@@ -3241,7 +3241,7 @@ pub fn linear_decode_apply_4b(
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         return metal_profile_host_time("linear_decode_apply_4b", || {
-            metal_host::linear_decode_apply(
+            host_fallback::linear_decode_apply(
                 batch_size,
                 num_v_heads,
                 head_k_dim,
@@ -3297,7 +3297,7 @@ pub fn linear_stateful_conv_value_decay_4b(
             && std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_LINEAR_CONV_VALUE_DECAY").is_none()
         {
             return metal_profile_time("linear_stateful_conv_value_decay_4b", "native", || {
-                metal_native::linear_conv_value_decay_bf16(
+                native_fallback::linear_conv_value_decay_bf16(
                     conv_dim,
                     state_len,
                     kernel_size,
@@ -3313,7 +3313,7 @@ pub fn linear_stateful_conv_value_decay_4b(
             });
         }
         return metal_profile_host_time("linear_stateful_conv_value_decay_4b", || {
-            metal_host::linear_stateful_conv_value_decay(
+            host_fallback::linear_stateful_conv_value_decay(
                 dtype,
                 batch_size,
                 conv_dim,
@@ -3377,9 +3377,9 @@ pub fn delta_recurrent_prefill(
     crate::gqh::gemm_flush();
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::F32 && !metal_native::disabled_by_env() {
+        if dtype == ScalarType::F32 && !native_fallback::disabled_by_env() {
             let result = metal_profile_time("delta_recurrent_prefill", "native", || {
-                metal_native::delta_recurrent_prefill_f32(
+                native_fallback::delta_recurrent_prefill_f32(
                     batch_heads,
                     seq_len,
                     k_head_dim,
@@ -3398,7 +3398,7 @@ pub fn delta_recurrent_prefill(
             }
         }
         return metal_profile_host_time("delta_recurrent_prefill", || {
-            metal_host::delta_recurrent_prefill(
+            host_fallback::delta_recurrent_prefill(
                 dtype,
                 batch_heads,
                 seq_len,
@@ -4386,16 +4386,16 @@ pub fn l2norm(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() && !metal_force_host_l2norm() {
+        if !native_fallback::disabled_by_env() && !metal_force_host_l2norm() {
             let result = metal_profile_time("l2norm", "native", || {
-                metal_native::l2norm(dtype, n_rows, n_cols, eps, input, out)
+                native_fallback::l2norm(dtype, n_rows, n_cols, eps, input, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("l2norm", || {
-            metal_host::l2norm(dtype, n_rows, n_cols, eps, input, out)
+            host_fallback::l2norm(dtype, n_rows, n_cols, eps, input, out)
         });
     }
     ffi_profile_time_result("qwen.l2norm", ordinal, || {
@@ -4455,14 +4455,14 @@ fn swiglu_mul_impl(
         let _ = ordinal;
         if !prefill_native_disabled(options) {
             let result = prefill_metal_profile_time(options, "swiglu_mul", "native", || {
-                metal_native::swiglu_mul(dtype, elem_count, gate, up, out)
+                native_fallback::swiglu_mul(dtype, elem_count, gate, up, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return prefill_metal_profile_host_time(options, "swiglu_mul", || {
-            metal_host::swiglu_mul(dtype, elem_count, gate, up, out)
+            host_fallback::swiglu_mul(dtype, elem_count, gate, up, out)
         });
     }
     ffi_profile_time_result("qwen.swiglu_mul", ordinal, || {
@@ -4529,29 +4529,29 @@ pub fn rms_norm_gated(
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         if dtype == ScalarType::BF16
-            && !metal_native::disabled_by_env()
+            && !native_fallback::disabled_by_env()
             && !metal_force_host_rms_norm_gated()
         {
             let result = metal_profile_time("rms_norm_gated", "native", || {
-                metal_native::rms_norm_gated_bf16(n_rows, n_cols, eps, hidden, gate, weight, out)
+                native_fallback::rms_norm_gated_bf16(n_rows, n_cols, eps, hidden, gate, weight, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         if dtype == ScalarType::F32
-            && !metal_native::disabled_by_env()
+            && !native_fallback::disabled_by_env()
             && !metal_force_host_rms_norm_gated()
         {
             let result = metal_profile_time("rms_norm_gated", "native", || {
-                metal_native::rms_norm_gated_f32(n_rows, n_cols, eps, hidden, gate, weight, out)
+                native_fallback::rms_norm_gated_f32(n_rows, n_cols, eps, hidden, gate, weight, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("rms_norm_gated", || {
-            metal_host::rms_norm_gated(dtype, n_rows, n_cols, eps, hidden, gate, weight, out)
+            host_fallback::rms_norm_gated(dtype, n_rows, n_cols, eps, hidden, gate, weight, out)
         });
     }
     ffi_profile_time_result("qwen.rms_norm_gated", ordinal, || {
@@ -4625,16 +4625,16 @@ pub fn mul_scalar(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() && !metal_force_host_mul_scalar() {
+        if !native_fallback::disabled_by_env() && !metal_force_host_mul_scalar() {
             let result = metal_profile_time("mul_scalar", "native", || {
-                metal_native::mul_scalar(dtype, total_elems, scalar, input, out)
+                native_fallback::mul_scalar(dtype, total_elems, scalar, input, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("mul_scalar", || {
-            metal_host::mul_scalar(dtype, total_elems, scalar, input, out)
+            host_fallback::mul_scalar(dtype, total_elems, scalar, input, out)
         });
     }
     ffi_profile_time_result("qwen.mul_scalar", ordinal, || {
@@ -4676,7 +4676,7 @@ pub fn fused_rms_norm_linear_rows(
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         return metal_profile_host_time("fused_rms_norm_linear_rows", || {
-            metal_host::fused_rms_norm_linear_rows(
+            host_fallback::fused_rms_norm_linear_rows(
                 dtype,
                 n_rows,
                 hidden_dim,
@@ -4814,7 +4814,7 @@ fn matmul_rhs_transposed_impl(
                     options,
                     "matmul_rhs_transposed_gemv_m1_tiled",
                     "native",
-                    || metal_native::matmul_rhs_transposed_bf16_gemv_m1_tiled(n, k, lhs, rhs, out),
+                    || native_fallback::matmul_rhs_transposed_bf16_gemv_m1_tiled(n, k, lhs, rhs, out),
                 );
                 if result.is_ok() {
                     return result;
@@ -4824,7 +4824,7 @@ fn matmul_rhs_transposed_impl(
                 options,
                 "matmul_rhs_transposed_gemv_m1",
                 "native",
-                || metal_native::matmul_rhs_transposed_bf16_gemv_m1(n, k, lhs, rhs, out),
+                || native_fallback::matmul_rhs_transposed_bf16_gemv_m1(n, k, lhs, rhs, out),
             );
             if result.is_ok() {
                 return result;
@@ -4840,7 +4840,7 @@ fn matmul_rhs_transposed_impl(
         {
             let result =
                 prefill_metal_profile_time(options, "matmul_rhs_transposed", "native", || {
-                    metal_native::matmul_rhs_transposed_bf16(batch_elems, m, n, k, lhs, rhs, out)
+                    native_fallback::matmul_rhs_transposed_bf16(batch_elems, m, n, k, lhs, rhs, out)
                 });
             if result.is_ok() {
                 return result;
@@ -4856,14 +4856,14 @@ fn matmul_rhs_transposed_impl(
         {
             let result =
                 prefill_metal_profile_time(options, "matmul_rhs_transposed", "native", || {
-                    metal_native::matmul_rhs_transposed_f32(batch_elems, m, n, k, lhs, rhs, out)
+                    native_fallback::matmul_rhs_transposed_f32(batch_elems, m, n, k, lhs, rhs, out)
                 });
             if result.is_ok() {
                 return result;
             }
         }
         return prefill_metal_profile_host_time(options, "matmul_rhs_transposed", || {
-            metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out)
+            host_fallback::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out)
         });
     }
     let profile_key = if prefill_profile_shapes(options) {
@@ -4905,7 +4905,7 @@ pub fn metal_matmul_rhs_transposed_residual_bf16(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     metal_profile_time("matmul_rhs_transposed_residual", "native", || {
-        metal_native::matmul_rhs_transposed_residual_bf16(
+        native_fallback::matmul_rhs_transposed_residual_bf16(
             batch_elems,
             m,
             n,
@@ -4935,7 +4935,7 @@ pub fn matmul_rhs_transposed_fp8(
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         return metal_profile_host_time("matmul_rhs_transposed_fp8", || {
-            metal_host::matmul_rhs_transposed_fp8(
+            host_fallback::matmul_rhs_transposed_fp8(
                 batch_elems,
                 m,
                 n,
@@ -5090,7 +5090,7 @@ fn matmul_rhs_transposed_int4_impl(
                     "matmul_rhs_transposed_int4_gemv_m1_tiled",
                     "native",
                     || {
-                        metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
+                        native_fallback::matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
                             n, k, group_size, lhs, rhs_int4, scale, zero, out,
                         )
                     },
@@ -5104,7 +5104,7 @@ fn matmul_rhs_transposed_int4_impl(
                 "matmul_rhs_transposed_int4_gemv_m1",
                 "native",
                 || {
-                    metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1(
+                    native_fallback::matmul_rhs_transposed_int4_bf16_gemv_m1(
                         n, k, group_size, lhs, rhs_int4, scale, zero, out,
                     )
                 },
@@ -5114,7 +5114,7 @@ fn matmul_rhs_transposed_int4_impl(
             }
         }
         return prefill_metal_profile_time(options, "matmul_rhs_transposed_int4", "native", || {
-            metal_native::matmul_rhs_transposed_int4_bf16(
+            native_fallback::matmul_rhs_transposed_int4_bf16(
                 batch_elems,
                 m,
                 n,
@@ -5924,14 +5924,14 @@ pub fn matmul_rhs_transposed_int8(
     scale: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         return Err(ffi_error(
             "matmul_rhs_transposed_int8 requires the CUDA backend".to_string(),
         ));
     }
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     {
         if gpu_hal::current_backend() != Backend::Cuda {
             return Err(ffi_error(
@@ -5976,14 +5976,14 @@ pub fn int8_outlier_add(
     outlier_vals: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    #[cfg(not(supersonic_backend_cuda))]
+    #[cfg(not(any()))]
     {
         return Err(ffi_error(
             "int8_outlier_add requires the CUDA backend".to_string(),
         ));
     }
 
-    #[cfg(supersonic_backend_cuda)]
+    #[cfg(any())]
     {
         if gpu_hal::current_backend() != Backend::Cuda {
             return Err(ffi_error(
@@ -6124,7 +6124,7 @@ fn rms_norm_rows_impl(
             )
         {
             let result = prefill_metal_profile_time(options, "rms_norm_rows", "native", || {
-                metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, true, input, weight, out)
+                native_fallback::rms_norm_rows_bf16(n_rows, n_cols, eps, true, input, weight, out)
             });
             if result.is_ok() {
                 return result;
@@ -6139,14 +6139,14 @@ fn rms_norm_rows_impl(
             )
         {
             let result = prefill_metal_profile_time(options, "rms_norm_rows", "native", || {
-                metal_native::rms_norm_rows_f32(n_rows, n_cols, eps, true, input, weight, out)
+                native_fallback::rms_norm_rows_f32(n_rows, n_cols, eps, true, input, weight, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return prefill_metal_profile_host_time(options, "rms_norm_rows", || {
-            metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out)
+            host_fallback::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out)
         });
     }
     let profile_key = if prefill_profile_shapes(options) {
@@ -6193,29 +6193,29 @@ pub fn rms_norm_rows_plain(
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         if dtype == ScalarType::BF16
-            && !metal_native::disabled_by_env()
+            && !native_fallback::disabled_by_env()
             && !metal_force_host_rms_norm()
         {
             let result = metal_profile_time("rms_norm_rows_plain", "native", || {
-                metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, input, weight, out)
+                native_fallback::rms_norm_rows_bf16(n_rows, n_cols, eps, false, input, weight, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         if dtype == ScalarType::F32
-            && !metal_native::disabled_by_env()
+            && !native_fallback::disabled_by_env()
             && !metal_force_host_rms_norm()
         {
             let result = metal_profile_time("rms_norm_rows_plain", "native", || {
-                metal_native::rms_norm_rows_f32(n_rows, n_cols, eps, false, input, weight, out)
+                native_fallback::rms_norm_rows_f32(n_rows, n_cols, eps, false, input, weight, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("rms_norm_rows_plain", || {
-            metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, out)
+            host_fallback::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, out)
         });
     }
     let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
@@ -6260,32 +6260,32 @@ pub fn rms_norm_rows_plain_inplace(
     crate::gqh::gemm_flush();
     if data.backend() == Backend::Metal {
         let mut input = GpuBuffer::zeros(ordinal, dtype, data.shape())?;
-        metal_native::flush_batch()?;
+        native_fallback::flush_batch()?;
         gpu_hal::copy_d2d(ordinal, input.as_mut_ptr(), data.as_ptr(), data.len_bytes())?;
         if dtype == ScalarType::BF16
-            && !metal_native::disabled_by_env()
+            && !native_fallback::disabled_by_env()
             && !metal_force_host_rms_norm()
         {
             let result = metal_profile_time("rms_norm_rows_plain_inplace", "native", || {
-                metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, &input, weight, data)
+                native_fallback::rms_norm_rows_bf16(n_rows, n_cols, eps, false, &input, weight, data)
             });
             if result.is_ok() {
                 return result;
             }
         }
         if dtype == ScalarType::F32
-            && !metal_native::disabled_by_env()
+            && !native_fallback::disabled_by_env()
             && !metal_force_host_rms_norm()
         {
             let result = metal_profile_time("rms_norm_rows_plain_inplace", "native", || {
-                metal_native::rms_norm_rows_f32(n_rows, n_cols, eps, false, &input, weight, data)
+                native_fallback::rms_norm_rows_f32(n_rows, n_cols, eps, false, &input, weight, data)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("rms_norm_rows_plain_inplace", || {
-            metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, &input, weight, data)
+            host_fallback::rms_norm_rows(dtype, n_rows, n_cols, eps, false, &input, weight, data)
         });
     }
     let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
@@ -6353,7 +6353,7 @@ fn element_add_inplace_impl(
 ) -> Result<(), GpuError> {
     if lhs_out.backend() == Backend::Metal {
         let mut lhs = GpuBuffer::zeros(ordinal, dtype, lhs_out.shape())?;
-        metal_native::flush_batch()?;
+        native_fallback::flush_batch()?;
         gpu_hal::copy_d2d(
             ordinal,
             lhs.as_mut_ptr(),
@@ -6369,14 +6369,14 @@ fn element_add_inplace_impl(
         {
             let result =
                 prefill_metal_profile_time(options, "element_add_inplace", "native", || {
-                    metal_native::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
+                    native_fallback::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
                 });
             if result.is_ok() {
                 return result;
             }
         }
         return prefill_metal_profile_host_time(options, "element_add_inplace", || {
-            metal_host::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
+            host_fallback::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
         });
     }
     let ptr = lhs_out.as_mut_ptr();
@@ -6411,7 +6411,7 @@ pub fn qwen36_router_softmax_topk_bf16(
         "qwen36_batched_prefill_router_softmax_topk",
         "native",
         || {
-            metal_native::qwen36_router_softmax_topk_bf16(
+            native_fallback::qwen36_router_softmax_topk_bf16(
                 n_tokens,
                 num_experts,
                 top_k,
@@ -6442,7 +6442,7 @@ pub fn qwen36_router_softmax_topk_bf16_with_options(
         "qwen36_batched_prefill_router_softmax_topk",
         "native",
         || {
-            metal_native::qwen36_router_softmax_topk_bf16(
+            native_fallback::qwen36_router_softmax_topk_bf16(
                 n_tokens,
                 num_experts,
                 top_k,
@@ -6466,7 +6466,7 @@ pub fn qwen36_ffn_residual_add_bf16(
         ));
     }
     metal_profile_time("qwen36_batched_prefill_ffn_residual_add", "native", || {
-        metal_native::qwen36_ffn_residual_add_bf16(total_elems, residual, combined, shared)
+        native_fallback::qwen36_ffn_residual_add_bf16(total_elems, residual, combined, shared)
     })
 }
 
@@ -6486,7 +6486,7 @@ pub fn qwen36_ffn_residual_add_bf16_with_options(
         Some(options),
         "qwen36_batched_prefill_ffn_residual_add",
         "native",
-        || metal_native::qwen36_ffn_residual_add_bf16(total_elems, residual, combined, shared),
+        || native_fallback::qwen36_ffn_residual_add_bf16(total_elems, residual, combined, shared),
     )
 }
 
@@ -6552,14 +6552,14 @@ fn cast_impl(
             )
         {
             let result = prefill_metal_profile_time(options, "cast", "native", || {
-                metal_native::cast(input_dtype, output_dtype, total_elems, input, out)
+                native_fallback::cast(input_dtype, output_dtype, total_elems, input, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return prefill_metal_profile_host_time(options, "cast", || {
-            metal_host::cast(input_dtype, output_dtype, total_elems, input, out)
+            host_fallback::cast(input_dtype, output_dtype, total_elems, input, out)
         });
     }
     ffi_profile_time_result("qwen.cast", ordinal, || {
@@ -6592,16 +6592,16 @@ pub fn element_add(
     crate::gqh::gemm_flush();
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() && !metal_force_host_element_add() {
+        if !native_fallback::disabled_by_env() && !metal_force_host_element_add() {
             let result = metal_profile_time("element_add", "native", || {
-                metal_native::element_add(dtype, total_elems, lhs, rhs, out)
+                native_fallback::element_add(dtype, total_elems, lhs, rhs, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("element_add", || {
-            metal_host::element_add(dtype, total_elems, lhs, rhs, out)
+            host_fallback::element_add(dtype, total_elems, lhs, rhs, out)
         });
     }
     ffi_profile_time_result("qwen.element_add", ordinal, || {
@@ -6800,7 +6800,7 @@ fn apply_rope_prefill_impl(
         if !prefill_native_disabled(options) {
             let result =
                 prefill_metal_profile_time(options, "apply_rope_prefill", "native", || {
-                    metal_native::apply_rope_prefill(
+                    native_fallback::apply_rope_prefill(
                         dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table,
                         pos_offset, data,
                     )
@@ -6810,7 +6810,7 @@ fn apply_rope_prefill_impl(
             }
         }
         return prefill_metal_profile_host_time(options, "apply_rope_prefill", || {
-            metal_host::apply_rope_prefill(
+            host_fallback::apply_rope_prefill(
                 dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset,
                 data,
             )
@@ -7162,14 +7162,14 @@ fn transpose_shd_hsd_impl(
             )
         {
             let result = prefill_metal_profile_time(options, "transpose_shd_hsd", "native", || {
-                metal_native::transpose_shd_hsd(dtype, s, h, d, src, dst)
+                native_fallback::transpose_shd_hsd(dtype, s, h, d, src, dst)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return prefill_metal_profile_host_time(options, "transpose_shd_hsd", || {
-            metal_host::transpose_shd_hsd(dtype, s, h, d, src, dst)
+            host_fallback::transpose_shd_hsd(dtype, s, h, d, src, dst)
         });
     }
     ffi_profile_time_result("qwen.transpose_shd_hsd", ordinal, || {
@@ -7293,16 +7293,16 @@ pub fn transpose_pad_conv(
     crate::gqh::gemm_flush();
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() {
+        if !native_fallback::disabled_by_env() {
             let result = metal_profile_time("transpose_pad_conv", "native", || {
-                metal_native::transpose_pad_conv(dtype, s, c, pad, src, dst)
+                native_fallback::transpose_pad_conv(dtype, s, c, pad, src, dst)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("transpose_pad_conv", || {
-            metal_host::transpose_pad_conv(dtype, s, c, pad, src, dst)
+            host_fallback::transpose_pad_conv(dtype, s, c, pad, src, dst)
         });
     }
     ffi_profile_time_result("qwen.transpose_pad_conv", ordinal, || {
@@ -7336,16 +7336,16 @@ pub fn extract_conv_state(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() {
+        if !native_fallback::disabled_by_env() {
             let result = metal_profile_time("extract_conv_state", "native", || {
-                metal_native::extract_conv_state(dtype, s, c, kern_minus_1, src, dst)
+                native_fallback::extract_conv_state(dtype, s, c, kern_minus_1, src, dst)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("extract_conv_state", || {
-            metal_host::extract_conv_state(dtype, s, c, kern_minus_1, src, dst)
+            host_fallback::extract_conv_state(dtype, s, c, kern_minus_1, src, dst)
         });
     }
     ffi_profile_time_result("qwen.extract_conv_state", ordinal, || {
@@ -7445,14 +7445,14 @@ fn sigmoid_mul_impl(
         let _ = ordinal;
         if !prefill_native_disabled(options) {
             let result = prefill_metal_profile_time(options, "sigmoid_mul", "native", || {
-                metal_native::sigmoid_mul(dtype, total_elems, data, gate, out)
+                native_fallback::sigmoid_mul(dtype, total_elems, data, gate, out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return prefill_metal_profile_host_time(options, "sigmoid_mul", || {
-            metal_host::sigmoid_mul(dtype, total_elems, data, gate, out)
+            host_fallback::sigmoid_mul(dtype, total_elems, data, gate, out)
         });
     }
     ffi_profile_time_result("qwen.sigmoid_mul", ordinal, || {
@@ -7592,14 +7592,14 @@ fn sigmoid_mul_row_scalar_bf16_impl(
     if !prefill_native_disabled(options) {
         let result =
             prefill_metal_profile_time(options, "sigmoid_mul_row_scalar", "native", || {
-                metal_native::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
+                native_fallback::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
             });
         if result.is_ok() {
             return result;
         }
     }
     prefill_metal_profile_host_time(options, "sigmoid_mul_row_scalar", || {
-        metal_host::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
+        host_fallback::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
     })
 }
 
@@ -7622,16 +7622,16 @@ pub fn compute_beta_g(
 ) -> Result<(), GpuError> {
     if beta.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::F32 && !metal_native::disabled_by_env() {
+        if dtype == ScalarType::F32 && !native_fallback::disabled_by_env() {
             let result = metal_profile_time("compute_beta_g", "native", || {
-                metal_native::compute_beta_g_f32(seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
+                native_fallback::compute_beta_g_f32(seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("compute_beta_g", || {
-            metal_host::compute_beta_g(dtype, seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
+            host_fallback::compute_beta_g(dtype, seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
         });
     }
     ffi_profile_time_result("qwen.compute_beta_g", ordinal, || {
@@ -7806,14 +7806,14 @@ fn split_qgate_impl(
             )
         {
             let result = prefill_metal_profile_time(options, "split_qgate", "native", || {
-                metal_native::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
+                native_fallback::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return prefill_metal_profile_host_time(options, "split_qgate", || {
-            metal_host::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
+            host_fallback::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
         });
     }
     ffi_profile_time_result("qwen.split_qgate", ordinal, || {
@@ -7906,16 +7906,16 @@ pub fn split_qkv(
     crate::gqh::gemm_flush();
     if q.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() && !metal_force_host_split_qkv() {
+        if !native_fallback::disabled_by_env() && !metal_force_host_split_qkv() {
             let result = metal_profile_time("split_qkv", "native", || {
-                metal_native::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v)
+                native_fallback::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v)
             });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_host_time("split_qkv", || {
-            metal_host::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v)
+            host_fallback::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v)
         });
     }
     ffi_profile_time_result("qwen.split_qkv", ordinal, || {
@@ -8093,9 +8093,9 @@ pub fn repeat_interleave_heads(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env() {
+        if !native_fallback::disabled_by_env() {
             let result = metal_profile_time("repeat_interleave_heads", "native", || {
-                metal_native::repeat_interleave_heads(
+                native_fallback::repeat_interleave_heads(
                     dtype, s, n_heads, head_dim, repeats, src, dst,
                 )
             });
@@ -8104,7 +8104,7 @@ pub fn repeat_interleave_heads(
             }
         }
         return metal_profile_host_time("repeat_interleave_heads", || {
-            metal_host::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst)
+            host_fallback::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst)
         });
     }
     ffi_profile_time_result("qwen.repeat_interleave_heads", ordinal, || {
@@ -8221,7 +8221,7 @@ pub fn quantize_kv_to_fp8(
     })
 }
 
-#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 mod tests {
     use super::*;
     use gpu_hal::{set_backend, Backend};

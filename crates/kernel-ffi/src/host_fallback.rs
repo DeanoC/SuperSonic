@@ -1750,7 +1750,7 @@ pub(crate) fn linear_decode_apply(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+#[cfg(any())]
 mod tests {
     use super::*;
     use gpu_hal::{set_backend, Backend};
@@ -1798,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_host_sigmoid_mul_row_scalar_bf16_matches_reference() {
+    fn host_fallback_sigmoid_mul_row_scalar_bf16_matches_reference() {
         use_metal_backend();
         let ordinal = 0usize;
         let data_vals = [1.0f32, -2.0, 0.5, 10.0, 3.0, -4.0];
@@ -1820,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_host_matmul_rhs_transposed_matches_reference() {
+    fn host_fallback_matmul_rhs_transposed_matches_reference() {
         use_metal_backend();
         let ordinal = 0usize;
         let lhs = GpuBuffer::from_host_bytes(
@@ -1849,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_host_full_attention_prefill_matches_reference() {
+    fn host_fallback_full_attention_prefill_matches_reference() {
         use_metal_backend();
         let ordinal = 0usize;
         let query = GpuBuffer::from_host_bytes(
@@ -1905,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_host_fused_rms_norm_linear_rows_matches_reference() {
+    fn host_fallback_fused_rms_norm_linear_rows_matches_reference() {
         use_metal_backend();
         let ordinal = 0usize;
         let hidden = GpuBuffer::from_host_bytes(
@@ -1963,7 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_host_delta_recurrent_prefill_matches_reference() {
+    fn host_fallback_delta_recurrent_prefill_matches_reference() {
         use_metal_backend();
         let ordinal = 0usize;
         let initial_state =
@@ -2020,7 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_host_standalone_matvec_host_f32_matches_reference() {
+    fn host_fallback_standalone_matvec_host_f32_matches_reference() {
         use_metal_backend();
         let ordinal = 0usize;
         let input = GpuBuffer::from_host_bytes(
@@ -2045,7 +2045,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_host_qwen_rms_norm_standalone_matvec_host_f32_matches_reference() {
+    fn host_fallback_qwen_rms_norm_standalone_matvec_host_f32_matches_reference() {
         use_metal_backend();
         let ordinal = 0usize;
         let input =
