@@ -88,9 +88,25 @@ def slugify_heading(text: str) -> str:
 def _heading_texts(text: str) -> list[str]:
     lines = text.splitlines()
     headings: list[str] = []
+    active_fence: tuple[str, int] | None = None
     index = 0
     while index < len(lines):
         line = lines[index]
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if active_fence is not None:
+            if (
+                fence
+                and fence.group(1)[0] == active_fence[0]
+                and len(fence.group(1)) >= active_fence[1]
+                and not fence.group(2).strip()
+            ):
+                active_fence = None
+            index += 1
+            continue
+        if fence:
+            active_fence = (fence.group(1)[0], len(fence.group(1)))
+            index += 1
+            continue
         atx = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)[ \t]*|[ \t]*)$", line)
         if atx:
             heading = atx.group(2) or ""

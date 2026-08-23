@@ -31,6 +31,12 @@ CORRECTNESS_GATE_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*")
 REQUIRED_CORRECTNESS_GATE = "qwen38-gqh-correctness"
 ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 CONTROL_TOKENS = {";", "|", "&&", "||", ">", ">>", "<", "2>", "2>>"}
+PREFLIGHT_ASSIGNMENTS = {"SUPERSONIC_REQUIRE_GQH_ARTIFACTS": "1"}
+PREFLIGHT_TOKENS = [
+    "python3",
+    "tools/check-qwen38-artifacts.py",
+    "--require-8192",
+]
 
 
 def rel(path: Path) -> str:
@@ -51,9 +57,25 @@ def anchors_for(path: Path) -> set[str]:
 def heading_texts(text: str) -> list[str]:
     lines = text.splitlines()
     headings: list[str] = []
+    active_fence: tuple[str, int] | None = None
     index = 0
     while index < len(lines):
         line = lines[index]
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if active_fence is not None:
+            if (
+                fence
+                and fence.group(1)[0] == active_fence[0]
+                and len(fence.group(1)) >= active_fence[1]
+                and not fence.group(2).strip()
+            ):
+                active_fence = None
+            index += 1
+            continue
+        if fence:
+            active_fence = (fence.group(1)[0], len(fence.group(1)))
+            index += 1
+            continue
         atx = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)[ \t]*|[ \t]*)$", line)
         if atx:
             heading = atx.group(2) or ""
@@ -106,20 +128,14 @@ def _parse_gate_command(command: object) -> tuple[dict[str, str], list[str]]:
     while tokens and ASSIGNMENT_RE.fullmatch(tokens[0]):
         name, value = tokens.pop(0).split("=", 1)
         assignments[name] = value
-    if tokens and tokens[0] == "env":
-        tokens.pop(0)
-        while tokens and ASSIGNMENT_RE.fullmatch(tokens[0]):
-            name, value = tokens.pop(0).split("=", 1)
-            assignments[name] = value
     return assignments, tokens
 
 
 def _is_strict_preflight(command: object) -> bool:
     assignments, tokens = _parse_gate_command(command)
     return (
-        assignments.get("SUPERSONIC_REQUIRE_GQH_ARTIFACTS") == "1"
-        and tokens[:2] == ["python3", "tools/check-qwen38-artifacts.py"]
-        and "--require-8192" in tokens[2:]
+        assignments == PREFLIGHT_ASSIGNMENTS
+        and tokens == PREFLIGHT_TOKENS
     )
 
 
@@ -138,8 +154,10 @@ def _is_serial_crawl(command: object) -> bool:
         "--test-threads=1",
     ]
     return (
-        assignments.get("SUPERSONIC_REQUIRE_GQH_ARTIFACTS") == "1"
-        and assignments.get("RUST_TEST_THREADS") == "1"
+        assignments == {
+            "SUPERSONIC_REQUIRE_GQH_ARTIFACTS": "1",
+            "RUST_TEST_THREADS": "1",
+        }
         and tokens == required_prefix
     )
 

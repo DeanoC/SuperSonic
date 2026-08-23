@@ -95,6 +95,12 @@ class SupportMatrixTests(unittest.TestCase):
         )
         mutations = {
             "echo-only preflight": original_text.replace(preflight, f"echo {preflight}", 1),
+            "help preflight": original_text.replace(preflight, f"{preflight} --help", 1),
+            "version preflight": original_text.replace(preflight, f"{preflight} --version", 1),
+            "unknown preflight flag": original_text.replace(preflight, f"{preflight} --bogus", 1),
+            "extra environment assignment": original_text.replace(
+                preflight, f"NOOP=1 {preflight}", 1
+            ),
             "missing preflight": original_text.replace(
                 preflight,
                 "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 python3 tools/check-qwen38-artifacts.py",
@@ -110,6 +116,10 @@ class SupportMatrixTests(unittest.TestCase):
                 "qwen38_gqh_gguf_crawl", "wrong_test", 1
             ),
             "echo-only crawl": original_text.replace(crawl, f"echo {crawl}", 1),
+            "short-circuit preflight": original_text.replace(preflight, f"{preflight} || true", 1),
+            "substitution preflight": original_text.replace(
+                preflight, f"{preflight} $(echo bypass)", 1
+            ),
         }
 
         for label, manifest_text in mutations.items():
@@ -141,6 +151,29 @@ class SupportMatrixTests(unittest.TestCase):
             self.assertEqual(
                 support_matrix.anchors_for(path),
                 {"repeat", "repeat-1", "repeat-2", "indented-title"},
+            )
+
+    def test_markdown_anchor_parser_ignores_variable_fenced_code_blocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "doc.md"
+            path.write_text(
+                "# Before\n"
+                "# Before\n"
+                "````markdown\n"
+                "# Hidden backtick\n"
+                "```\n"
+                "# Still hidden\n"
+                "````\n"
+                "~~~text\n"
+                "## Hidden tilde\n"
+                "~~~~\n"
+                "## After\n"
+                "## After\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                support_matrix.anchors_for(path),
+                {"before", "before-1", "after", "after-1"},
             )
 
     def test_validator_rejects_non_product_model_backend_and_source(self):

@@ -278,6 +278,27 @@ class ActiveDocsTests(unittest.TestCase):
             {"repeat", "repeat-1", "repeat-2", "indented-title"},
         )
 
+    def test_github_anchor_parser_ignores_variable_fenced_code_blocks(self):
+        checker = load_checker()
+        markdown = (
+            "# Before\n"
+            "# Before\n"
+            "````markdown\n"
+            "# Hidden backtick\n"
+            "```\n"
+            "# Still hidden\n"
+            "````\n"
+            "~~~text\n"
+            "## Hidden tilde\n"
+            "~~~~\n"
+            "## After\n"
+            "## After\n"
+        )
+        self.assertEqual(
+            checker.anchors_for(markdown),
+            {"before", "before-1", "after", "after-1"},
+        )
+
     def test_anchor_links_accept_github_duplicate_and_setext_ids_but_reject_missing(self):
         checker = load_checker()
         with tempfile.TemporaryDirectory() as temporary:
@@ -298,6 +319,29 @@ class ActiveDocsTests(unittest.TestCase):
 
         self.assertEqual(1, len(violations))
         self.assertIn("#repeat-2", violations[0])
+
+    def test_fenced_heading_anchor_is_invalid_while_real_headings_link(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative_path in checker.ACTIVE_DOCS:
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Product\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "# Before\n"
+                "```\n"
+                "# Hidden\n"
+                "```\n"
+                "## After\n"
+                "[before](#before) [after](#after) [hidden](#hidden)\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        self.assertEqual(1, len(violations))
+        self.assertIn("#hidden", violations[0])
 
     def test_public_positioning_is_measured_performance_first(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
