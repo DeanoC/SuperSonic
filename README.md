@@ -1,69 +1,40 @@
 # SuperSonic
 
-Optimized LLM inference with persistent decode megakernels. Each supported
-(model, backend, GPU) combination gets a hand-tuned kernel — no fallback to
-generic slow paths.
+SuperSonic is the product path for Qwen3.8-27B inference with custom GQH
+artifacts on HIP. The active support contract is intentionally small: the
+`gfx1100` and `gfx1201` lanes share the same model and artifact roles.
 
-Measured decode throughput: see [docs/performance.md](docs/performance.md).
-
-## Quick Start
+## Quick start
 
 ```bash
-# Build with the backend(s) you want compiled in.
-# Omit SUPERSONIC_BACKENDS to build the default configured backend set.
-SUPERSONIC_BACKENDS=cuda cargo build --release
+HIP_ARCH=gfx1201 cargo build --release --workspace
 
-# Run (auto-bakes weights on first run)
-SUPERSONIC_BACKENDS=cuda cargo run --release --bin supersonic -- \
-  --backend cuda \
-  --model qwen3.5-0.8b \
-  --model-dir /path/to/Qwen3.5-0.8B \
+HIP_VISIBLE_DEVICES=0 \
+  cargo run --release --bin supersonic -- \
+  --model qwen3.8-27b \
+  --model-dir /data/models/Qwen3.8-27B \
+  --gguf-file /home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf \
   --prompt "Hello, world" \
-  --max-new-tokens 8
+  --max-new-tokens 8 \
+  --device 0
 ```
 
-On first run, SuperSonic bakes the HuggingFace safetensors into an optimized
-format at `{model_dir}/.supersonic/v1/`. Subsequent runs load from this baked
-format. If a local bake is missing, SuperSonic can download a published bake
-from the repo's GitHub releases — see
-[docs/bake-distribution.md](docs/bake-distribution.md). Pass `--no-download`
-to disable network fetches.
+The GGUF and model directory are separate roles. Keep the artifact pair on a
+local filesystem and follow the [artifact contract](docs/artifact-format.md)
+before running a correctness gate.
 
-## Documentation
+## Active documentation
 
-- **[Supported matrix](docs/supported-matrix.md)** — model × quant × arch
-  validated combinations with per-arch caveats.
-- **[Feature compatibility](docs/feature-compatibility.md)** — runtime
-  features (KV-FP8, VMM, SpecPrefill, DFlash, MoE prefetch, certified-KV)
-  with the feature×feature grid and a picker for common use cases.
-- **[Performance](docs/performance.md)** — measured decode throughput per
-  (model, arch, quant), summarized as headline matrices.
-- **[Detailed performance](docs/detailed_performance.md)** — methodology,
-  attribution tables, historical logs, and runtime-feature impact.
-- **[Benchmarks](docs/benchmarks.md)** — repeatable test, benchmark,
-  Lucebox, and profiling commands, including the Qwen3.6 27B 100 tok/s run.
-- **[Build and run](docs/build-and-run.md)** — per-backend build commands
-  and the validated `supersonic` invocation set.
-- **[OpenAI-compatible server](docs/server.md)** — `supersonic-serve`
-  endpoints, OpenCode setup, and harness compatibility notes.
-- **[Producing release bakes](docs/bake-distribution.md)** — how to
-  produce, sign, and publish bakes for a new model variant.
-- **[Testing gates](docs/testing.md)** — E2E test runner, prerequisites,
-  architecture scripts, and per-feature parity tests.
-- **[Development architecture](docs/development/repo-architecture.md)** —
-  repository ownership boundaries for runner, runtime, model crates, FFI,
-  kernels, tests, and docs.
-- **[Consolidation roadmap](docs/development/consolidation-roadmap.md)** —
-  staged cleanup plan and non-breaking inventory for current tools.
-- **[Kernel build groups](docs/development/kernel-build-groups.md)** —
-  checked scaffold for future backend/model compile groups in `kernel-ffi`.
-- **[DFlash speculative decode](docs/dflash.md)** — Qwen3.5/Qwen3.6 INT4
-  speculative decode design, server mode, and milestones.
-- **[Qwen3-30B-A3B HIP bring-up](docs/bringup/qwen3-30b-a3b-hip.md)** —
-  separate Qwen3 MoE scaffolding and INT4 bake contract for HIP.
-- **[SpecPrefill](docs/specprefill.md)** — long-prompt TTFT optimization
-  via speculator-driven sparse prefill.
-- **[Certified KV (Llama 3.1)](docs/certified-kv-audit-map.md)** — KV
-  provenance for retrieval / safety-critical contexts.
-- **[Low-level memory](docs/lowlevel-memory.md)** — VMM design, virtual
-  KV cache mapping, eviction.
+- [Build and run](docs/build-and-run.md)
+- [Supported matrix](docs/supported-matrix.md)
+- [Artifact format](docs/artifact-format.md)
+- [Testing gates](docs/testing.md)
+- [Benchmarks](docs/benchmarks.md)
+- [Performance](docs/performance.md)
+
+Validate the checked product boundaries with:
+
+```bash
+python3 tools/check-support-matrix.py
+python3 tools/check-active-docs.py
+```

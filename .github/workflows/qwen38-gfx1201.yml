@@ -30,10 +30,11 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: "1"
       HIP_ARCH: gfx1201
-      # The runner may expose the R9700 at a non-zero physical ordinal.  The
-      # selection step below masks that ordinal so every test uses --device 0.
-      SUPERSONIC_R9700_GPU_ID: ${{ vars.SUPERSONIC_R9700_GPU_ID || '0' }}
-      HIP_VISIBLE_DEVICES: ${{ vars.SUPERSONIC_R9700_GPU_ID || '0' }}
+      # The canonical host currently exposes the R9700 as physical GPU 1.
+      # Discovery below remains authoritative so a different runner layout
+      # cannot silently select GPU zero.  An override is accepted only after
+      # the same gfx1201 validation.
+      SUPERSONIC_R9700_GPU_ID: ${{ vars.SUPERSONIC_R9700_GPU_ID }}
       SUPERSONIC_DEVICE: "0"
       RUST_TEST_THREADS: "1"
       SUPERSONIC_REQUIRE_GQH_ARTIFACTS: "1"
@@ -48,27 +49,38 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Select R9700 and record machine state
+      - name: Discover and select R9700 physical device
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$CI_OUTPUT_ROOT"
-          gpu_id="${SUPERSONIC_R9700_GPU_ID:-0}"
-          if [[ ! "$gpu_id" =~ ^[0-9]+$ ]]; then
-            echo "SUPERSONIC_R9700_GPU_ID must be a numeric physical ROCm ordinal: $gpu_id" >&2
-            exit 1
-          fi
-          export HIP_VISIBLE_DEVICES="$gpu_id"
-          {
-            echo "HIP_VISIBLE_DEVICES=$gpu_id"
-            echo "SUPERSONIC_DEVICE=0"
-          } >> "$GITHUB_ENV"
-          echo "selected physical R9700 ordinal: $gpu_id (masked test ordinal: 0)" \
-            | tee "$CI_OUTPUT_ROOT/device-selection.log"
-          rocminfo | tee "$CI_OUTPUT_ROOT/rocminfo.txt"
-          grep -Eiq 'gfx1201|R9700' "$CI_OUTPUT_ROOT/rocminfo.txt"
-          rocm-smi --showproductname --showuse --showmemuse --showtemp \
+          command -v amd-smi
+          timeout --foreground 30s amd-smi list --json \
+            | tee "$CI_OUTPUT_ROOT/amd-smi-list.json"
+          selection="$(python3 tools/select-r9700-device.py \
+            --input "$CI_OUTPUT_ROOT/amd-smi-list.json" \
+            --override "${SUPERSONIC_R9700_GPU_ID:-}")"
+          printf '%s\n' "$selection" | tee "$CI_OUTPUT_ROOT/device-selection.log"
+          while IFS='=' read -r name value; do
+            case "$name" in
+              SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE)
+                printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
+                export "$name=$value"
+                ;;
+              *)
+                echo "unexpected selector output: $name" >&2
+                exit 1
+                ;;
+            esac
+          done <<< "$selection"
+          physical_gpu="$SUPERSONIC_R9700_GPU_ID"
+          [[ "$HIP_VISIBLE_DEVICES" == "$physical_gpu" ]]
+          [[ "$SUPERSONIC_DEVICE" == "0" ]]
+          timeout --foreground 30s rocm-smi -d "$physical_gpu" \
+            --showproductname --showuse --showmemuse --showtemp \
             | tee "$CI_OUTPUT_ROOT/rocm-smi-initial.txt"
 
       - name: Wait for GPU idle
@@ -81,21 +93,26 @@ jobs:
           max_gpu_use_percent=10
           max_vram_use_percent=20
           idle_samples=0
-          elapsed=0
-          while true; do
-            rocm-smi --showuse --showmemuse --showtemp \
-              | tee "$CI_OUTPUT_ROOT/rocm-smi-idle-${elapsed}.txt"
-            gpu_use="$(awk -F': ' '/GPU use \(%\)/ {
-              gsub(/[^0-9.]/, "", $NF); print int($NF); exit
-            }' "$CI_OUTPUT_ROOT/rocm-smi-idle-${elapsed}.txt")"
-            vram_use="$(awk -F': ' '/GPU Memory Allocated \(VRAM%\)/ {
-              gsub(/[^0-9.]/, "", $NF); print int($NF); exit
-            }' "$CI_OUTPUT_ROOT/rocm-smi-idle-${elapsed}.txt")"
-            if [[ -z "$gpu_use" || -z "$vram_use" ]]; then
-              echo "failed to parse rocm-smi utilization output" >&2
+          deadline=$(( $(date +%s) + max_wait_seconds ))
+          physical_gpu="${SUPERSONIC_R9700_GPU_ID:?device selection did not export a physical GPU}"
+          while :; do
+            now="$(date +%s)"
+            if (( now >= deadline )); then
+              echo "timed out waiting for GPU ${physical_gpu} idle after ${max_wait_seconds}s" >&2
               exit 1
             fi
-            if (( gpu_use <= max_gpu_use_percent && vram_use <= max_vram_use_percent )); then
+            remaining=$((deadline - now))
+            probe_timeout=$(( remaining < 30 ? remaining : 30 ))
+            probe_file="$CI_OUTPUT_ROOT/rocm-smi-idle-${now}.txt"
+            timeout --foreground "${probe_timeout}s" rocm-smi -d "$physical_gpu" \
+              --showuse --showmemuse --showtemp \
+              | tee "$probe_file"
+            utilization="$(python3 tools/parse-rocm-smi.py --input "$probe_file")"
+            gpu_use="$(awk '{for (i=1; i<=NF; i++) if ($i ~ /^gpu_use_percent=/) {sub(/^[^=]*=/, "", $i); print $i}}' <<< "$utilization")"
+            vram_use="$(awk '{for (i=1; i<=NF; i++) if ($i ~ /^vram_use_percent=/) {sub(/^[^=]*=/, "", $i); print $i}}' <<< "$utilization")"
+            if awk -v gpu="$gpu_use" -v vram="$vram_use" \
+              -v max_gpu="$max_gpu_use_percent" -v max_vram="$max_vram_use_percent" \
+              'BEGIN { exit !(gpu <= max_gpu && vram <= max_vram) }'; then
               idle_samples=$((idle_samples + 1))
               echo "GPU idle sample ${idle_samples}/${required_idle_samples}: gpu=${gpu_use}% vram=${vram_use}%"
             else
@@ -106,12 +123,11 @@ jobs:
               echo "GPU has been idle for ${required_idle_samples} consecutive samples"
               break
             fi
-            if (( elapsed >= max_wait_seconds )); then
-              echo "timed out waiting for GPU idle after ${max_wait_seconds}s" >&2
-              exit 1
-            fi
-            sleep "$interval_seconds"
-            elapsed=$((elapsed + interval_seconds))
+            now="$(date +%s)"
+            remaining=$((deadline - now))
+            (( remaining > 0 )) || { echo "GPU idle deadline expired" >&2; exit 1; }
+            sleep_for=$(( interval_seconds < remaining ? interval_seconds : remaining ))
+            sleep "$sleep_for"
           done
 
       - name: Strict canonical artifact preflight

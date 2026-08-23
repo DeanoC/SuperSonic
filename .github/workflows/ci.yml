@@ -25,6 +25,11 @@ jobs:
   cpu:
     name: CPU contract and compile gate
     runs-on: ubuntu-24.04
+    # Official AMD ROCm 6.3.2 development image pinned by manifest digest.
+    # It supplies HIP headers/hipcc for compilation only; no GPU device is
+    # requested or required by this job.
+    container:
+      image: rocm/dev-ubuntu-22.04@sha256:bdc3ac031337580aeadf70e4130cd6a20a8a52cc58c4380f84746789653d8c8e
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
@@ -32,9 +37,36 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check patch whitespace
-        run: git diff --check
+      - name: Check actual pull-request patch
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            test -n "${PR_BASE_SHA:-}"
+            test -n "${PR_HEAD_SHA:-}"
+            test -n "${PR_NUMBER:-}"
+            git fetch --no-tags origin \
+              "refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-${PR_NUMBER}-head" \
+              "$PR_BASE_SHA"
+            python3 tools/check-pr-diff.py --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
+          else
+            base="$(git merge-base HEAD^ HEAD)"
+            python3 tools/check-pr-diff.py --base "$base" --head HEAD
+          fi
+
+      - name: Verify pinned HIP toolchain
+        run: |
+          set -euo pipefail
+          command -v hipcc
+          hipcc --version
+          command -v cargo
+          cargo --version
 
       - name: Check Rust formatting
         run: cargo fmt --all --check
@@ -67,6 +99,7 @@ jobs:
           python3 tools/check-kernel-groups.py
           python3 tools/check-tool-inventory.py
           python3 tools/check-retained-source-terms.py
+          python3 tools/check-active-docs.py
 
       - name: Run CPU-safe Python validators
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v

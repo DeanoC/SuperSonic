@@ -238,7 +238,10 @@ mod tests {
                 && format!("{:?}", entry.model.family()) == "Qwen38"
         }));
 
-        let mut archs: Vec<_> = REGISTRY.iter().map(|entry| entry.arch.to_string()).collect();
+        let mut archs: Vec<_> = REGISTRY
+            .iter()
+            .map(|entry| entry.arch.to_string())
+            .collect();
         archs.sort();
         archs.dedup();
         assert_eq!(archs, vec!["gfx1100", "gfx1201"]);
