@@ -262,3 +262,5 @@ Fix-round-2 implementation remains under the required subject:
 ```text
 ci: gate Qwen3.8 GQH on CPU and R9700
 ```
+
+Fix-round-2 implementation commit: `a6a18ed`.
