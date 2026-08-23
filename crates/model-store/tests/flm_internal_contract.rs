@@ -1,39 +1,16 @@
 use std::fs;
 use std::path::Path;
 
-use model_store::{codec, flm, gqh};
+use model_store::gqh;
 
 #[test]
-fn gqh_ids_are_consistent_between_gguf_and_internal_flm() {
-    for ids in codec::GQH_CODEC_IDS {
-        let rung = gqh::GqhRung::from_ggml_type(ids.gguf_qtype)
-            .unwrap_or_else(|| panic!("missing GGUF qtype {}", ids.gguf_qtype));
-        assert_eq!(rung.flm_codec(), ids.flm_codec);
-
-        let round_trip = gqh::GqhRung::from_flm_codec(ids.flm_codec)
-            .unwrap_or_else(|| panic!("missing FLM codec {}", ids.flm_codec));
-        assert_eq!(round_trip.ggml_type(), ids.gguf_qtype);
+fn public_gqh_mapping_covers_all_product_qtypes() {
+    for (qtype, expected) in [(108, "Gqh3"), (109, "Gqh2H"), (110, "Gqh2C"), (111, "Gqh4")] {
+        let rung = gqh::GqhRung::from_ggml_type(qtype)
+            .unwrap_or_else(|| panic!("missing public GGUF qtype {qtype}"));
+        assert_eq!(format!("{rung:?}"), expected);
+        assert_eq!(rung.ggml_type(), qtype);
     }
-}
-
-#[test]
-fn internal_flm_tensor_descriptor_round_trips_without_gpu() {
-    let descriptor = flm::FlmTensorDescriptor {
-        tensor_id: 7,
-        name: "blk.0.attn_q.weight".to_string(),
-        role_id: flm::LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT,
-        rank: 2,
-        shape: [4096, 5120, 0, 0],
-        value_format_id: flm::VALUE_FORMAT_SYM_INT4,
-        reconstruction_dtype: flm::FLM_DTYPE_BF16,
-        storage_binding_start: 3,
-        storage_binding_count: 2,
-        flags: flm::LOGICAL_TENSOR_FLAG_REQUIRED,
-    };
-
-    let wire = descriptor.encode().expect("encode internal FLM descriptor");
-    let decoded = flm::FlmTensorDescriptor::decode(&wire).expect("decode internal FLM descriptor");
-    assert_eq!(decoded, descriptor);
 }
 
 #[test]
@@ -95,6 +72,26 @@ fn model_store_has_no_legacy_bake_or_distribution_surface() {
             "Qwen3.8 weights still carry removed bake surface: {forbidden}"
         );
     }
+}
+
+#[test]
+fn flm_foundations_and_flm_terms_are_not_public_api() {
+    let model_store_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib_rs =
+        fs::read_to_string(model_store_root.join("src/lib.rs")).expect("read model-store lib");
+    assert!(lib_rs.contains("mod codec;"));
+    assert!(lib_rs.contains("mod flm;"));
+    assert!(!lib_rs.contains("pub mod codec;"));
+    assert!(!lib_rs.contains("pub mod flm;"));
+
+    let gqh_rs = fs::read_to_string(model_store_root.join("src/gqh.rs")).expect("read GQH source");
+    assert!(!gqh_rs.contains("pub fn from_flm_codec"));
+    assert!(!gqh_rs.contains("pub fn flm_codec"));
+
+    let flm_rs =
+        fs::read_to_string(model_store_root.join("src/flm.rs")).expect("read internal FLM source");
+    assert!(!flm_rs.contains("FTD1"));
+    assert!(!flm_rs.contains("pub type FlmTensorDescriptor"));
 }
 
 fn collect_rust_source(path: &Path, out: &mut String) {

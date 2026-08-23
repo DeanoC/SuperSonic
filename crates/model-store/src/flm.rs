@@ -2,11 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::Error;
 
-pub const ARCH_QWEN3_6_DENSE: u32 = 1;
-pub const ARCH_QWEN3_6_MOE: u32 = 2;
+pub const ARCH_QWEN3_8_DENSE: u32 = 3;
 pub const TOKENIZER_QWEN_BPE_V1: u32 = 1;
-pub const TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1: u32 = 1;
-pub const TENSOR_ABI_QWEN3_6_MOE_MIXED_LOWBIT_V1: u32 = 2;
+pub const TENSOR_ABI_QWEN3_8_DENSE_GQH_V1: u32 = 3;
 pub const CODEC_RAW_BF16: u16 = 1;
 pub const CODEC_SYM_INT4_G128_BF16: u16 = 2;
 pub const CODEC_RAW_I64: u16 = 3;
@@ -18,18 +16,11 @@ pub const CODEC_FP8_E4M3_B128_BF16_INV: u16 = 8;
 pub const CODEC_FP8_E4M3_B64_BF16: u16 = 9;
 pub const CODEC_SUPERSONIC_NATIVE_INT4_G128_BF16: u16 = 10;
 pub const CODEC_ROW_GROUP_INT4_BF16_SYM: u16 = 11;
-pub use crate::codec::{
-    CODEC_GQH2_C, CODEC_GQH2_H, CODEC_GQH3, CODEC_GQH4, GGML_TYPE_GQH2_C, GGML_TYPE_GQH2_H,
-    GGML_TYPE_GQH3, GGML_TYPE_GQH4,
-};
 pub const STORAGE_ABI_GQH3: u16 = 10;
 pub const STORAGE_ABI_GQH2_H: u16 = 11;
 pub const STORAGE_ABI_GQH2_C: u16 = 12;
-pub const MODEL_QWEN3_6_DENSE_V1: u16 = 1;
-pub const MODEL_QWEN3_6_MOE_V1: u16 = 2;
 pub const MODEL_QWEN3_8_DENSE_V1: u16 = 3;
-pub const QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1: u32 = 1;
-pub const QUANT_PROFILE_QWEN3_6_MOE_MIXED_LOWBIT_V1: u32 = 2;
+pub const QUANT_PROFILE_QWEN3_8_GQH_V1: u32 = 3;
 pub const ASSET_TOKENIZER_VOCAB: u16 = 1;
 pub const ASSET_TOKENIZER_MERGES: u16 = 2;
 pub const ASSET_TOKENIZER_ADDED_TOKENS: u16 = 3;
@@ -90,7 +81,7 @@ pub const FLM_DTYPE_INT64: u16 = 6;
 
 const RUNTIME_MAGIC: &[u8; 8] = b"FLMRUN1\0";
 const RUNTIME_VERSION: u16 = 4;
-const SECTION_CONFIG_QWEN36_DENSE: u32 = 1;
+const SECTION_CONFIG_QWEN38_DENSE: u32 = 1;
 const SECTION_TOKENIZER: u32 = 2;
 const SECTION_CODEC_TABLE: u32 = 3;
 const SECTION_TENSOR_ABI: u32 = 4;
@@ -102,11 +93,9 @@ const SECTION_STORAGE_ABI_TABLE: u32 = 9;
 const SECTION_LOGICAL_TENSOR_TABLE: u32 = 10;
 const SECTION_STORAGE_BINDING_TABLE: u32 = 11;
 const SECTION_PLAN_STEP_TABLE: u32 = 12;
-const SECTION_CONFIG_QWEN36_MOE: u32 = 13;
 const SECTION_RECORD_SIZE: usize = 12;
 const HEADER_PREFIX_SIZE: usize = 16;
 const CONFIG_FIXED_SIZE: usize = 13 * 4 + 2 * 8 + 2 + 4;
-const MOE_CONFIG_FIXED_SIZE: usize = 17 * 4 + 2 * 8 + 5 + 4;
 const TOKENIZER_SIZE: usize = 8 * 4;
 const CODEC_RECORD_SIZE: usize = 10;
 const MODEL_DESCRIPTOR_SIZE: usize = 24;
@@ -122,7 +111,7 @@ const PLAN_STEP_HEADER_SIZE: usize = 8;
 const PLAN_STEP_ROW_SIZE: usize = 38;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct FlmQwen36DenseConfig {
+pub struct FlmQwen38Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -143,38 +132,6 @@ pub struct FlmQwen36DenseConfig {
     pub tie_word_embeddings: bool,
     pub eos_token_ids: Vec<u32>,
     pub full_attention_layers: Vec<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FlmQwen36MoeConfig {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub moe_intermediate_size: usize,
-    pub shared_expert_intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub max_position_embeddings: usize,
-    pub linear_conv_kernel_dim: usize,
-    pub linear_key_head_dim: usize,
-    pub linear_value_head_dim: usize,
-    pub linear_num_key_heads: usize,
-    pub linear_num_value_heads: usize,
-    pub num_experts: usize,
-    pub num_experts_per_tok: usize,
-    pub mtp_num_hidden_layers: usize,
-    pub rms_norm_eps: f64,
-    pub rope_theta: f64,
-    pub partial_rotary_factor: f64,
-    pub activation_id: u8,
-    pub tie_word_embeddings: bool,
-    pub attn_output_gate: bool,
-    pub mtp_use_dedicated_embeddings: bool,
-    pub mrope_interleaved: bool,
-    pub eos_token_ids: Vec<u32>,
-    pub full_attention_layers: Vec<usize>,
-    pub mrope_section: [u32; 3],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -352,156 +309,6 @@ pub struct FlmLogicalTensor {
     pub flags: u16,
 }
 
-/// Internal FLM logical-tensor descriptor used for CPU-side format checks.
-/// This is intentionally not re-exported from the model-store crate root and
-/// is not a product weight-loader API.
-pub type FlmTensorDescriptor = FlmLogicalTensor;
-
-const TENSOR_DESCRIPTOR_MAGIC: &[u8; 4] = b"FTD1";
-const TENSOR_DESCRIPTOR_VERSION: u16 = 1;
-const TENSOR_DESCRIPTOR_HEADER_SIZE: usize = 46;
-
-impl FlmLogicalTensor {
-    /// Encode one descriptor without touching a GPU or a model artifact.
-    pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        validate_tensor_descriptor_fields(self)?;
-        let name = self.name.as_bytes();
-        let name_len = u16::try_from(name.len()).map_err(|_| {
-            Error::Other("FLM tensor descriptor name exceeds u16 length".to_string())
-        })?;
-
-        let mut out = Vec::with_capacity(TENSOR_DESCRIPTOR_HEADER_SIZE + name.len());
-        out.extend_from_slice(TENSOR_DESCRIPTOR_MAGIC);
-        out.extend_from_slice(&TENSOR_DESCRIPTOR_VERSION.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&self.tensor_id.to_le_bytes());
-        out.extend_from_slice(&self.role_id.to_le_bytes());
-        out.push(self.rank);
-        out.push(0);
-        for dim in self.shape {
-            out.extend_from_slice(&dim.to_le_bytes());
-        }
-        out.extend_from_slice(&self.value_format_id.to_le_bytes());
-        out.extend_from_slice(&self.reconstruction_dtype.to_le_bytes());
-        out.extend_from_slice(&self.storage_binding_start.to_le_bytes());
-        out.extend_from_slice(&self.storage_binding_count.to_le_bytes());
-        out.extend_from_slice(&self.flags.to_le_bytes());
-        out.extend_from_slice(&name_len.to_le_bytes());
-        out.extend_from_slice(name);
-        Ok(out)
-    }
-
-    /// Decode one descriptor without touching a GPU or a model artifact.
-    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
-        if buf.len() < TENSOR_DESCRIPTOR_HEADER_SIZE {
-            return Err(Error::Other(format!(
-                "FLM tensor descriptor is truncated ({} B < {TENSOR_DESCRIPTOR_HEADER_SIZE})",
-                buf.len()
-            )));
-        }
-        if &buf[..4] != TENSOR_DESCRIPTOR_MAGIC {
-            return Err(Error::Other("bad FLM tensor descriptor magic".to_string()));
-        }
-        let version = read_u16(buf, 4, "FLM tensor descriptor version")?;
-        if version != TENSOR_DESCRIPTOR_VERSION {
-            return Err(Error::Other(format!(
-                "unsupported FLM tensor descriptor version {version}; expected {TENSOR_DESCRIPTOR_VERSION}"
-            )));
-        }
-        let reserved = read_u16(buf, 6, "FLM tensor descriptor reserved")?;
-        if reserved != 0 {
-            return Err(Error::Other(
-                "FLM tensor descriptor reserved field is nonzero".to_string(),
-            ));
-        }
-
-        let tensor_id = read_u32(buf, 8, "FLM tensor descriptor tensor_id")?;
-        let role_id = read_u16(buf, 12, "FLM tensor descriptor role_id")?;
-        let rank = *read_exact_range(buf, 14, 1, "FLM tensor descriptor rank")?
-            .first()
-            .expect("slice length checked");
-        let reserved0 = *read_exact_range(buf, 15, 1, "FLM tensor descriptor reserved0")?
-            .first()
-            .expect("slice length checked");
-        if reserved0 != 0 {
-            return Err(Error::Other(
-                "FLM tensor descriptor reserved0 is nonzero".to_string(),
-            ));
-        }
-        let mut shape = [0u32; 4];
-        for (idx, dim) in shape.iter_mut().enumerate() {
-            *dim = read_u32(buf, 16 + idx * 4, "FLM tensor descriptor shape")?;
-        }
-        let value_format_id = read_u16(buf, 32, "FLM tensor descriptor value_format_id")?;
-        let reconstruction_dtype = read_u16(buf, 34, "FLM tensor descriptor reconstruction_dtype")?;
-        let storage_binding_start =
-            read_u32(buf, 36, "FLM tensor descriptor storage_binding_start")?;
-        let storage_binding_count =
-            read_u16(buf, 40, "FLM tensor descriptor storage_binding_count")?;
-        let flags = read_u16(buf, 42, "FLM tensor descriptor flags")?;
-        let name_len = usize::from(read_u16(buf, 44, "FLM tensor descriptor name_len")?);
-        let name_end = TENSOR_DESCRIPTOR_HEADER_SIZE
-            .checked_add(name_len)
-            .ok_or_else(|| Error::Other("FLM tensor descriptor name overflows".to_string()))?;
-        let name_bytes = read_exact_range(
-            buf,
-            TENSOR_DESCRIPTOR_HEADER_SIZE,
-            name_len,
-            "FLM tensor descriptor name",
-        )?;
-        if name_end != buf.len() {
-            return Err(Error::Other(format!(
-                "FLM tensor descriptor has trailing bytes (expected {name_end}, got {})",
-                buf.len()
-            )));
-        }
-        let name = std::str::from_utf8(name_bytes)
-            .map_err(|err| Error::Other(format!("FLM tensor descriptor name is not UTF-8: {err}")))?
-            .to_string();
-
-        let descriptor = Self {
-            tensor_id,
-            name,
-            role_id,
-            rank,
-            shape,
-            value_format_id,
-            reconstruction_dtype,
-            storage_binding_start,
-            storage_binding_count,
-            flags,
-        };
-        validate_tensor_descriptor_fields(&descriptor)?;
-        Ok(descriptor)
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        self.encode()
-    }
-
-    pub fn from_bytes(buf: &[u8]) -> Result<Self, Error> {
-        Self::decode(buf)
-    }
-}
-
-fn validate_tensor_descriptor_fields(descriptor: &FlmLogicalTensor) -> Result<(), Error> {
-    if descriptor.rank > 4 {
-        return Err(Error::Other(format!(
-            "FLM tensor descriptor rank {} exceeds 4",
-            descriptor.rank
-        )));
-    }
-    if descriptor.shape[usize::from(descriptor.rank)..]
-        .iter()
-        .any(|dim| *dim != 0)
-    {
-        return Err(Error::Other(
-            "FLM tensor descriptor has nonzero shape beyond rank".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlmStorageBinding {
     pub logical_tensor_id: u32,
@@ -543,8 +350,7 @@ pub enum FlmStage3DirectWeightKind {
 #[derive(Debug, Clone)]
 pub struct FlmRuntimeDirectory {
     pub architecture_id: u32,
-    pub config: FlmQwen36DenseConfig,
-    pub moe_config: Option<FlmQwen36MoeConfig>,
+    pub config: FlmQwen38Config,
     pub tokenizer: FlmTokenizerDescriptor,
     pub assets: HashMap<u32, FlmAsset>,
     codecs: Vec<FlmCodecDescriptor>,
@@ -638,15 +444,7 @@ impl FlmRuntimeDirectory {
         let (architecture_id, sections) = parse_section_table(buf)?;
         let model_descriptor =
             parse_model_descriptor(section(buf, &sections, SECTION_MODEL_DESCRIPTOR)?)?;
-        let expected_model_id = match architecture_id {
-            ARCH_QWEN3_6_DENSE => MODEL_QWEN3_6_DENSE_V1,
-            ARCH_QWEN3_6_MOE => MODEL_QWEN3_6_MOE_V1,
-            other => {
-                return Err(Error::Other(format!(
-                    "unsupported FLM runtime architecture {other}"
-                )));
-            }
-        };
+        let expected_model_id = MODEL_QWEN3_8_DENSE_V1;
         if model_descriptor.model_id != expected_model_id {
             return Err(Error::Other(format!(
                 "FLM model descriptor model_id {} does not match architecture {} (expected {})",
@@ -661,15 +459,7 @@ impl FlmRuntimeDirectory {
 
     pub fn parse(buf: &[u8]) -> Result<Self, Error> {
         let (architecture_id, sections) = parse_section_table(buf)?;
-        let (config, moe_config) = if architecture_id == ARCH_QWEN3_6_MOE {
-            let moe = parse_qwen36_moe_config(section(buf, &sections, SECTION_CONFIG_QWEN36_MOE)?)?;
-            (dense_config_from_moe(&moe), Some(moe))
-        } else {
-            (
-                parse_qwen36_config(section(buf, &sections, SECTION_CONFIG_QWEN36_DENSE)?)?,
-                None,
-            )
-        };
+        let config = parse_qwen38_config(section(buf, &sections, SECTION_CONFIG_QWEN38_DENSE)?)?;
         let tokenizer = parse_tokenizer(section(buf, &sections, SECTION_TOKENIZER)?)?;
         let codecs = parse_codec_table(section(buf, &sections, SECTION_CODEC_TABLE)?)?;
         let tensor_abi = parse_tensor_abi(section(buf, &sections, SECTION_TENSOR_ABI)?)?;
@@ -721,7 +511,6 @@ impl FlmRuntimeDirectory {
         Ok(Self {
             architecture_id,
             config,
-            moe_config,
             tokenizer,
             assets,
             codecs,
@@ -734,16 +523,6 @@ impl FlmRuntimeDirectory {
             plan_steps,
             stage3_indexes,
         })
-    }
-
-    pub fn qwen36_config(&self) -> Option<&FlmQwen36DenseConfig> {
-        (self.architecture_id == ARCH_QWEN3_6_DENSE).then_some(&self.config)
-    }
-
-    pub fn qwen36_moe_config(&self) -> Option<&FlmQwen36MoeConfig> {
-        (self.architecture_id == ARCH_QWEN3_6_MOE)
-            .then_some(self.moe_config.as_ref())
-            .flatten()
     }
 
     pub fn tokenizer(&self) -> Option<&FlmTokenizerDescriptor> {
@@ -767,13 +546,13 @@ impl FlmRuntimeDirectory {
         let asset = match matches.as_slice() {
             [] => {
                 return Err(Error::Other(format!(
-                    "Qwen3.6 runtime requires one native chat template asset with kind_id={ASSET_CHAT_TEMPLATE_UTF8}"
+                    "Qwen3.8 runtime requires one native chat template asset with kind_id={ASSET_CHAT_TEMPLATE_UTF8}"
                 )));
             }
             [asset] => *asset,
             _ => {
                 return Err(Error::Other(format!(
-                    "Qwen3.6 runtime requires exactly one native chat template asset with kind_id={ASSET_CHAT_TEMPLATE_UTF8}, found {}",
+                    "Qwen3.8 runtime requires exactly one native chat template asset with kind_id={ASSET_CHAT_TEMPLATE_UTF8}, found {}",
                     matches.len()
                 )));
             }
@@ -781,25 +560,25 @@ impl FlmRuntimeDirectory {
 
         if asset.name != "chat_template" {
             return Err(Error::Other(format!(
-                "Qwen3.6 native chat template asset must be named 'chat_template', got {:?}",
+                "Qwen3.8 native chat template asset must be named 'chat_template', got {:?}",
                 asset.name
             )));
         }
         let expected_flags = ASSET_FLAG_REQUIRED_FOR_RUNTIME | ASSET_FLAG_TEXT_UTF8;
         if asset.flags != expected_flags {
             return Err(Error::Other(format!(
-                "Qwen3.6 native chat template asset must have exactly flags={expected_flags}, got {}",
+                "Qwen3.8 native chat template asset must have exactly flags={expected_flags}, got {}",
                 asset.flags
             )));
         }
         let source = std::str::from_utf8(&asset.payload).map_err(|err| {
             Error::Other(format!(
-                "Qwen3.6 runtime chat template asset: chat template is not UTF-8: {err}"
+                "Qwen3.8 runtime chat template asset: chat template is not UTF-8: {err}"
             ))
         })?;
         if source.trim().is_empty() {
             return Err(Error::Other(
-                "Qwen3.6 runtime chat template asset: chat template is empty".into(),
+                "Qwen3.8 runtime chat template asset: chat template is empty".into(),
             ));
         }
         Ok(source)
@@ -1221,8 +1000,7 @@ impl FlmRuntimeDirectory {
 
 fn config_section_id_for_architecture(architecture_id: u32) -> Result<u32, Error> {
     match architecture_id {
-        ARCH_QWEN3_6_DENSE => Ok(SECTION_CONFIG_QWEN36_DENSE),
-        ARCH_QWEN3_6_MOE => Ok(SECTION_CONFIG_QWEN36_MOE),
+        ARCH_QWEN3_8_DENSE => Ok(SECTION_CONFIG_QWEN38_DENSE),
         other => Err(Error::Other(format!(
             "unsupported FLM runtime architecture {other}"
         ))),
@@ -1246,7 +1024,7 @@ fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), 
     }
     let section_count = read_u16(buf, 10, "FLM runtime section count")? as usize;
     let architecture_id = read_u32(buf, 12, "FLM runtime architecture_id")?;
-    if architecture_id != ARCH_QWEN3_6_DENSE && architecture_id != ARCH_QWEN3_6_MOE {
+    if architecture_id != ARCH_QWEN3_8_DENSE {
         return Err(Error::Other(format!(
             "unsupported FLM runtime architecture {architecture_id}"
         )));
@@ -1267,7 +1045,7 @@ fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), 
     for idx in 0..section_count {
         let off = HEADER_PREFIX_SIZE + idx * SECTION_RECORD_SIZE;
         let section_id = read_u32(buf, off, "FLM runtime section id")?;
-        if !(SECTION_CONFIG_QWEN36_DENSE..=SECTION_CONFIG_QWEN36_MOE).contains(&section_id) {
+        if section_id == 0 || section_id > SECTION_PLAN_STEP_TABLE {
             return Err(Error::Other(format!(
                 "FLM runtime section {idx} has unknown id {section_id}"
             )));
@@ -1349,7 +1127,7 @@ fn section<'a>(
     read_exact_range(buf, range.offset, range.len, "FLM runtime section")
 }
 
-fn parse_qwen36_config(buf: &[u8]) -> Result<FlmQwen36DenseConfig, Error> {
+fn parse_qwen38_config(buf: &[u8]) -> Result<FlmQwen38Config, Error> {
     read_exact_range(buf, 0, CONFIG_FIXED_SIZE + 8, "FLM qwen config")?;
     let mut offset = 0usize;
     let vocab_size = read_usize(buf, &mut offset, "FLM qwen vocab_size")?;
@@ -1408,7 +1186,7 @@ fn parse_qwen36_config(buf: &[u8]) -> Result<FlmQwen36DenseConfig, Error> {
     }
 
     ensure_consumed(buf, offset, "FLM qwen config")?;
-    Ok(FlmQwen36DenseConfig {
+    Ok(FlmQwen38Config {
         vocab_size,
         hidden_size,
         intermediate_size,
@@ -1430,140 +1208,6 @@ fn parse_qwen36_config(buf: &[u8]) -> Result<FlmQwen36DenseConfig, Error> {
         eos_token_ids,
         full_attention_layers,
     })
-}
-
-fn parse_qwen36_moe_config(buf: &[u8]) -> Result<FlmQwen36MoeConfig, Error> {
-    read_exact_range(
-        buf,
-        0,
-        MOE_CONFIG_FIXED_SIZE + 8 + 12,
-        "FLM qwen moe config",
-    )?;
-    let mut offset = 0usize;
-    let vocab_size = read_usize(buf, &mut offset, "FLM qwen moe vocab_size")?;
-    let hidden_size = read_usize(buf, &mut offset, "FLM qwen moe hidden_size")?;
-    let moe_intermediate_size = read_usize(buf, &mut offset, "FLM qwen moe moe_intermediate_size")?;
-    let shared_expert_intermediate_size = read_usize(
-        buf,
-        &mut offset,
-        "FLM qwen moe shared_expert_intermediate_size",
-    )?;
-    let num_hidden_layers = read_usize(buf, &mut offset, "FLM qwen moe num_hidden_layers")?;
-    let num_attention_heads = read_usize(buf, &mut offset, "FLM qwen moe num_attention_heads")?;
-    let num_key_value_heads = read_usize(buf, &mut offset, "FLM qwen moe num_key_value_heads")?;
-    let head_dim = read_usize(buf, &mut offset, "FLM qwen moe head_dim")?;
-    let max_position_embeddings =
-        read_usize(buf, &mut offset, "FLM qwen moe max_position_embeddings")?;
-    let linear_conv_kernel_dim =
-        read_usize(buf, &mut offset, "FLM qwen moe linear_conv_kernel_dim")?;
-    let linear_key_head_dim = read_usize(buf, &mut offset, "FLM qwen moe linear_key_head_dim")?;
-    let linear_value_head_dim = read_usize(buf, &mut offset, "FLM qwen moe linear_value_head_dim")?;
-    let linear_num_key_heads = read_usize(buf, &mut offset, "FLM qwen moe linear_num_key_heads")?;
-    let linear_num_value_heads =
-        read_usize(buf, &mut offset, "FLM qwen moe linear_num_value_heads")?;
-    let num_experts = read_usize(buf, &mut offset, "FLM qwen moe num_experts")?;
-    let num_experts_per_tok = read_usize(buf, &mut offset, "FLM qwen moe num_experts_per_tok")?;
-    let mtp_num_hidden_layers = read_usize(buf, &mut offset, "FLM qwen moe mtp_num_hidden_layers")?;
-    let rms_norm_eps = read_f64_advance(buf, &mut offset, "FLM qwen moe rms_norm_eps")?;
-    let rope_theta = read_f64_advance(buf, &mut offset, "FLM qwen moe rope_theta")?;
-    let activation_id = read_u8_advance(buf, &mut offset, "FLM qwen moe activation_id")?;
-    let tie_word_embeddings =
-        read_bool_advance(buf, &mut offset, "FLM qwen moe tie_word_embeddings")?;
-    let attn_output_gate = read_bool_advance(buf, &mut offset, "FLM qwen moe attn_output_gate")?;
-    let mtp_use_dedicated_embeddings = read_bool_advance(
-        buf,
-        &mut offset,
-        "FLM qwen moe mtp_use_dedicated_embeddings",
-    )?;
-    let mrope_interleaved = read_bool_advance(buf, &mut offset, "FLM qwen moe mrope_interleaved")?;
-    let eos_count = read_count(buf, &mut offset, "FLM qwen moe eos_count")?;
-    let partial_rotary_factor =
-        read_f64_advance(buf, &mut offset, "FLM qwen moe partial_rotary_factor")?;
-
-    let mut eos_token_ids = Vec::with_capacity(eos_count);
-    for idx in 0..eos_count {
-        eos_token_ids.push(read_u32_advance(
-            buf,
-            &mut offset,
-            &format!("FLM qwen moe eos token id {idx}"),
-        )?);
-    }
-
-    let layer_count = read_count(buf, &mut offset, "FLM qwen moe full attention layer count")?;
-    let mut full_attention_layers = Vec::with_capacity(layer_count);
-    for idx in 0..layer_count {
-        full_attention_layers.push(read_usize(
-            buf,
-            &mut offset,
-            &format!("FLM qwen moe full attention layer {idx}"),
-        )?);
-    }
-
-    let mut mrope_section = [0u32; 3];
-    for (idx, value) in mrope_section.iter_mut().enumerate() {
-        *value = read_u32_advance(
-            buf,
-            &mut offset,
-            &format!("FLM qwen moe mrope_section {idx}"),
-        )?;
-    }
-
-    ensure_consumed(buf, offset, "FLM qwen moe config")?;
-    Ok(FlmQwen36MoeConfig {
-        vocab_size,
-        hidden_size,
-        moe_intermediate_size,
-        shared_expert_intermediate_size,
-        num_hidden_layers,
-        num_attention_heads,
-        num_key_value_heads,
-        head_dim,
-        max_position_embeddings,
-        linear_conv_kernel_dim,
-        linear_key_head_dim,
-        linear_value_head_dim,
-        linear_num_key_heads,
-        linear_num_value_heads,
-        num_experts,
-        num_experts_per_tok,
-        mtp_num_hidden_layers,
-        rms_norm_eps,
-        rope_theta,
-        partial_rotary_factor,
-        activation_id,
-        tie_word_embeddings,
-        attn_output_gate,
-        mtp_use_dedicated_embeddings,
-        mrope_interleaved,
-        eos_token_ids,
-        full_attention_layers,
-        mrope_section,
-    })
-}
-
-fn dense_config_from_moe(moe: &FlmQwen36MoeConfig) -> FlmQwen36DenseConfig {
-    FlmQwen36DenseConfig {
-        vocab_size: moe.vocab_size,
-        hidden_size: moe.hidden_size,
-        intermediate_size: moe.moe_intermediate_size,
-        num_hidden_layers: moe.num_hidden_layers,
-        num_attention_heads: moe.num_attention_heads,
-        num_key_value_heads: moe.num_key_value_heads,
-        head_dim: moe.head_dim,
-        max_position_embeddings: moe.max_position_embeddings,
-        linear_conv_kernel_dim: moe.linear_conv_kernel_dim,
-        linear_key_head_dim: moe.linear_key_head_dim,
-        linear_value_head_dim: moe.linear_value_head_dim,
-        linear_num_key_heads: moe.linear_num_key_heads,
-        linear_num_value_heads: moe.linear_num_value_heads,
-        rms_norm_eps: moe.rms_norm_eps,
-        rope_theta: moe.rope_theta,
-        partial_rotary_factor: moe.partial_rotary_factor,
-        activation_id: moe.activation_id,
-        tie_word_embeddings: moe.tie_word_embeddings,
-        eos_token_ids: moe.eos_token_ids.clone(),
-        full_attention_layers: moe.full_attention_layers.clone(),
-    }
 }
 
 fn parse_tokenizer(buf: &[u8]) -> Result<FlmTokenizerDescriptor, Error> {
@@ -1702,17 +1346,11 @@ fn validate_model_descriptor(
         expected_tensor_abi_id,
         expected_quant_profile_id,
     ) = match architecture_id {
-        ARCH_QWEN3_6_DENSE => (
-            MODEL_QWEN3_6_DENSE_V1,
-            SECTION_CONFIG_QWEN36_DENSE,
-            TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1,
-            QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1,
-        ),
-        ARCH_QWEN3_6_MOE => (
-            MODEL_QWEN3_6_MOE_V1,
-            SECTION_CONFIG_QWEN36_MOE,
-            TENSOR_ABI_QWEN3_6_MOE_MIXED_LOWBIT_V1,
-            QUANT_PROFILE_QWEN3_6_MOE_MIXED_LOWBIT_V1,
+        ARCH_QWEN3_8_DENSE => (
+            MODEL_QWEN3_8_DENSE_V1,
+            SECTION_CONFIG_QWEN38_DENSE,
+            TENSOR_ABI_QWEN3_8_DENSE_GQH_V1,
+            QUANT_PROFILE_QWEN3_8_GQH_V1,
         ),
         other => {
             return Err(Error::Other(format!(
@@ -2418,16 +2056,6 @@ fn read_u8_advance(buf: &[u8], offset: &mut usize, what: &str) -> Result<u8, Err
     Ok(value)
 }
 
-fn read_bool_advance(buf: &[u8], offset: &mut usize, what: &str) -> Result<bool, Error> {
-    match read_u8_advance(buf, offset, what)? {
-        0 => Ok(false),
-        1 => Ok(true),
-        other => Err(Error::Other(format!(
-            "{what} has invalid bool value {other}"
-        ))),
-    }
-}
-
 fn read_u16_advance(buf: &[u8], offset: &mut usize, what: &str) -> Result<u16, Error> {
     let value = read_u16(buf, *offset, what)?;
     *offset += 2;
@@ -2545,6 +2173,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn internal_gqh_codec_ids_cover_all_four_rungs() {
+        for ids in crate::codec::GQH_CODEC_IDS {
+            let rung = crate::gqh::GqhRung::from_ggml_type(ids.gguf_qtype)
+                .unwrap_or_else(|| panic!("missing GGUF qtype {}", ids.gguf_qtype));
+            assert_eq!(rung.flm_codec(), ids.flm_codec);
+            assert_eq!(
+                crate::codec::ggml_type_for_flm_codec(ids.flm_codec),
+                Some(ids.gguf_qtype)
+            );
+        }
+    }
+
+    #[test]
+    fn qwen38_runtime_identity_and_logical_tensor_wire_parse_without_gpu() {
+        let logical_table = build_stage3_logical_tensor_section();
+        let logical = parse_logical_tensors(&logical_table).expect("parse logical tensor table");
+        assert_eq!(logical.len(), 1);
+        assert_eq!(logical[0].tensor_id, 1);
+        assert_eq!(
+            logical[0].name,
+            "model.language_model.layers.0.mlp.gate_proj.weight"
+        );
+        assert_eq!(logical[0].role_id, LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+        assert_eq!(logical[0].rank, 2);
+        assert_eq!(logical[0].shape, [128, 64, 0, 0]);
+        assert_eq!(logical[0].value_format_id, VALUE_FORMAT_SYM_INT4);
+        assert_eq!(logical[0].reconstruction_dtype, FLM_DTYPE_BF16);
+
+        let mut runtime = build_test_runtime_directory_with_stage3_tables();
+        put_u32_at(&mut runtime, 12, ARCH_QWEN3_8_DENSE);
+        let (model_descriptor_offset, _) = section_range(&runtime, SECTION_MODEL_DESCRIPTOR);
+        put_u16_at(
+            &mut runtime,
+            model_descriptor_offset + 2,
+            MODEL_QWEN3_8_DENSE_V1,
+        );
+
+        let identity =
+            FlmRuntimeDirectory::parse_identity(&runtime).expect("parse Qwen3.8 identity");
+        assert_eq!(identity.architecture_id, ARCH_QWEN3_8_DENSE);
+        assert_eq!(identity.model_id, MODEL_QWEN3_8_DENSE_V1);
+
+        let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse Qwen3.8 runtime");
+        assert_eq!(parsed.architecture_id, ARCH_QWEN3_8_DENSE);
+        assert_eq!(parsed.model_descriptor().model_id, MODEL_QWEN3_8_DENSE_V1);
+        assert_eq!(parsed.logical_tensors(), logical.as_slice());
+    }
+
     fn write_u16(out: &mut Vec<u8>, value: u16) {
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -2600,33 +2277,6 @@ mod tests {
         out
     }
 
-    fn build_qwen_moe_config_section() -> Vec<u8> {
-        let mut out = Vec::new();
-        for value in [
-            248_320u32, 2048, 512, 512, 40, 16, 2, 256, 262_144, 4, 128, 128, 16, 32, 256, 8, 1,
-        ] {
-            write_u32(&mut out, value);
-        }
-        write_f64(&mut out, 1e-6);
-        write_f64(&mut out, 10_000_000.0);
-        out.push(1);
-        out.push(0);
-        out.push(1);
-        out.push(0);
-        out.push(1);
-        write_u32(&mut out, 1);
-        write_f64(&mut out, 0.25);
-        write_u32(&mut out, 248_044);
-        write_u32(&mut out, 10);
-        for layer in [3u32, 7, 11, 15, 19, 23, 27, 31, 35, 39] {
-            write_u32(&mut out, layer);
-        }
-        for value in [11u32, 11, 10] {
-            write_u32(&mut out, value);
-        }
-        out
-    }
-
     fn build_tokenizer_section() -> Vec<u8> {
         let mut out = Vec::new();
         for value in [
@@ -2663,17 +2313,7 @@ mod tests {
 
     fn build_tensor_abi_section() -> Vec<u8> {
         let mut out = Vec::new();
-        write_u32(&mut out, TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
-        write_string(&mut out, "model.language_model");
-        write_string(&mut out, ".weight_packed");
-        write_string(&mut out, ".weight_scale");
-        write_string(&mut out, ".weight_shape");
-        out
-    }
-
-    fn build_moe_tensor_abi_section() -> Vec<u8> {
-        let mut out = Vec::new();
-        write_u32(&mut out, TENSOR_ABI_QWEN3_6_MOE_MIXED_LOWBIT_V1);
+        write_u32(&mut out, TENSOR_ABI_QWEN3_8_DENSE_GQH_V1);
         write_string(&mut out, "model.language_model");
         write_string(&mut out, ".weight_packed");
         write_string(&mut out, ".weight_scale");
@@ -2744,23 +2384,11 @@ mod tests {
     fn build_model_descriptor_section() -> Vec<u8> {
         let mut out = Vec::new();
         write_u16(&mut out, 1);
-        write_u16(&mut out, MODEL_QWEN3_6_DENSE_V1);
-        write_u32(&mut out, SECTION_CONFIG_QWEN36_DENSE);
+        write_u16(&mut out, MODEL_QWEN3_8_DENSE_V1);
+        write_u32(&mut out, SECTION_CONFIG_QWEN38_DENSE);
         write_u32(&mut out, TOKENIZER_QWEN_BPE_V1);
-        write_u32(&mut out, TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
-        write_u32(&mut out, QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1);
-        write_u32(&mut out, 0);
-        out
-    }
-
-    fn build_moe_model_descriptor_section() -> Vec<u8> {
-        let mut out = Vec::new();
-        write_u16(&mut out, 1);
-        write_u16(&mut out, MODEL_QWEN3_6_MOE_V1);
-        write_u32(&mut out, SECTION_CONFIG_QWEN36_MOE);
-        write_u32(&mut out, TOKENIZER_QWEN_BPE_V1);
-        write_u32(&mut out, TENSOR_ABI_QWEN3_6_MOE_MIXED_LOWBIT_V1);
-        write_u32(&mut out, QUANT_PROFILE_QWEN3_6_MOE_MIXED_LOWBIT_V1);
+        write_u32(&mut out, TENSOR_ABI_QWEN3_8_DENSE_GQH_V1);
+        write_u32(&mut out, QUANT_PROFILE_QWEN3_8_GQH_V1);
         write_u32(&mut out, 0);
         out
     }
@@ -2961,7 +2589,7 @@ mod tests {
         out.extend_from_slice(b"FLMRUN1\0");
         write_u16(&mut out, RUNTIME_VERSION);
         write_u16(&mut out, sections.len() as u16);
-        write_u32(&mut out, ARCH_QWEN3_6_DENSE);
+        write_u32(&mut out, ARCH_QWEN3_8_DENSE);
         for (section_id, data) in &sections {
             write_u32(&mut out, *section_id);
             write_u32(&mut out, offset);
@@ -2992,7 +2620,7 @@ mod tests {
         out.extend_from_slice(b"FLMRUN1\0");
         write_u16(&mut out, RUNTIME_VERSION);
         write_u16(&mut out, sections.len() as u16);
-        write_u32(&mut out, ARCH_QWEN3_6_DENSE);
+        write_u32(&mut out, ARCH_QWEN3_8_DENSE);
         for (section_id, data) in &sections {
             write_u32(&mut out, *section_id);
             write_u32(&mut out, offset);
@@ -3007,38 +2635,6 @@ mod tests {
 
     fn build_test_runtime_directory() -> Vec<u8> {
         build_test_runtime_directory_with_assets(&base_assets())
-    }
-
-    fn build_test_moe_runtime_directory() -> Vec<u8> {
-        let assets = base_assets();
-        let (asset_table, asset_payloads) = build_asset_sections(&assets);
-        let sections = [
-            (SECTION_CONFIG_QWEN36_MOE, build_qwen_moe_config_section()),
-            (2u32, build_tokenizer_section()),
-            (3u32, build_codec_table_section()),
-            (4u32, build_moe_tensor_abi_section()),
-            (5u32, asset_table),
-            (6u32, asset_payloads),
-            (7u32, build_moe_model_descriptor_section()),
-            (8u32, build_tensor_manifest_section()),
-        ];
-        let header_len = 8 + 2 + 2 + 4 + sections.len() * 12;
-        let mut offset = header_len as u32;
-        let mut out = Vec::new();
-        out.extend_from_slice(b"FLMRUN1\0");
-        write_u16(&mut out, RUNTIME_VERSION);
-        write_u16(&mut out, sections.len() as u16);
-        write_u32(&mut out, ARCH_QWEN3_6_MOE);
-        for (section_id, data) in &sections {
-            write_u32(&mut out, *section_id);
-            write_u32(&mut out, offset);
-            write_u32(&mut out, data.len() as u32);
-            offset += data.len() as u32;
-        }
-        for (_, data) in sections {
-            out.extend_from_slice(&data);
-        }
-        out
     }
 
     fn section_record_offset(runtime: &[u8], section_id: u32) -> usize {
@@ -3193,9 +2789,9 @@ mod tests {
         let runtime = build_test_runtime_directory();
         let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse runtime");
 
-        assert_eq!(parsed.architecture_id, ARCH_QWEN3_6_DENSE);
-        assert_eq!(parsed.qwen36_config().unwrap().hidden_size, 5120);
-        assert_eq!(parsed.qwen36_config().unwrap().full_attention_layers[0], 3);
+        assert_eq!(parsed.architecture_id, ARCH_QWEN3_8_DENSE);
+        assert_eq!(parsed.config.hidden_size, 5120);
+        assert_eq!(parsed.config.full_attention_layers[0], 3);
         assert_eq!(
             parsed.tokenizer().unwrap().tokenizer_id,
             TOKENIZER_QWEN_BPE_V1
@@ -3224,23 +2820,6 @@ mod tests {
             parsed.codec_by_semantic_id(CODEC_RAW_I64).unwrap().codec_id,
             2
         );
-    }
-
-    #[test]
-    fn parses_runtime_directory_with_qwen_moe_config() {
-        let runtime = build_test_moe_runtime_directory();
-        let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse moe runtime");
-
-        assert_eq!(parsed.architecture_id, ARCH_QWEN3_6_MOE);
-        assert!(parsed.qwen36_config().is_none());
-        assert_eq!(parsed.qwen36_moe_config().unwrap().hidden_size, 2048);
-        assert_eq!(parsed.qwen36_moe_config().unwrap().num_experts, 256);
-        assert_eq!(parsed.qwen36_moe_config().unwrap().num_experts_per_tok, 8);
-        assert_eq!(
-            parsed.qwen36_moe_config().unwrap().mrope_section,
-            [11, 11, 10]
-        );
-        assert_eq!(parsed.model_descriptor().model_id, MODEL_QWEN3_6_MOE_V1);
     }
 
     #[test]
@@ -3321,10 +2900,10 @@ mod tests {
         let runtime = build_test_runtime_directory();
         let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse runtime v4");
 
-        assert_eq!(parsed.model_descriptor().model_id, MODEL_QWEN3_6_DENSE_V1);
+        assert_eq!(parsed.model_descriptor().model_id, MODEL_QWEN3_8_DENSE_V1);
         assert_eq!(
             parsed.model_descriptor().quant_profile_id,
-            QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1
+            QUANT_PROFILE_QWEN3_8_GQH_V1
         );
         assert_eq!(parsed.asset(1).unwrap().kind_id, ASSET_TOKENIZER_VOCAB);
         assert!(parsed.asset(1).unwrap().flags & ASSET_FLAG_REQUIRED_FOR_RUNTIME != 0);
@@ -3456,7 +3035,7 @@ mod tests {
             .expect_err("missing chat template must fail");
         assert_eq!(
             missing.to_string(),
-            "Qwen3.6 runtime requires one native chat template asset with kind_id=5"
+            "Qwen3.8 runtime requires one native chat template asset with kind_id=5"
         );
 
         let mut duplicate_assets = base_assets();
@@ -3472,7 +3051,7 @@ mod tests {
         .expect_err("duplicate chat templates must fail");
         assert_eq!(
             duplicate.to_string(),
-            "Qwen3.6 runtime requires exactly one native chat template asset with kind_id=5, found 2"
+            "Qwen3.8 runtime requires exactly one native chat template asset with kind_id=5, found 2"
         );
 
         let mut wrong_name_assets = base_assets();
@@ -3487,7 +3066,7 @@ mod tests {
         .expect_err("wrong chat template name must fail");
         assert_eq!(
             wrong_name.to_string(),
-            "Qwen3.6 native chat template asset must be named 'chat_template', got \"template\""
+            "Qwen3.8 native chat template asset must be named 'chat_template', got \"template\""
         );
 
         let mut wrong_flags_assets = base_assets();
@@ -3502,7 +3081,7 @@ mod tests {
         .expect_err("wrong chat template flags must fail");
         assert_eq!(
             wrong_flags.to_string(),
-            "Qwen3.6 native chat template asset must have exactly flags=5, got 1"
+            "Qwen3.8 native chat template asset must have exactly flags=5, got 1"
         );
     }
 
@@ -3520,7 +3099,7 @@ mod tests {
         .expect_err("invalid UTF-8 chat template must fail");
         assert!(invalid_utf8
             .to_string()
-            .starts_with("Qwen3.6 runtime chat template asset: chat template is not UTF-8:"));
+            .starts_with("Qwen3.8 runtime chat template asset: chat template is not UTF-8:"));
 
         let mut empty_assets = base_assets();
         let mut empty = chat_template_asset();
@@ -3533,7 +3112,7 @@ mod tests {
                 .expect_err("empty chat template must fail");
         assert_eq!(
             empty.to_string(),
-            "Qwen3.6 runtime chat template asset: chat template is empty"
+            "Qwen3.8 runtime chat template asset: chat template is empty"
         );
     }
 

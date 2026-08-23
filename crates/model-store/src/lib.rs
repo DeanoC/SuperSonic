@@ -4,11 +4,14 @@
 //! internal, CPU-only format foundation until a later product design promotes
 //! it through the same artifact and correctness gates.
 
-#[doc(hidden)]
-pub mod codec;
+#[allow(dead_code)]
+mod codec;
 pub mod dmix2;
-#[doc(hidden)]
-pub mod flm;
+// The FLM parser is intentionally dormant background format work.  Keeping it
+// private and warning-tolerant makes that boundary explicit until a product
+// loader is designed and gated.
+#[allow(dead_code)]
+mod flm;
 pub mod gguf;
 pub mod gqh;
 pub mod q2k;

@@ -33,7 +33,8 @@ impl GqhRung {
         }
     }
 
-    pub fn from_flm_codec(semantic_id: u16) -> Option<Self> {
+    #[allow(dead_code)]
+    pub(crate) fn from_flm_codec(semantic_id: u16) -> Option<Self> {
         match crate::codec::ggml_type_for_flm_codec(semantic_id) {
             Some(GGML_TYPE_GQH3) => Some(Self::Gqh3),
             Some(GGML_TYPE_GQH2_H) => Some(Self::Gqh2H),
@@ -52,7 +53,8 @@ impl GqhRung {
         }
     }
 
-    pub fn flm_codec(self) -> u16 {
+    #[allow(dead_code)]
+    pub(crate) fn flm_codec(self) -> u16 {
         match self {
             Self::Gqh3 => crate::codec::CODEC_GQH3,
             Self::Gqh2H => crate::codec::CODEC_GQH2_H,

@@ -528,6 +528,7 @@ mod tests {
         assert_eq!(rung_from_flm_codec(13), Some(RUNG_GQH3));
         assert_eq!(rung_from_flm_codec(14), Some(RUNG_GQH2_H));
         assert_eq!(rung_from_flm_codec(15), Some(RUNG_GQH2_C));
+        assert_eq!(rung_from_flm_codec(16), Some(RUNG_GQH4));
         assert!(rung_from_ggml_type(107).is_none());
     }
 
