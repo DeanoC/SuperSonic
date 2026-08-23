@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Check that retained Qwen3.8 MTP code has no legacy implementation names.
+"""Check retained Qwen3.8 source boundaries for legacy implementation names.
 
 This is deliberately a source-boundary check rather than a blanket ban on
 historical words in the runtime.  Task 5 leaves the outer tree/tap/rollback
 experiments in place for the later kernel reduction, so those names are not
 part of this check.  The symbols below are the shared MTP cache/scratch and
-the Qwen3.8 MTP entry points that are part of the retained product path.
+the Qwen3.8 MTP entry points that are part of the retained product path.  The
+retained full-attention HIP sources are also checked for product-facing
+Qwen3.5 comments and stale model-geometry counts; their qwen35 spellings are
+ABI/compiler identifiers and are intentionally outside this product check.
 """
 
 from __future__ import annotations
@@ -21,6 +24,11 @@ RUNTIME_FILES = (
     Path("crates/runtime/src/prefill_engine.rs"),
     Path("crates/runtime/src/mtp.rs"),
     Path("crates/runtime/src/lib.rs"),
+)
+
+KERNEL_FILES = (
+    Path("kernels/full_attention.hip"),
+    Path("kernels/full_attention_4b.hip"),
 )
 
 # Keep this list specific.  Broadly rejecting `dflash` would also reject the
@@ -45,6 +53,26 @@ MTP_DECL_RE = re.compile(
     r"\b(?:struct|enum|type|impl|fn)\s+"
     r"(?:Mtp[A-Za-z0-9_]*|mtp_[A-Za-z0-9_]*)\b"
 )
+
+FORBIDDEN_KERNEL_PRODUCT_RE = re.compile(r"qwen\s*3[.]5", re.IGNORECASE)
+STALE_KERNEL_GEOMETRY_RE = re.compile(
+    r"(?:\b(?!64\b)\d+\s+total\b[^\n]*(?:decoder\s+layer|qwen3[.]8)|"
+    r"\bProcesses\s+all\s+(?!64\b)\d+\s+decoder\s+layers\b|"
+    r"\bpartial\s+rotary\s+dimension\s*\(\s*(?!64\b)\d+\s+for\s+"
+    r"(?:canonical\s+)?qwen3[.]8\b)",
+    re.IGNORECASE,
+)
+REQUIRED_KERNEL_GEOMETRY = {
+    Path("kernels/full_attention.hip"): (
+        "64 total for canonical Qwen3.8-27B",
+        "Processes all 64 decoder layers",
+    ),
+    Path("kernels/full_attention_4b.hip"): (
+        "64 total for canonical Qwen3.8-27B",
+        "Processes all 64 decoder layers",
+        "partial rotary dimension (64 for canonical Qwen3.8-27B)",
+    ),
+}
 
 
 def find_violations(root: Path) -> list[tuple[Path, int, str, str]]:
@@ -98,6 +126,27 @@ def find_violations(root: Path) -> list[tuple[Path, int, str, str]]:
             saw_open_brace = saw_open_brace or "{" in line
             if saw_open_brace and brace_depth <= 0:
                 active_decl = None
+
+    for relative in KERNEL_FILES:
+        path = root / relative
+        if not path.is_file():
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines()
+        source = "\n".join(lines)
+        for line_number, line in enumerate(lines, start=1):
+            match = FORBIDDEN_KERNEL_PRODUCT_RE.search(line)
+            if match:
+                violations.append((relative, line_number, match.group(0), line.strip()))
+
+            match = STALE_KERNEL_GEOMETRY_RE.search(line)
+            if match:
+                violations.append((relative, line_number, match.group(0), line.strip()))
+
+        for required in REQUIRED_KERNEL_GEOMETRY[relative]:
+            if required not in source:
+                violations.append(
+                    (relative, 0, required, "required canonical kernel geometry marker missing")
+                )
     return violations
 
 

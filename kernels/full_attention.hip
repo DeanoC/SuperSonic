@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 // Weight descriptor for the persistent decode megakernel.
-// One struct per decoder layer (24 total for the retained Qwen3.8 geometry).
+// One struct per decoder layer (64 total for canonical Qwen3.8-27B).
 // Immutable weight pointers are const; mutable state pointers are non-const.
 struct Qwen35DecodeLayerDesc {
     int layer_type;                    // 0=linear_attention, 1=full_attention
@@ -3577,7 +3577,7 @@ __global__ void supersonic_qwen35_norm_multi_proj_kernel(
 // =============================================================================
 // MONOLITHIC PERSISTENT DECODE MEGAKERNEL
 //
-// Processes all 24 decoder layers in a single kernel launch.
+// Processes all 64 decoder layers in a single kernel launch.
 // Hidden state lives in global workspace (F32). All matvecs use multi-block
 // work-stealing. Sequential ops done by block 0, others spin on barrier.
 //

@@ -1,4 +1,6 @@
+import importlib.util
 import re
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -15,6 +17,7 @@ HAL_VMM = ROOT / "crates" / "gpu-hal" / "src" / "vmm.rs"
 CORE_LIB = ROOT / "crates" / "core" / "src" / "lib.rs"
 CORE_BACKEND = ROOT / "crates" / "core" / "src" / "backend.rs"
 KERNEL_FFI_SRC = ROOT / "crates" / "kernel-ffi" / "src"
+RETAINED_SOURCE_VALIDATOR = ROOT / "tools" / "check-retained-source-terms.py"
 RETAINED_BRIDGES = (
     ROOT / "kernels" / "full_attention_bridge.cpp",
     ROOT / "kernels" / "full_attention_bridge_4b.cpp",
@@ -98,6 +101,60 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
                 if legacy_env.search(line):
                     violations.append(f"{path}:{line_number}: {line.strip()}")
         self.assertEqual([], violations)
+
+    def test_retained_qwen38_kernel_comments_use_canonical_geometry(self):
+        sources = (
+            ROOT / "kernels" / "full_attention.hip",
+            ROOT / "kernels" / "full_attention_4b.hip",
+        )
+        product_ref = re.compile(r"qwen3[.]5", re.IGNORECASE)
+        stale_refs = []
+        for path in sources:
+            text = path.read_text(encoding="utf-8")
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                if product_ref.search(line):
+                    stale_refs.append(f"{path}:{line_number}: {line.strip()}")
+            self.assertIn(
+                "64 total for canonical Qwen3.8-27B",
+                text,
+                f"{path} must state the canonical 64-layer geometry",
+            )
+            self.assertNotRegex(
+                text,
+                r"\bProcesses\s+all\s+(?!64\b)\d+\s+decoder\s+layers\b",
+                f"{path} must not describe a non-canonical layer count",
+            )
+        self.assertEqual([], stale_refs)
+        self.assertIn(
+            "partial rotary dimension (64 for canonical Qwen3.8-27B)",
+            (sources[1]).read_text(encoding="utf-8"),
+        )
+
+    def test_retained_source_validator_scans_kernel_geometry(self):
+        spec = importlib.util.spec_from_file_location(
+            "check_retained_source_terms", RETAINED_SOURCE_VALIDATOR
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+
+        with tempfile.TemporaryDirectory() as temporary_root:
+            root = Path(temporary_root)
+            kernel_root = root / "kernels"
+            kernel_root.mkdir()
+            stale = (
+                "// qwen3.5 product identity\n"
+                "// One struct per decoder layer (24 total for the retained Qwen3.8 geometry).\n"
+            )
+            for name in ("full_attention.hip", "full_attention_4b.hip"):
+                (kernel_root / name).write_text(stale, encoding="utf-8")
+
+            violations = validator.find_violations(root)
+
+        rendered = "\n".join(term for _, _, term, _ in violations).lower()
+        self.assertIn("qwen3.5", rendered)
+        self.assertIn("24 total", rendered)
 
     def test_removed_ffi_source_surfaces_are_absent(self):
         removed_names = {

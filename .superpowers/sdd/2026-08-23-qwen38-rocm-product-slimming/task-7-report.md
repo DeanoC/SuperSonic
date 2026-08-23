@@ -165,3 +165,55 @@ passed
 ```
 
 Fix-round commit: `fix(qwen38): remove legacy kernel environment controls`
+
+## Fix round 2 — canonical kernel geometry comments
+
+The second fix-round RED checks were added before the final source edits:
+
+```text
+python3 -m unittest \
+  tests.test_kernel_groups.HipOnlyBuildSurfaceTests.test_retained_qwen38_kernel_comments_use_canonical_geometry \
+  tests.test_kernel_groups.HipOnlyBuildSurfaceTests.test_retained_source_validator_scans_kernel_geometry -v
+FAIL: retained HIP comments still said "Processes all 24 decoder layers";
+      the validator fixture also found no Qwen3.5/"24 total" violations because
+      the validator did not yet scan the retained HIP sources
+```
+
+The retained HIP comments now use the canonical Qwen3.8-27B 64-layer contract,
+including the partial rotary dimension.  `check-retained-source-terms.py` now
+scans both retained full-attention HIP sources, rejects dotted Qwen3.5 product
+references and stale non-canonical geometry/count language, and requires the
+canonical layer/rotary markers.  Historical `qwen35` ABI/compiler spellings
+remain intentionally outside this product-reference check.
+
+The focused GREEN evidence is:
+
+```text
+python3 -m unittest \
+  tests.test_kernel_groups.HipOnlyBuildSurfaceTests.test_retained_qwen38_kernel_comments_use_canonical_geometry \
+  tests.test_kernel_groups.HipOnlyBuildSurfaceTests.test_retained_source_validator_scans_kernel_geometry -v
+2 passed
+
+python3 -m unittest tests.test_kernel_groups -v
+13 passed
+
+python3 tools/check-retained-source-terms.py
+retained Qwen3.8 MTP source-boundary check passed
+
+python3 tools/check-kernel-groups.py
+kernel groups ok: 2 groups, 4 bridge sources, 6 tracked support sources
+
+python3 tools/check-support-matrix.py
+support matrix ok: 2 entries cover 2 arches
+
+HIP_ARCH=gfx1201 cargo check -p kernel-ffi --lib
+finished successfully
+
+HIP_ARCH=gfx1201 cargo test -p kernel-ffi --lib 'gqh::tests::maps_gguf_and_flm_ids' -- --nocapture
+1 passed
+
+git diff --check
+passed
+```
+
+Fix-round commit: `fix(qwen38): correct canonical kernel geometry comments`
