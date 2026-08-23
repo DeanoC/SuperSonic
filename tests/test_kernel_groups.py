@@ -15,6 +15,10 @@ HAL_VMM = ROOT / "crates" / "gpu-hal" / "src" / "vmm.rs"
 CORE_LIB = ROOT / "crates" / "core" / "src" / "lib.rs"
 CORE_BACKEND = ROOT / "crates" / "core" / "src" / "backend.rs"
 KERNEL_FFI_SRC = ROOT / "crates" / "kernel-ffi" / "src"
+RETAINED_BRIDGES = (
+    ROOT / "kernels" / "full_attention_bridge.cpp",
+    ROOT / "kernels" / "full_attention_bridge_4b.cpp",
+)
 RETAINED_SOURCE_ROOTS = (
     ROOT / "crates" / "core" / "src",
     ROOT / "crates" / "gpu-hal" / "src",
@@ -83,6 +87,18 @@ class KernelGroupManifestTests(unittest.TestCase):
 
 
 class HipOnlyBuildSurfaceTests(unittest.TestCase):
+    def test_active_bridges_have_no_legacy_qwen35_environment_controls(self):
+        legacy_env = re.compile(
+            r"(?:getenv|var(?:_os)?)\s*\(\s*\"[^\"]*QWEN35[^\"]*\"",
+            re.IGNORECASE,
+        )
+        violations = []
+        for path in RETAINED_BRIDGES:
+            for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                if legacy_env.search(line):
+                    violations.append(f"{path}:{line_number}: {line.strip()}")
+        self.assertEqual([], violations)
+
     def test_removed_ffi_source_surfaces_are_absent(self):
         removed_names = {
             "certified_kv.rs",

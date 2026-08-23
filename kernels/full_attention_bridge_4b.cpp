@@ -1903,7 +1903,7 @@ struct ScopedHipDevice {
 };
 
 int linear_prefill_block_override() {
-    const char* value = std::getenv("DOTCACHE_QWEN35_HIP_FUSED_PREFILL_BLOCK");
+    const char* value = std::getenv("DOTCACHE_QWEN38_HIP_FUSED_PREFILL_BLOCK");
     if (value == nullptr || *value == '\0') {
         return 0;
     }
@@ -8064,7 +8064,7 @@ int persistent_decode_device(
     // original 1x grid left half the GPU idle with only 1 block/CU, and
     // register pressure (VGPR=128) prevents a second resident block.
     // Oversubscribing 2x on RDNA3 (= one block per CU) is a proven safe
-    // win: ~1.57x faster on qwen3.5-0.8b BF16, no hangs across tested
+    // win: ~1.57x faster on qwen3.8-27b BF16, no hangs across tested
     // Qwen variants.
     //
     // HIP docs note `multiProcessorCount` reports CUs on CDNA (MI-series)
@@ -8075,7 +8075,7 @@ int persistent_decode_device(
     // writing); other arches get the conservative 1x default.
     //
     // Higher multipliers (3x+) hang silently on models with more
-    // transformer layers (qwen3.5-2b at 4x produces no output) —
+    // transformer layers (the retained Qwen3.8 geometry at 4x produces no output) —
     // suspected grid_barrier scaling issue. Env var
     // Grid-size priority (first match wins):
     //   1. SUPERSONIC_QWEN4B_BLOCKS env var (explicit user override).
@@ -8205,7 +8205,7 @@ int persistent_decode_device(
     int io_flags = 3;
     const bool use_gqh_split = int4_scales != nullptr
         && hidden_dim >= 5120
-        && std::getenv("SUPERSONIC_QWEN35_GQH_NOSPLIT") == nullptr
+        && std::getenv("SUPERSONIC_QWEN38_GQH_NOSPLIT") == nullptr
         && !coop_requested;
     hipError_t launch_err = hipSuccess;
     if (use_gqh_split) {
@@ -8495,7 +8495,7 @@ int persistent_decode_device(
         }
         static GqhMlpHdrs mlp_hdrs;
         const bool use_gqh_gemv =
-            std::getenv("SUPERSONIC_QWEN35_GQH_NOGEMV") == nullptr
+            std::getenv("SUPERSONIC_QWEN38_GQH_NOGEMV") == nullptr
             && load_gqh_mlp_hdrs(
                 layers_base, int4_base, num_layers, &mlp_hdrs);
         static bool dumped_gemv = false;
@@ -8602,9 +8602,9 @@ int persistent_decode_device(
                 grid_down);
         }
         const char* dump_dir =
-            std::getenv("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_DIR");
+            std::getenv("SUPERSONIC_QWEN38_DUMP_DECODE_HIDDENS_DIR");
         const char* dump_pos_env =
-            std::getenv("SUPERSONIC_QWEN35_DUMP_DECODE_HIDDENS_POS");
+            std::getenv("SUPERSONIC_QWEN38_DUMP_DECODE_HIDDENS_POS");
         const bool dump_this = dump_dir != nullptr
             && dump_pos_env != nullptr
             && std::atoi(dump_pos_env) == static_cast<int>(seqlen_offset);
@@ -8672,7 +8672,7 @@ int persistent_decode_device(
             dump_ws_f32_n(name, ws_hidden, hidden_dim);
         };
         const char* dump_lin_env =
-            std::getenv("SUPERSONIC_QWEN35_DUMP_LINEAR_LAYER");
+            std::getenv("SUPERSONIC_QWEN38_DUMP_LINEAR_LAYER");
         const int dump_lin =
             (dump_this && dump_lin_env) ? std::atoi(dump_lin_env) : -1;
         float* ws_normed = ws_hidden + batch_size * hidden_dim;
@@ -8692,7 +8692,7 @@ int persistent_decode_device(
         const int64_t proj_stride = proj_buf_floats;
         const int64_t mlp_stride = static_cast<int64_t>(intermediate_size) * 2;
         const int64_t attn_stride = attn_scratch_floats;
-        const char* out_mode_env = std::getenv("SUPERSONIC_QWEN35_GQH_GEMV_OUT");
+        const char* out_mode_env = std::getenv("SUPERSONIC_QWEN38_GQH_GEMV_OUT");
         int host_out_mask = 0;
         if (use_gqh_gemv) {
             if (out_mode_env == nullptr || std::strcmp(out_mode_env, "all") == 0) {
@@ -9303,7 +9303,7 @@ int persistent_decode_device(
                     if (do_full || do_lin) {
                         static bool dumped_out_cmp = false;
                         if (!dumped_out_cmp &&
-                            std::getenv("SUPERSONIC_QWEN35_GQH_GEMV_OUT_CMP") !=
+                            std::getenv("SUPERSONIC_QWEN38_GQH_GEMV_OUT_CMP") !=
                                 nullptr) {
                             dumped_out_cmp = true;
                             const int in_dim = do_full ? mx.attn_size : mx.val_dim;

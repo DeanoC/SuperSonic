@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 // Weight descriptor for the persistent decode megakernel.
-// One struct per decoder layer (24 total for Qwen3.5-0.8B).
+// One struct per decoder layer (24 total for the retained Qwen3.8 geometry).
 // Immutable weight pointers are const; mutable state pointers are non-const.
 struct Qwen35DecodeLayerDesc {
     int layer_type;                    // 0=linear_attention, 1=full_attention

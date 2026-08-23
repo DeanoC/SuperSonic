@@ -40,7 +40,7 @@ struct ScopedHipDevice {
 };
 
 int linear_prefill_block_override() {
-    const char* value = std::getenv("DOTCACHE_QWEN35_HIP_FUSED_PREFILL_BLOCK");
+    const char* value = std::getenv("DOTCACHE_QWEN38_HIP_FUSED_PREFILL_BLOCK");
     if (value == nullptr || *value == '\0') {
         return 0;
     }
@@ -4623,7 +4623,7 @@ extern "C" int supersonic_qwen35_hip_standalone_matvec(
 
 // The HIP 0.8B-native persistent decode kernel was deleted on 2026-04-20 —
 // it had no INT4/FP8 path and ran ~2.8x slower than routing 0.8B through
-// `full_attention_4b.hip`. All HIP Qwen3.5 variants now set
+// `full_attention_4b.hip`. The retained HIP Qwen3.8 path sets
 // `use_4b_kernel = true` in the registry, so `persistent_decode` (non-4B)
 // is never dispatched to HIP at runtime. The symbol below is kept as a
 // linker-visible stub: the Rust FFI wrapper `kernel_ffi::persistent_decode`

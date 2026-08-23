@@ -106,8 +106,10 @@ passed
 ```
 
 The complete `cargo test -p model-store --lib` suite was also attempted: 129
-tests passed and one existing HIP VMM test failed because this environment has
-no usable HIP VMM/device (`hipGetDevice`/VMM unavailable).  It is an environment
+tests passed and one existing GPU-I/O test failed:
+`store::tests::virtual_arena_range_load_names_gpu_direct_backend_without_fallback`.
+VMM capability passed, then `hipFileSetParameterBool AllowCompatMode=false`
+returned `Internal GPU IO library error`.  This is an environment/GPU-I/O
 limitation, not a Qwen3.8 rename failure.
 
 ## Commit
@@ -126,3 +128,40 @@ refactor(qwen38): make Qwen3.8 the sole model identity
   boundaries and negative legacy-name validators described above.  No active
   Rust product import, type, parser alias, registry row, or support-matrix lane
   uses the old identity.
+
+## Fix round 1 — active kernel environment controls
+
+The first fix-round RED check was:
+
+```text
+python3 -m unittest \
+  tests.test_kernel_groups.HipOnlyBuildSurfaceTests.test_active_bridges_have_no_legacy_qwen35_environment_controls -v
+FAIL: 9 legacy QWEN35 environment controls found in the retained bridges
+```
+
+The retained bridge controls were renamed to their QWEN38 forms, and the
+Qwen3.5 comments in the retained HIP source/bridges were corrected to Qwen3.8
+terminology.  The focused GREEN evidence is:
+
+```text
+python3 -m unittest \
+  tests.test_kernel_groups.HipOnlyBuildSurfaceTests.test_active_bridges_have_no_legacy_qwen35_environment_controls -v
+passed
+
+python3 -m unittest tests.test_kernel_groups -v
+11 passed
+
+python3 tools/check-retained-source-terms.py
+retained Qwen3.8 MTP source-boundary check passed
+
+HIP_ARCH=gfx1201 cargo check -p kernel-ffi --lib
+finished successfully
+
+HIP_ARCH=gfx1201 cargo test -p kernel-ffi --lib 'gqh::tests::maps_gguf_and_flm_ids' -- --nocapture
+1 passed
+
+git diff --check
+passed
+```
+
+Fix-round commit: `fix(qwen38): remove legacy kernel environment controls`
