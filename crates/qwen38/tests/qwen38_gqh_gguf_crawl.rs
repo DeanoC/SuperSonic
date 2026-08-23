@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use gpu_hal::{Backend, GpuBuffer, ScalarType};
+use gpu_hal::{GpuBuffer, ScalarType};
 use kernel_ffi::gqh::{self, RUNG_GQH2_H, RUNG_GQH3};
 use model_store::gguf::GgufFile;
 use model_store::gqh::GqhRung;
@@ -261,12 +261,12 @@ fn rung7_loaded_ffn_up_gqh_matvec() {
     let rows = 8usize;
     let packed_all = file.tensor_bytes("blk.0.ffn_up.weight").expect("bytes");
     let row_bytes = packed_all.len() / tensor.dims[1];
-    let packed = &packed_all[..row_bytes * rows];
+    let packed_tight = &packed_all[..row_bytes * rows];
     let mut cpu_w = vec![0.0f32; rows * cols];
     for r in 0..rows {
         model_store::gqh::decode_row(
             rung,
-            &packed[r * row_bytes..(r + 1) * row_bytes],
+            &packed_tight[r * row_bytes..(r + 1) * row_bytes],
             cols,
             Some(header.clone()),
             &mut cpu_w[r * cols..(r + 1) * cols],
@@ -298,15 +298,28 @@ fn rung7_loaded_ffn_up_gqh_matvec() {
     }
 
     let row_bytes_w = weights.layers[0].up_proj_w.shape()[1];
+    let device_row_bytes = model_store::gqh::device_row_bytes(rung, cols).expect("device row");
+    assert_eq!(row_bytes_w, device_row_bytes, "loaded GQH device stride");
+    let packed_device =
+        model_store::gqh::planarize(rung, rows, cols, packed_tight).expect("planarize rows");
+    assert_eq!(
+        packed_device.len(),
+        rows * device_row_bytes,
+        "GQH upload boundary requires device-planar rows ({device_row_bytes} B)"
+    );
     let mut y = GpuBuffer::zeros(ordinal, ScalarType::F32, &[rows]).expect("y");
     let x_buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[cols], &{
         x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()
     })
     .expect("x");
-    // Slice is the first `rows` packed rows of the already-uploaded weight.
-    let packed_prefix =
-        GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_bytes_w], packed)
-            .expect("prefix");
+    // Convert the first tight GGUF rows to the device-planar layout used by matvec.
+    let packed_prefix = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::U8,
+        &[rows, device_row_bytes],
+        &packed_device,
+    )
+    .expect("prefix");
     gqh::matvec(
         ordinal,
         match rung {
@@ -366,12 +379,12 @@ fn rung7b_batched_gqh_matvec_ncols4() {
     let ncols = 4usize;
     let packed_all = file.tensor_bytes("blk.0.ffn_up.weight").expect("bytes");
     let row_bytes = packed_all.len() / tensor.dims[1];
-    let packed = &packed_all[..row_bytes * rows];
+    let packed_tight = &packed_all[..row_bytes * rows];
     let mut cpu_w = vec![0.0f32; rows * cols];
     for r in 0..rows {
         model_store::gqh::decode_row(
             rung,
-            &packed[r * row_bytes..(r + 1) * row_bytes],
+            &packed_tight[r * row_bytes..(r + 1) * row_bytes],
             cols,
             Some(header.clone()),
             &mut cpu_w[r * cols..(r + 1) * cols],
@@ -411,9 +424,21 @@ fn rung7b_batched_gqh_matvec_ncols4() {
         x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()
     })
     .expect("x");
-    let packed_prefix =
-        GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_bytes], packed)
-            .expect("prefix");
+    let device_row_bytes = model_store::gqh::device_row_bytes(rung, cols).expect("device row");
+    let packed_device =
+        model_store::gqh::planarize(rung, rows, cols, packed_tight).expect("planarize rows");
+    assert_eq!(
+        packed_device.len(),
+        rows * device_row_bytes,
+        "GQH upload boundary requires device-planar rows ({device_row_bytes} B)"
+    );
+    let packed_prefix = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::U8,
+        &[rows, device_row_bytes],
+        &packed_device,
+    )
+    .expect("prefix");
     let mut y = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols, rows]).expect("y");
     gqh::matvec(
         ordinal,

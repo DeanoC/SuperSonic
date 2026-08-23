@@ -239,3 +239,95 @@ Required focused commit subject:
 ```text
 refactor(model-store): make FLM foundation private and Qwen3.8-native
 ```
+
+## GQH artifact fixture fix — systematic debugging
+
+### Phase 1: independent reproduction and data-flow evidence
+
+The two controller-reported failures were reproduced independently on the
+canonical R9700 (`HIP_VISIBLE_DEVICES=1`, `HIP_ARCH=gfx1201`) before changing
+the test fixtures:
+
+```text
+rung7_loaded_ffn_up_gqh_matvec
+  panic at qwen38_gqh_gguf_crawl.rs:309
+  from_host_bytes: expected 16896 bytes, got 16800
+
+rung7b_batched_gqh_matvec_ncols4
+  panic at qwen38_gqh_gguf_crawl.rs:444
+  batched ffn_up [0] got -176.29019 want -0.00901258
+```
+
+The exact `blk.0.ffn_up.weight` descriptor in the canonical GGUF is dims
+`[5120, 17408]`, qtype `108` (GQH3), with header scale
+`0.1630859375` and grid `3`.  Its on-disk tight row is 20 GQH superblocks ×
+105 bytes = 2100 bytes.  The production device layout is computed by
+`model_store::gqh::device_row_bytes(Gqh3, 5120)` and is 2112 bytes because
+the planar planes are aligned.
+
+`GgufFile::tensor_bytes` and the CPU `decode_row` path correctly consume the
+tight 2100-byte rows.  `qwen38::gguf_ingest::upload_packed` then calls the
+production `model_store::gqh::planarize` and uploads `[rows, 2112]` device
+rows.  The failing fixtures instead sliced tight rows and directly built a
+GPU buffer for `gqh::matvec`:
+
+- A used the loaded buffer's 2112-byte shape with 2100-byte host rows,
+  producing the `16896` versus `16800` upload error for eight rows.
+- B used a 2100-byte GPU shape, so upload succeeded, but the direct HIP
+  `gqh::matvec` entry point dispatches the planar kernel without an automatic
+  tight-to-planar conversion.  The kernel therefore interpreted tight AoS
+  bytes with planar offsets/stride, causing the numerical mismatch.
+
+The working loaded-weight and kernel-FFI paths already establish the correct
+contract: they call production `gqh::planarize` before any planar matvec.
+The bug was confined to the original artifact-test fixtures introduced with
+the GQH crawl; no production loader or kernel behavior required alteration.
+
+### Phase 3/4: TDD RED/GREEN and minimal fix
+
+Before the fix, both fixtures received a boundary assertion requiring the
+temporary upload bytes to equal `rows × device_row_bytes`.  The controller's
+R9700 RED capture was the expected precise failure:
+
+```text
+left: 16800
+right: 16896
+```
+
+The minimal fix keeps `packed_tight` for CPU reference decoding, calls the
+production `model_store::gqh::planarize(rung, rows, cols, packed_tight)` for
+both temporary GPU prefixes, asserts the resulting device length, and uploads
+with the 2112-byte device stride.  The unused `Backend` import was removed as
+a mechanical cleanup.  No production source changed.
+
+Fresh canonical R9700 GREEN evidence, run serially:
+
+```text
+rung7_loaded_ffn_up_gqh_matvec       1 passed, 0 failed (36.97s)
+rung7b_batched_gqh_matvec_ncols4     1 passed, 0 failed (36.82s)
+full qwen38_gqh_gguf_crawl (11 tests) 11 passed, 0 failed (259.94s)
+```
+
+The full crawl used the strict artifact environment and canonical paths:
+
+```text
+HIP_VISIBLE_DEVICES=1
+HIP_ARCH=gfx1201
+SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1
+SUPERSONIC_GQH_GGUF=/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf
+SUPERSONIC_GQH_8192_GGUF=/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf
+SUPERSONIC_QWEN38_MODEL_DIR=/data/models/Qwen3.8-27B
+```
+
+Quick post-fix checks also pass: `rustfmt --edition 2021 --check
+crates/qwen38/tests/qwen38_gqh_gguf_crawl.rs` and `git diff --check`.
+
+### Focused fixture-fix commit
+
+```text
+fix(qwen38): planarize GQH artifact test prefixes
+```
+
+The focused commit contains only the two artifact-test fixture corrections, the
+mechanical unused-import removal, and this report evidence; no loader, kernel,
+or model-store production source changed.
