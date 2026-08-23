@@ -56,10 +56,7 @@ class RetainedSourceTermsTests(unittest.TestCase):
             runtime.mkdir(parents=True)
             (runtime / "decode_engine.rs").write_text(
                 "// MtpDFlashCache and MtpMetalV2Scratch are historical names.\n"
-                "unsafe extern \"C\" {\n"
-                "    #[link_name = \"supersonic_qwen35_hip_mtp_restore_linear_prefix\"]\n"
-                "    fn supersonic_qwen35_hip_mtp_restore_linear_prefix();\n"
-                "}\n",
+                "fn retained_decode_path() {}\n",
                 encoding="utf-8",
             )
             (runtime / "prefill_engine.rs").write_text(
@@ -77,6 +74,12 @@ class RetainedSourceTermsTests(unittest.TestCase):
                 "fn legacy_profile_enabled() -> bool {\n"
                 "    std::env::var_os(\"SUPERSONIC_QWEN35_DRAFT_MTP_GREEDY\").is_some()\n"
                 "}\n",
+                encoding="utf-8",
+            )
+            abi = root / "crates" / "kernel-ffi" / "src" / "qwen38.rs"
+            abi.parent.mkdir(parents=True)
+            abi.write_text(
+                "#[link_name = \"supersonic_qwen35_hip_mtp_restore_linear_prefix\"]\n",
                 encoding="utf-8",
             )
 
@@ -99,6 +102,72 @@ class RetainedSourceTermsTests(unittest.TestCase):
             {
                 Path("crates/runtime/src/prefill_engine.rs"),
                 Path("crates/runtime/src/lib.rs"),
+            },
+            violations,
+        )
+
+    def test_lexes_all_nested_runtime_rust_and_rejects_legacy_tokens_and_envs(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crates" / "runtime" / "src"
+            nested = runtime / "new" / "deep"
+            nested.mkdir(parents=True)
+            (nested / "future_module.rs").write_text(
+                "fn qwen35_draft_mtp_forward() {}\n"
+                "fn qwen35_mtpfoo() {}\n"
+                "fn mtp_qwen35_forward() {}\n"
+                "fn mtpqwen35foo() {}\n"
+                "fn mtp_dflash_cache() {}\n"
+                "fn mtp_metal_v2_decode_step() {}\n"
+                "fn standalone_dflash_verify() {}\n"
+                "fn standalone_spec_prefill() {}\n"
+                "fn standalone_certified_kv() {}\n"
+                "fn allowed_dflashback() {}\n"
+                "fn allowed_uncertified() {}\n"
+                "fn allowed_certifiedness() {}\n",
+                encoding="utf-8",
+            )
+            (runtime / "lexer_cases.rs").write_text(
+                "/* outer dflash /* nested SUPERSONIC_DFLASH_PROFILE */ still comment */\n"
+                "fn char_dflash_after_quote() { let quote = '\"'; }\n"
+                "let lower = \"supersonic_dflash_profile\";\n"
+                "let escaped = \"SUPERSONIC_\\x44FLASH_PROFILE\";\n"
+                "let unicode = \"SUPERSONIC_\\u{44}FLASH_PROFILE\";\n"
+                "let byte = b\"SUPERSONIC_METALV2_PROFILE\";\n"
+                "let raw = br###\"SUPERSONIC_qwen35_draft_mtp_greedy\"###;\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        rendered = "\n".join(term for _, _, term, _ in violations)
+        for term in (
+            "qwen35_draft_mtp_forward",
+            "qwen35_mtpfoo",
+            "mtp_qwen35_forward",
+            "mtpqwen35foo",
+            "mtp_dflash_cache",
+            "mtp_metal_v2_decode_step",
+            "standalone_dflash_verify",
+            "standalone_spec_prefill",
+            "standalone_certified_kv",
+            "dflash_after_quote",
+            "supersonic_dflash_profile",
+            "SUPERSONIC_DFLASH_PROFILE",
+            "SUPERSONIC_METALV2_PROFILE",
+            "SUPERSONIC_qwen35_draft_mtp_greedy",
+        ):
+            self.assertIn(term, rendered)
+        self.assertNotIn("allowed_dflashback", rendered)
+        self.assertNotIn("allowed_uncertified", rendered)
+        self.assertNotIn("allowed_certifiedness", rendered)
+        self.assertNotIn("still comment", rendered)
+        self.assertEqual(
+            {path for path, *_ in violations},
+            {
+                Path("crates/runtime/src/new/deep/future_module.rs"),
+                Path("crates/runtime/src/lexer_cases.rs"),
             },
             violations,
         )

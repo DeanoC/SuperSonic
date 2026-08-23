@@ -19,12 +19,7 @@ import re
 import sys
 
 
-RUNTIME_FILES = (
-    Path("crates/runtime/src/decode_engine.rs"),
-    Path("crates/runtime/src/prefill_engine.rs"),
-    Path("crates/runtime/src/mtp.rs"),
-    Path("crates/runtime/src/lib.rs"),
-)
+RUNTIME_ROOT = Path("crates/runtime/src")
 
 KERNEL_FILES = (
     Path("kernels/full_attention.hip"),
@@ -32,8 +27,8 @@ KERNEL_FILES = (
 )
 
 # Keep these exact spellings for readable diagnostics and compatibility with
-# the original boundary check.  The prefix expressions below cover new
-# fields/helpers/envs that use a variant of one of these legacy names.
+# the original boundary check.  The lexer below also catches their CamelCase,
+# snake_case, and mixed-order variants.
 FORBIDDEN_MTP_TERMS = (
     "DFlashFusedVerifyCache",
     "dflash_fused_verify_cache",
@@ -44,20 +39,14 @@ FORBIDDEN_MTP_TERMS = (
     "qwen35_mtp_draft_greedy",
 )
 
-# Catch legacy field/helper identifiers in either order, such as
-# `MtpDFlashCache`, `DFlashMtpCache`, `MtpMetalV2Scratch`, and
-# `mtp_metal_v2_decode_step`.  Matching complete Rust identifiers keeps prose
-# comments and historical ABI strings out of this check.  The case-sensitive
-# boundary classes still permit CamelCase and snake_case spellings while
-# avoiding unrelated words such as `dflashback`.
-RUST_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-FORBIDDEN_MTP_IDENTIFIER_RE = re.compile(
-    r"(?:^|_|[a-z0-9])(?i:dflash|metalv2|metal_v2|qwen35_mtp)"
-    r"(?=$|_|[A-Z0-9])"
-)
+# Rust environment controls are conventionally uppercase, but the boundary
+# check is deliberately case-insensitive so a lowercase or escaped spelling
+# cannot evade it.  These are inspected only in decoded Rust string literals;
+# historical ABI symbols outside `crates/runtime` are therefore not in scope.
 FORBIDDEN_MTP_ENV_RE = re.compile(
-    r"\bSUPERSONIC_(?i:DFLASH[A-Z0-9_]*|METALV2[A-Z0-9_]*|"
-    r"METAL_V2[A-Z0-9_]*|QWEN35_[A-Z0-9_]*MTP[A-Z0-9_]*)\b"
+    r"\bSUPERSONIC_(?:DFLASH[A-Z0-9_]*|METALV2[A-Z0-9_]*|"
+    r"METAL_V2[A-Z0-9_]*|QWEN35_[A-Z0-9_]*MTP[A-Z0-9_]*)\b",
+    re.IGNORECASE,
 )
 FORBIDDEN_KERNEL_PRODUCT_RE = re.compile(r"qwen\s*3[.]5", re.IGNORECASE)
 STALE_KERNEL_GEOMETRY_RE = re.compile(
@@ -80,60 +69,165 @@ REQUIRED_KERNEL_GEOMETRY = {
 }
 
 
-def _mask_rust_comments_and_strings(source: str) -> tuple[str, list[tuple[int, str]]]:
-    """Mask comments/string syntax while retaining string literals separately."""
+class _RustLexeme:
+    __slots__ = ("kind", "value", "offset")
 
-    masked = list(source)
-    literals: list[tuple[int, str]] = []
+    def __init__(self, kind: str, value: str, offset: int) -> None:
+        self.kind = kind
+        self.value = value
+        self.offset = offset
 
-    def blank(start: int, end: int) -> None:
-        for index in range(start, end):
-            if source[index] != "\n":
-                masked[index] = " "
 
-    def raw_string_bounds(start: int) -> tuple[int, int, int] | None:
-        if source[start] != "r":
-            return None
-        index = start + 1
+_SIMPLE_RUST_ESCAPES = {
+    "0": "\0",
+    "\\": "\\",
+    "\"": '"',
+    "'": "'",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_identifier_start(char: str) -> bool:
+    return char == "_" or char.isalpha()
+
+
+def _is_identifier_continue(char: str) -> bool:
+    return _is_identifier_start(char) or char.isdigit()
+
+
+def _consume_identifier(source: str, start: int) -> tuple[str, int]:
+    if source.startswith("r#", start) and start + 2 < len(source):
+        if _is_identifier_start(source[start + 2]):
+            index = start + 3
+            while index < len(source) and _is_identifier_continue(source[index]):
+                index += 1
+            return source[start + 2 : index], index
+
+    index = start + 1
+    while index < len(source) and _is_identifier_continue(source[index]):
+        index += 1
+    return source[start:index], index
+
+
+def _raw_string_opener(source: str, start: int) -> tuple[int, int] | None:
+    for prefix in ("br", "cr", "r"):
+        if not source.startswith(prefix, start):
+            continue
+        index = start + len(prefix)
         while index < len(source) and source[index] == "#":
             index += 1
-        if index >= len(source) or source[index] != '"':
-            return None
-        hashes = index - start - 1
-        content_start = index + 1
-        closing = '"' + ("#" * hashes)
-        content_end = source.find(closing, content_start)
-        if content_end < 0:
-            return content_start, len(source), len(source)
-        return content_start, content_end, content_end + len(closing)
+        if index < len(source) and source[index] == '"':
+            return index, index - start - len(prefix)
+    return None
 
-    def quoted_string_end(start: int) -> int:
-        index = start + 1
-        escaped = False
-        while index < len(source):
-            char = source[index]
-            if char == "\n":
-                break
-            if char == '"' and not escaped:
-                return index + 1
-            if char == "\\" and not escaped:
-                escaped = True
-            else:
-                escaped = False
+
+def _normal_string_quote(source: str, start: int) -> int | None:
+    if source[start] == '"':
+        return start
+    if source[start] in "bc" and start + 1 < len(source) and source[start + 1] == '"':
+        return start + 1
+    return None
+
+
+def _decode_rust_escape(source: str, slash: int) -> tuple[str, int]:
+    index = slash + 1
+    if index >= len(source):
+        return "\\", index
+
+    escaped = source[index]
+    if escaped in _SIMPLE_RUST_ESCAPES:
+        return _SIMPLE_RUST_ESCAPES[escaped], index + 1
+
+    if escaped == "\n":
+        index += 1
+        while index < len(source) and source[index] in " \t":
             index += 1
-        return index
+        return "", index
+    if escaped == "\r":
+        index += 1
+        if index < len(source) and source[index] == "\n":
+            index += 1
+        while index < len(source) and source[index] in " \t":
+            index += 1
+        return "", index
 
+    if escaped == "x":
+        digits = source[index + 1 : index + 3]
+        if len(digits) == 2 and all(char in _HEX_DIGITS for char in digits):
+            return chr(int(digits, 16)), index + 3
+        return "x", index + 1
+
+    if escaped == "u" and index + 1 < len(source) and source[index + 1] == "{":
+        close = source.find("}", index + 2, index + 9)
+        if close >= 0:
+            digits = source[index + 2 : close]
+            if 1 <= len(digits) <= 6 and all(char in _HEX_DIGITS for char in digits):
+                codepoint = int(digits, 16)
+                if codepoint <= 0x10FFFF:
+                    return chr(codepoint), close + 1
+        return "u", index + 1
+
+    # Invalid Rust escapes are retained conservatively as their escaped
+    # character.  This still catches a legacy control written as `\\D...` in
+    # a fixture instead of silently discarding the suspicious character.
+    return escaped, index + 1
+
+
+def _parse_normal_string(source: str, quote: int) -> tuple[str, int]:
+    value: list[str] = []
+    index = quote + 1
+    while index < len(source):
+        char = source[index]
+        if char == '"':
+            return "".join(value), index + 1
+        if char == "\\":
+            decoded, index = _decode_rust_escape(source, index)
+            value.append(decoded)
+            continue
+        if char in "\r\n":
+            return "".join(value), index
+        value.append(char)
+        index += 1
+    return "".join(value), index
+
+
+def _parse_raw_string(source: str, quote: int, hashes: int) -> tuple[str, int]:
+    content_start = quote + 1
+    closing = '"' + ("#" * hashes)
+    content_end = source.find(closing, content_start)
+    if content_end < 0:
+        return source[content_start:], len(source)
+    return source[content_start:content_end], content_end + len(closing)
+
+
+def _char_literal_end(source: str, start: int) -> int | None:
+    index = start + 1
+    if index >= len(source) or source[index] in "\r\n'":
+        return None
+    if source[index] == "\\":
+        _, index = _decode_rust_escape(source, index)
+    else:
+        index += 1
+    if index < len(source) and source[index] == "'":
+        return index + 1
+    return None
+
+
+def _lex_rust(source: str) -> list[_RustLexeme]:
+    """Lex enough Rust syntax to separate identifiers from comments/literals."""
+
+    lexemes: list[_RustLexeme] = []
     index = 0
     while index < len(source):
         if source.startswith("//", index):
-            end = source.find("\n", index)
-            end = len(source) if end < 0 else end
-            blank(index, end)
-            index = end
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline
             continue
 
         if source.startswith("/*", index):
-            start = index
             depth = 1
             index += 2
             while index < len(source) and depth:
@@ -145,27 +239,40 @@ def _mask_rust_comments_and_strings(source: str) -> tuple[str, list[tuple[int, s
                     index += 2
                 else:
                     index += 1
-            blank(start, index)
             continue
 
-        raw_bounds = raw_string_bounds(index)
-        if raw_bounds is not None:
-            content_start, content_end, end = raw_bounds
-            literals.append((index, source[content_start:content_end]))
-            blank(index, end)
-            index = end
+        raw_opener = _raw_string_opener(source, index)
+        if raw_opener is not None:
+            quote, hashes = raw_opener
+            value, index = _parse_raw_string(source, quote, hashes)
+            lexemes.append(_RustLexeme("string", value, quote))
             continue
 
-        if source[index] == '"':
-            end = quoted_string_end(index)
-            literals.append((index, source[index + 1 : max(index + 1, end - 1)]))
-            blank(index, end)
-            index = end
+        quote = _normal_string_quote(source, index)
+        if quote is not None:
+            value, index = _parse_normal_string(source, quote)
+            lexemes.append(_RustLexeme("string", value, quote))
+            continue
+
+        if source[index] == "'":
+            end = _char_literal_end(source, index)
+            index = end if end is not None else index + 1
+            continue
+
+        if source.startswith("r#", index) and index + 2 < len(source):
+            if _is_identifier_start(source[index + 2]):
+                value, index = _consume_identifier(source, index)
+                lexemes.append(_RustLexeme("identifier", value, index - len(value)))
+                continue
+
+        if _is_identifier_start(source[index]):
+            value, index = _consume_identifier(source, index)
+            lexemes.append(_RustLexeme("identifier", value, index - len(value)))
             continue
 
         index += 1
 
-    return "".join(masked), literals
+    return lexemes
 
 
 def _line_starts(source: str) -> list[int]:
@@ -178,32 +285,92 @@ def _line_number(starts: list[int], offset: int) -> int:
     return bisect_right(starts, offset)
 
 
+def _identifier_parts(identifier: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    for index, char in enumerate(identifier):
+        if char == "_":
+            if start < index:
+                parts.append(identifier[start:index].lower())
+            start = index + 1
+            continue
+        if index <= start or not char.isupper():
+            continue
+        previous = identifier[index - 1]
+        next_char = identifier[index + 1] if index + 1 < len(identifier) else ""
+        acronym_start = previous.isupper() and next_char.islower()
+        uppercase_run = index - start
+        if previous.islower() or previous.isdigit() or (acronym_start and uppercase_run > 1):
+            parts.append(identifier[start:index].lower())
+            start = index
+    if start < len(identifier):
+        parts.append(identifier[start:].lower())
+    return parts
+
+
+def _has_compound(parts: list[str], compound: tuple[str, ...]) -> bool:
+    width = len(compound)
+    return any(tuple(parts[index : index + width]) == compound for index in range(len(parts)))
+
+
+def _legacy_identifier_reason(identifier: str) -> str | None:
+    parts = _identifier_parts(identifier)
+    normalized = "".join(parts)
+    has_qwen35 = "qwen35" in normalized
+    has_mtp = "mtp" in normalized
+    if has_qwen35 and has_mtp:
+        return "qwen35/mtp legacy identifier"
+    if "dflash" in normalized and has_mtp:
+        return "dflash/mtp legacy identifier"
+    if "metalv2" in normalized and has_mtp:
+        return "metalv2/mtp legacy identifier"
+
+    if "dflash" in parts:
+        return "standalone dflash legacy identifier"
+    if _has_compound(parts, ("metal", "v2")) or any(
+        part.startswith("metalv2") for part in parts
+    ):
+        return "standalone metalv2 legacy identifier"
+    if _has_compound(parts, ("spec", "prefill")) or any(
+        part.startswith("specprefill") for part in parts
+    ):
+        return "standalone specprefill legacy identifier"
+    if any(part == "certified" or part.startswith("certifiedkv") for part in parts):
+        return "standalone certified legacy identifier"
+    return None
+
+
 def _legacy_mtp_violations(
     lines: list[str], relative: Path
 ) -> list[tuple[Path, int, str, str]]:
     source = "\n".join(lines)
-    masked, literals = _mask_rust_comments_and_strings(source)
     starts = _line_starts(source)
     violations: list[tuple[Path, int, str, str]] = []
 
-    for match in RUST_IDENTIFIER_RE.finditer(masked):
-        token = match.group(0)
-        if FORBIDDEN_MTP_IDENTIFIER_RE.search(token):
-            line_number = _line_number(starts, match.start())
-            violations.append((relative, line_number, token, lines[line_number - 1].strip()))
-
-    for offset, literal in literals:
-        match = FORBIDDEN_MTP_ENV_RE.search(literal)
+    for lexeme in _lex_rust(source):
+        line_number = _line_number(starts, lexeme.offset)
+        line = lines[line_number - 1].strip() if lines else ""
+        if lexeme.kind == "identifier":
+            if _legacy_identifier_reason(lexeme.value) is not None:
+                violations.append((relative, line_number, lexeme.value, line))
+            continue
+        match = FORBIDDEN_MTP_ENV_RE.search(lexeme.value)
         if match:
-            line_number = _line_number(starts, offset)
-            violations.append((relative, line_number, match.group(0), lines[line_number - 1].strip()))
+            violations.append((relative, line_number, match.group(0), line))
 
     return violations
 
 
+def _runtime_files(root: Path) -> list[Path]:
+    runtime_root = root / RUNTIME_ROOT
+    if not runtime_root.is_dir():
+        return []
+    return sorted(path.relative_to(root) for path in runtime_root.rglob("*.rs"))
+
+
 def find_violations(root: Path) -> list[tuple[Path, int, str, str]]:
     violations: list[tuple[Path, int, str, str]] = []
-    for relative in RUNTIME_FILES:
+    for relative in _runtime_files(root):
         path = root / relative
         if not path.is_file():
             continue
