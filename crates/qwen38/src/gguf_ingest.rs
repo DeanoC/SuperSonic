@@ -321,6 +321,7 @@ fn upload_packed(
     ordinal: usize,
     headers: &mut BTreeMap<String, GqhHeader>,
     mix_headers: &mut BTreeMap<String, model_store::dmix2::MixHeader>,
+    registrations: &mut Vec<kernel_ffi::gqh::Registration>,
     header_key: &str,
 ) -> Result<GpuBuffer, model_store::Error> {
     let tensor = file
@@ -389,11 +390,17 @@ fn upload_packed(
     };
     let buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, row_bytes], &upload)
         .map_err(model_store::Error::from)?;
+    let mut registered = false;
     if let Some(h) = headers.get(header_key) {
         kernel_ffi::gqh::register_header(buf.as_ptr(), h.tensor_scale, h.grid_code);
+        registered = true;
     }
     if let Some(h) = mix_headers.get(header_key) {
         kernel_ffi::gqh::register_mix(buf.as_ptr(), h.qtype as i32, h.mode, h.lut);
+        registered = true;
+    }
+    if registered {
+        registrations.push(kernel_ffi::gqh::Registration::new(buf.as_ptr()));
     }
     Ok(buf)
 }
@@ -505,6 +512,7 @@ pub fn load_weights(
     let hidden = config.hidden_size;
     let mut headers = BTreeMap::new();
     let mut mix_headers = BTreeMap::new();
+    let mut gqh_registrations = Vec::new();
 
     let embed_tokens = Arc::new(load_qk_embed(file, ordinal, hidden, config.vocab_size)?);
     let lm_head = Arc::new(upload_packed(
@@ -513,6 +521,7 @@ pub fn load_weights(
         ordinal,
         &mut headers,
         &mut mix_headers,
+        &mut gqh_registrations,
         "lm_head.weight",
     )?);
     let norm_weight = upload_f32_as_bf16(file, "output_norm.weight", ordinal, &[hidden])?;
@@ -534,6 +543,7 @@ pub fn load_weights(
             ordinal,
             &mut headers,
             &mut mix_headers,
+            &mut gqh_registrations,
             &format!("layers.{idx}.mlp.gate_proj"),
         )?;
         let up_proj_w = upload_packed(
@@ -542,6 +552,7 @@ pub fn load_weights(
             ordinal,
             &mut headers,
             &mut mix_headers,
+            &mut gqh_registrations,
             &format!("layers.{idx}.mlp.up_proj"),
         )?;
         let down_proj_w = upload_packed(
@@ -550,6 +561,7 @@ pub fn load_weights(
             ordinal,
             &mut headers,
             &mut mix_headers,
+            &mut gqh_registrations,
             &format!("layers.{idx}.mlp.down_proj"),
         )?;
 
@@ -560,6 +572,7 @@ pub fn load_weights(
                 ordinal,
                 &mut headers,
                 &mut mix_headers,
+                &mut gqh_registrations,
                 &format!("layers.{idx}.self_attn.q_proj"),
             )?;
             let k_proj_w = upload_packed(
@@ -568,6 +581,7 @@ pub fn load_weights(
                 ordinal,
                 &mut headers,
                 &mut mix_headers,
+                &mut gqh_registrations,
                 &format!("layers.{idx}.self_attn.k_proj"),
             )?;
             let v_proj_w = upload_packed(
@@ -576,6 +590,7 @@ pub fn load_weights(
                 ordinal,
                 &mut headers,
                 &mut mix_headers,
+                &mut gqh_registrations,
                 &format!("layers.{idx}.self_attn.v_proj"),
             )?;
             let o_proj_w = upload_packed(
@@ -584,6 +599,7 @@ pub fn load_weights(
                 ordinal,
                 &mut headers,
                 &mut mix_headers,
+                &mut gqh_registrations,
                 &format!("layers.{idx}.self_attn.o_proj"),
             )?;
             let q_norm_w = Some(upload_f32_as_bf16(
@@ -655,6 +671,7 @@ pub fn load_weights(
                         ordinal,
                         &mut headers,
                         &mut mix_headers,
+                        &mut gqh_registrations,
                         &format!("layers.{idx}.linear_attn.in_proj_qkv"),
                     )?,
                     z_proj_w: upload_packed(
@@ -663,6 +680,7 @@ pub fn load_weights(
                         ordinal,
                         &mut headers,
                         &mut mix_headers,
+                        &mut gqh_registrations,
                         &format!("layers.{idx}.linear_attn.in_proj_z"),
                     )?,
                     qkvz_proj_w: None,
@@ -672,6 +690,7 @@ pub fn load_weights(
                         ordinal,
                         &mut headers,
                         &mut mix_headers,
+                        &mut gqh_registrations,
                         &format!("layers.{idx}.linear_attn.in_proj_b"),
                     )?,
                     a_proj_w: upload_packed(
@@ -680,6 +699,7 @@ pub fn load_weights(
                         ordinal,
                         &mut headers,
                         &mut mix_headers,
+                        &mut gqh_registrations,
                         &format!("layers.{idx}.linear_attn.in_proj_a"),
                     )?,
                     ba_proj_w: None,
@@ -690,6 +710,7 @@ pub fn load_weights(
                         ordinal,
                         &mut headers,
                         &mut mix_headers,
+                        &mut gqh_registrations,
                         &format!("layers.{idx}.linear_attn.out_proj"),
                     )?,
                     dt_bias: upload_f32_as_bf16(
@@ -752,7 +773,14 @@ pub fn load_weights(
         });
     }
 
-    let mtp = load_mtp_block(file, config, ordinal, &mut headers, &mut mix_headers)?;
+    let mtp = load_mtp_block(
+        file,
+        config,
+        ordinal,
+        &mut headers,
+        &mut mix_headers,
+        &mut gqh_registrations,
+    )?;
     let gqh_sidecars = upload_gqh_sidecars(ordinal, &headers, &mix_headers)?;
     let mut config = config.clone();
     if mtp.is_some() {
@@ -780,6 +808,7 @@ pub fn load_weights(
         is_int8: false,
         int8_outlier_threshold: 0.0,
         mtp,
+        gqh_registrations,
     })
 }
 
@@ -789,6 +818,7 @@ fn load_mtp_block(
     ordinal: usize,
     headers: &mut BTreeMap<String, GqhHeader>,
     mix_headers: &mut BTreeMap<String, model_store::dmix2::MixHeader>,
+    registrations: &mut Vec<kernel_ffi::gqh::Registration>,
 ) -> Result<Option<MtpWeights>, model_store::Error> {
     if file.tensor("blk.64.nextn.eh_proj.weight").is_none() {
         return Ok(None);
@@ -810,6 +840,7 @@ fn load_mtp_block(
         ordinal,
         headers,
         mix_headers,
+        registrations,
         "mtp.eh_proj",
     )?;
     let input_norm_w = upload_f32_as_bf16(file, "blk.64.attn_norm.weight", ordinal, &[hidden])?;
@@ -825,6 +856,7 @@ fn load_mtp_block(
         ordinal,
         headers,
         mix_headers,
+        registrations,
         "mtp.mlp.gate_proj",
     )?;
     let up_proj_w = upload_packed(
@@ -833,6 +865,7 @@ fn load_mtp_block(
         ordinal,
         headers,
         mix_headers,
+        registrations,
         "mtp.mlp.up_proj",
     )?;
     let down_proj_w = upload_packed(
@@ -841,6 +874,7 @@ fn load_mtp_block(
         ordinal,
         headers,
         mix_headers,
+        registrations,
         "mtp.mlp.down_proj",
     )?;
     let q_proj_w = upload_packed(
@@ -849,6 +883,7 @@ fn load_mtp_block(
         ordinal,
         headers,
         mix_headers,
+        registrations,
         "mtp.self_attn.q_proj",
     )?;
     let k_proj_w = upload_packed(
@@ -857,6 +892,7 @@ fn load_mtp_block(
         ordinal,
         headers,
         mix_headers,
+        registrations,
         "mtp.self_attn.k_proj",
     )?;
     let v_proj_w = upload_packed(
@@ -865,6 +901,7 @@ fn load_mtp_block(
         ordinal,
         headers,
         mix_headers,
+        registrations,
         "mtp.self_attn.v_proj",
     )?;
     let o_proj_w = upload_packed(
@@ -873,6 +910,7 @@ fn load_mtp_block(
         ordinal,
         headers,
         mix_headers,
+        registrations,
         "mtp.self_attn.o_proj",
     )?;
     let q_norm_w = Some(upload_f32_as_bf16(

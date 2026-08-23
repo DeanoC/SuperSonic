@@ -2,6 +2,7 @@
 
 #include "gqh.hip"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <hip/hip_bfloat16.h>
@@ -1298,6 +1299,37 @@ int gqh_gemv_flush() {
     return gqh_gemv_launch_args(held);
 }
 }  // namespace
+
+extern "C" void supersonic_gqh_hip_unregister_wire(const void* wire) {
+    if (wire == nullptr) {
+        return;
+    }
+
+    // A held GEMV is deliberately not flushed here: its result is no longer
+    // observable once the owning model is being destroyed, and launching it
+    // would dereference a buffer that is about to be freed. Other owners'
+    // held state remains intact.
+    if (g_gemv_held_valid && g_gemv_held.wire == wire) {
+        g_gemv_held_valid = false;
+    }
+    if (g_gemv_prev_valid && g_gemv_prev.wire == wire) {
+        g_gemv_prev_valid = false;
+    }
+    g_gemv_fusable.erase(wire);
+
+    g_gqh_tight.erase(wire);
+    g_gqh_ileave.erase(wire);
+    auto padded = g_gqh_padded.find(wire);
+    if (padded != g_gqh_padded.end()) {
+        uint8_t* padded_ptr = padded->second;
+        (void)hipFree(padded_ptr);
+        g_gqh_padded.erase(padded);
+        auto alloc = std::find(g_gqh_padded_allocs.begin(), g_gqh_padded_allocs.end(), padded_ptr);
+        if (alloc != g_gqh_padded_allocs.end()) {
+            g_gqh_padded_allocs.erase(alloc);
+        }
+    }
+}
 
 extern "C" int supersonic_gqh_hip_matvec_stream(
     int device_ordinal,

@@ -550,6 +550,20 @@ pub struct DecodeEngine {
     mtp_linear_snap: Option<LinearStateSnapshot>,
 }
 
+impl Drop for DecodeEngine {
+    fn drop(&mut self) {
+        if !self.use_4b_kernel {
+            return;
+        }
+        let int4 = self
+            .int4_scale_device
+            .as_ref()
+            .map(|buffer| buffer.as_ptr())
+            .unwrap_or(std::ptr::null());
+        kernel_ffi::gqh::invalidate_decode_cache(self.scratch.desc_device.as_ptr(), int4);
+    }
+}
+
 pub struct DecodeEngineSnapshot {
     state: ModelState,
     pub logits: Vec<f32>,
@@ -2894,6 +2908,20 @@ impl DecodeEngine {
         self.decode_step_batch_impl(token_ids, seqlen_offset, true, false)
     }
 
+    fn build_optional_batch_seq_descs_for_decode(
+        states: &[&ModelState],
+        seqlen_offsets: &[usize],
+        kv_fp8: bool,
+    ) -> Result<Option<Vec<kernel_ffi::BatchSeqDesc>>> {
+        if states.len() <= 1 {
+            return Ok(None);
+        }
+        let descs = build_batch_seq_descs(states, seqlen_offsets, kv_fp8).ok_or_else(|| {
+            anyhow::anyhow!("build batch sequence descriptors for B={}", states.len())
+        })?;
+        Ok(Some(descs))
+    }
+
     fn decode_step_batch_impl(
         &mut self,
         token_ids: &[u32],
@@ -2965,11 +2993,13 @@ impl DecodeEngine {
             .chain(self.extra_states.iter())
             .collect();
         let offsets = vec![seqlen_offset; b];
-        let batch_descs = build_batch_seq_descs(&state_refs, &offsets, self.kv_fp8)
-            .ok_or_else(|| anyhow::anyhow!("build batch sequence descriptors for B={b}"))?;
-        self.scratch
-            .upload_batch_seq_descs(&batch_descs)
-            .map_err(|e| anyhow::anyhow!("upload batch sequence descriptors: {e}"))?;
+        let batch_descs =
+            Self::build_optional_batch_seq_descs_for_decode(&state_refs, &offsets, self.kv_fp8)?;
+        if let Some(ref batch_descs) = batch_descs {
+            self.scratch
+                .upload_batch_seq_descs(batch_descs)
+                .map_err(|e| anyhow::anyhow!("upload batch sequence descriptors: {e}"))?;
+        }
         if let Some(kv_descs) = build_kv_fp8_descs(&self.state, self.kv_fp8) {
             self.scratch
                 .upload_kv_fp8_descs(&kv_descs)
@@ -3005,7 +3035,9 @@ impl DecodeEngine {
             self.fp8_scale_device.as_ref(),
             self.scratch.kv_fp8_desc_device.as_ref(),
             b,
-            self.scratch.batch_seq_desc_device.as_ref(),
+            batch_descs
+                .as_ref()
+                .and_then(|_| self.scratch.batch_seq_desc_device.as_ref()),
             self.int4_scale_device.as_ref(),
             enable_timing_slots,
             false,
@@ -3133,7 +3165,41 @@ impl DecodeEngine {
 
 #[cfg(test)]
 mod mtp_accept_tests {
-    use super::DecodeEngine;
+    use super::{DecodeEngine, ModelState};
+
+    #[test]
+    fn single_sequence_decode_does_not_require_batch_descriptors() {
+        let state = ModelState {
+            layers: Vec::new(),
+            mtp: None,
+        };
+        let states = [&state];
+
+        let descs = DecodeEngine::build_optional_batch_seq_descs_for_decode(&states, &[0], false)
+            .expect("single-sequence descriptor selection");
+
+        assert!(descs.is_none());
+    }
+
+    #[test]
+    fn multi_sequence_decode_keeps_batch_descriptors() {
+        let first = ModelState {
+            layers: Vec::new(),
+            mtp: None,
+        };
+        let second = ModelState {
+            layers: Vec::new(),
+            mtp: None,
+        };
+        let states = [&first, &second];
+
+        let descs =
+            DecodeEngine::build_optional_batch_seq_descs_for_decode(&states, &[0, 0], false)
+                .expect("multi-sequence descriptor selection")
+                .expect("B>1 must retain batch descriptors");
+
+        assert!(descs.is_empty());
+    }
 
     #[test]
     fn greedy_sample_is_argmax() {

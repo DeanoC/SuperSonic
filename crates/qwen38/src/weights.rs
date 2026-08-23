@@ -179,6 +179,9 @@ pub struct Qwen38Weights {
     pub gqh_sidecars: BTreeMap<String, GpuBuffer>,
     /// Optional NextN/MTP block (`blk.64` on Qwen3.8 GGUF).
     pub mtp: Option<MtpWeights>,
+    /// RAII guards for every packed tensor registered with the GQH bridge.
+    /// Kept separate from the buffers so cleanup can run before `hipFree`.
+    pub(crate) gqh_registrations: Vec<kernel_ffi::gqh::Registration>,
 }
 
 /// DeepSeek-style NextN head: enorm/hnorm + eh_proj + one full-attn decoder
@@ -333,4 +336,15 @@ pub struct FullWeights {
     pub o_proj_int4_scale: Option<GpuBuffer>,
     pub o_proj_int4_zero: Option<GpuBuffer>,
     pub o_proj_awq_inv_scale: Option<GpuBuffer>,
+}
+
+impl Drop for Qwen38Weights {
+    fn drop(&mut self) {
+        // Run before Rust drops the owned GpuBuffers. The bridge caches by raw
+        // allocation address, so invalidation after hipFree would be too late
+        // when HIP reuses that address for the next model.
+        for registration in &mut self.gqh_registrations {
+            registration.unregister();
+        }
+    }
 }

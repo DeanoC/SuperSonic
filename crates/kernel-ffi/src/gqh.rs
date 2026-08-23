@@ -79,6 +79,65 @@ pub fn lookup_header(ptr: *const c_void) -> Option<RegisteredHeader> {
         .copied()
 }
 
+/// Remove all process-global metadata associated with a packed device buffer.
+///
+/// The C++ bridge caches layout conversion state by raw pointer, so this must
+/// run before the owning `GpuBuffer` is freed. It is intentionally idempotent:
+/// cleanup can run during both normal destruction and error unwinding.
+pub fn unregister(ptr: *const c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    header_map()
+        .lock()
+        .expect("gqh header registry")
+        .remove(&(ptr as usize));
+    mix_map()
+        .lock()
+        .expect("mix registry")
+        .remove(&(ptr as usize));
+    unsafe {
+        supersonic_gqh_hip_unregister_wire(ptr);
+    }
+}
+
+/// Owns one registration for the lifetime of its packed GPU allocation.
+/// `Qwen38Weights` keeps these guards so partial loads and normal model drops
+/// both invalidate bridge metadata before HIP frees the allocation.
+pub struct Registration {
+    ptr: usize,
+}
+
+impl Registration {
+    pub fn new(ptr: *const c_void) -> Self {
+        Self { ptr: ptr as usize }
+    }
+
+    pub fn unregister(&mut self) {
+        if self.ptr == 0 {
+            return;
+        }
+        unregister(self.ptr as *const c_void);
+        self.ptr = 0;
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
+/// Invalidate bridge-side decode caches owned by one engine instance.
+pub fn invalidate_decode_cache(layers: *const c_void, int4: *const c_void) {
+    if layers.is_null() && int4.is_null() {
+        return;
+    }
+    unsafe {
+        supersonic_qwen35_4b_hip_invalidate_decode_cache(layers, int4);
+    }
+}
+
 pub const RUNG_GQH3: i32 = 0;
 pub const RUNG_GQH2_H: i32 = 1;
 pub const RUNG_GQH2_C: i32 = 2;
@@ -131,6 +190,10 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn supersonic_gqh_hip_enable_tight_decode();
+
+    fn supersonic_gqh_hip_unregister_wire(wire: *const c_void);
+
+    fn supersonic_qwen35_4b_hip_invalidate_decode_cache(layers: *const c_void, int4: *const c_void);
     fn supersonic_gqh_hip_ensure_tight(
         device_ordinal: c_int,
         rung: c_int,
@@ -517,6 +580,35 @@ mod tests {
         assert_eq!(got.tensor_scale, 1.25);
         assert_eq!(got.grid_code, 3);
         assert!(lookup_header(std::ptr::null()).is_none());
+        unregister(ptr);
+    }
+
+    #[test]
+    fn unregister_is_idempotent_for_header_and_mix_metadata() {
+        let ptr = 0x2000 as *const c_void;
+        register_header(ptr, 2.5, 7);
+        register_mix(ptr, 105, 3, [0.0; 16]);
+        assert!(lookup_header(ptr).is_some());
+        assert!(lookup_mix(ptr).is_some());
+
+        unregister(ptr);
+        assert!(lookup_header(ptr).is_none());
+        assert!(lookup_mix(ptr).is_none());
+
+        // A buffer can be observed by more than one owner-cleanup path while
+        // unwinding a failed load. Repeated cleanup must remain harmless.
+        unregister(ptr);
+    }
+
+    #[test]
+    fn registration_guard_cleans_up_on_drop() {
+        let ptr = 0x3000 as *const c_void;
+        register_header(ptr, 3.75, 2);
+        {
+            let _registration = Registration::new(ptr);
+            assert!(lookup_header(ptr).is_some());
+        }
+        assert!(lookup_header(ptr).is_none());
     }
 
     #[test]

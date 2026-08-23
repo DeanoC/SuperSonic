@@ -292,10 +292,35 @@ struct GqhMlpHdrs {
     GqhProjHdr up[80];
     GqhProjHdr down[80];
     GqhMixerLayer mix[80];
+    const void* layers = nullptr;
     const void* int4 = nullptr;
     int n = 0;
     bool ok = false;
 };
+
+// These caches contain raw device pointers copied from one DecodeEngine. They
+// are process-global for the retained single-threaded bridge, but their owner
+// must explicitly invalidate them before that engine frees its buffers.
+GqhMlpHdrs g_gqh_mlp_hdrs;
+
+struct SplitGraphCache {
+    hipGraphExec_t exec = nullptr;
+    hipGraph_t graph = nullptr;
+    hipStream_t stream = nullptr;
+    int num_layers = -1;
+    int grid_in = 0, grid_mid = 0, grid_out = 0, grid_gate = 0, grid_up = 0,
+        grid_down = 0;
+    const void* layers = nullptr;
+    void* hidden_io = nullptr;
+    float* workspace = nullptr;
+    unsigned int* counters = nullptr;
+    unsigned int* barrier_counter = nullptr;
+    unsigned int* barrier_flag = nullptr;
+    const void* int4 = nullptr;
+    int batch_size = 0;
+};
+
+SplitGraphCache g_split_graph_cache;
 
 hipError_t load_gqh_proj_hdr(
     const void* wire, const void* scale_ptr, int qtype, GqhProjHdr* out) {
@@ -349,7 +374,8 @@ bool load_gqh_mlp_hdrs(
     const Qwen35INT4ScaleDesc* int4_dev,
     int num_layers,
     GqhMlpHdrs* cache) {
-    if (cache->ok && cache->int4 == int4_dev && cache->n == num_layers) {
+    if (cache->ok && cache->layers == layers_dev && cache->int4 == int4_dev &&
+        cache->n == num_layers) {
         return true;
     }
     if (layers_dev == nullptr || int4_dev == nullptr || num_layers <= 0 ||
@@ -437,6 +463,7 @@ bool load_gqh_mlp_hdrs(
         m.b.wire = L.b_proj_w;
         m.a.wire = L.a_proj_w;
     }
+    cache->layers = layers_dev;
     cache->int4 = int4_dev;
     cache->n = num_layers;
     cache->ok = true;
@@ -8493,7 +8520,7 @@ int persistent_decode_device(
                 occ5,
                 a5.localSizeBytes);
         }
-        static GqhMlpHdrs mlp_hdrs;
+        GqhMlpHdrs& mlp_hdrs = g_gqh_mlp_hdrs;
         const bool use_gqh_gemv =
             std::getenv("SUPERSONIC_QWEN38_GQH_NOGEMV") == nullptr
             && load_gqh_mlp_hdrs(
@@ -8618,23 +8645,7 @@ int persistent_decode_device(
             std::getenv("SUPERSONIC_DECODE_PROF") == nullptr &&
             (hip_prop.major < 12 ||
              std::getenv("SUPERSONIC_HIP_GRAPH") != nullptr);
-        struct SplitGraphCache {
-            hipGraphExec_t exec = nullptr;
-            hipGraph_t graph = nullptr;
-            hipStream_t stream = nullptr;
-            int num_layers = -1;
-            int grid_in = 0, grid_mid = 0, grid_out = 0, grid_gate = 0, grid_up = 0,
-                grid_down = 0;
-            const void* layers = nullptr;
-            void* hidden_io = nullptr;
-            float* workspace = nullptr;
-            unsigned int* counters = nullptr;
-            unsigned int* barrier_counter = nullptr;
-            unsigned int* barrier_flag = nullptr;
-            const void* int4 = nullptr;
-            int batch_size = 0;
-        };
-        static SplitGraphCache cache;
+        SplitGraphCache& cache = g_split_graph_cache;
         float* ws_hidden = workspace;
         auto dump_ws_f32_n = [&](const char* name, const float* src, int n) {
             if (!dump_this || src == nullptr || n <= 0) {
@@ -9851,6 +9862,48 @@ extern "C" int supersonic_qwen35_hip_mtp_restore_linear_prefix(int commit_len) {
         }
     }
     return 0;
+}
+
+extern "C" void supersonic_qwen35_4b_hip_invalidate_decode_cache(
+    const void* layers,
+    const void* int4) {
+    if (layers == nullptr && int4 == nullptr) {
+        return;
+    }
+
+    const bool mlp_owned = g_gqh_mlp_hdrs.ok &&
+        ((layers != nullptr && g_gqh_mlp_hdrs.layers == layers) ||
+         (int4 != nullptr && g_gqh_mlp_hdrs.int4 == int4));
+    if (mlp_owned) {
+        g_gqh_mlp_hdrs = GqhMlpHdrs{};
+    }
+
+    SplitGraphCache& cache = g_split_graph_cache;
+    const bool graph_owned =
+        (layers != nullptr && cache.layers == layers) ||
+        (int4 != nullptr && cache.int4 == int4);
+    if (!graph_owned) {
+        return;
+    }
+    if (cache.exec != nullptr) {
+        (void)hipGraphExecDestroy(cache.exec);
+        cache.exec = nullptr;
+    }
+    if (cache.graph != nullptr) {
+        (void)hipGraphDestroy(cache.graph);
+        cache.graph = nullptr;
+    }
+    // Keep the lazily-created stream for reuse, but clear every owner key so
+    // the next engine cannot mistake this cache for a live graph.
+    cache.num_layers = -1;
+    cache.layers = nullptr;
+    cache.hidden_io = nullptr;
+    cache.workspace = nullptr;
+    cache.counters = nullptr;
+    cache.barrier_counter = nullptr;
+    cache.barrier_flag = nullptr;
+    cache.int4 = nullptr;
+    cache.batch_size = 0;
 }
 
 extern "C" int supersonic_qwen35_4b_hip_persistent_decode(
