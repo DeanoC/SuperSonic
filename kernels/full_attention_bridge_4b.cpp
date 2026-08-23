@@ -235,6 +235,37 @@ struct DecodeBridgeLockGuard {
     ~DecodeBridgeLockGuard() { supersonic_gqh_hip_unlock(); }
 };
 
+// HIP allocations and streams are owned by a device ordinal, not by the
+// thread's incidental current-device setting. Keep the switch status visible
+// to callers that are about to touch an allocation; the destructor can restore
+// the previous device but cannot report a restore failure.
+struct ScopedHipDevice {
+    int previous = -1;
+    bool changed = false;
+    hipError_t status = hipSuccess;
+
+    explicit ScopedHipDevice(int target) {
+        status = hipGetDevice(&previous);
+        if (status != hipSuccess) {
+            return;
+        }
+        if (previous != target) {
+            status = hipSetDevice(target);
+            if (status == hipSuccess) {
+                changed = true;
+            }
+        }
+    }
+
+    ~ScopedHipDevice() {
+        if (changed && previous >= 0) {
+            (void)hipSetDevice(previous);
+        }
+    }
+
+    bool ok() const { return status == hipSuccess; }
+};
+
 int gqh_rung_from_qtype(int qtype) {
     if (qtype == 108) return 0;
     if (qtype == 109) return 1;
@@ -1201,10 +1232,26 @@ hipError_t ensure_decode_rec_scratch(int ordinal, int nv, int khd, int vhd) {
         return hipSuccess;
     }
     if (s.q != nullptr) {
-        (void)hipDeviceSynchronize();
-        (void)hipFree(s.q);
-        s.q = nullptr;
-        s.cap = 0;
+        if (s.device_ordinal < 0) {
+            return hipErrorInvalidDevice;
+        }
+        ScopedHipDevice old_owner(s.device_ordinal);
+        if (!old_owner.ok()) {
+            return old_owner.status;
+        }
+        hipError_t err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            return err;
+        }
+        err = hipFree(s.q);
+        if (err != hipSuccess) {
+            return err;
+        }
+        s = DecodeRecScratch{};
+    }
+    ScopedHipDevice target(ordinal);
+    if (!target.ok()) {
+        return target.status;
     }
     float* base = nullptr;
     hipError_t err = hipMalloc(&base, need * sizeof(float));
@@ -1502,9 +1549,26 @@ hipError_t ensure_decode_full_attn_scratch(
         return hipSuccess;
     }
     if (s.q != nullptr) {
-        (void)hipDeviceSynchronize();
-        (void)hipFree(s.q);
-        s.q = nullptr;
+        if (s.device_ordinal < 0) {
+            return hipErrorInvalidDevice;
+        }
+        ScopedHipDevice old_owner(s.device_ordinal);
+        if (!old_owner.ok()) {
+            return old_owner.status;
+        }
+        hipError_t err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            return err;
+        }
+        err = hipFree(s.q);
+        if (err != hipSuccess) {
+            return err;
+        }
+        s = DecodeFullAttnScratch{};
+    }
+    ScopedHipDevice target(ordinal);
+    if (!target.ok()) {
+        return target.status;
     }
     const size_t q_n = static_cast<size_t>(nh) * hd;
     const size_t slots = static_cast<size_t>(nh) * kSplits;
@@ -2135,25 +2199,6 @@ int prefill_backend_failure(int project_status, hipError_t native_status) {
         | ((static_cast<uint32_t>(project_status) & 0x7fffu) << 16)
         | (static_cast<uint32_t>(native_status) & 0xffffu));
 }
-
-struct ScopedHipDevice {
-    int previous = -1;
-    bool changed = false;
-
-    explicit ScopedHipDevice(int target) {
-        hipGetDevice(&previous);
-        if (previous != target) {
-            hipSetDevice(target);
-            changed = true;
-        }
-    }
-
-    ~ScopedHipDevice() {
-        if (changed && previous >= 0) {
-            hipSetDevice(previous);
-        }
-    }
-};
 
 void clear_split_graph_cache(SplitGraphCache& cache, bool destroy_stream) {
     const int owner = cache.device_ordinal;
@@ -5439,6 +5484,7 @@ static int matmul_rhs_transposed_wmma_small_m_bf16_device(
 }
 
 static hipblasHandle_t hipblas_handle_for(int device_ordinal) {
+    DecodeBridgeLockGuard guard;
     static hipblasHandle_t handles[16] = {};
     static bool ready[16] = {};
     if (device_ordinal < 0 || device_ordinal >= 16) {
@@ -5505,17 +5551,29 @@ static hipStream_t gqh_s_dq = nullptr;
 static hipStream_t gqh_s_gemm = nullptr;
 static hipEvent_t gqh_ev_gemm[2] = {nullptr, nullptr};
 static bool gqh_ev_gemm_recorded[2] = {false, false};
+static int gqh_resource_device = -1;
 
-extern "C" void supersonic_gqh_hip_gemm_flush() {
+extern "C" int supersonic_gqh_hip_gemm_flush(int device_ordinal) {
     DecodeBridgeLockGuard guard;
+    const int owner = gqh_resource_device >= 0 ? gqh_resource_device : device_ordinal;
+    ScopedHipDevice scoped(owner);
+    if (!scoped.ok()) {
+        return static_cast<int>(scoped.status);
+    }
     // Enqueue a default-stream wait so later default-stream kernels see
     // GEMM output, without blocking the CPU (host EventSynchronize was
-    // serializing the whole prefill around each consumer).
+    // serializing the whole prefill around each consumer). Events are created
+    // on `gqh_resource_device`; wait on that owner even when the caller's
+    // target ordinal differs, then restore the caller's device on scope exit.
     for (int i = 0; i < 2; ++i) {
         if (gqh_ev_gemm_recorded[i] && gqh_ev_gemm[i] != nullptr) {
-            (void)hipStreamWaitEvent(nullptr, gqh_ev_gemm[i], 0);
+            const hipError_t err = hipStreamWaitEvent(nullptr, gqh_ev_gemm[i], 0);
+            if (err != hipSuccess) {
+                return static_cast<int>(err);
+            }
         }
     }
+    return 0;
 }
 
 extern "C" int supersonic_gqh_hip_decode(
@@ -5549,6 +5607,9 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         return 1;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return 2;
+    }
     hipblasHandle_t handle = hipblas_handle_for(device_ordinal);
     if (handle == nullptr) {
         return 1;
@@ -5558,12 +5619,16 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
     static hipEvent_t ev_dq[2] = {nullptr, nullptr};
     static int phase = 0;
     static bool ready = false;
-    static int resource_device = -1;
-    if (ready && resource_device != device_ordinal) {
+    if (ready && gqh_resource_device != device_ordinal) {
         int previous = -1;
         (void)hipGetDevice(&previous);
-        (void)hipSetDevice(resource_device);
-        (void)hipDeviceSynchronize();
+        if (hipSetDevice(gqh_resource_device) != hipSuccess) {
+            return 2;
+        }
+        if (hipDeviceSynchronize() != hipSuccess) {
+            if (previous >= 0) (void)hipSetDevice(previous);
+            return 2;
+        }
         for (int i = 0; i < 2; ++i) {
             if (ev_dq[i] != nullptr) (void)hipEventDestroy(ev_dq[i]);
             ev_dq[i] = nullptr;
@@ -5581,7 +5646,7 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         ready = false;
         phase = 0;
         if (previous >= 0) (void)hipSetDevice(previous);
-        resource_device = -1;
+        gqh_resource_device = -1;
     }
     if (!ready) {
         if (hipStreamCreateWithFlags(&gqh_s_dq, hipStreamNonBlocking) != hipSuccess) {
@@ -5600,7 +5665,7 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
             }
         }
         ready = true;
-        resource_device = device_ordinal;
+        gqh_resource_device = device_ordinal;
     }
     const int p = phase & 1;
     const size_t need = static_cast<size_t>(n) * static_cast<size_t>(k);
@@ -5677,7 +5742,9 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         return 9;
     }
     gqh_ev_gemm_recorded[p] = true;
-    (void)hipblasSetStream(handle, nullptr);
+    if (hipblasSetStream(handle, nullptr) != HIPBLAS_STATUS_SUCCESS) {
+        return 10;
+    }
     phase = phase + 1;
     return 0;
 }
@@ -5690,6 +5757,11 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
     const void* lhs,
     const void* rhs,
     void* out) {
+    DecodeBridgeLockGuard guard;
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+    if (!scoped.ok()) {
+        return prefill_backend_failure(268, scoped.status);
+    }
     switch (dtype) {
     case 2:
         if (matmul_rhs_transposed_hipblas_bf16(
@@ -8393,7 +8465,14 @@ int persistent_decode_device(
 ) {
     DecodeBridgeLockGuard guard;
     ScopedHipDevice scoped(device_ordinal);
-    supersonic_gqh_hip_gemm_flush();
+    if (!scoped.ok()) {
+        return prefill_backend_failure(249, scoped.status);
+    }
+    const int gemm_flush_status = supersonic_gqh_hip_gemm_flush(device_ordinal);
+    if (gemm_flush_status != 0) {
+        return prefill_backend_failure(
+            250, static_cast<hipError_t>(gemm_flush_status));
+    }
 
     hipDeviceProp_t props;
     if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 250;
@@ -10147,6 +10226,14 @@ int persistent_decode_device(
 extern "C" int supersonic_qwen35_hip_mtp_restore_linear_prefix(
     int device_ordinal, const void* layers, int commit_len) {
     DecodeBridgeLockGuard guard;
+    // The snapshot and every live-state pointer belong to this ordinal. Do
+    // the device switch before validating or copying any of those pointers so
+    // a caller that last ran on another device cannot make HIP interpret the
+    // address in the wrong context.
+    ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return static_cast<int>(scoped.status);
+    }
     MtpPrefixSnap& s = mtp_prefix_snap();
     if (commit_len <= 0 || s.device_ordinal != device_ordinal ||
         s.owner_layers != layers) {

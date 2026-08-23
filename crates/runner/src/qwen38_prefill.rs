@@ -32,7 +32,7 @@ pub(crate) fn run_qwen38_prefill(
         );
     }
     let result = engine.prefill_native_with_final_norm(prompt_ids)?;
-    kernel_ffi::gqh::gemm_flush();
+    kernel_ffi::gqh::gemm_flush(engine.ordinal())?;
     let next_token = DecodeEngine::greedy_sample(&result.logits);
     eprintln!(
         "[prefill] native HIP prefill done in {:.0}ms",

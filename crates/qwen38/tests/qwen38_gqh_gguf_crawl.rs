@@ -525,7 +525,7 @@ fn rung7c_gqh_large_m_dequant_gemm_matches_fused() {
     // Dequant+GEMM queues hipBLAS work on a non-default stream. Cross that
     // stream boundary before the direct D2H read so release timing cannot
     // observe the output buffer before GEMM has completed.
-    kernel_ffi::gqh::gemm_flush();
+    kernel_ffi::gqh::gemm_flush(ordinal).expect("gemm flush");
 
     let decode = |buf: &GpuBuffer| -> Vec<f32> {
         buf.to_host_bytes()

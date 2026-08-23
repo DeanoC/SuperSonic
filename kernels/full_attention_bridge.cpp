@@ -11,7 +11,19 @@
 #include <stdint.h>
 #include <type_traits>
 
+extern "C" void supersonic_gqh_hip_lock();
+extern "C" void supersonic_gqh_hip_unlock();
+
 namespace {
+
+// The legacy prefill GEMM path retains process-global hipBLAS/scratch state.
+// Use the same recursive bridge lock as the GQH/4B bridges so a concurrent
+// request cannot overwrite the shared scores buffer or mutate a handle while
+// another request is using it.
+struct DecodeBridgeLockGuard {
+    DecodeBridgeLockGuard() { supersonic_gqh_hip_lock(); }
+    ~DecodeBridgeLockGuard() { supersonic_gqh_hip_unlock(); }
+};
 
 int prefill_backend_failure(int project_status, hipError_t native_status) {
     return static_cast<int>(
@@ -23,12 +35,18 @@ int prefill_backend_failure(int project_status, hipError_t native_status) {
 struct ScopedHipDevice {
     int previous = -1;
     bool changed = false;
+    hipError_t status = hipSuccess;
 
     explicit ScopedHipDevice(int target) {
-        hipGetDevice(&previous);
+        status = hipGetDevice(&previous);
+        if (status != hipSuccess) {
+            return;
+        }
         if (previous != target) {
-            hipSetDevice(target);
-            changed = true;
+            status = hipSetDevice(target);
+            if (status == hipSuccess) {
+                changed = true;
+            }
         }
     }
 
@@ -37,6 +55,8 @@ struct ScopedHipDevice {
             hipSetDevice(previous);
         }
     }
+
+    bool ok() const { return status == hipSuccess; }
 };
 
 int linear_prefill_block_override() {
@@ -64,16 +84,19 @@ hipError_t maybe_sync() {
     return enabled ? hipDeviceSynchronize() : hipSuccess;
 }
 
-hipblasHandle_t attn_hipblas() {
-    static hipblasHandle_t handle = nullptr;
-    static bool ready = false;
-    if (!ready) {
-        if (hipblasCreate(&handle) != HIPBLAS_STATUS_SUCCESS) {
-            handle = nullptr;
-        }
-        ready = true;
+hipblasHandle_t attn_hipblas(int device_ordinal) {
+    static hipblasHandle_t handles[16] = {};
+    static bool ready[16] = {};
+    if (device_ordinal < 0 || device_ordinal >= 16) {
+        return nullptr;
     }
-    return handle;
+    if (!ready[device_ordinal]) {
+        if (hipblasCreate(&handles[device_ordinal]) != HIPBLAS_STATUS_SUCCESS) {
+            handles[device_ordinal] = nullptr;
+        }
+        ready[device_ordinal] = true;
+    }
+    return handles[device_ordinal];
 }
 
 float* attn_scratch_f32(size_t n, float** slot, size_t* cap) {
@@ -93,21 +116,42 @@ float* attn_scratch_f32(size_t n, float** slot, size_t* cap) {
     return *slot;
 }
 
-hip_bfloat16* attn_scratch_bf16(size_t n, hip_bfloat16** slot, size_t* cap) {
-    if (n <= *cap && *slot != nullptr) {
-        return *slot;
+struct AttnScratchBf16 {
+    hip_bfloat16* ptr = nullptr;
+    size_t cap = 0;
+    int device_ordinal = -1;
+};
+
+hip_bfloat16* attn_scratch_bf16(
+    int device_ordinal, size_t n, AttnScratchBf16* scratch) {
+    if (n <= scratch->cap && scratch->ptr != nullptr &&
+        scratch->device_ordinal == device_ordinal) {
+        return scratch->ptr;
     }
-    if (*slot != nullptr) {
-        (void)hipFree(*slot);
-        *slot = nullptr;
-        *cap = 0;
+    if (scratch->ptr != nullptr) {
+        if (scratch->device_ordinal < 0) {
+            return nullptr;
+        }
+        ScopedHipDevice old_owner(scratch->device_ordinal);
+        if (!old_owner.ok() || hipDeviceSynchronize() != hipSuccess) {
+            return nullptr;
+        }
+        if (hipFree(scratch->ptr) != hipSuccess) {
+            return nullptr;
+        }
+        *scratch = AttnScratchBf16{};
     }
-    if (hipMalloc(slot, n * sizeof(hip_bfloat16)) != hipSuccess) {
-        *slot = nullptr;
+    ScopedHipDevice target(device_ordinal);
+    if (!target.ok()) {
         return nullptr;
     }
-    *cap = n;
-    return *slot;
+    if (hipMalloc(&scratch->ptr, n * sizeof(hip_bfloat16)) != hipSuccess) {
+        scratch->ptr = nullptr;
+        return nullptr;
+    }
+    scratch->cap = n;
+    scratch->device_ordinal = device_ordinal;
+    return scratch->ptr;
 }
 
 // scores = Q[pack*q_len,hd] @ K[kv_len,hd]^T then causal softmax, then
@@ -116,6 +160,7 @@ hip_bfloat16* attn_scratch_bf16(size_t n, hip_bfloat16** slot, size_t* cap) {
 // uses qi = row % q_len. Falls back to a smaller pack if the score
 // matrix will not allocate.
 int launch_gemm_attn_bf16(
+    int device_ordinal,
     int batch_size,
     int q_heads,
     int kv_heads,
@@ -130,12 +175,11 @@ int launch_gemm_attn_bf16(
     const hip_bfloat16* value,
     float* out
 ) {
-    hipblasHandle_t blas = attn_hipblas();
+    hipblasHandle_t blas = attn_hipblas(device_ordinal);
     if (blas == nullptr || q_len <= 0 || kv_len <= 0 || q_heads <= 0 || kv_heads <= 0) {
         return 1;
     }
-    static hip_bfloat16* scores = nullptr;
-    static size_t scores_cap = 0;
+    static AttnScratchBf16 scores;
     const int groups = num_kv_groups > 0 ? num_kv_groups : 1;
     const size_t per_head = static_cast<size_t>(q_len) * static_cast<size_t>(kv_len);
     int pack = groups;
@@ -146,12 +190,17 @@ int launch_gemm_attn_bf16(
         pack = q_heads;
     }
     while (pack > 1 &&
-           attn_scratch_bf16(per_head * static_cast<size_t>(pack), &scores, &scores_cap) ==
+           attn_scratch_bf16(
+               device_ordinal,
+               per_head * static_cast<size_t>(pack),
+               &scores) ==
                nullptr) {
         pack = pack > 2 ? pack / 2 : 1;
     }
-    if (attn_scratch_bf16(per_head * static_cast<size_t>(pack), &scores, &scores_cap) ==
-        nullptr) {
+    if (attn_scratch_bf16(
+            device_ordinal,
+            per_head * static_cast<size_t>(pack),
+            &scores) == nullptr) {
         return 2;
     }
     static bool dumped_pack = false;
@@ -209,7 +258,7 @@ int launch_gemm_attn_bf16(
                     HIP_R_16BF,
                     head_dim,
                     &beta,
-                    scores,
+                    scores.ptr,
                     HIP_R_16BF,
                     kv_len,
                     HIPBLAS_COMPUTE_32F,
@@ -223,7 +272,7 @@ int launch_gemm_attn_bf16(
                     dim3(256),
                     0,
                     0,
-                    scores,
+                    scores.ptr,
                     m,
                     q_len,
                     kv_len,
@@ -244,7 +293,7 @@ int launch_gemm_attn_bf16(
                     v,
                     HIP_R_16BF,
                     head_dim,
-                    scores,
+                    scores.ptr,
                     HIP_R_16BF,
                     kv_len,
                     &beta,
@@ -279,6 +328,9 @@ int full_attention_prefill_device(
     void* out
 ) {
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return prefill_backend_failure(136, scoped.status);
+    }
 
     hipDeviceProp_t props;
     if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) {
@@ -384,6 +436,9 @@ int full_attention_prefill_tiled_device(
     if (q_len <= 0) return 0;
 
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return prefill_backend_failure(137, scoped.status);
+    }
 
     // The kernel hardcodes block.x = 32 and the per-lane acc_dim/load
     // strides assume warpSize == 32. On wave64 (CDNA gfx9xx) the kernel
@@ -424,7 +479,7 @@ int full_attention_prefill_tiled_device(
     } else if (long_seq) {
         if constexpr (std::is_same<T, hip_bfloat16>::value) {
             const int rc = launch_gemm_attn_bf16(
-                batch_size, q_heads, kv_heads, q_len, kv_len, head_dim,
+                device_ordinal, batch_size, q_heads, kv_heads, q_len, kv_len, head_dim,
                 num_kv_groups, scale, seqlen_offset,
                 static_cast<const hip_bfloat16*>(query),
                 static_cast<const hip_bfloat16*>(key),
@@ -2223,6 +2278,7 @@ extern "C" int supersonic_qwen35_hip_full_attention_prefill(
     const void* key,
     const void* value,
     void* out) {
+    DecodeBridgeLockGuard guard;
 
     // Default: use the K-tiled FlashAttention-style kernel for BF16 prefill.
     // SUPERSONIC_PREFILL_ATTN_TILED=0 forces the legacy single-warp

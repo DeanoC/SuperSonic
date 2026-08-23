@@ -1002,7 +1002,7 @@ pub fn full_attention_prefill(
     value: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     let num_kv_groups = q_heads / kv_heads;
     ffi_profile_time_result("qwen.full_attention_prefill", ordinal, || {
         let status = unsafe {
@@ -1046,7 +1046,7 @@ pub fn linear_prefill_conv_pack(
     weights: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     ffi_profile_time_result("qwen.linear_prefill_conv_pack", ordinal, || {
         let status = unsafe {
             supersonic_qwen35_hip_linear_prefill_conv_pack(
@@ -1087,7 +1087,7 @@ pub fn delta_recurrent_prefill(
     g: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     ffi_profile_time_result("qwen.delta_recurrent_prefill", ordinal, || {
         let status = unsafe {
             supersonic_qwen35_hip_delta_recurrent_prefill(
@@ -1184,7 +1184,7 @@ pub fn swiglu_mul(
     up: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     swiglu_mul_impl(ordinal, dtype, elem_count, gate, up, out)
 }
 
@@ -2290,7 +2290,7 @@ pub fn rms_norm_rows(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     rms_norm_rows_impl(ordinal, dtype, n_rows, n_cols, eps, input, weight, out)
 }
 
@@ -2337,7 +2337,7 @@ pub fn rms_norm_rows_plain(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     let profile_key = if std::env::var_os("SUPERSONIC_FFI_PROFILE_SHAPES").is_some() {
         format!(
             "qwen.rms_norm_rows_plain[rows={} cols={} dtype={:?}]",
@@ -2377,7 +2377,7 @@ pub fn rms_norm_rows_plain_inplace(
     data: &mut GpuBuffer,
     weight: &GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     let profile_key = if std::env::var_os("SUPERSONIC_FFI_PROFILE_SHAPES").is_some() {
         format!(
             "qwen.rms_norm_rows_plain_inplace[rows={} cols={} dtype={:?}]",
@@ -2455,7 +2455,7 @@ pub fn cast(
     input: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     cast_impl(ordinal, input_dtype, output_dtype, total_elems, input, out)
 }
 
@@ -2494,7 +2494,7 @@ pub fn element_add(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     ffi_profile_time_result("qwen.element_add", ordinal, || {
         let status = unsafe {
             supersonic_qwen35_hip_element_add(
@@ -2640,7 +2640,7 @@ pub fn apply_rope_prefill(
     pos_offset: usize,
     data: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     apply_rope_prefill_impl(
         ordinal, dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset,
         data,
@@ -2697,7 +2697,7 @@ pub fn transpose_shd_hsd(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     transpose_shd_hsd_impl(ordinal, dtype, s, h, d, src, dst)
 }
 
@@ -2771,7 +2771,7 @@ pub fn transpose_shd_to_cache_bf16(
     src: &GpuBuffer,
     cache: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     if src.dtype() != ScalarType::BF16 || cache.dtype() != ScalarType::BF16 {
         return Err(GpuError::InvalidArg(format!(
             "transpose_shd_to_cache_bf16 expects BF16 buffers; got src={:?} cache={:?}",
@@ -2820,7 +2820,7 @@ pub fn transpose_pad_conv(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     ffi_profile_time_result("qwen.transpose_pad_conv", ordinal, || {
         let status = unsafe {
             supersonic_qwen35_hip_transpose_pad_conv(
@@ -2977,7 +2977,7 @@ pub fn cast_transpose_gate_hsd_to_shd_bf16(
     gate_shd: &GpuBuffer,
     out_shd: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     if attn_hsd.dtype() != ScalarType::F32
         || gate_shd.dtype() != ScalarType::BF16
         || out_shd.dtype() != ScalarType::BF16
@@ -3141,7 +3141,7 @@ pub fn split_qgate(
     query_out: &mut GpuBuffer,
     gate_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     split_qgate_impl(
         ordinal, dtype, s, num_heads, head_dim, src, query_out, gate_out,
     )
@@ -3192,7 +3192,7 @@ pub fn split_qgate_norm_bf16(
     query_out: &mut GpuBuffer,
     gate_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     if src.dtype() != ScalarType::BF16
         || norm_w.dtype() != ScalarType::BF16
         || query_out.dtype() != ScalarType::BF16
@@ -3240,7 +3240,7 @@ pub fn split_qkv(
     k: &mut GpuBuffer,
     v: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     ffi_profile_time_result("qwen.split_qkv", ordinal, || {
         let status = unsafe {
             supersonic_qwen35_hip_split_qkv(
@@ -3336,7 +3336,7 @@ pub fn split_norm_transpose_qkv_bf16(
     k: &mut GpuBuffer,
     v: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     if q.backend() != Backend::Hip {
         return Err(ffi_error(
             "split_norm_transpose_qkv_bf16 is only implemented for HIP".into(),
@@ -3377,7 +3377,7 @@ pub fn split_qkvz_bf16(
     qkv: &mut GpuBuffer,
     z: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    crate::gqh::gemm_flush();
+    crate::gqh::gemm_flush(ordinal)?;
     if qkv.backend() != Backend::Hip {
         return Err(ffi_error(
             "split_qkvz_bf16 is only implemented for HIP".into(),

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace {
 bool g_gqh_allow_tight = false;
@@ -107,11 +108,17 @@ int launch_result(int launch_project_status, int sync_project_status) {
 struct ScopedHipDevice {
     int previous = -1;
     bool changed = false;
+    hipError_t status = hipSuccess;
     explicit ScopedHipDevice(int target) {
-        hipGetDevice(&previous);
+        status = hipGetDevice(&previous);
+        if (status != hipSuccess) {
+            return;
+        }
         if (previous != target) {
-            hipSetDevice(target);
-            changed = true;
+            status = hipSetDevice(target);
+            if (status == hipSuccess) {
+                changed = true;
+            }
         }
     }
     ~ScopedHipDevice() {
@@ -119,6 +126,7 @@ struct ScopedHipDevice {
             hipSetDevice(previous);
         }
     }
+    bool ok() const { return status == hipSuccess; }
 };
 
 enum GqhRung : int {
@@ -1260,10 +1268,13 @@ bool gqh_gemv_pairable(const GqhGemvArgs& a, const GqhGemvArgs& b) {
         a.y_col_stride == b.y_col_stride && a.wire != b.wire && a.y != b.y;
 }
 
-// 0 on launch, non-zero when the fused arm is unavailable and the caller must
-// fall back to the two singles.
+// 0 on launch, 1 when the fused arm is unavailable and the caller must fall
+// back to the two singles, or an encoded HIP failure after the pair launch.
 int gqh_gemv_launch_pair(const GqhGemvArgs& a, const GqhGemvArgs& b) {
     ScopedHipDevice scoped(a.device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
     hipStream_t hs = static_cast<hipStream_t>(a.stream);
     auto* pa = static_cast<const uint8_t*>(a.wire);
     auto* pb = static_cast<const uint8_t*>(b.wire);
@@ -1350,7 +1361,10 @@ int gqh_gemv_launch_pair(const GqhGemvArgs& a, const GqhGemvArgs& b) {
         GQH_LAUNCH_SPLIT_PAIR(false, false);
     }
 #undef GQH_LAUNCH_SPLIT_PAIR
-    return 0;
+    // Keep launch/error inspection on the owning device. The scope must not
+    // end before hipGetLastError()/maybe_sync: those calls inspect the launch
+    // state of the current device.
+    return launch_result(421, 422);
 }
 
 int gqh_gemv_flush() {
@@ -1364,50 +1378,89 @@ int gqh_gemv_flush() {
 }
 }  // namespace
 
-extern "C" void supersonic_gqh_hip_unregister_wire(int device_ordinal, const void* wire) {
+extern "C" void supersonic_gqh_hip_unregister_wires(
+    int device_ordinal, const void* const* wires, size_t count) {
     GqhBridgeLockGuard guard;
-    if (wire == nullptr) {
+    if (wires == nullptr || count == 0) {
         return;
     }
 
-    const GqhWireKey key{device_ordinal, wire};
-    const bool has_tight = g_gqh_tight.find(key) != g_gqh_tight.end();
-    const bool has_ileave = g_gqh_ileave.find(key) != g_gqh_ileave.end();
-    const auto padded = g_gqh_padded.find(key);
-    const bool has_padded = padded != g_gqh_padded.end();
-    const bool has_held = g_gemv_held_valid &&
-        g_gemv_held.device_ordinal == device_ordinal && g_gemv_held.wire == wire;
-    const bool has_prev = g_gemv_prev_valid &&
-        g_gemv_prev.device_ordinal == device_ordinal && g_gemv_prev.wire == wire;
+    std::vector<GqhWireKey> keys;
+    keys.reserve(count);
+    std::unordered_set<GqhWireKey, GqhWireKeyHash> unique;
+    unique.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        if (wires[i] == nullptr) {
+            continue;
+        }
+        const GqhWireKey key{device_ordinal, wires[i]};
+        if (unique.insert(key).second) {
+            keys.push_back(key);
+        }
+    }
+    if (keys.empty()) {
+        return;
+    }
+
+    bool needs_sync = false;
+    for (const GqhWireKey& key : keys) {
+        needs_sync = needs_sync || g_gqh_tight.find(key) != g_gqh_tight.end() ||
+            g_gqh_ileave.find(key) != g_gqh_ileave.end() ||
+            g_gqh_padded.find(key) != g_gqh_padded.end() ||
+            (g_gemv_held_valid && g_gemv_held.device_ordinal == device_ordinal &&
+             g_gemv_held.wire == key.wire) ||
+            (g_gemv_prev_valid && g_gemv_prev.device_ordinal == device_ordinal &&
+             g_gemv_prev.wire == key.wire);
+    }
+
+    auto remove_metadata = [&] {
+        for (const GqhWireKey& key : keys) {
+            // A held GEMV is deliberately not flushed here: its result is no
+            // longer observable once the owning model is being destroyed, and
+            // launching it would dereference a buffer that is about to be
+            // freed.
+            if (g_gemv_held_valid && g_gemv_held.device_ordinal == device_ordinal &&
+                g_gemv_held.wire == key.wire) {
+                g_gemv_held_valid = false;
+            }
+            if (g_gemv_prev_valid && g_gemv_prev.device_ordinal == device_ordinal &&
+                g_gemv_prev.wire == key.wire) {
+                g_gemv_prev_valid = false;
+            }
+            g_gemv_fusable.erase(key);
+            g_gqh_tight.erase(key);
+            g_gqh_ileave.erase(key);
+            const auto padded = g_gqh_padded.find(key);
+            if (padded != g_gqh_padded.end()) {
+                (void)hipFree(padded->second);
+                g_gqh_padded.erase(padded);
+            }
+        }
+    };
 
     // Metadata and padded allocations can be read by an already-launched
     // kernel. Synchronize the owning device before removing or freeing them.
-    // Do not touch HIP for an untracked/fake pointer: registration cleanup is
-    // also used by CPU-only unwind tests.
-    if (has_tight || has_ileave || has_padded || has_held || has_prev) {
+    // Keep the owner scope alive through hipFree; freeing a device pointer on
+    // the caller's incidental current device is not ownership-safe. Do not
+    // touch HIP for an untracked/fake pointer: registration cleanup is also
+    // used by CPU-only unwind tests.
+    if (needs_sync) {
         ScopedHipDevice scoped(device_ordinal);
-        (void)hipDeviceSynchronize();
+        if (!scoped.ok()) {
+            return;
+        }
+        if (hipDeviceSynchronize() != hipSuccess) {
+            return;
+        }
+        remove_metadata();
+    } else {
+        remove_metadata();
     }
+}
 
-    // A held GEMV is deliberately not flushed here: its result is no longer
-    // observable once the owning model is being destroyed, and launching it
-    // would dereference a buffer that is about to be freed. Other owners'
-    // held state remains intact.
-    if (has_held) {
-        g_gemv_held_valid = false;
-    }
-    if (has_prev) {
-        g_gemv_prev_valid = false;
-    }
-    g_gemv_fusable.erase(key);
-
-    g_gqh_tight.erase(key);
-    g_gqh_ileave.erase(key);
-    if (has_padded) {
-        uint8_t* padded_ptr = padded->second;
-        (void)hipFree(padded_ptr);
-        g_gqh_padded.erase(padded);
-    }
+extern "C" void supersonic_gqh_hip_unregister_wire(int device_ordinal, const void* wire) {
+    const void* wires[1] = {wire};
+    supersonic_gqh_hip_unregister_wires(device_ordinal, wires, 1);
 }
 
 extern "C" int supersonic_gqh_hip_matvec_stream(
@@ -1435,8 +1488,12 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
         g_gemv_held_valid = false;
         g_gemv_prev_valid = false;
         if (gqh_gemv_pairable(held, cur)) {
-            if (gqh_gemv_launch_pair(held, cur) == 0) {
-                return launch_result(421, 422);
+            const int pair_status = gqh_gemv_launch_pair(held, cur);
+            if (pair_status == 0) {
+                return 0;
+            }
+            if (pair_status != 1) {
+                return pair_status;
             }
             const int st = gqh_gemv_launch_args(held);
             return st != 0 ? st : gqh_gemv_launch_args(cur);

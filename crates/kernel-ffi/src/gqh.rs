@@ -3,7 +3,7 @@
 //! Decode is bit-exact against `model_store::gqh`. The fused matvec keeps the
 //! same scale product order (`e4m3(d) * tensor_scale`, then `* (ratio/15)`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_int, c_void};
 use std::sync::{Mutex, OnceLock};
 
@@ -98,6 +98,28 @@ pub fn unregister(ordinal: usize, ptr: *const c_void) {
         .remove(&(ordinal, ptr as usize));
     unsafe {
         supersonic_gqh_hip_unregister_wire(ordinal as c_int, ptr);
+    }
+}
+
+fn unregister_many(ordinal: usize, ptrs: &[usize]) {
+    if ptrs.is_empty() {
+        return;
+    }
+    {
+        let mut headers = header_map().lock().expect("gqh header registry");
+        for &ptr in ptrs {
+            headers.remove(&(ordinal, ptr));
+        }
+    }
+    {
+        let mut mixes = mix_map().lock().expect("mix registry");
+        for &ptr in ptrs {
+            mixes.remove(&(ordinal, ptr));
+        }
+    }
+    let wires: Vec<*const c_void> = ptrs.iter().map(|&ptr| ptr as *const c_void).collect();
+    unsafe {
+        supersonic_gqh_hip_unregister_wires(ordinal as c_int, wires.as_ptr(), wires.len());
     }
 }
 
@@ -233,8 +255,18 @@ impl RegistrationBatch {
 
     pub fn clear(&mut self) {
         self.pending.clear();
+        let mut grouped: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for registration in &mut self.committed {
-            registration.unregister();
+            if registration.ptr != 0 {
+                grouped
+                    .entry(registration.ordinal)
+                    .or_default()
+                    .push(registration.ptr);
+                registration.ptr = 0;
+            }
+        }
+        for (ordinal, ptrs) in grouped {
+            unregister_many(ordinal, &ptrs);
         }
         self.committed.clear();
     }
@@ -283,7 +315,7 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> c_int;
 
-    fn supersonic_gqh_hip_gemm_flush();
+    fn supersonic_gqh_hip_gemm_flush(device_ordinal: c_int) -> c_int;
 
     fn supersonic_gqh_hip_dequant_gemm_bf16(
         device_ordinal: c_int,
@@ -316,6 +348,11 @@ unsafe extern "C" {
     fn supersonic_gqh_hip_enable_tight_decode();
 
     fn supersonic_gqh_hip_unregister_wire(device_ordinal: c_int, wire: *const c_void);
+    fn supersonic_gqh_hip_unregister_wires(
+        device_ordinal: c_int,
+        wires: *const *const c_void,
+        count: usize,
+    );
 
     fn supersonic_qwen35_4b_hip_invalidate_decode_cache(
         device_ordinal: c_int,
@@ -475,10 +512,12 @@ pub fn dequant_gemm_bf16(
     Ok(())
 }
 
-pub fn gemm_flush() {
-    unsafe {
-        supersonic_gqh_hip_gemm_flush();
+pub fn gemm_flush(ordinal: usize) -> Result<(), GpuError> {
+    let status = unsafe { supersonic_gqh_hip_gemm_flush(ordinal as c_int) };
+    if status != 0 {
+        return Err(backend_error(Backend::Hip, "gqh gemm flush", status));
     }
+    Ok(())
 }
 
 pub fn enable_tight_decode() {
@@ -799,6 +838,25 @@ mod tests {
         assert!(lookup_header(0, ptr).is_none());
         assert!(lookup_header(1, ptr).is_some());
         unregister(1, ptr);
+        assert!(lookup_header(1, ptr).is_none());
+    }
+
+    #[test]
+    fn registration_batches_keep_same_pointer_lifetimes_isolated_by_ordinal() {
+        let ptr = 0x7_1000 as *const c_void;
+        {
+            let mut first = RegistrationBatch::new();
+            let mut second = RegistrationBatch::new();
+            first.stage_header(0, ptr, 10.5, 1);
+            second.stage_header(1, ptr, 11.5, 2);
+            first.commit();
+            second.commit();
+            assert_eq!(lookup_header(0, ptr).unwrap().tensor_scale, 10.5);
+            assert_eq!(lookup_header(1, ptr).unwrap().tensor_scale, 11.5);
+            first.clear();
+            assert!(lookup_header(0, ptr).is_none());
+            assert_eq!(lookup_header(1, ptr).unwrap().tensor_scale, 11.5);
+        }
         assert!(lookup_header(1, ptr).is_none());
     }
 
