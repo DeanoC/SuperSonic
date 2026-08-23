@@ -40,7 +40,8 @@ class ActiveDocsTests(unittest.TestCase):
             (root / "README.md").write_text(
                 "# Product\n\n"
                 "Run with --backend cuda for Qwen3.5.\n"
-                "SUPERSONIC_BACKENDS=cuda QWEN35_MODEL_DIR=/tmp/Gemma4\n",
+                "SUPERSONIC_BACKENDS=cuda QWEN35_MODEL_DIR=/tmp/Gemma4\n"
+                "KV-FP8 VMM MoE Q4_K_M safetensors --int4\n",
                 encoding="utf-8",
             )
 
@@ -51,6 +52,8 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertTrue(any("SUPERSONIC_BACKENDS" in violation for violation in violations))
         self.assertTrue(any("QWEN35" in violation for violation in violations))
         self.assertTrue(any("Gemma4" in violation for violation in violations))
+        self.assertTrue(any("KV-FP8" in violation for violation in violations))
+        self.assertTrue(any("Q4_K_M" in violation for violation in violations))
 
     def test_internal_flm_term_is_allowed_only_in_explicit_internal_section(self):
         checker = load_checker()

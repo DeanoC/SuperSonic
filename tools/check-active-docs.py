@@ -29,8 +29,11 @@ FORBIDDEN_PATTERNS = (
     re.compile(r"\b(?:gemma|phi|llama)(?:[0-9]|[_-][a-z0-9])", re.IGNORECASE),
     re.compile(r"qwen[-_ ]*3[.]?[56](?![0-9])", re.IGNORECASE),
     re.compile(r"\bDFlash\b|\bSpecPrefill\b|\bCertified[-_ ]?KV\b", re.IGNORECASE),
+    re.compile(r"\bKV[-_ ]?FP8\b|\bFP8\b|\bVMM\b|\bMoE\b", re.IGNORECASE),
+    re.compile(r"\b(?:Q4KM|Q4_K_M|safetensors|oracle)\b|--gptq\b", re.IGNORECASE),
     re.compile(r"--flm(?:-file)?\b|\bflm[_-]file\b", re.IGNORECASE),
     re.compile(r"--q4km\b|\bq4[_-]k[_-]m\b", re.IGNORECASE),
+    re.compile(r"--(?:int4|bf16|fp8|batch-size|force-kernel-decode)\b", re.IGNORECASE),
 )
 FLM_RE = re.compile(r"\bFLM\b|--flm(?:-file)?\b|\bflm[_-]file\b", re.IGNORECASE)
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)\s]+)")
