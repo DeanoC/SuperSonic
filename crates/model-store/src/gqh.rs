@@ -1,4 +1,4 @@
-//! GQH (Geo-Quant Hierarchical) codecs 13–15 / GGUF qtypes 108–111.
+//! GQH (Geo-Quant Hierarchical) codecs 13–16 / GGUF qtypes 108–111.
 //!
 //! Decode is bit-exact against the geo-lucebox CPU reference and the
 //! `tests/gqh-vectors` wires. Do not reassociate the float products.
@@ -9,10 +9,7 @@ mod tables {
 
 use crate::Error;
 
-pub const GGML_TYPE_GQH3: u32 = 108;
-pub const GGML_TYPE_GQH2_H: u32 = 109;
-pub const GGML_TYPE_GQH2_C: u32 = 110;
-pub const GGML_TYPE_GQH4: u32 = 111;
+pub use crate::codec::{GGML_TYPE_GQH2_C, GGML_TYPE_GQH2_H, GGML_TYPE_GQH3, GGML_TYPE_GQH4};
 
 pub const GQH_HEADERS_KV: &str = "geoquant.gqh.headers";
 const GQH_MAGIC: &[u8; 8] = b"GQHh1\0\0\0";
@@ -27,21 +24,21 @@ pub enum GqhRung {
 
 impl GqhRung {
     pub fn from_ggml_type(ty: u32) -> Option<Self> {
-        match ty {
-            GGML_TYPE_GQH3 => Some(Self::Gqh3),
-            GGML_TYPE_GQH2_H => Some(Self::Gqh2H),
-            GGML_TYPE_GQH2_C => Some(Self::Gqh2C),
-            GGML_TYPE_GQH4 => Some(Self::Gqh4),
+        match crate::codec::flm_codec_for_ggml_type(ty) {
+            Some(crate::codec::CODEC_GQH3) => Some(Self::Gqh3),
+            Some(crate::codec::CODEC_GQH2_H) => Some(Self::Gqh2H),
+            Some(crate::codec::CODEC_GQH2_C) => Some(Self::Gqh2C),
+            Some(crate::codec::CODEC_GQH4) => Some(Self::Gqh4),
             _ => None,
         }
     }
 
     pub fn from_flm_codec(semantic_id: u16) -> Option<Self> {
-        match semantic_id {
-            crate::flm::CODEC_GQH3 => Some(Self::Gqh3),
-            crate::flm::CODEC_GQH2_H => Some(Self::Gqh2H),
-            crate::flm::CODEC_GQH2_C => Some(Self::Gqh2C),
-            crate::flm::CODEC_GQH4 => Some(Self::Gqh4),
+        match crate::codec::ggml_type_for_flm_codec(semantic_id) {
+            Some(GGML_TYPE_GQH3) => Some(Self::Gqh3),
+            Some(GGML_TYPE_GQH2_H) => Some(Self::Gqh2H),
+            Some(GGML_TYPE_GQH2_C) => Some(Self::Gqh2C),
+            Some(GGML_TYPE_GQH4) => Some(Self::Gqh4),
             _ => None,
         }
     }
@@ -57,10 +54,10 @@ impl GqhRung {
 
     pub fn flm_codec(self) -> u16 {
         match self {
-            Self::Gqh3 => crate::flm::CODEC_GQH3,
-            Self::Gqh2H => crate::flm::CODEC_GQH2_H,
-            Self::Gqh2C => crate::flm::CODEC_GQH2_C,
-            Self::Gqh4 => crate::flm::CODEC_GQH4,
+            Self::Gqh3 => crate::codec::CODEC_GQH3,
+            Self::Gqh2H => crate::codec::CODEC_GQH2_H,
+            Self::Gqh2C => crate::codec::CODEC_GQH2_C,
+            Self::Gqh4 => crate::codec::CODEC_GQH4,
         }
     }
 

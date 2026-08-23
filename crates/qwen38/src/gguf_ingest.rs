@@ -778,7 +778,6 @@ pub fn load_weights(
         is_int4: false,
         int4_group_size: 0,
         is_int8: false,
-        int8_baked_store: None,
         int8_outlier_threshold: 0.0,
         mtp,
     })

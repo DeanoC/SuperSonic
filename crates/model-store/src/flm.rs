@@ -18,17 +18,13 @@ pub const CODEC_FP8_E4M3_B128_BF16_INV: u16 = 8;
 pub const CODEC_FP8_E4M3_B64_BF16: u16 = 9;
 pub const CODEC_SUPERSONIC_NATIVE_INT4_G128_BF16: u16 = 10;
 pub const CODEC_ROW_GROUP_INT4_BF16_SYM: u16 = 11;
-pub const CODEC_GQH3: u16 = 13;
-pub const CODEC_GQH2_H: u16 = 14;
-pub const CODEC_GQH2_C: u16 = 15;
-pub const CODEC_GQH4: u16 = 16;
+pub use crate::codec::{
+    CODEC_GQH2_C, CODEC_GQH2_H, CODEC_GQH3, CODEC_GQH4, GGML_TYPE_GQH2_C, GGML_TYPE_GQH2_H,
+    GGML_TYPE_GQH3, GGML_TYPE_GQH4,
+};
 pub const STORAGE_ABI_GQH3: u16 = 10;
 pub const STORAGE_ABI_GQH2_H: u16 = 11;
 pub const STORAGE_ABI_GQH2_C: u16 = 12;
-pub const GGML_TYPE_GQH3: u32 = 108;
-pub const GGML_TYPE_GQH2_H: u32 = 109;
-pub const GGML_TYPE_GQH2_C: u32 = 110;
-pub const GGML_TYPE_GQH4: u32 = 111;
 pub const MODEL_QWEN3_6_DENSE_V1: u16 = 1;
 pub const MODEL_QWEN3_6_MOE_V1: u16 = 2;
 pub const MODEL_QWEN3_8_DENSE_V1: u16 = 3;
@@ -342,7 +338,7 @@ impl FlmRowGroupQuantParams {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlmLogicalTensor {
     pub tensor_id: u32,
     pub name: String,
@@ -354,6 +350,156 @@ pub struct FlmLogicalTensor {
     pub storage_binding_start: u32,
     pub storage_binding_count: u16,
     pub flags: u16,
+}
+
+/// Internal FLM logical-tensor descriptor used for CPU-side format checks.
+/// This is intentionally not re-exported from the model-store crate root and
+/// is not a product weight-loader API.
+pub type FlmTensorDescriptor = FlmLogicalTensor;
+
+const TENSOR_DESCRIPTOR_MAGIC: &[u8; 4] = b"FTD1";
+const TENSOR_DESCRIPTOR_VERSION: u16 = 1;
+const TENSOR_DESCRIPTOR_HEADER_SIZE: usize = 46;
+
+impl FlmLogicalTensor {
+    /// Encode one descriptor without touching a GPU or a model artifact.
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        validate_tensor_descriptor_fields(self)?;
+        let name = self.name.as_bytes();
+        let name_len = u16::try_from(name.len()).map_err(|_| {
+            Error::Other("FLM tensor descriptor name exceeds u16 length".to_string())
+        })?;
+
+        let mut out = Vec::with_capacity(TENSOR_DESCRIPTOR_HEADER_SIZE + name.len());
+        out.extend_from_slice(TENSOR_DESCRIPTOR_MAGIC);
+        out.extend_from_slice(&TENSOR_DESCRIPTOR_VERSION.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&self.tensor_id.to_le_bytes());
+        out.extend_from_slice(&self.role_id.to_le_bytes());
+        out.push(self.rank);
+        out.push(0);
+        for dim in self.shape {
+            out.extend_from_slice(&dim.to_le_bytes());
+        }
+        out.extend_from_slice(&self.value_format_id.to_le_bytes());
+        out.extend_from_slice(&self.reconstruction_dtype.to_le_bytes());
+        out.extend_from_slice(&self.storage_binding_start.to_le_bytes());
+        out.extend_from_slice(&self.storage_binding_count.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(name);
+        Ok(out)
+    }
+
+    /// Decode one descriptor without touching a GPU or a model artifact.
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        if buf.len() < TENSOR_DESCRIPTOR_HEADER_SIZE {
+            return Err(Error::Other(format!(
+                "FLM tensor descriptor is truncated ({} B < {TENSOR_DESCRIPTOR_HEADER_SIZE})",
+                buf.len()
+            )));
+        }
+        if &buf[..4] != TENSOR_DESCRIPTOR_MAGIC {
+            return Err(Error::Other("bad FLM tensor descriptor magic".to_string()));
+        }
+        let version = read_u16(buf, 4, "FLM tensor descriptor version")?;
+        if version != TENSOR_DESCRIPTOR_VERSION {
+            return Err(Error::Other(format!(
+                "unsupported FLM tensor descriptor version {version}; expected {TENSOR_DESCRIPTOR_VERSION}"
+            )));
+        }
+        let reserved = read_u16(buf, 6, "FLM tensor descriptor reserved")?;
+        if reserved != 0 {
+            return Err(Error::Other(
+                "FLM tensor descriptor reserved field is nonzero".to_string(),
+            ));
+        }
+
+        let tensor_id = read_u32(buf, 8, "FLM tensor descriptor tensor_id")?;
+        let role_id = read_u16(buf, 12, "FLM tensor descriptor role_id")?;
+        let rank = *read_exact_range(buf, 14, 1, "FLM tensor descriptor rank")?
+            .first()
+            .expect("slice length checked");
+        let reserved0 = *read_exact_range(buf, 15, 1, "FLM tensor descriptor reserved0")?
+            .first()
+            .expect("slice length checked");
+        if reserved0 != 0 {
+            return Err(Error::Other(
+                "FLM tensor descriptor reserved0 is nonzero".to_string(),
+            ));
+        }
+        let mut shape = [0u32; 4];
+        for (idx, dim) in shape.iter_mut().enumerate() {
+            *dim = read_u32(buf, 16 + idx * 4, "FLM tensor descriptor shape")?;
+        }
+        let value_format_id = read_u16(buf, 32, "FLM tensor descriptor value_format_id")?;
+        let reconstruction_dtype = read_u16(buf, 34, "FLM tensor descriptor reconstruction_dtype")?;
+        let storage_binding_start =
+            read_u32(buf, 36, "FLM tensor descriptor storage_binding_start")?;
+        let storage_binding_count =
+            read_u16(buf, 40, "FLM tensor descriptor storage_binding_count")?;
+        let flags = read_u16(buf, 42, "FLM tensor descriptor flags")?;
+        let name_len = usize::from(read_u16(buf, 44, "FLM tensor descriptor name_len")?);
+        let name_end = TENSOR_DESCRIPTOR_HEADER_SIZE
+            .checked_add(name_len)
+            .ok_or_else(|| Error::Other("FLM tensor descriptor name overflows".to_string()))?;
+        let name_bytes = read_exact_range(
+            buf,
+            TENSOR_DESCRIPTOR_HEADER_SIZE,
+            name_len,
+            "FLM tensor descriptor name",
+        )?;
+        if name_end != buf.len() {
+            return Err(Error::Other(format!(
+                "FLM tensor descriptor has trailing bytes (expected {name_end}, got {})",
+                buf.len()
+            )));
+        }
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|err| Error::Other(format!("FLM tensor descriptor name is not UTF-8: {err}")))?
+            .to_string();
+
+        let descriptor = Self {
+            tensor_id,
+            name,
+            role_id,
+            rank,
+            shape,
+            value_format_id,
+            reconstruction_dtype,
+            storage_binding_start,
+            storage_binding_count,
+            flags,
+        };
+        validate_tensor_descriptor_fields(&descriptor)?;
+        Ok(descriptor)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.encode()
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, Error> {
+        Self::decode(buf)
+    }
+}
+
+fn validate_tensor_descriptor_fields(descriptor: &FlmLogicalTensor) -> Result<(), Error> {
+    if descriptor.rank > 4 {
+        return Err(Error::Other(format!(
+            "FLM tensor descriptor rank {} exceeds 4",
+            descriptor.rank
+        )));
+    }
+    if descriptor.shape[usize::from(descriptor.rank)..]
+        .iter()
+        .any(|dim| *dim != 0)
+    {
+        return Err(Error::Other(
+            "FLM tensor descriptor has nonzero shape beyond rank".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
