@@ -12,6 +12,8 @@ HAL_BACKEND = ROOT / "crates" / "gpu-hal" / "src" / "backend.rs"
 HAL_LIB = ROOT / "crates" / "gpu-hal" / "src" / "lib.rs"
 HAL_OPS = ROOT / "crates" / "gpu-hal" / "src" / "ops.rs"
 HAL_VMM = ROOT / "crates" / "gpu-hal" / "src" / "vmm.rs"
+CORE_LIB = ROOT / "crates" / "core" / "src" / "lib.rs"
+CORE_BACKEND = ROOT / "crates" / "core" / "src" / "backend.rs"
 KERNEL_FFI_SRC = ROOT / "crates" / "kernel-ffi" / "src"
 RETAINED_SOURCE_ROOTS = (
     ROOT / "crates" / "core" / "src",
@@ -148,7 +150,8 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
         lib = HAL_LIB.read_text(encoding="utf-8")
         ops = HAL_OPS.read_text(encoding="utf-8")
         vmm = HAL_VMM.read_text(encoding="utf-8")
-        self.assertIn("vec![Backend::Hip]", backend)
+        self.assertRegex(backend, r"pub enum Backend\s*\{\s*Hip,\s*\}")
+        self.assertNotIn("compiled_backends", backend)
         self.assertIn("Backend::Hip\n}", backend)
         self.assertNotIn("supersonic_backend_cuda", backend)
         self.assertNotIn("supersonic_backend_metal", backend)
@@ -157,6 +160,25 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
         self.assertNotIn("use crate::cuda_sys", ops)
         self.assertNotIn("use crate::metal_sys", ops)
         self.assertNotIn("use crate::cuda_sys", vmm)
+
+    def test_hip_surfaces_have_no_disabled_non_hip_branches(self):
+        for path in (
+            HAL_OPS,
+            HAL_VMM,
+            KERNEL_FFI_SRC / "qwen35.rs",
+        ):
+            source = path.read_text(encoding="utf-8")
+            self.assertNotIn(
+                "cfg(not(supersonic_backend_hip))",
+                source,
+                f"disabled non-HIP branch remains in {path}",
+            )
+
+    def test_core_and_hal_have_no_backend_selector_compatibility_surfaces(self):
+        self.assertFalse(CORE_BACKEND.exists(), "legacy core backend parser remains")
+        self.assertNotIn("pub mod backend", CORE_LIB.read_text(encoding="utf-8"))
+        self.assertNotIn("compiled_backends", HAL_BACKEND.read_text(encoding="utf-8"))
+        self.assertNotIn("set_backend", HAL_BACKEND.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

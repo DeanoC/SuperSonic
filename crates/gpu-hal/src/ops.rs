@@ -1,4 +1,3 @@
-use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::BTreeMap;
 #[cfg(supersonic_backend_hipfile)]
 use std::ffi::{c_char, CStr, CString};
@@ -11,11 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-#[cfg(supersonic_backend_hip)]
 use crate::backend::AllocStrategy;
 use crate::backend::{current_backend, current_strategy_for, Backend, BufferKind, DeviceInfo};
 use crate::error::{backend_error, GpuError, Result};
-#[cfg(supersonic_backend_hip)]
 use crate::hip_sys::*;
 use crate::scalar_type::ScalarType;
 
@@ -264,27 +261,15 @@ pub(crate) fn with_device_impl<T>(
     let mut prev = 0;
     match backend {
         Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
-            {
-                let status = unsafe { hipGetDevice(&mut prev) };
-                if status != 0 {
-                    return Err(backend_error(Backend::Hip, "hipGetDevice", status));
-                }
+            let status = unsafe { hipGetDevice(&mut prev) };
+            if status != 0 {
+                return Err(backend_error(Backend::Hip, "hipGetDevice", status));
             }
-            #[cfg(not(supersonic_backend_hip))]
-            return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
         }
     }
     let restore = if prev != ordinal_i32 {
         let status = match backend {
-            Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                unsafe {
-                    hipSetDevice(ordinal_i32)
-                }
-                #[cfg(not(supersonic_backend_hip))]
-                1
-            }
+            Backend::Hip => unsafe { hipSetDevice(ordinal_i32) },
         };
         if status != 0 {
             return Err(match backend {
@@ -299,14 +284,7 @@ pub(crate) fn with_device_impl<T>(
     if let Some(prev) = restore {
         let _ = prev;
         let status = match backend {
-            Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                unsafe {
-                    hipSetDevice(prev)
-                }
-                #[cfg(not(supersonic_backend_hip))]
-                1
-            }
+            Backend::Hip => unsafe { hipSetDevice(prev) },
         };
         if status != 0 {
             return Err(match backend {
@@ -323,14 +301,7 @@ pub fn set_device(ordinal: usize) -> Result<()> {
         .map_err(|_| GpuError::InvalidArg(format!("device ordinal {ordinal} overflows c_int")))?;
     let _ = ordinal_i32;
     let status = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
-            unsafe {
-                hipSetDevice(ordinal_i32)
-            }
-            #[cfg(not(supersonic_backend_hip))]
-            1
-        }
+        Backend::Hip => unsafe { hipSetDevice(ordinal_i32) },
     };
     if status != 0 {
         return Err(match backend {
@@ -390,7 +361,6 @@ pub(crate) fn alloc(
         let backend = current_backend();
         with_device_impl(backend, ordinal, || match backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
                 unsafe {
                     if strategy == AllocStrategy::HostMapped {
                         let mut host_ptr = std::ptr::null_mut();
@@ -437,8 +407,6 @@ pub(crate) fn alloc(
                     })?;
                     Ok((nn, AllocatorKind::Discrete))
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
         })
     })
@@ -454,19 +422,14 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
     }
     match backend {
         Backend::Hip => with_device_impl(backend, ordinal, || {
-            #[cfg(supersonic_backend_hip)]
-            {
-                let mut ptr = std::ptr::null_mut();
-                let status = unsafe { hipHostMalloc(&mut ptr, len_bytes, 0) };
-                if status != 0 {
-                    return Err(backend_error(Backend::Hip, "hipHostMalloc", status));
-                }
-                NonNull::new(ptr).ok_or_else(|| {
-                    GpuError::backend(Backend::Hip, "hipHostMalloc returned null".into())
-                })
+            let mut ptr = std::ptr::null_mut();
+            let status = unsafe { hipHostMalloc(&mut ptr, len_bytes, 0) };
+            if status != 0 {
+                return Err(backend_error(Backend::Hip, "hipHostMalloc", status));
             }
-            #[cfg(not(supersonic_backend_hip))]
-            Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            NonNull::new(ptr).ok_or_else(|| {
+                GpuError::backend(Backend::Hip, "hipHostMalloc returned null".into())
+            })
         }),
     }
 }
@@ -474,7 +437,7 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
 /// Return the device-visible pointer for mapped pinned host memory.
 pub fn host_pinned_device_ptr(
     backend: Backend,
-    ordinal: usize,
+    _ordinal: usize,
     ptr: *mut c_void,
 ) -> Result<NonNull<c_void>> {
     if ptr.is_null() {
@@ -489,23 +452,18 @@ pub fn host_pinned_device_ptr(
 }
 
 /// Free host memory allocated by `alloc_host_pinned`.
-pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_bytes: usize) {
+pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, _len_bytes: usize) {
     if ptr.is_null() {
         return;
     }
     match backend {
         Backend::Hip => {
             let _: Result<()> = with_device_impl(backend, ordinal, || {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipHostFree(ptr) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipHostFree", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipHostFree(ptr) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipHostFree", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             });
         }
     }
@@ -602,16 +560,11 @@ impl RegisteredHostBuffer {
         hal_profile_time("host_register", len_bytes, || {
             with_device_impl(backend, ordinal, || match backend {
                 Backend::Hip => {
-                    #[cfg(supersonic_backend_hip)]
-                    {
-                        let status = unsafe { hipHostRegister(ptr.as_ptr(), len_bytes, 0) };
-                        if status != 0 {
-                            return Err(backend_error(Backend::Hip, "hipHostRegister", status));
-                        }
-                        Ok(())
+                    let status = unsafe { hipHostRegister(ptr.as_ptr(), len_bytes, 0) };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipHostRegister", status));
                     }
-                    #[cfg(not(supersonic_backend_hip))]
-                    Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                    Ok(())
                 }
             })
         })?;
@@ -641,16 +594,11 @@ impl Drop for RegisteredHostBuffer {
         let _ = hal_profile_time("host_unregister", len_bytes, || {
             with_device_impl(backend, ordinal, || match backend {
                 Backend::Hip => {
-                    #[cfg(supersonic_backend_hip)]
-                    {
-                        let status = unsafe { hipHostUnregister(ptr) };
-                        if status != 0 {
-                            return Err(backend_error(Backend::Hip, "hipHostUnregister", status));
-                        }
-                        Ok(())
+                    let status = unsafe { hipHostUnregister(ptr) };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipHostUnregister", status));
                     }
-                    #[cfg(not(supersonic_backend_hip))]
-                    Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                    Ok(())
                 }
             })
         });
@@ -685,25 +633,10 @@ pub(crate) fn free(
     hal_profile_time("free", 0, || {
         let _ = with_device_impl(backend, ordinal, || {
             let status = match (backend, allocator) {
-                (Backend::Hip, AllocatorKind::UnifiedHost { host_ptr }) => {
-                    #[cfg(supersonic_backend_hip)]
-                    unsafe {
-                        hipHostFree(host_ptr.as_ptr())
-                    }
-                    #[cfg(not(supersonic_backend_hip))]
-                    {
-                        let _ = host_ptr;
-                        1
-                    }
-                }
-                (Backend::Hip, AllocatorKind::Discrete) => {
-                    #[cfg(supersonic_backend_hip)]
-                    unsafe {
-                        hipFree(dev_ptr)
-                    }
-                    #[cfg(not(supersonic_backend_hip))]
-                    1
-                }
+                (Backend::Hip, AllocatorKind::UnifiedHost { host_ptr }) => unsafe {
+                    hipHostFree(host_ptr.as_ptr())
+                },
+                (Backend::Hip, AllocatorKind::Discrete) => unsafe { hipFree(dev_ptr) },
             };
             if status != 0 {
                 return Err(match (backend, allocator) {
@@ -731,14 +664,7 @@ pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
         let backend = current_backend();
         with_device_impl(backend, ordinal, || {
             let status = match backend {
-                Backend::Hip => {
-                    #[cfg(supersonic_backend_hip)]
-                    unsafe {
-                        hipMemcpy(dst, src, len, HIP_MEMCPY_HOST_TO_DEVICE)
-                    }
-                    #[cfg(not(supersonic_backend_hip))]
-                    1
-                }
+                Backend::Hip => unsafe { hipMemcpy(dst, src, len, HIP_MEMCPY_HOST_TO_DEVICE) },
             };
             if status != 0 {
                 return Err(match backend {
@@ -770,18 +696,12 @@ pub fn copy_h2d_async(
     hal_profile_time("copy_h2d_async", len, || {
         with_device_impl(stream.backend, ordinal, || match stream.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe {
-                        hipMemcpyAsync(dst, src, len, HIP_MEMCPY_HOST_TO_DEVICE, stream.raw)
-                    };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipMemcpyAsync(H2D)", status));
-                    }
-                    Ok(())
+                let status =
+                    unsafe { hipMemcpyAsync(dst, src, len, HIP_MEMCPY_HOST_TO_DEVICE, stream.raw) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipMemcpyAsync(H2D)", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         })
     })
@@ -934,14 +854,7 @@ pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
         let backend = current_backend();
         with_device_impl(backend, ordinal, || {
             let status = match backend {
-                Backend::Hip => {
-                    #[cfg(supersonic_backend_hip)]
-                    unsafe {
-                        hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_HOST)
-                    }
-                    #[cfg(not(supersonic_backend_hip))]
-                    1
-                }
+                Backend::Hip => unsafe { hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_HOST) },
             };
             if status != 0 {
                 return Err(match backend {
@@ -964,14 +877,7 @@ pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
         let backend = current_backend();
         with_device_impl(backend, ordinal, || {
             let status = match backend {
-                Backend::Hip => {
-                    #[cfg(supersonic_backend_hip)]
-                    unsafe {
-                        hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_DEVICE)
-                    }
-                    #[cfg(not(supersonic_backend_hip))]
-                    1
-                }
+                Backend::Hip => unsafe { hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_DEVICE) },
             };
             if status != 0 {
                 return Err(match backend {
@@ -994,14 +900,7 @@ pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> 
         let backend = current_backend();
         with_device_impl(backend, ordinal, || {
             let status = match backend {
-                Backend::Hip => {
-                    #[cfg(supersonic_backend_hip)]
-                    unsafe {
-                        hipMemset(dst, 0, len)
-                    }
-                    #[cfg(not(supersonic_backend_hip))]
-                    1
-                }
+                Backend::Hip => unsafe { hipMemset(dst, 0, len) },
             };
             if status != 0 {
                 return Err(match backend {
@@ -1032,16 +931,11 @@ pub fn memset_zeros_async(
     hal_profile_time("memset_zeros_async", len, || {
         with_device_impl(stream.backend, ordinal, || match stream.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipMemsetAsync(dst, 0, len, stream.raw) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipMemsetAsync", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipMemsetAsync(dst, 0, len, stream.raw) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipMemsetAsync", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         })
     })
@@ -1053,14 +947,7 @@ pub fn sync(ordinal: usize) -> Result<()> {
         let backend = current_backend();
         with_device_impl(backend, ordinal, || {
             let status = match backend {
-                Backend::Hip => {
-                    #[cfg(supersonic_backend_hip)]
-                    unsafe {
-                        hipDeviceSynchronize()
-                    }
-                    #[cfg(not(supersonic_backend_hip))]
-                    1
-                }
+                Backend::Hip => unsafe { hipDeviceSynchronize() },
             };
             if status != 0 {
                 return Err(match backend {
@@ -1103,22 +990,16 @@ impl GpuStream {
         let backend = current_backend();
         let raw = with_device_impl(backend, ordinal, || match backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let mut raw: *mut c_void = std::ptr::null_mut();
-                    let status =
-                        unsafe { hipStreamCreateWithFlags(&mut raw, HIP_STREAM_NON_BLOCKING) };
-                    if status != 0 {
-                        return Err(backend_error(
-                            Backend::Hip,
-                            "hipStreamCreateWithFlags",
-                            status,
-                        ));
-                    }
-                    Ok(raw)
+                let mut raw: *mut c_void = std::ptr::null_mut();
+                let status = unsafe { hipStreamCreateWithFlags(&mut raw, HIP_STREAM_NON_BLOCKING) };
+                if status != 0 {
+                    return Err(backend_error(
+                        Backend::Hip,
+                        "hipStreamCreateWithFlags",
+                        status,
+                    ));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(raw)
             }
         })?;
         Ok(Self {
@@ -1131,16 +1012,11 @@ impl GpuStream {
     pub fn synchronize(&self) -> Result<()> {
         with_device_impl(self.backend, self.ordinal, || match self.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipStreamSynchronize(self.raw) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipStreamSynchronize", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipStreamSynchronize(self.raw) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipStreamSynchronize", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         })
     }
@@ -1153,16 +1029,11 @@ impl GpuStream {
         }
         with_device_impl(self.backend, self.ordinal, || match self.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipStreamWaitEvent(self.raw, event.raw, 0) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipStreamWaitEvent", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipStreamWaitEvent(self.raw, event.raw, 0) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipStreamWaitEvent", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         })
     }
@@ -1175,16 +1046,11 @@ impl Drop for GpuStream {
         }
         let _ = with_device_impl(self.backend, self.ordinal, || match self.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipStreamDestroy(self.raw) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipStreamDestroy", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipStreamDestroy(self.raw) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipStreamDestroy", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         });
     }
@@ -1197,16 +1063,11 @@ impl GpuEvent {
         let mut raw: *mut c_void = std::ptr::null_mut();
         with_device_impl(backend, ordinal, || match backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipEventCreate(&mut raw) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipEventCreate", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipEventCreate(&mut raw) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipEventCreate", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         })?;
         Ok(Self {
@@ -1219,16 +1080,11 @@ impl GpuEvent {
     pub fn record(&self) -> Result<()> {
         with_device_impl(self.backend, self.ordinal, || match self.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipEventRecord(self.raw, std::ptr::null_mut()) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipEventRecord", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipEventRecord(self.raw, std::ptr::null_mut()) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipEventRecord", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         })
     }
@@ -1241,16 +1097,11 @@ impl GpuEvent {
         }
         with_device_impl(self.backend, self.ordinal, || match self.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipEventRecord(self.raw, stream.raw) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipEventRecord", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipEventRecord(self.raw, stream.raw) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipEventRecord", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         })
     }
@@ -1258,19 +1109,14 @@ impl GpuEvent {
     pub fn query(&self) -> Result<bool> {
         with_device_impl(self.backend, self.ordinal, || match self.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipEventQuery(self.raw) };
-                    if status == 0 {
-                        Ok(true)
-                    } else if status == HIP_ERROR_NOT_READY {
-                        Ok(false)
-                    } else {
-                        Err(backend_error(Backend::Hip, "hipEventQuery", status))
-                    }
+                let status = unsafe { hipEventQuery(self.raw) };
+                if status == 0 {
+                    Ok(true)
+                } else if status == HIP_ERROR_NOT_READY {
+                    Ok(false)
+                } else {
+                    Err(backend_error(Backend::Hip, "hipEventQuery", status))
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
         })
     }
@@ -1278,16 +1124,11 @@ impl GpuEvent {
     pub fn synchronize(&self) -> Result<()> {
         with_device_impl(self.backend, self.ordinal, || match self.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipEventSynchronize(self.raw) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipEventSynchronize", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipEventSynchronize(self.raw) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipEventSynchronize", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         })
     }
@@ -1300,20 +1141,15 @@ impl GpuEvent {
         }
         match start.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let mut ms: f32 = 0.0;
-                    with_device_impl(start.backend, start.ordinal, || {
-                        let status = unsafe { hipEventElapsedTime(&mut ms, start.raw, end.raw) };
-                        if status != 0 {
-                            return Err(backend_error(Backend::Hip, "hipEventElapsedTime", status));
-                        }
-                        Ok(())
-                    })?;
-                    Ok(ms)
-                }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                let mut ms: f32 = 0.0;
+                with_device_impl(start.backend, start.ordinal, || {
+                    let status = unsafe { hipEventElapsedTime(&mut ms, start.raw, end.raw) };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipEventElapsedTime", status));
+                    }
+                    Ok(())
+                })?;
+                Ok(ms)
             }
         }
     }
@@ -1326,16 +1162,11 @@ impl Drop for GpuEvent {
         }
         let _ = with_device_impl(self.backend, self.ordinal, || match self.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let status = unsafe { hipEventDestroy(self.raw) };
-                    if status != 0 {
-                        return Err(backend_error(Backend::Hip, "hipEventDestroy", status));
-                    }
-                    Ok(())
+                let status = unsafe { hipEventDestroy(self.raw) };
+                if status != 0 {
+                    return Err(backend_error(Backend::Hip, "hipEventDestroy", status));
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                Ok(())
             }
         });
     }

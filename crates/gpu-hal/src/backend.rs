@@ -144,10 +144,6 @@ pub fn current_backend() -> Backend {
     Backend::Hip
 }
 
-pub fn compiled_backends() -> Vec<Backend> {
-    vec![Backend::Hip]
-}
-
 /// Set the active memory architecture. Called once at startup after
 /// typically from `ArchProfile::for_arch(...).memory`.
 pub fn set_memory_architecture(arch: MemoryArchitecture) {

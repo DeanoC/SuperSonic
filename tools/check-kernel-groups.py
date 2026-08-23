@@ -31,32 +31,6 @@ def rel(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
 
 
-def const_block(name: str, build_text: str) -> str:
-    marker = f"const {name}:"
-    start = build_text.find(marker)
-    if start == -1:
-        return ""
-    end_marker = "\n];"
-    end = build_text.find(end_marker, start)
-    if end == -1:
-        return ""
-    return build_text[start:end]
-
-
-def field_values_from_build_rs(name: str, field: str, build_text: str) -> set[str]:
-    block = const_block(name, build_text)
-    if not block:
-        return set()
-    return set(re.findall(rf"{field}:\s*\"([^\"]+)\"", block))
-
-
-def string_values_from_build_rs(name: str, build_text: str) -> set[str]:
-    block = const_block(name, build_text)
-    if not block:
-        return set()
-    return set(re.findall(r'"([^"]+)"', block))
-
-
 def validate_string_list(
     group_id: str, group: dict[str, object], key: str, errors: list[str]
 ) -> list[str]:
@@ -83,9 +57,10 @@ def main() -> int:
         errors.append(f"expected exactly two retained HIP groups, found {len(groups)}")
 
     build_text = BUILD_RS.read_text(encoding="utf-8")
-    build_bridge_sources = field_values_from_build_rs("HIP_BRIDGES", "src_name", build_text)
-    build_bridge_objects = field_values_from_build_rs("HIP_BRIDGES", "obj_name", build_text)
-    build_rerun_paths = string_values_from_build_rs("KERNEL_RERUN_PATHS", build_text)
+    if "kernel-groups.toml" not in build_text or "read_kernel_manifest" not in build_text:
+        errors.append("build.rs must consume kernel-groups.toml through read_kernel_manifest")
+    if re.search(r"\b(?:HIP_GROUPS|HIP_BRIDGES|KERNEL_RERUN_PATHS)\b", build_text):
+        errors.append("build.rs must not maintain a second hardcoded kernel-group list")
 
     seen_ids: set[str] = set()
     seen_bridge_sources: set[str] = set()
@@ -107,9 +82,6 @@ def main() -> int:
             errors.append(f"{group_id}: duplicate id")
         else:
             seen_ids.add(group_id)
-
-        if group_id != f"group #{index}" and group_id not in build_text:
-            errors.append(f"{group_id}: id is not referenced by build.rs")
 
         backend = group.get("backend")
         if backend not in VALID_BACKENDS:
@@ -146,16 +118,12 @@ def main() -> int:
                     errors.append(f"{group_id}: duplicate bridge source {source}")
                 seen_bridge_sources.add(source)
                 manifest_bridge_sources.add(Path(source).name)
-                if Path(source).name not in build_bridge_sources:
-                    errors.append(f"{group_id}: bridge source not compiled by build.rs: {source}")
             if not isinstance(obj, str) or not obj:
                 errors.append(f"{group_id}.bridge #{bridge_index}: missing string object")
             else:
                 if obj in seen_bridge_objects:
                     errors.append(f"{group_id}: duplicate bridge object {obj}")
                 seen_bridge_objects.add(obj)
-                if obj not in build_bridge_objects:
-                    errors.append(f"{group_id}: bridge object not referenced by build.rs: {obj}")
 
         kernel_sources = validate_string_list(group_id, group, "kernel_sources", errors)
         native_sources = validate_string_list(group_id, group, "native_sources", errors)
@@ -167,8 +135,6 @@ def main() -> int:
                 errors.append(f"{group_id}: removed source name is forbidden: {source}")
             if not (ROOT / source).is_file():
                 errors.append(f"{group_id}: kernel source does not exist: {source}")
-            if Path(source).name not in build_rerun_paths and source.replace("kernels/", "") not in build_rerun_paths:
-                errors.append(f"{group_id}: kernel source is not tracked by build.rs: {source}")
         for source in native_sources:
             manifest_native_sources.add(source)
             if FORBIDDEN_SOURCE_RE.search(source):
@@ -186,13 +152,6 @@ def main() -> int:
 
         if backend == "hip" and not bridges:
             errors.append(f"{group_id}: HIP groups require at least one bridge")
-
-    missing_from_manifest = build_bridge_sources - manifest_bridge_sources
-    if missing_from_manifest:
-        errors.append(
-            "build.rs bridge source(s) missing from manifest: "
-            + ", ".join(sorted(missing_from_manifest))
-        )
 
     missing_required_sources = REQUIRED_SOURCES - manifest_kernel_sources
     if missing_required_sources:

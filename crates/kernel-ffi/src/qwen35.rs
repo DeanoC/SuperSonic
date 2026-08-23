@@ -2,7 +2,6 @@ use std::ffi::{c_int, c_uint, c_void};
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 
-#[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
     fn supersonic_qwen35_hip_persistent_decode(
         dtype: c_int,
@@ -133,10 +132,6 @@ fn hip_error(what: &str, status: c_int) -> GpuError {
     )
 }
 
-fn hip_not_compiled() -> GpuError {
-    GpuError::InvalidArg("HIP backend not compiled".into())
-}
-
 /// Invoke the dense Qwen3.8 persistent decode kernel.
 pub fn persistent_decode(
     ordinal: usize,
@@ -156,7 +151,6 @@ pub fn persistent_decode(
     let counters = sync_buf.as_mut_ptr();
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_void };
     let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_void };
-    #[cfg(supersonic_backend_hip)]
     let status = unsafe {
         supersonic_qwen35_hip_persistent_decode(
             dtype.kernel_dtype_code(),
@@ -176,25 +170,6 @@ pub fn persistent_decode(
             rotary_dim,
         )
     };
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = (
-            ordinal,
-            dtype,
-            num_layers,
-            hidden_dim,
-            intermediate_size,
-            seqlen_offset,
-            layer_descs_device,
-            hidden_io,
-            workspace,
-            sync_buf,
-            cos_table,
-            sin_table,
-            rotary_dim,
-        );
-        return Err(hip_not_compiled());
-    }
     if status != 0 {
         return Err(hip_error("persistent_decode kernel", status));
     }
@@ -203,7 +178,6 @@ pub fn persistent_decode(
 
 /// Restore the linear recurrent state after a fused speculative verification.
 pub fn mtp_restore_linear_prefix(commit_len: usize) -> Result<bool, GpuError> {
-    #[cfg(supersonic_backend_hip)]
     {
         let status = unsafe { qwen38_mtp_restore_linear_prefix(commit_len as c_int) };
         return match status {
@@ -214,20 +188,12 @@ pub fn mtp_restore_linear_prefix(commit_len: usize) -> Result<bool, GpuError> {
             ))),
         };
     }
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = commit_len;
-        Err(hip_not_compiled())
-    }
 }
 
 pub fn set_hip_gqh_prepare_only(on: bool) {
-    #[cfg(supersonic_backend_hip)]
     unsafe {
         supersonic_qwen35_4b_hip_set_gqh_prepare_only(if on { 1 } else { 0 });
     }
-    #[cfg(not(supersonic_backend_hip))]
-    let _ = on;
 }
 
 /// Invoke the 4B persistent decode kernel.
@@ -276,7 +242,6 @@ pub fn persistent_decode_4b(
     let int4_scales_ptr = int4_scale_descs
         .map(|buffer| buffer.as_ptr())
         .unwrap_or(std::ptr::null());
-    #[cfg(supersonic_backend_hip)]
     let status = unsafe {
         supersonic_qwen35_4b_hip_persistent_decode(
             dtype.kernel_dtype_code(),
@@ -305,34 +270,6 @@ pub fn persistent_decode_4b(
             int4_scales_ptr,
         )
     };
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = (
-            ordinal,
-            dtype,
-            num_layers,
-            hidden_dim,
-            intermediate_size,
-            seqlen_offset,
-            layer_descs_device,
-            hidden_io,
-            workspace,
-            sync_buf,
-            cos_table,
-            sin_table,
-            rotary_dim,
-            proj_buf_floats,
-            attn_scratch_floats,
-            fp8_scale_descs,
-            kv_fp8_descs,
-            batch_size,
-            batch_descs,
-            int4_scale_descs,
-            enable_timing_slots,
-            enable_attention_trace,
-        );
-        return Err(hip_not_compiled());
-    }
     if status != 0 {
         return Err(hip_error("persistent_decode_4b kernel", status));
     }
@@ -351,7 +288,6 @@ pub fn rms_norm_4b(
     eps: f32,
     hidden_dim: usize,
 ) -> Result<(), GpuError> {
-    #[cfg(supersonic_backend_hip)]
     let status = unsafe {
         supersonic_qwen35_4b_hip_rms_norm(
             dtype.kernel_dtype_code(),
@@ -365,11 +301,6 @@ pub fn rms_norm_4b(
             output.as_mut_ptr(),
         )
     };
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = (ordinal, dtype, output, input, weight, eps, hidden_dim);
-        return Err(hip_not_compiled());
-    }
     if status != 0 {
         return Err(hip_error("rms_norm_4b kernel", status));
     }
@@ -392,7 +323,6 @@ pub fn standalone_matvec_4b(
         )));
     }
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
-    #[cfg(supersonic_backend_hip)]
     let status = unsafe {
         supersonic_qwen35_4b_hip_standalone_matvec(
             dtype.kernel_dtype_code(),
@@ -405,20 +335,6 @@ pub fn standalone_matvec_4b(
             counter_buf.as_mut_ptr() as *mut c_uint,
         )
     };
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = (
-            ordinal,
-            dtype,
-            output,
-            input,
-            weight,
-            in_dim,
-            out_dim,
-            counter_buf,
-        );
-        return Err(hip_not_compiled());
-    }
     if status != 0 {
         return Err(hip_error("standalone_matvec_4b kernel", status));
     }
@@ -435,7 +351,6 @@ pub fn rms_norm_4b_multirow(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    #[cfg(supersonic_backend_hip)]
     let status = unsafe {
         supersonic_qwen35_4b_hip_rms_norm(
             dtype.kernel_dtype_code(),
@@ -449,11 +364,6 @@ pub fn rms_norm_4b_multirow(
             out.as_mut_ptr(),
         )
     };
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = (ordinal, dtype, n_rows, hidden_dim, eps, input, weight, out);
-        return Err(hip_not_compiled());
-    }
     if status != 0 {
         return Err(hip_error("rms_norm_4b_multirow kernel", status));
     }
@@ -471,7 +381,6 @@ pub fn matmul_rhs_transposed_4b(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    #[cfg(supersonic_backend_hip)]
     let status = unsafe {
         supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
             dtype.kernel_dtype_code(),
@@ -485,11 +394,6 @@ pub fn matmul_rhs_transposed_4b(
             out.as_mut_ptr(),
         )
     };
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = (ordinal, dtype, batch_elems, m, n, k, lhs, rhs, out);
-        return Err(hip_not_compiled());
-    }
     if status != 0 {
         return Err(hip_error("matmul_rhs_transposed_4b kernel", status));
     }
@@ -505,7 +409,6 @@ pub fn rms_norm(
     eps: f32,
     hidden_dim: usize,
 ) -> Result<(), GpuError> {
-    #[cfg(supersonic_backend_hip)]
     let status = unsafe {
         supersonic_qwen35_hip_rms_norm(
             dtype.kernel_dtype_code(),
@@ -519,11 +422,6 @@ pub fn rms_norm(
             output.as_mut_ptr(),
         )
     };
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = (ordinal, dtype, output, input, weight, eps, hidden_dim);
-        return Err(hip_not_compiled());
-    }
     if status != 0 {
         return Err(hip_error("rms_norm kernel", status));
     }
@@ -546,7 +444,6 @@ pub fn standalone_matvec(
         )));
     }
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
-    #[cfg(supersonic_backend_hip)]
     let status = unsafe {
         supersonic_qwen35_hip_standalone_matvec(
             dtype.kernel_dtype_code(),
@@ -559,20 +456,6 @@ pub fn standalone_matvec(
             counter_buf.as_mut_ptr() as *mut c_uint,
         )
     };
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = (
-            ordinal,
-            dtype,
-            output,
-            input,
-            weight,
-            in_dim,
-            out_dim,
-            counter_buf,
-        );
-        return Err(hip_not_compiled());
-    }
     if status != 0 {
         return Err(hip_error("standalone_matvec kernel", status));
     }
@@ -639,7 +522,6 @@ pub fn qwen_rms_norm_standalone_matvec_host_f32(
 }
 
 pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
-    #[cfg(supersonic_backend_hip)]
     {
         let mut arch_name = vec![0u8; 64];
         let mut total_vram = 0u64;
@@ -663,15 +545,9 @@ pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
             total_vram,
         ))
     }
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = ordinal;
-        Err(hip_not_compiled())
-    }
 }
 
 pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
-    #[cfg(supersonic_backend_hip)]
     {
         let mut clock_khz = 0;
         let status = unsafe { supersonic_hip_device_clock_khz(ordinal as c_int, &mut clock_khz) };
@@ -680,18 +556,10 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
         }
         Ok(clock_khz)
     }
-    #[cfg(not(supersonic_backend_hip))]
-    {
-        let _ = ordinal;
-        Err(hip_not_compiled())
-    }
 }
 
 pub fn set_qwen35_4b_launch_preset(blocks: i32, coop: bool) {
-    #[cfg(supersonic_backend_hip)]
     unsafe {
         supersonic_qwen35_4b_hip_set_launch_preset(blocks as c_int, if coop { 1 } else { 0 });
     }
-    #[cfg(not(supersonic_backend_hip))]
-    let _ = (blocks, coop);
 }

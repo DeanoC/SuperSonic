@@ -4,7 +4,6 @@ use std::ptr::NonNull;
 
 use crate::backend::{current_backend, Backend};
 use crate::error::{backend_error, GpuError, Result};
-#[cfg(supersonic_backend_hip)]
 use crate::hip_sys::*;
 use crate::ops::{self, hal_profile_time};
 use crate::scalar_type::ScalarType;
@@ -60,7 +59,6 @@ pub struct VirtualArenaStats {
 }
 
 enum PhysicalHandle {
-    #[cfg(supersonic_backend_hip)]
     Hip(Option<HipMemGenericAllocationHandle>),
 }
 
@@ -250,17 +248,14 @@ impl Drop for VirtualBuffer {
         let _ = self.unmap_all_discard();
         match self.backend {
             Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                {
-                    let _ = ops::with_device_impl(self.backend, self.device_ordinal, || {
-                        let status =
-                            unsafe { hipMemAddressFree(self.ptr.as_ptr(), self.reserved_bytes) };
-                        if status != 0 {
-                            return Err(backend_error(Backend::Hip, "hipMemAddressFree", status));
-                        }
-                        Ok(())
-                    });
-                }
+                let _ = ops::with_device_impl(self.backend, self.device_ordinal, || {
+                    let status =
+                        unsafe { hipMemAddressFree(self.ptr.as_ptr(), self.reserved_bytes) };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipMemAddressFree", status));
+                    }
+                    Ok(())
+                });
             }
         }
     }
@@ -843,7 +838,6 @@ pub fn vmm_is_supported(backend: Backend, ordinal: usize) -> bool {
         return false;
     }
     if backend == Backend::Hip {
-        #[cfg(supersonic_backend_hip)]
         {
             let mut supported = 0;
             let status = unsafe {
@@ -856,10 +850,6 @@ pub fn vmm_is_supported(backend: Backend, ordinal: usize) -> bool {
             if status != 0 || supported == 0 {
                 return false;
             }
-        }
-        #[cfg(not(supersonic_backend_hip))]
-        {
-            return false;
         }
     }
     backend == Backend::Hip && vmm_granularity(backend, ordinal).is_ok()
@@ -899,7 +889,6 @@ fn effective_vmm_mapping_granularity(backend: Backend, api_granularity: usize) -
     api_granularity.max(align_up(floor, api_granularity))
 }
 
-#[cfg(supersonic_backend_hip)]
 fn allocation_prop_hip(ordinal: usize) -> HipMemAllocationProp {
     HipMemAllocationProp {
         type_: HIP_MEM_ALLOCATION_TYPE_PINNED,
@@ -920,35 +909,28 @@ fn allocation_prop_hip(ordinal: usize) -> HipMemAllocationProp {
 fn vmm_granularity(backend: Backend, ordinal: usize) -> Result<usize> {
     match backend {
         Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
-            {
-                let prop = allocation_prop_hip(ordinal);
-                let mut granularity = 0usize;
-                let status = unsafe {
-                    hipMemGetAllocationGranularity(
-                        &mut granularity,
-                        &prop,
-                        HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
-                    )
-                };
-                if status != 0 {
-                    return Err(backend_error(
-                        Backend::Hip,
-                        "hipMemGetAllocationGranularity",
-                        status,
-                    ));
-                }
-                if granularity == 0 {
-                    return Err(GpuError::Unsupported(
-                        "HIP VMM returned zero allocation granularity".into(),
-                    ));
-                }
-                Ok(granularity)
+            let prop = allocation_prop_hip(ordinal);
+            let mut granularity = 0usize;
+            let status = unsafe {
+                hipMemGetAllocationGranularity(
+                    &mut granularity,
+                    &prop,
+                    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+                )
+            };
+            if status != 0 {
+                return Err(backend_error(
+                    Backend::Hip,
+                    "hipMemGetAllocationGranularity",
+                    status,
+                ));
             }
-            #[cfg(not(supersonic_backend_hip))]
-            {
-                Err(GpuError::Unsupported("HIP backend not compiled".into()))
+            if granularity == 0 {
+                return Err(GpuError::Unsupported(
+                    "HIP VMM returned zero allocation granularity".into(),
+                ));
             }
+            Ok(granularity)
         }
     }
 }
@@ -961,23 +943,15 @@ fn reserve_address_range(
 ) -> Result<NonNull<c_void>> {
     ops::with_device_impl(backend, ordinal, || match backend {
         Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
-            {
-                let mut ptr = std::ptr::null_mut();
-                let status = unsafe {
-                    hipMemAddressReserve(&mut ptr, len, alignment, std::ptr::null_mut(), 0)
-                };
-                if status != 0 {
-                    return Err(backend_error(Backend::Hip, "hipMemAddressReserve", status));
-                }
-                NonNull::new(ptr).ok_or_else(|| {
-                    GpuError::backend(Backend::Hip, "hipMemAddressReserve returned null".into())
-                })
+            let mut ptr = std::ptr::null_mut();
+            let status =
+                unsafe { hipMemAddressReserve(&mut ptr, len, alignment, std::ptr::null_mut(), 0) };
+            if status != 0 {
+                return Err(backend_error(Backend::Hip, "hipMemAddressReserve", status));
             }
-            #[cfg(not(supersonic_backend_hip))]
-            {
-                Err(GpuError::Unsupported("HIP backend not compiled".into()))
-            }
+            NonNull::new(ptr).ok_or_else(|| {
+                GpuError::backend(Backend::Hip, "hipMemAddressReserve returned null".into())
+            })
         }
     })
 }
@@ -993,50 +967,43 @@ fn map_physical(
 ) -> Result<Mapping> {
     ops::with_device_impl(backend, ordinal, || match backend {
         Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
-            {
-                let prop = allocation_prop_hip(ordinal);
-                let mut handle = std::ptr::null_mut();
-                let status = unsafe { hipMemCreate(&mut handle, len, &prop, 0) };
-                if status != 0 {
-                    return Err(backend_error(Backend::Hip, "hipMemCreate", status));
-                }
-                let ptr = unsafe { (base.as_ptr() as *mut u8).add(offset) as *mut c_void };
-                let status = unsafe { hipMemMap(ptr, len, 0, handle, 0) };
-                if status != 0 {
-                    let _ = unsafe { hipMemRelease(handle) };
-                    return Err(backend_error(Backend::Hip, "hipMemMap", status));
-                }
-                let access = HipMemAccessDesc {
-                    location: HipMemLocation {
-                        type_: HIP_MEM_LOCATION_TYPE_DEVICE,
-                        id: ordinal as i32,
-                    },
-                    flags: HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE,
-                };
-                let access_ptr =
-                    unsafe { (base.as_ptr() as *mut u8).add(access_offset) as *mut c_void };
-                let status = unsafe { hipMemSetAccess(access_ptr, access_len, &access, 1) };
-                if status != 0 {
-                    let _ = unsafe { hipMemUnmap(ptr, len) };
-                    let _ = unsafe { hipMemRelease(handle) };
-                    return Err(backend_error(Backend::Hip, "hipMemSetAccess", status));
-                }
-                let status = unsafe { hipMemRelease(handle) };
-                if status != 0 {
-                    let _ = unsafe { hipMemUnmap(ptr, len) };
-                    return Err(backend_error(Backend::Hip, "hipMemRelease", status));
-                }
-                Ok(Mapping {
-                    offset,
-                    len,
-                    handle: PhysicalHandle::Hip(None),
-                })
+            let prop = allocation_prop_hip(ordinal);
+            let mut handle = std::ptr::null_mut();
+            let status = unsafe { hipMemCreate(&mut handle, len, &prop, 0) };
+            if status != 0 {
+                return Err(backend_error(Backend::Hip, "hipMemCreate", status));
             }
-            #[cfg(not(supersonic_backend_hip))]
-            {
-                Err(GpuError::Unsupported("HIP backend not compiled".into()))
+            let ptr = unsafe { (base.as_ptr() as *mut u8).add(offset) as *mut c_void };
+            let status = unsafe { hipMemMap(ptr, len, 0, handle, 0) };
+            if status != 0 {
+                let _ = unsafe { hipMemRelease(handle) };
+                return Err(backend_error(Backend::Hip, "hipMemMap", status));
             }
+            let access = HipMemAccessDesc {
+                location: HipMemLocation {
+                    type_: HIP_MEM_LOCATION_TYPE_DEVICE,
+                    id: ordinal as i32,
+                },
+                flags: HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE,
+            };
+            let access_ptr =
+                unsafe { (base.as_ptr() as *mut u8).add(access_offset) as *mut c_void };
+            let status = unsafe { hipMemSetAccess(access_ptr, access_len, &access, 1) };
+            if status != 0 {
+                let _ = unsafe { hipMemUnmap(ptr, len) };
+                let _ = unsafe { hipMemRelease(handle) };
+                return Err(backend_error(Backend::Hip, "hipMemSetAccess", status));
+            }
+            let status = unsafe { hipMemRelease(handle) };
+            if status != 0 {
+                let _ = unsafe { hipMemUnmap(ptr, len) };
+                return Err(backend_error(Backend::Hip, "hipMemRelease", status));
+            }
+            Ok(Mapping {
+                offset,
+                len,
+                handle: PhysicalHandle::Hip(None),
+            })
         }
     })
 }
