@@ -7,10 +7,10 @@ unlisted artifacts or devices.
 The machine-readable source is [`support/matrix.toml`](../support/matrix.toml).
 Run `python3 tools/check-support-matrix.py` after changing a row.
 
-| Model | Weight source | Architecture | Generation | Correctness gate |
-| --- | --- | --- | --- | --- |
-| `qwen3.8-27b` | custom `gqh-gguf` | `gfx1100` | single-sequence greedy, optional NextN/MTP | `qwen38-gqh-correctness` |
-| `qwen3.8-27b` | custom `gqh-gguf` | `gfx1201` | single-sequence greedy, optional NextN/MTP | `qwen38-gqh-correctness` |
+| Model | Weight source | Architecture | Status | Generation | Correctness gate |
+| --- | --- | --- | --- | --- | --- |
+| `qwen3.8-27b` | custom `gqh-gguf` | `gfx1100` | `experimental` | single-sequence greedy, optional NextN/MTP | `qwen38-gqh-correctness` |
+| `qwen3.8-27b` | custom `gqh-gguf` | `gfx1201` | `experimental` | single-sequence greedy, optional NextN/MTP | `qwen38-gqh-correctness` |
 
 ## HIP on `gfx1100`
 

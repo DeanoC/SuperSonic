@@ -63,6 +63,28 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertTrue(any("Phi 4" in violation for violation in violations))
         self.assertTrue(any("Llama 3" in violation for violation in violations))
 
+    def test_removed_terms_are_case_insensitive_and_bare_identities_fail(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative_path in checker.ACTIVE_DOCS:
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Product\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "# Product\n\n"
+                "supersonic_backends=cuda\n"
+                "Gemma Phi Llama\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        self.assertTrue(any("supersonic_backends" in violation.lower() for violation in violations))
+        self.assertTrue(any("gemma" in violation.lower() for violation in violations))
+        self.assertTrue(any("phi" in violation.lower() for violation in violations))
+        self.assertTrue(any("llama" in violation.lower() for violation in violations))
+
     def test_artifact_doc_matches_cheap_preflight_scope(self):
         artifact_doc = (ROOT / "docs" / "artifact-format.md").read_text(encoding="utf-8")
         self.assertIn("existence, readability", artifact_doc)
@@ -177,6 +199,15 @@ class ActiveDocsTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(marker.exists())
 
+    def test_readme_device_probe_is_bounded_and_build_docs_do_not_claim_local_idle_polling(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        snippet = readme.split("```bash", 1)[1].split("```", 1)[0]
+        self.assertIn("timeout --foreground 30s amd-smi static --asic --json", snippet)
+
+        build_docs = (ROOT / "docs" / "build-and-run.md").read_text(encoding="utf-8").lower()
+        self.assertNotIn("busy selected device is a failed run", build_docs)
+        self.assertIn("self-hosted workflow", build_docs)
+
     def test_internal_flm_term_is_allowed_only_in_explicit_internal_section(self):
         checker = load_checker()
         allowed = "## Internal FLM foundation\n\nThis is contributor-only context.\n"
@@ -184,6 +215,21 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertNotEqual(
             [], checker.find_text_violations(Path("README.md"), "The FLM backend is public.")
         )
+
+    def test_internal_flm_section_is_bounded_by_same_or_higher_heading(self):
+        checker = load_checker()
+        nested = (
+            "## Internal FLM foundation\n"
+            "### Contributor details\n"
+            "FLM codec work stays internal here.\n"
+        )
+        self.assertEqual([], checker.find_text_violations(Path("AGENTS.md"), nested))
+
+        after_same_level = nested + "## Public contract\nFLM is public.\n"
+        self.assertNotEqual([], checker.find_text_violations(Path("AGENTS.md"), after_same_level))
+
+        after_higher_level = nested + "# Public contract\nFLM is public.\n"
+        self.assertNotEqual([], checker.find_text_violations(Path("AGENTS.md"), after_higher_level))
 
     def test_local_documentation_anchor_is_checked(self):
         checker = load_checker()
@@ -200,6 +246,22 @@ class ActiveDocsTests(unittest.TestCase):
             violations = checker.find_violations(root)
 
         self.assertTrue(any("missing" in violation for violation in violations))
+
+    def test_same_document_anchor_is_checked(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative_path in checker.ACTIVE_DOCS:
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Product\n## Existing\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "# Product\n\n[broken](#missing)\n", encoding="utf-8"
+            )
+
+            violations = checker.find_violations(root)
+
+        self.assertTrue(any("#missing" in violation for violation in violations))
 
     def test_public_positioning_is_measured_performance_first(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -235,6 +297,109 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertRegex(lowered, r"gfx1100|gfx1201")
         self.assertRegex(lowered, r"prompt|workload")
         self.assertRegex(lowered, r"correctness|parity")
+
+    def test_every_throughput_number_requires_colocated_strong_evidence(self):
+        checker = load_checker()
+        weak = (
+            "A benchmark measured 37.2 tok/s.\n\n"
+            "The commit is abcdef1 and the artifact is documented elsewhere.\n"
+        )
+        weak_violations = checker.find_performance_violations(Path("README.md"), weak)
+        self.assertTrue(weak_violations)
+
+        strong = (
+            "commit: abcdef1, artifact: /tmp/qwen38.gqh.gguf, target: gfx1201, "
+            "prompt=Hello, warmup=1, median decode measurement: 37.2 tok/s.\n"
+        )
+        self.assertEqual([], checker.find_performance_violations(Path("README.md"), strong))
+
+        mixed = strong + "\nA second run reports 100 tok/s without its run record.\n"
+        self.assertTrue(checker.find_performance_violations(Path("README.md"), mixed))
+
+        generic_context = (
+            "commit: abcdef1, artifact: /tmp/qwen38.gqh.gguf, target: gfx1201; "
+            "workload and measurement are documented elsewhere: 37.2 tok/s.\n"
+        )
+        self.assertTrue(checker.find_performance_violations(Path("README.md"), generic_context))
+
+    def test_testing_artifact_block_defines_and_propagates_strict_environment(self):
+        document = (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")
+        section = document.split("## `gfx1201` artifact gate", 1)[1]
+        block = section.split("```bash", 1)[1].split("```", 1)[0]
+        for name in (
+            "SUPERSONIC_GQH_GGUF",
+            "SUPERSONIC_QWEN38_MODEL_DIR",
+            "SUPERSONIC_GQH_8192_GGUF",
+        ):
+            self.assertRegex(block, rf"export {name}=\"\$\{{{name}:-[^\"]+\}}\"")
+        self.assertIn("SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1", block)
+        self.assertIn("tools/check-qwen38-artifacts.py --require-8192", block)
+        self.assertIn("--include-ignored", block)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_python = fake_bin / "python3"
+            fake_python.write_text(
+                """#!/usr/bin/python3
+import os
+import sys
+from pathlib import Path
+
+if sys.argv[1:] != ["tools/check-qwen38-artifacts.py", "--require-8192"]:
+    raise SystemExit(f"unexpected python args: {sys.argv[1:]}")
+line = (
+    "python|GQH=" + os.environ["SUPERSONIC_GQH_GGUF"]
+    + "|MODEL=" + os.environ["SUPERSONIC_QWEN38_MODEL_DIR"]
+    + "|8192=" + os.environ["SUPERSONIC_GQH_8192_GGUF"]
+    + "|REQ=" + os.environ["SUPERSONIC_REQUIRE_GQH_ARTIFACTS"] + "\\n"
+)
+with Path(os.environ["MARKER"]).open("a", encoding="utf-8") as out:
+    out.write(line)
+""",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            fake_cargo = fake_bin / "cargo"
+            fake_cargo.write_text(
+                """#!/usr/bin/env bash
+set -euo pipefail
+printf 'cargo|%s|GQH=%s|MODEL=%s|8192=%s|REQ=%s\\n' "$*" \
+  "$SUPERSONIC_GQH_GGUF" "$SUPERSONIC_QWEN38_MODEL_DIR" \
+  "$SUPERSONIC_GQH_8192_GGUF" "$SUPERSONIC_REQUIRE_GQH_ARTIFACTS" >> "$MARKER"
+""",
+                encoding="utf-8",
+            )
+            fake_cargo.chmod(0o755)
+            marker = root / "propagation.log"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+                    "MARKER": str(marker),
+                }
+            )
+            result = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + block],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = marker.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len([line for line in lines if line.startswith("python|")]), 1)
+        cargo_lines = [line for line in lines if line.startswith("cargo|")]
+        self.assertEqual(len(cargo_lines), 3)
+        for line in lines:
+            self.assertIn("GQH=/home/deano/gqh-artifacts/", line)
+            self.assertIn("MODEL=/data/models/Qwen3.8-27B", line)
+            self.assertIn("8192=/home/deano/gqh-artifacts/", line)
+            self.assertIn("REQ=1", line)
+        self.assertTrue(any("--include-ignored" in line for line in cargo_lines))
 
     def test_contributor_guidance_is_canonical_and_complete(self):
         agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")

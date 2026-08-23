@@ -57,6 +57,35 @@ class SupportMatrixTests(unittest.TestCase):
             self.assertTrue(entry["correctness_gate"].strip())
             self.assertTrue(entry.get("gate_commands"))
 
+    def test_each_active_gate_fails_closed_before_serial_artifact_crawl(self):
+        with support_matrix.MANIFEST.open("rb") as handle:
+            data = tomllib.load(handle)
+
+        for entry in data["entry"]:
+            self.assertEqual(entry["status"], "experimental")
+            self.assertEqual(entry["correctness_gate"], "qwen38-gqh-correctness")
+            commands = "\n".join(entry["gate_commands"])
+            self.assertIn("SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1", commands)
+            self.assertIn("tools/check-qwen38-artifacts.py --require-8192", commands)
+            self.assertIn("qwen38_gqh_gguf_crawl", commands)
+            self.assertIn("--include-ignored", commands)
+            self.assertIn("--test-threads=1", commands)
+
+    def test_supported_document_displays_status_and_named_gate_for_each_arch(self):
+        document = (Path(__file__).resolve().parents[1] / "docs" / "supported-matrix.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("| Status |", document)
+        for arch in ("gfx1100", "gfx1201"):
+            rows = [
+                line
+                for line in document.splitlines()
+                if line.startswith("| `qwen3.8-27b`") and f"`{arch}`" in line
+            ]
+            self.assertEqual(len(rows), 1, arch)
+            self.assertIn("`experimental`", rows[0])
+            self.assertIn("`qwen38-gqh-correctness`", rows[0])
+
     def test_validator_rejects_non_product_model_backend_and_source(self):
         invalid_manifest = """
 version = 1

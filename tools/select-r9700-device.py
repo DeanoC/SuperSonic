@@ -106,6 +106,7 @@ def parse_devices(output: str) -> list[Device]:
             raise ValueError(f"amd-smi JSON is invalid: {nested_exc}") from nested_exc
 
     records: dict[int, dict[str, str | int]] = {}
+    seen_record_indexes: set[int] = set()
 
     def visit(
         node: Any,
@@ -118,6 +119,11 @@ def parse_devices(output: str) -> list[Device]:
             if record_context:
                 direct_index = _direct_index(node)
                 if direct_index is not None:
+                    if direct_index in seen_record_indexes:
+                        raise ValueError(
+                            f"amd-smi JSON contains duplicate physical GPU ordinal {direct_index}"
+                        )
+                    seen_record_indexes.add(direct_index)
                     current_index = direct_index
             gfx = _direct_gfx(node)
             market = _direct_market(node)
@@ -163,6 +169,13 @@ def parse_devices(output: str) -> list[Device]:
 def select_device(devices: list[Device], override: str | None = None) -> Device:
     """Select one validated device; never infer GPU zero as a default."""
 
+    physical_indexes = [device.physical_index for device in devices]
+    if len(set(physical_indexes)) != len(physical_indexes):
+        raise ValueError(
+            "device discovery contains duplicate physical GPU ordinals: "
+            f"{physical_indexes}"
+        )
+
     if override is not None and override.strip():
         value = override.strip()
         if not value.isdigit():
@@ -177,27 +190,24 @@ def select_device(devices: list[Device], override: str | None = None) -> Device:
                 f"R9700 override physical GPU {physical_index} reports {selected.gfx_arch}, "
                 "not gfx1201"
             )
+        if "r9700" not in selected.market_name.lower():
+            raise ValueError(
+                f"R9700 override physical GPU {physical_index} is not a named R9700 device"
+            )
         return selected
 
     gfx1201 = [device for device in devices if device.gfx_arch == "gfx1201"]
-    named_r9700 = [
-        device for device in gfx1201 if "r9700" in device.market_name.lower()
-    ]
-    # If market names are present, require the product identity as well.  Some
-    # older AMD SMI builds omit market_name; a single gfx1201 device remains a
-    # safe, authoritative choice in that layout.
-    candidates = (
-        named_r9700
-        if any(device.market_name for device in gfx1201)
-        else gfx1201
-    )
-    if len(candidates) != 1:
-        indexes = [device.physical_index for device in candidates]
+    if len(gfx1201) != 1:
+        indexes = [device.physical_index for device in gfx1201]
         raise ValueError(
             "exactly one physical gfx1201/R9700 device is required; "
             f"discovered candidates={indexes}"
         )
-    selected = candidates[0]
+    selected = gfx1201[0]
+    if selected.market_name and "r9700" not in selected.market_name.lower():
+        raise ValueError(
+            f"selected physical GPU {selected.physical_index} is not a named R9700 device"
+        )
     if selected.gfx_arch != "gfx1201":
         raise ValueError(f"selected physical GPU is {selected.gfx_arch}, not gfx1201")
     return selected
@@ -220,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--override",
         default="",
-        help="optional physical ordinal; it is accepted only after gfx1201 validation",
+        help="optional physical ordinal; it is accepted only after named R9700/gfx1201 validation",
     )
     args = parser.parse_args(argv)
     output = args.input.read_text(encoding="utf-8") if args.input else sys.stdin.read()

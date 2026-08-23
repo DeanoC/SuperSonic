@@ -41,7 +41,8 @@ through `HIP_VISIBLE_DEVICES` while the program uses logical `--device 0`.
 
 Do not assume physical ordinal zero. If discovery, the override, or the
 selected architecture is ambiguous, the setup stops without exporting a
-selection. A missing or busy selected device is a failed run, not a fallback.
+selection. The self-hosted workflow performs bounded idle probes before its
+artifact gate; this local page does not duplicate that polling loop.
 
 ## Run
 

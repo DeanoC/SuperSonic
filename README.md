@@ -23,7 +23,7 @@ set -euo pipefail
 static_report="${TMPDIR:-/tmp}/supersonic-amd-smi-static.json"
 requested_gpu="${SUPERSONIC_R9700_GPU_ID:-}"
 unset SUPERSONIC_R9700_GPU_ID SUPERSONIC_R9700_GPU_ARCH HIP_VISIBLE_DEVICES SUPERSONIC_DEVICE
-amd-smi static --asic --json > "$static_report"
+timeout --foreground 30s amd-smi static --asic --json > "$static_report"
 selection="$(
   python3 tools/select-r9700-device.py \
     --input "$static_report" \

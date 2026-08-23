@@ -116,6 +116,56 @@ class R9700SelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.selector.select_device(self.devices, override="0")
 
+    def test_explicit_override_requires_named_r9700_identity(self):
+        non_r9700 = self.selector.Device(
+            physical_index=2,
+            gfx_arch="gfx1201",
+            market_name="AMD Radeon RX 8900",
+        )
+        with self.assertRaises(ValueError):
+            self.selector.select_device(self.devices + [non_r9700], override="2")
+
+    def test_named_and_unnamed_gfx1201_candidates_are_ambiguous(self):
+        unnamed = self.selector.Device(
+            physical_index=2,
+            gfx_arch="gfx1201",
+            market_name="",
+        )
+        with self.assertRaises(ValueError):
+            self.selector.select_device(self.devices + [unnamed])
+
+    def test_duplicate_physical_ordinals_fail_closed(self):
+        payload = {
+            "gpu_data": [
+                {
+                    "gpu": 1,
+                    "asic": {
+                        "market_name": "AMD Radeon AI PRO R9700",
+                        "target_graphics_version": "gfx1201",
+                    },
+                },
+                {
+                    "gpu": 1,
+                    "asic": {
+                        "market_name": "AMD Radeon RX 8900",
+                        "target_graphics_version": "gfx1201",
+                    },
+                },
+            ]
+        }
+        with self.assertRaises(ValueError):
+            self.selector.parse_devices(json.dumps(payload))
+
+        duplicate_devices = self.devices + [
+            self.selector.Device(
+                physical_index=1,
+                gfx_arch="gfx1201",
+                market_name="AMD Radeon AI PRO R9700",
+            )
+        ]
+        with self.assertRaises(ValueError):
+            self.selector.select_device(duplicate_devices, override="1")
+
     def test_ambiguous_or_missing_gfx1201_devices_fail_without_override(self):
         with self.assertRaises(ValueError):
             self.selector.select_device(

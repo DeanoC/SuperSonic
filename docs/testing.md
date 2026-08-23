@@ -35,15 +35,14 @@ one Rust test thread. Preflight must pass before the release build or any
 large artifact is loaded:
 
 ```bash
+set -euo pipefail
 export HIP_ARCH=gfx1201
 export RUST_TEST_THREADS=1
 export SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1
+export SUPERSONIC_GQH_GGUF="${SUPERSONIC_GQH_GGUF:-/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf}"
+export SUPERSONIC_QWEN38_MODEL_DIR="${SUPERSONIC_QWEN38_MODEL_DIR:-/data/models/Qwen3.8-27B}"
+export SUPERSONIC_GQH_8192_GGUF="${SUPERSONIC_GQH_8192_GGUF:-/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf}"
 python3 tools/check-qwen38-artifacts.py --require-8192
-```
-
-Then run the serial correctness suite:
-
-```bash
 RUST_TEST_THREADS=1 cargo test --release -p kernel-ffi --lib 'gqh::tests::' \
   -- --include-ignored --test-threads=1 --nocapture
 RUST_TEST_THREADS=1 cargo test --release -p qwen38 --test qwen38_gqh_gguf_crawl \
