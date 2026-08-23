@@ -11,17 +11,46 @@ the AMD SMI static ASIC record and accepts an override only after validating
 that record; it intentionally does not assume physical GPU zero:
 
 ```bash
-amd-smi static --asic --json > /tmp/supersonic-amd-smi-static.json
-while IFS='=' read -r name value; do
-  case "$name" in
-    SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE)
-      export "$name=$value" ;;
-  esac
-done < <(
+set -euo pipefail
+static_report="${TMPDIR:-/tmp}/supersonic-amd-smi-static.json"
+requested_gpu="${SUPERSONIC_R9700_GPU_ID:-}"
+unset SUPERSONIC_R9700_GPU_ID SUPERSONIC_R9700_GPU_ARCH HIP_VISIBLE_DEVICES SUPERSONIC_DEVICE
+amd-smi static --asic --json > "$static_report"
+selection="$(
   python3 tools/select-r9700-device.py \
-    --input /tmp/supersonic-amd-smi-static.json \
-    --override "${SUPERSONIC_R9700_GPU_ID:-}"
-)
+    --input "$static_report" \
+    --override "$requested_gpu"
+)"
+
+declare -A selected=()
+while IFS='=' read -r name value; do
+  [[ -n "$name" && -n "$value" ]] || {
+    echo "invalid R9700 selector output: empty name or value" >&2
+    exit 1
+  }
+  case "$name" in
+    SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE) ;;
+    *)
+      echo "invalid R9700 selector output: unexpected key $name" >&2
+      exit 1
+      ;;
+  esac
+  [[ -z "${selected[$name]+present}" ]] || {
+    echo "invalid R9700 selector output: duplicate key $name" >&2
+    exit 1
+  }
+  selected["$name"]="$value"
+done <<< "$selection"
+
+[[ "${#selected[@]}" -eq 4 ]]
+[[ "${selected[SUPERSONIC_R9700_GPU_ID]}" =~ ^[0-9]+$ ]]
+[[ "${selected[SUPERSONIC_R9700_GPU_ARCH]}" == "gfx1201" ]]
+[[ "${selected[HIP_VISIBLE_DEVICES]}" == "${selected[SUPERSONIC_R9700_GPU_ID]}" ]]
+[[ "${selected[SUPERSONIC_DEVICE]}" == "0" ]]
+export SUPERSONIC_R9700_GPU_ID="${selected[SUPERSONIC_R9700_GPU_ID]}"
+export SUPERSONIC_R9700_GPU_ARCH="${selected[SUPERSONIC_R9700_GPU_ARCH]}"
+export HIP_VISIBLE_DEVICES="${selected[HIP_VISIBLE_DEVICES]}"
+export SUPERSONIC_DEVICE="${selected[SUPERSONIC_DEVICE]}"
 ```
 
 ```bash

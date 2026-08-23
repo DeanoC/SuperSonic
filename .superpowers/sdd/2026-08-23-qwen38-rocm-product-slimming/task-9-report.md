@@ -264,3 +264,28 @@ ci: gate Qwen3.8 GQH on CPU and R9700
 ```
 
 Fix-round-2 implementation commit: `a6a18ed`.
+
+## Task 9 fix round 3
+
+The README R9700 discovery example now fails closed. The RED test executed
+the actual fenced shell snippet and exposed the old process-substitution loop,
+which could continue after a selector failure. GREEN behavior captures the
+selector status with command substitution, clears stale selection variables,
+requires exactly four expected fields, validates one numeric physical ordinal,
+`gfx1201`, the physical-to-logical mapping, and `SUPERSONIC_DEVICE=0`, then
+exports the values. Invalid ASIC JSON and an override to the non-R9700 GPU 0
+both exit before writing a selection marker; the captured host schema selects
+physical GPU 1.
+
+### Fix-round-3 verification
+
+```text
+python3 -m unittest tests.test_active_docs -v                 PASS (7 tests)
+python3 -m unittest tests.test_ci_workflows -v                PASS (4 tests)
+python3 -m unittest discover -s tests -p 'test_*.py'          PASS (44 tests)
+python3 tools/check-active-docs.py                            PASS
+bash -n README selector snippet                              PASS
+git diff --check                                              PASS
+```
+
+No hosted/container or R9700 workflow execution was performed or claimed.
