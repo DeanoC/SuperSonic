@@ -48,6 +48,61 @@ class RetainedSourceTermsTests(unittest.TestCase):
         self.assertIn("dflash_verify_step", rendered)
         self.assertIn("SUPERSONIC_DFLASH_PROFILE_VERIFY", rendered)
 
+    def test_rejects_legacy_mtp_identifiers_in_both_orders_without_comment_or_abi_hits(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crates" / "runtime" / "src"
+            runtime.mkdir(parents=True)
+            (runtime / "decode_engine.rs").write_text(
+                "// MtpDFlashCache and MtpMetalV2Scratch are historical names.\n"
+                "unsafe extern \"C\" {\n"
+                "    #[link_name = \"supersonic_qwen35_hip_mtp_restore_linear_prefix\"]\n"
+                "    fn supersonic_qwen35_hip_mtp_restore_linear_prefix();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (runtime / "prefill_engine.rs").write_text(
+                "struct MtpState {\n"
+                "    cache: Option<MtpDFlashCache>,\n"
+                "    reverse_cache: Option<DFlashMtpCache>,\n"
+                "    scratch: Option<MtpMetalV2Scratch>,\n"
+                "    reverse_scratch: Option<MetalV2MtpScratch>,\n"
+                "}\n"
+                "fn mtp_metal_v2_decode_step() {}\n"
+                "fn dflash_mtp_decode_step() {}\n",
+                encoding="utf-8",
+            )
+            (runtime / "lib.rs").write_text(
+                "fn legacy_profile_enabled() -> bool {\n"
+                "    std::env::var_os(\"SUPERSONIC_QWEN35_DRAFT_MTP_GREEDY\").is_some()\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        rendered = "\n".join(term for _, _, term, _ in violations)
+        for term in (
+            "MtpDFlashCache",
+            "DFlashMtpCache",
+            "MtpMetalV2Scratch",
+            "MetalV2MtpScratch",
+            "mtp_metal_v2_decode_step",
+            "dflash_mtp_decode_step",
+            "SUPERSONIC_QWEN35_DRAFT_MTP_GREEDY",
+        ):
+            self.assertIn(term, rendered)
+        self.assertTrue(violations)
+        self.assertEqual(
+            {path for path, *_ in violations},
+            {
+                Path("crates/runtime/src/prefill_engine.rs"),
+                Path("crates/runtime/src/lib.rs"),
+            },
+            violations,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -170,8 +170,9 @@ pub fn build_fp8_scale_descs(weights: &Qwen38Weights) -> Option<Vec<FP8ScaleDesc
 /// Build INT4 / ggml-K / GQH scale descriptors (parallel to layer descs).
 ///
 /// The kernel-facing descriptor keeps its historical INT4 name for ABI
-/// stability. For Qwen3.8 GQH tensors, each `*_proj_scale` slot is a pointer
-/// to the GQH `{tensor_scale, grid_code}` sidecar; it is not a GPTQ scale.
+/// stability. For Qwen3.8 GQH tensors, each non-null `*_proj_scale` slot is a
+/// pointer to GQH `{tensor_scale, grid_code}` metadata; headerless GQH2_C has
+/// no such sidecar, and these pointers are not legacy GPTQ scales.
 /// Returns None if the megakernel has no low-bit weights to dequant.
 pub fn build_int4_scale_descs(weights: &Qwen38Weights) -> Option<Vec<INT4ScaleDesc>> {
     if !weights.is_int4 && weights.gqh_headers.is_empty() {
