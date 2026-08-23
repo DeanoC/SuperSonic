@@ -565,15 +565,7 @@ impl Drop for DecodeEngine {
             self.scratch.desc_device.as_ptr(),
             int4,
         ) {
-            // A failed owner-safe teardown must not let the subsequent field
-            // drops free descriptors that the process-global graph may still
-            // reference. Quarantine those allocations; the bridge bookkeeping
-            // remains intact for a later retry in this process.
-            eprintln!("decode cache invalidation deferred: {err}");
-            gpu_hal::quarantine_buffer(self.ordinal, self.scratch.desc_device.as_ptr());
-            if !int4.is_null() {
-                gpu_hal::quarantine_buffer(self.ordinal, int4);
-            }
+            eprintln!("decode cache invalidation returned before ownership was published: {err}");
         }
     }
 }

@@ -62,3 +62,24 @@ Unsupported model values, missing sidecars, incompatible GQH headers, missing
 GPU artifacts, ambiguous device discovery, and token mismatches are failures.
 Only an unconfigured local artifact-dependent test may report a documented
 local skip; the configured workflow must fail closed.
+
+### GPU integrity fail-stop policy
+
+The HIP bridges own process-global GQH metadata, held GEMV arguments, streams,
+events, scratch allocations, and decode graphs. If a device switch,
+synchronization, event/stream operation, free/destroy, or device restoration
+fails after one of those objects can reference a model allocation, the bridge
+logs the operation, HIP status, and device ordinal and deliberately aborts the
+process. Continuing would let Rust field drops free memory that an in-flight
+kernel or process-global bridge state could still dereference. Validation,
+allocation, and other failures before that ownership/async boundary remain
+ordinary returned errors.
+
+The deterministic developer-only death test compiles the injection seam out of
+normal builds and verifies the tracked-wire unregister boundary:
+
+```bash
+SUPERSONIC_GPU_FAILURE_TESTS=1 HIP_ARCH=gfx1201 \
+  cargo test -p kernel-ffi --lib \
+  'gqh::tests::fatal_cleanup_aborts_in_child' -- --exact --nocapture
+```

@@ -195,6 +195,7 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path, bridges: &[KernelBridge]) {
 
     println!("cargo:rerun-if-env-changed=GQH_ALLOW_FMA");
     let allow_gqh_fma = env::var_os("GQH_ALLOW_FMA").is_some_and(|value| value != "0");
+    let failure_injection = env::var_os("SUPERSONIC_GPU_FAILURE_TESTS").is_some();
     let mut objects = Vec::with_capacity(bridges.len());
     for bridge in bridges {
         let object = out_dir.join(&bridge.obj_name);
@@ -208,6 +209,9 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path, bridges: &[KernelBridge]) {
             .arg(&object);
         if allow_gqh_fma {
             command.arg("-DGQH_ALLOW_FMA");
+        }
+        if failure_injection {
+            command.arg("-DSUPERSONIC_FAILURE_INJECTION");
         }
         for arch in &archs {
             command.arg(format!("--offload-arch={arch}"));
@@ -239,7 +243,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HIP_ARCH");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=HIP_PATH");
+    println!("cargo:rerun-if-env-changed=SUPERSONIC_GPU_FAILURE_TESTS");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hip)");
+    println!("cargo:rustc-check-cfg=cfg(supersonic_failure_injection)");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
@@ -261,4 +267,7 @@ fn main() {
     );
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     compile_hip(&kernel_dir, &out_dir, &bridges);
+    if env::var_os("SUPERSONIC_GPU_FAILURE_TESTS").is_some() {
+        println!("cargo:rustc-cfg=supersonic_failure_injection");
+    }
 }

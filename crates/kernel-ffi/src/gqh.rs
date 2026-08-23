@@ -4,7 +4,7 @@
 //! same scale product order (`e4m3(d) * tensor_scale`, then `* (ratio/15)`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::sync::{Mutex, OnceLock};
 
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
@@ -103,27 +103,44 @@ fn unregister_many_ffi(ordinal: usize, ptrs: &[usize]) -> Result<(), GpuError> {
         supersonic_gqh_hip_unregister_wires(ordinal as c_int, wires.as_ptr(), wires.len())
     };
     if status != 0 {
-        return Err(GpuError::backend_status(
-            Backend::Hip,
-            "gqh unregister",
-            status,
-        ));
+        unsafe {
+            supersonic_gpu_integrity_fail_stop(
+                c"gqh unregister returned after tracked-state failure".as_ptr(),
+                status,
+                ordinal as c_int,
+            )
+        }
     }
     Ok(())
+}
+
+fn abort_registration_cleanup(
+    operation: &'static std::ffi::CStr,
+    ordinal: usize,
+    err: &GpuError,
+) -> ! {
+    eprintln!(
+        "[gpu-integrity] fatal operation={} ordinal={} error={err}",
+        operation.to_string_lossy(),
+        ordinal
+    );
+    unsafe {
+        supersonic_gpu_integrity_fail_stop(operation.as_ptr(), -1, ordinal as c_int);
+    }
 }
 
 /// Remove all process-global metadata associated with a packed device buffer.
 ///
 /// The C++ bridge caches layout conversion state by raw pointer, so this must
 /// run before the owning `GpuBuffer` is freed. Rust metadata is removed only
-/// after the C++ bridge reports success; a caller that needs to retry can use
-/// [`try_unregister`].
+/// after the C++ bridge reports success. Safe pre-state failures are returned
+/// from [`try_unregister`]; tracked-state HIP failures fail-stop in the bridge.
 pub fn unregister(ordinal: usize, ptr: *const c_void) {
     if ptr.is_null() {
         return;
     }
-    if try_unregister(ordinal, ptr).is_err() {
-        gpu_hal::quarantine_buffer(ordinal, ptr);
+    if let Err(err) = try_unregister(ordinal, ptr) {
+        abort_registration_cleanup(c"gqh unregister", ordinal, &err);
     }
 }
 
@@ -165,8 +182,8 @@ impl Registration {
         if self.ptr == 0 {
             return;
         }
-        if self.try_unregister().is_err() {
-            gpu_hal::quarantine_buffer(self.ordinal, self.ptr as *const c_void);
+        if let Err(err) = self.try_unregister() {
+            abort_registration_cleanup(c"gqh registration drop", self.ordinal, &err);
         }
     }
 }
@@ -276,17 +293,11 @@ impl RegistrationBatch {
         }
     }
 
-    /// Clear committed registrations and preserve every failed group for a
-    /// later retry. Rust maps and guard pointers are changed only after the
-    /// C++ unregister callback succeeds.
+    /// Clear committed registrations. A safe pre-state error leaves the
+    /// committed guards intact. Rust maps and guard pointers are changed only
+    /// after the C++ unregister callback succeeds; tracked-state HIP failures
+    /// terminate in the C++ bridge before this result can cross FFI.
     pub fn try_clear(&mut self) -> Result<(), GpuError> {
-        self.try_clear_with(unregister_many_ffi)
-    }
-
-    fn try_clear_with<F>(&mut self, mut unregister: F) -> Result<(), GpuError>
-    where
-        F: FnMut(usize, &[usize]) -> Result<(), GpuError>,
-    {
         self.pending.clear();
         let mut grouped: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for registration in &self.committed {
@@ -298,7 +309,7 @@ impl RegistrationBatch {
             }
         }
         for (ordinal, ptrs) in grouped {
-            unregister(ordinal, &ptrs)?;
+            unregister_many_ffi(ordinal, &ptrs)?;
             remove_rust_metadata(ordinal, &ptrs);
             for registration in &mut self.committed {
                 if registration.ordinal == ordinal && ptrs.contains(&registration.ptr) {
@@ -310,22 +321,14 @@ impl RegistrationBatch {
         Ok(())
     }
 
-    fn quarantine(&mut self) {
-        for registration in &self.committed {
-            if registration.ptr != 0 {
-                gpu_hal::quarantine_buffer(registration.ordinal, registration.ptr as *const c_void);
-            }
-        }
-        // Do not run Registration::drop after a failed unregister: it would
-        // issue an unbounded second attempt while the owning buffers are being
-        // torn down. Leaking the guard keeps the bridge bookkeeping intact.
-        let committed = std::mem::take(&mut self.committed);
-        std::mem::forget(committed);
-    }
-
     pub fn clear(&mut self) {
-        if self.try_clear().is_err() {
-            self.quarantine();
+        if let Err(err) = self.try_clear() {
+            let ordinal = self
+                .committed
+                .first()
+                .map(|registration| registration.ordinal)
+                .unwrap_or(0);
+            abort_registration_cleanup(c"gqh registration batch clear", ordinal, &err);
         }
     }
 }
@@ -338,8 +341,13 @@ impl Default for RegistrationBatch {
 
 impl Drop for RegistrationBatch {
     fn drop(&mut self) {
-        if self.try_clear().is_err() {
-            self.quarantine();
+        if let Err(err) = self.try_clear() {
+            let ordinal = self
+                .committed
+                .first()
+                .map(|registration| registration.ordinal)
+                .unwrap_or(0);
+            abort_registration_cleanup(c"gqh registration batch drop", ordinal, &err);
         }
     }
 }
@@ -423,6 +431,12 @@ unsafe extern "C" {
         wires: *const *const c_void,
         count: usize,
     ) -> c_int;
+
+    fn supersonic_gpu_integrity_fail_stop(
+        operation: *const c_char,
+        status: c_int,
+        device_ordinal: c_int,
+    ) -> !;
 
     fn supersonic_qwen35_4b_hip_invalidate_decode_cache(
         device_ordinal: c_int,
@@ -714,7 +728,17 @@ pub fn mix_matvec(
 mod tests {
     use super::*;
     use model_store::gqh::{decode_wire, GqhRung};
+    #[cfg(supersonic_failure_injection)]
+    use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
+    #[cfg(supersonic_failure_injection)]
+    use std::process::Command;
+
+    #[cfg(supersonic_failure_injection)]
+    unsafe extern "C" {
+        fn supersonic_gqh_test_track_wire(device_ordinal: c_int, wire: *const c_void);
+        fn supersonic_gqh_test_inject_unregister_sync_failure(status: c_int);
+    }
 
     fn vector_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../model-store/tests/gqh-vectors")
@@ -807,6 +831,33 @@ mod tests {
                 None
             }
         }
+    }
+
+    #[cfg(supersonic_failure_injection)]
+    #[test]
+    fn fatal_cleanup_aborts_in_child() {
+        if std::env::var_os("SUPERSONIC_GPU_FAILURE_CHILD").is_some() {
+            let wire = 0x7_4000usize as *const c_void;
+            unsafe {
+                supersonic_gqh_test_track_wire(0, wire);
+                supersonic_gqh_test_inject_unregister_sync_failure(709);
+                let wires = [wire];
+                let _ = supersonic_gqh_hip_unregister_wires(0, wires.as_ptr(), wires.len());
+            }
+            panic!("injected tracked-wire cleanup returned");
+        }
+
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "gqh::tests::fatal_cleanup_aborts_in_child",
+                "--nocapture",
+            ])
+            .env("SUPERSONIC_GPU_FAILURE_CHILD", "1")
+            .status()
+            .expect("spawn fatal cleanup child");
+        // POSIX SIGABRT is signal 6; keep the death test dependency-free.
+        assert_eq!(status.signal(), Some(6));
     }
 
     #[test]
@@ -928,40 +979,6 @@ mod tests {
             assert_eq!(lookup_header(1, ptr).unwrap().tensor_scale, 11.5);
         }
         assert!(lookup_header(1, ptr).is_none());
-    }
-
-    #[test]
-    fn registration_batch_keeps_state_when_unregister_fails_and_retries() {
-        let ptr = 0x7_2000 as *const c_void;
-        let mut batch = RegistrationBatch::new();
-        batch.stage_header(0, ptr, 12.5, 4);
-        batch.stage_mix(0, ptr, 105, 3, [1.0; 16]);
-        batch.commit();
-
-        let mut attempts = 0;
-        let first = batch.try_clear_with(|_, _| {
-            attempts += 1;
-            Err(GpuError::backend(
-                Backend::Hip,
-                "injected unregister failure".into(),
-            ))
-        });
-        assert!(first.is_err());
-        assert!(lookup_header(0, ptr).is_some());
-        assert!(lookup_mix(0, ptr).is_some());
-        assert_eq!(batch.committed.len(), 1);
-        assert_ne!(batch.committed[0].ptr, 0);
-
-        batch
-            .try_clear_with(|_, _| {
-                attempts += 1;
-                Ok(())
-            })
-            .expect("retry unregister");
-        assert_eq!(attempts, 2);
-        assert!(lookup_header(0, ptr).is_none());
-        assert!(lookup_mix(0, ptr).is_none());
-        assert!(batch.committed.is_empty());
     }
 
     #[test]

@@ -13,6 +13,10 @@
 
 extern "C" void supersonic_gqh_hip_lock();
 extern "C" void supersonic_gqh_hip_unlock();
+extern "C" [[noreturn]] void supersonic_gpu_integrity_fail_stop(
+    const char* operation,
+    int status,
+    int device_ordinal);
 
 namespace {
 
@@ -57,12 +61,19 @@ struct ScopedHipDevice {
         const hipError_t err = hipSetDevice(previous);
         if (err == hipSuccess) {
             changed = false;
+        } else {
+            supersonic_gpu_integrity_fail_stop(
+                "legacy attention device restore", static_cast<int>(err), previous);
         }
-        return err;
+        return hipSuccess;
     }
 
     ~ScopedHipDevice() {
-        (void)restore();
+        const hipError_t err = restore();
+        if (err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "legacy attention device restore", static_cast<int>(err), previous);
+        }
     }
 
     bool ok() const { return status == hipSuccess; }
@@ -124,22 +135,35 @@ hip_bfloat16* attn_scratch_bf16(
         if (scratch->device_ordinal < 0) {
             return nullptr;
         }
-        ScopedHipDevice old_owner(scratch->device_ordinal);
+        const int old_device = scratch->device_ordinal;
+        ScopedHipDevice old_owner(old_device);
         if (!old_owner.ok()) {
-            return nullptr;
+            supersonic_gpu_integrity_fail_stop(
+                "legacy attention scratch owner switch",
+                static_cast<int>(old_owner.status),
+                scratch->device_ordinal);
         }
         hipError_t err = hipDeviceSynchronize();
         if (err != hipSuccess) {
-            return nullptr;
+            supersonic_gpu_integrity_fail_stop(
+                "legacy attention scratch synchronize",
+                static_cast<int>(err),
+                scratch->device_ordinal);
         }
         err = hipFree(scratch->ptr);
         if (err != hipSuccess) {
-            return nullptr;
+            supersonic_gpu_integrity_fail_stop(
+                "legacy attention scratch free",
+                static_cast<int>(err),
+                scratch->device_ordinal);
         }
         *scratch = AttnScratchBf16{};
         err = old_owner.restore();
         if (err != hipSuccess) {
-            return nullptr;
+            supersonic_gpu_integrity_fail_stop(
+                "legacy attention scratch owner restore",
+                static_cast<int>(err),
+                old_device);
         }
     }
     ScopedHipDevice target(device_ordinal);
@@ -154,8 +178,12 @@ hip_bfloat16* attn_scratch_bf16(
     }
     scratch->cap = n;
     scratch->device_ordinal = device_ordinal;
-    if (target.restore() != hipSuccess) {
-        return nullptr;
+    const hipError_t restore_err = target.restore();
+    if (restore_err != hipSuccess) {
+        supersonic_gpu_integrity_fail_stop(
+            "legacy attention scratch target restore",
+            static_cast<int>(restore_err),
+            device_ordinal);
     }
     return scratch->ptr;
 }

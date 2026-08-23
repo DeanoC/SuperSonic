@@ -43,6 +43,10 @@ int g_gqh_row_off = 0;
 // Defined with the gate/up fusion block below. Issues any launch that block is
 // holding back; every bridge entry point calls it before doing anything else.
 int gqh_gemv_flush();
+
+#ifdef SUPERSONIC_FAILURE_INJECTION
+int g_test_unregister_sync_failure = 0;
+#endif
 }  // namespace
 
 extern "C" void supersonic_gqh_hip_lock() {
@@ -51,6 +55,20 @@ extern "C" void supersonic_gqh_hip_lock() {
 
 extern "C" void supersonic_gqh_hip_unlock() {
     g_gqh_bridge_mutex.unlock();
+}
+
+extern "C" [[noreturn]] void supersonic_gpu_integrity_fail_stop(
+    const char* operation,
+    int status,
+    int device_ordinal) {
+    std::fprintf(
+        stderr,
+        "[gpu-integrity] fatal operation=%s status=%d ordinal=%d\n",
+        operation == nullptr ? "unknown" : operation,
+        status,
+        device_ordinal);
+    std::fflush(stderr);
+    std::abort();
 }
 
 namespace {
@@ -64,6 +82,20 @@ struct GqhBridgeLockGuard {
         g_gqh_bridge_mutex.unlock();
     }
 };
+
+#ifdef SUPERSONIC_FAILURE_INJECTION
+extern "C" void supersonic_gqh_test_track_wire(int device_ordinal, const void* wire) {
+    GqhBridgeLockGuard guard;
+    if (wire != nullptr) {
+        g_gqh_tight.insert({device_ordinal, wire});
+    }
+}
+
+extern "C" void supersonic_gqh_test_inject_unregister_sync_failure(int status) {
+    GqhBridgeLockGuard guard;
+    g_test_unregister_sync_failure = status;
+}
+#endif
 
 }  // namespace
 
@@ -129,12 +161,19 @@ struct ScopedHipDevice {
         const hipError_t err = hipSetDevice(previous);
         if (err == hipSuccess) {
             changed = false;
+        } else {
+            supersonic_gpu_integrity_fail_stop(
+                "gqh device restore", static_cast<int>(err), previous);
         }
-        return err;
+        return hipSuccess;
     }
 
     ~ScopedHipDevice() {
-        (void)restore();
+        const hipError_t err = restore();
+        if (err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "gqh device restore", static_cast<int>(err), previous);
+        }
     }
     bool ok() const { return status == hipSuccess; }
 };
@@ -1384,7 +1423,12 @@ int gqh_gemv_flush() {
     }
     const GqhGemvArgs held = g_gemv_held;
     g_gemv_held_valid = false;
-    return gqh_gemv_launch_args(held);
+    const int status = gqh_gemv_launch_args(held);
+    if (status != 0) {
+        supersonic_gpu_integrity_fail_stop(
+            "GQH held GEMV flush", status, held.device_ordinal);
+    }
+    return 0;
 }
 }  // namespace
 
@@ -1425,15 +1469,12 @@ extern "C" int supersonic_gqh_hip_unregister_wires(
 
     auto remove_metadata = [&]() -> hipError_t {
         for (const GqhWireKey& key : keys) {
-            // A held GEMV is deliberately not flushed here: its result is no
-            // longer observable once the owning model is being destroyed, and
-            // launching it would dereference a buffer that is about to be
-            // freed.
             const auto padded = g_gqh_padded.find(key);
             if (padded != g_gqh_padded.end()) {
                 // Remove one allocation at a time, retaining the entry when
-                // HIP reports an error so a later owner-safe retry can make
-                // progress without double-freeing a successful earlier key.
+                // A free failure leaves the entry intact until the fatal
+                // integrity handler terminates the process; never erase
+                // bookkeeping before HIP confirms the free.
                 const hipError_t err = hipFree(padded->second);
                 if (err != hipSuccess) {
                     return err;
@@ -1464,21 +1505,52 @@ extern "C" int supersonic_gqh_hip_unregister_wires(
     if (needs_sync) {
         ScopedHipDevice scoped(device_ordinal);
         if (!scoped.ok()) {
-            return static_cast<int>(scoped.status);
+            supersonic_gpu_integrity_fail_stop(
+                "gqh unregister owner switch", static_cast<int>(scoped.status), device_ordinal);
         }
-        auto finish = [&](int status) {
-            const hipError_t restore_err = scoped.restore();
-            return status != 0 ? status : static_cast<int>(restore_err);
-        };
+#ifdef SUPERSONIC_FAILURE_INJECTION
+        if (g_test_unregister_sync_failure != 0) {
+            const int status = g_test_unregister_sync_failure;
+            g_test_unregister_sync_failure = 0;
+            supersonic_gpu_integrity_fail_stop(
+                "gqh unregister synchronize", status, device_ordinal);
+        }
+#endif
+        bool held_matches = false;
+        for (const GqhWireKey& key : keys) {
+            held_matches = held_matches ||
+                (g_gemv_held_valid && g_gemv_held.device_ordinal == device_ordinal &&
+                 g_gemv_held.wire == key.wire);
+        }
+        if (held_matches) {
+            const int flush_status = gqh_gemv_flush();
+            if (flush_status != 0) {
+                supersonic_gpu_integrity_fail_stop(
+                    "gqh unregister held GEMV flush", flush_status, device_ordinal);
+            }
+        }
+        for (const GqhWireKey& key : keys) {
+            if (g_gemv_prev_valid && g_gemv_prev.device_ordinal == device_ordinal &&
+                g_gemv_prev.wire == key.wire) {
+                g_gemv_prev_valid = false;
+            }
+        }
         const hipError_t sync_err = hipDeviceSynchronize();
         if (sync_err != hipSuccess) {
-            return finish(static_cast<int>(sync_err));
+            supersonic_gpu_integrity_fail_stop(
+                "gqh unregister synchronize", static_cast<int>(sync_err), device_ordinal);
         }
         const hipError_t remove_err = remove_metadata();
         if (remove_err != hipSuccess) {
-            return finish(static_cast<int>(remove_err));
+            supersonic_gpu_integrity_fail_stop(
+                "gqh unregister padded free", static_cast<int>(remove_err), device_ordinal);
         }
-        return finish(0);
+        const hipError_t restore_err = scoped.restore();
+        if (restore_err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "gqh unregister owner restore", static_cast<int>(restore_err), device_ordinal);
+        }
+        return 0;
     } else {
         const hipError_t remove_err = remove_metadata();
         if (remove_err != hipSuccess) {

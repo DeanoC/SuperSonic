@@ -29,6 +29,10 @@ extern "C" int supersonic_qwen35_4b_bf16_matmul_bridge_status(
 
 extern "C" void supersonic_gqh_hip_lock();
 extern "C" void supersonic_gqh_hip_unlock();
+extern "C" [[noreturn]] void supersonic_gpu_integrity_fail_stop(
+    const char* operation,
+    int status,
+    int device_ordinal);
 
 namespace {
 
@@ -237,8 +241,9 @@ struct DecodeBridgeLockGuard {
 
 // HIP allocations and streams are owned by a device ordinal, not by the
 // thread's incidental current-device setting. Keep the switch status visible
-// to callers that are about to touch an allocation; the destructor can restore
-// the previous device but cannot report a restore failure.
+// to callers that are about to touch an allocation. Explicit restore reports
+// the operation; the destructor applies the same fail-stop policy if it is
+// reached with an un-restored device switch.
 struct ScopedHipDevice {
     int previous = -1;
     bool changed = false;
@@ -264,12 +269,19 @@ struct ScopedHipDevice {
         const hipError_t err = hipSetDevice(previous);
         if (err == hipSuccess) {
             changed = false;
+        } else {
+            supersonic_gpu_integrity_fail_stop(
+                "4b device restore", static_cast<int>(err), previous);
         }
-        return err;
+        return hipSuccess;
     }
 
     ~ScopedHipDevice() {
-        (void)restore();
+        const hipError_t err = restore();
+        if (err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "4b device restore", static_cast<int>(err), previous);
+        }
     }
 
     bool ok() const { return status == hipSuccess; }
@@ -772,25 +784,30 @@ DecodeSideResources& decode_side_resources() {
 hipError_t reset_decode_side_resources(DecodeSideResources& s) {
     const int owner = s.device_ordinal;
     if (owner < 0) {
-        return (s.stream == nullptr && s.events[0] == nullptr && s.events[1] == nullptr)
-            ? hipSuccess
-            : hipErrorInvalidDevice;
+        if (s.stream != nullptr || s.events[0] != nullptr || s.events[1] != nullptr) {
+            supersonic_gpu_integrity_fail_stop(
+                "decode side resources missing owner", static_cast<int>(hipErrorInvalidDevice), owner);
+        }
+        return hipSuccess;
     }
     ScopedHipDevice scoped(owner);
     if (!scoped.ok()) {
-        return scoped.status;
+        supersonic_gpu_integrity_fail_stop(
+            "decode side resource owner switch", static_cast<int>(scoped.status), owner);
     }
     if (s.stream != nullptr || s.events[0] != nullptr || s.events[1] != nullptr) {
         const hipError_t sync_err = hipDeviceSynchronize();
         if (sync_err != hipSuccess) {
-            return sync_err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode side resource synchronize", static_cast<int>(sync_err), owner);
         }
     }
     for (hipEvent_t& event : s.events) {
         if (event != nullptr) {
             const hipError_t err = hipEventDestroy(event);
             if (err != hipSuccess) {
-                return err;
+                supersonic_gpu_integrity_fail_stop(
+                    "decode side event destroy", static_cast<int>(err), owner);
             }
             event = nullptr;
         }
@@ -798,14 +815,16 @@ hipError_t reset_decode_side_resources(DecodeSideResources& s) {
     if (s.stream != nullptr) {
         const hipError_t err = hipStreamDestroy(s.stream);
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode side stream destroy", static_cast<int>(err), owner);
         }
         s.stream = nullptr;
     }
     s.device_ordinal = -1;
     const hipError_t restore_err = scoped.restore();
     if (restore_err != hipSuccess) {
-        return restore_err;
+        supersonic_gpu_integrity_fail_stop(
+            "decode side resource owner restore", static_cast<int>(restore_err), owner);
     }
     return hipSuccess;
 }
@@ -840,36 +859,66 @@ hipError_t ensure_decode_side_resources(int ordinal) {
     return hipSuccess;
 }
 
-hipStream_t decode_side_stream(int ordinal) {
-    return ensure_decode_side_resources(ordinal) == hipSuccess
-        ? decode_side_resources().stream
-        : nullptr;
+hipError_t decode_side_stream(int ordinal, hipStream_t* out) {
+    if (out == nullptr) {
+        return hipErrorInvalidValue;
+    }
+    const hipError_t err = ensure_decode_side_resources(ordinal);
+    if (err != hipSuccess) {
+        return err;
+    }
+    *out = decode_side_resources().stream;
+    return hipSuccess;
 }
 
-hipEvent_t decode_side_event(int ordinal, int which) {
-    if (which < 0 || which > 1 ||
-        ensure_decode_side_resources(ordinal) != hipSuccess) {
-        return nullptr;
+hipError_t decode_fork_side(int ordinal, hipStream_t main, hipStream_t side) {
+    if (side == nullptr) {
+        return hipSuccess;
     }
-    return decode_side_resources().events[which];
+    const hipError_t ensure_err = ensure_decode_side_resources(ordinal);
+    if (ensure_err != hipSuccess) {
+        return ensure_err;
+    }
+    hipEvent_t ev = decode_side_resources().events[0];
+    if (ev == nullptr) {
+        return hipErrorInvalidResourceHandle;
+    }
+    const hipError_t record_err = hipEventRecord(ev, main);
+    if (record_err != hipSuccess) {
+        supersonic_gpu_integrity_fail_stop(
+            "decode side fork event record", static_cast<int>(record_err), ordinal);
+    }
+    const hipError_t wait_err = hipStreamWaitEvent(side, ev, 0);
+    if (wait_err != hipSuccess) {
+        supersonic_gpu_integrity_fail_stop(
+            "decode side fork event wait", static_cast<int>(wait_err), ordinal);
+    }
+    return hipSuccess;
 }
 
-void decode_fork_side(int ordinal, hipStream_t main, hipStream_t side) {
-    hipEvent_t ev = decode_side_event(ordinal, 0);
-    if (side == nullptr || ev == nullptr) {
-        return;
+hipError_t decode_join_side(int ordinal, hipStream_t main, hipStream_t side) {
+    if (side == nullptr) {
+        return hipSuccess;
     }
-    (void)hipEventRecord(ev, main);
-    (void)hipStreamWaitEvent(side, ev, 0);
-}
-
-void decode_join_side(int ordinal, hipStream_t main, hipStream_t side) {
-    hipEvent_t ev = decode_side_event(ordinal, 1);
-    if (side == nullptr || ev == nullptr) {
-        return;
+    const hipError_t ensure_err = ensure_decode_side_resources(ordinal);
+    if (ensure_err != hipSuccess) {
+        return ensure_err;
     }
-    (void)hipEventRecord(ev, side);
-    (void)hipStreamWaitEvent(main, ev, 0);
+    hipEvent_t ev = decode_side_resources().events[1];
+    if (ev == nullptr) {
+        return hipErrorInvalidResourceHandle;
+    }
+    const hipError_t record_err = hipEventRecord(ev, side);
+    if (record_err != hipSuccess) {
+        supersonic_gpu_integrity_fail_stop(
+            "decode side join event record", static_cast<int>(record_err), ordinal);
+    }
+    const hipError_t wait_err = hipStreamWaitEvent(main, ev, 0);
+    if (wait_err != hipSuccess) {
+        supersonic_gpu_integrity_fail_stop(
+            "decode side join event wait", static_cast<int>(wait_err), ordinal);
+    }
+    return hipSuccess;
 }
 
 hipError_t launch_gqh_gemv(
@@ -1133,20 +1182,26 @@ hipError_t release_mtp_prefix_slabs(
         return hipSuccess;
     }
     if (s.device_ordinal < 0) {
-        return hipErrorInvalidDevice;
+        supersonic_gpu_integrity_fail_stop(
+            "MTP prefix slabs missing owner", static_cast<int>(hipErrorInvalidDevice), -1);
     }
     ScopedHipDevice owner(s.device_ordinal);
     if (!owner.ok()) {
-        return owner.status;
+        supersonic_gpu_integrity_fail_stop(
+            "MTP prefix slab owner switch",
+            static_cast<int>(owner.status),
+            s.device_ordinal);
     }
     const hipError_t sync_err = hipDeviceSynchronize();
     if (sync_err != hipSuccess) {
-        return sync_err;
+        supersonic_gpu_integrity_fail_stop(
+            "MTP prefix slab synchronize", static_cast<int>(sync_err), s.device_ordinal);
     }
     if (release_rec && s.rec_slab != nullptr) {
         const hipError_t err = hipFree(s.rec_slab);
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "MTP prefix rec slab free", static_cast<int>(err), s.device_ordinal);
         }
         s.rec_slab = nullptr;
         s.rec_slab_bytes = 0;
@@ -1154,13 +1209,19 @@ hipError_t release_mtp_prefix_slabs(
     if (release_conv && s.conv_slab != nullptr) {
         const hipError_t err = hipFree(s.conv_slab);
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "MTP prefix conv slab free", static_cast<int>(err), s.device_ordinal);
         }
         s.conv_slab = nullptr;
         s.conv_slab_bytes = 0;
     }
     s.ready = false;
-    return owner.restore();
+    const hipError_t restore_err = owner.restore();
+    if (restore_err != hipSuccess) {
+        supersonic_gpu_integrity_fail_stop(
+            "MTP prefix slab owner restore", static_cast<int>(restore_err), s.device_ordinal);
+    }
+    return hipSuccess;
 }
 
 hipError_t ensure_mtp_prefix_snap(
@@ -1226,7 +1287,11 @@ hipError_t ensure_mtp_prefix_snap(
     }
     auto finish = [&](hipError_t err) {
         const hipError_t restore_err = target.restore();
-        return err != hipSuccess ? err : restore_err;
+        if (restore_err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "MTP prefix target restore", static_cast<int>(restore_err), hdrs.device_ordinal);
+        }
+        return err;
     };
     s.device_ordinal = hdrs.device_ordinal;
     s.owner_layers = hdrs.layers;
@@ -1300,24 +1365,34 @@ hipError_t ensure_decode_rec_scratch(int ordinal, int nv, int khd, int vhd) {
     }
     if (s.q != nullptr) {
         if (s.device_ordinal < 0) {
-            return hipErrorInvalidDevice;
+            supersonic_gpu_integrity_fail_stop(
+                "decode recurrent scratch missing owner",
+                static_cast<int>(hipErrorInvalidDevice),
+                -1);
         }
-        ScopedHipDevice old_owner(s.device_ordinal);
+        const int old_device = s.device_ordinal;
+        ScopedHipDevice old_owner(old_device);
         if (!old_owner.ok()) {
-            return old_owner.status;
+            supersonic_gpu_integrity_fail_stop(
+                "decode recurrent scratch owner switch",
+                static_cast<int>(old_owner.status),
+                old_device);
         }
         hipError_t err = hipDeviceSynchronize();
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode recurrent scratch synchronize", static_cast<int>(err), old_device);
         }
         err = hipFree(s.q);
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode recurrent scratch free", static_cast<int>(err), old_device);
         }
         s = DecodeRecScratch{};
         err = old_owner.restore();
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode recurrent scratch owner restore", static_cast<int>(err), old_device);
         }
     }
     ScopedHipDevice target(ordinal);
@@ -1328,7 +1403,13 @@ hipError_t ensure_decode_rec_scratch(int ordinal, int nv, int khd, int vhd) {
     hipError_t err = hipMalloc(&base, need * sizeof(float));
     if (err != hipSuccess) {
         const hipError_t restore_err = target.restore();
-        return err != hipSuccess ? err : restore_err;
+        if (restore_err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "decode recurrent scratch target restore",
+                static_cast<int>(restore_err),
+                ordinal);
+        }
+        return err;
     }
     s.q = base;
     s.k = s.q + qk;
@@ -1338,7 +1419,11 @@ hipError_t ensure_decode_rec_scratch(int ordinal, int nv, int khd, int vhd) {
     s.device_ordinal = ordinal;
     s.cap = need;
     const hipError_t restore_err = target.restore();
-    return restore_err == hipSuccess ? hipSuccess : restore_err;
+    if (restore_err != hipSuccess) {
+        supersonic_gpu_integrity_fail_stop(
+            "decode recurrent scratch target restore", static_cast<int>(restore_err), ordinal);
+    }
+    return hipSuccess;
 }
 
 void launch_decode_pack_rec_inputs(
@@ -1623,24 +1708,34 @@ hipError_t ensure_decode_full_attn_scratch(
     }
     if (s.q != nullptr) {
         if (s.device_ordinal < 0) {
-            return hipErrorInvalidDevice;
+            supersonic_gpu_integrity_fail_stop(
+                "decode attention scratch missing owner",
+                static_cast<int>(hipErrorInvalidDevice),
+                -1);
         }
-        ScopedHipDevice old_owner(s.device_ordinal);
+        const int old_device = s.device_ordinal;
+        ScopedHipDevice old_owner(old_device);
         if (!old_owner.ok()) {
-            return old_owner.status;
+            supersonic_gpu_integrity_fail_stop(
+                "decode attention scratch owner switch",
+                static_cast<int>(old_owner.status),
+                old_device);
         }
         hipError_t err = hipDeviceSynchronize();
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode attention scratch synchronize", static_cast<int>(err), old_device);
         }
         err = hipFree(s.q);
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode attention scratch free", static_cast<int>(err), old_device);
         }
         s = DecodeFullAttnScratch{};
         err = old_owner.restore();
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode attention scratch owner restore", static_cast<int>(err), old_device);
         }
     }
     ScopedHipDevice target(ordinal);
@@ -1657,7 +1752,13 @@ hipError_t ensure_decode_full_attn_scratch(
     hipError_t err = hipMalloc(&base, bytes);
     if (err != hipSuccess) {
         const hipError_t restore_err = target.restore();
-        return err != hipSuccess ? err : restore_err;
+        if (restore_err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "decode attention scratch target restore",
+                static_cast<int>(restore_err),
+                ordinal);
+        }
+        return err;
     }
     auto* bf = static_cast<hip_bfloat16*>(base);
     s.q = bf;
@@ -1674,7 +1775,11 @@ hipError_t ensure_decode_full_attn_scratch(
     s.n_splits = kSplits;
     s.device_ordinal = ordinal;
     const hipError_t restore_err = target.restore();
-    return restore_err == hipSuccess ? hipSuccess : restore_err;
+    if (restore_err != hipSuccess) {
+        supersonic_gpu_integrity_fail_stop(
+            "decode attention scratch target restore", static_cast<int>(restore_err), ordinal);
+    }
+    return hipSuccess;
 }
 
 hipError_t launch_host_full_attn(
@@ -1842,25 +1947,31 @@ hipError_t ensure_decode_rms_partials(int ordinal, float** out) {
     static int owner = -1;
     if (p != nullptr && owner != ordinal) {
         if (owner < 0) {
-            return hipErrorInvalidDevice;
+            supersonic_gpu_integrity_fail_stop(
+                "decode RMS scratch missing owner", static_cast<int>(hipErrorInvalidDevice), -1);
         }
-        ScopedHipDevice old_owner(owner);
+        const int old_device = owner;
+        ScopedHipDevice old_owner(old_device);
         if (!old_owner.ok()) {
-            return old_owner.status;
+            supersonic_gpu_integrity_fail_stop(
+                "decode RMS scratch owner switch", static_cast<int>(old_owner.status), old_device);
         }
         hipError_t err = hipDeviceSynchronize();
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode RMS scratch synchronize", static_cast<int>(err), old_device);
         }
         err = hipFree(p);
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode RMS scratch free", static_cast<int>(err), old_device);
         }
         p = nullptr;
         owner = -1;
         err = old_owner.restore();
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode RMS scratch owner restore", static_cast<int>(err), old_device);
         }
     }
     if (p == nullptr) {
@@ -1872,12 +1983,17 @@ hipError_t ensure_decode_rms_partials(int ordinal, float** out) {
         if (err != hipSuccess) {
             p = nullptr;
             const hipError_t restore_err = target.restore();
-            return err != hipSuccess ? err : restore_err;
+            if (restore_err != hipSuccess) {
+                supersonic_gpu_integrity_fail_stop(
+                    "decode RMS scratch target restore", static_cast<int>(restore_err), ordinal);
+            }
+            return err;
         }
         owner = ordinal;
         const hipError_t restore_err = target.restore();
         if (restore_err != hipSuccess) {
-            return restore_err;
+            supersonic_gpu_integrity_fail_stop(
+                "decode RMS scratch target restore", static_cast<int>(restore_err), ordinal);
         }
     }
     *out = p;
@@ -1986,21 +2102,26 @@ int g_ggml_device_ordinal = -1;
 hipError_t ensure_ggml_k_gemv_scratch(int ordinal, int in_dim, int out_dim) {
     if (g_ggml_device_ordinal < 0 &&
         (g_ggml_x_bf != nullptr || g_ggml_y_bf != nullptr)) {
-        return hipErrorInvalidDevice;
+        supersonic_gpu_integrity_fail_stop(
+            "GGML-K scratch missing owner", static_cast<int>(hipErrorInvalidDevice), -1);
     }
     if (g_ggml_device_ordinal >= 0 && g_ggml_device_ordinal != ordinal) {
-        ScopedHipDevice old_owner(g_ggml_device_ordinal);
+        const int old_device = g_ggml_device_ordinal;
+        ScopedHipDevice old_owner(old_device);
         if (!old_owner.ok()) {
-            return old_owner.status;
+            supersonic_gpu_integrity_fail_stop(
+                "GGML-K scratch owner switch", static_cast<int>(old_owner.status), old_device);
         }
         hipError_t err = hipDeviceSynchronize();
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "GGML-K scratch synchronize", static_cast<int>(err), old_device);
         }
         if (g_ggml_x_bf != nullptr) {
             err = hipFree(g_ggml_x_bf);
             if (err != hipSuccess) {
-                return err;
+                supersonic_gpu_integrity_fail_stop(
+                    "GGML-K input scratch free", static_cast<int>(err), old_device);
             }
             g_ggml_x_bf = nullptr;
             g_ggml_cap_in = 0;
@@ -2008,7 +2129,8 @@ hipError_t ensure_ggml_k_gemv_scratch(int ordinal, int in_dim, int out_dim) {
         if (g_ggml_y_bf != nullptr) {
             err = hipFree(g_ggml_y_bf);
             if (err != hipSuccess) {
-                return err;
+                supersonic_gpu_integrity_fail_stop(
+                    "GGML-K output scratch free", static_cast<int>(err), old_device);
             }
             g_ggml_y_bf = nullptr;
             g_ggml_cap_out = 0;
@@ -2016,7 +2138,8 @@ hipError_t ensure_ggml_k_gemv_scratch(int ordinal, int in_dim, int out_dim) {
         g_ggml_device_ordinal = -1;
         err = old_owner.restore();
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "GGML-K scratch owner restore", static_cast<int>(err), old_device);
         }
     }
 
@@ -2026,7 +2149,11 @@ hipError_t ensure_ggml_k_gemv_scratch(int ordinal, int in_dim, int out_dim) {
     }
     auto finish = [&](hipError_t err) {
         const hipError_t restore_err = target.restore();
-        return err != hipSuccess ? err : restore_err;
+        if (restore_err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "GGML-K scratch target restore", static_cast<int>(restore_err), ordinal);
+        }
+        return err;
     };
     g_ggml_device_ordinal = ordinal;
     if (in_dim > g_ggml_cap_in) {
@@ -2359,12 +2486,14 @@ hipError_t clear_split_graph_cache(SplitGraphCache& cache, bool destroy_stream) 
     if (owner >= 0) {
         ScopedHipDevice scoped(owner);
         if (!scoped.ok()) {
-            return scoped.status;
+            supersonic_gpu_integrity_fail_stop(
+                "split graph owner switch", static_cast<int>(scoped.status), owner);
         }
         if (cache.stream != nullptr) {
             const hipError_t err = hipStreamSynchronize(cache.stream);
             if (err != hipSuccess) {
-                return err;
+                supersonic_gpu_integrity_fail_stop(
+                    "split graph stream synchronize", static_cast<int>(err), owner);
             }
         }
         // Graph replay and the graph stream are process-global. Synchronize
@@ -2372,39 +2501,47 @@ hipError_t clear_split_graph_cache(SplitGraphCache& cache, bool destroy_stream) 
         // invalidation is called from another device context.
         const hipError_t sync_err = hipDeviceSynchronize();
         if (sync_err != hipSuccess) {
-            return sync_err;
+            supersonic_gpu_integrity_fail_stop(
+                "split graph device synchronize", static_cast<int>(sync_err), owner);
         }
         if (cache.exec != nullptr) {
             const hipError_t err = hipGraphExecDestroy(cache.exec);
             if (err != hipSuccess) {
-                return err;
+                supersonic_gpu_integrity_fail_stop(
+                    "split graph exec destroy", static_cast<int>(err), owner);
             }
             cache.exec = nullptr;
         }
         if (cache.graph != nullptr) {
             const hipError_t err = hipGraphDestroy(cache.graph);
             if (err != hipSuccess) {
-                return err;
+                supersonic_gpu_integrity_fail_stop(
+                    "split graph destroy", static_cast<int>(err), owner);
             }
             cache.graph = nullptr;
         }
         if (destroy_stream && cache.stream != nullptr) {
             const hipError_t err = hipStreamDestroy(cache.stream);
             if (err != hipSuccess) {
-                return err;
+                supersonic_gpu_integrity_fail_stop(
+                    "split graph stream destroy", static_cast<int>(err), owner);
             }
             cache.stream = nullptr;
         }
         // Do not report success until the caller's current device has been
-        // restored. If restoration fails, leave the owner/bookkeeping for a
-        // later owner-safe retry.
+        // restored. A restore failure is unrecoverable while graph metadata
+        // still names the owner and is handled by the integrity policy.
         const hipError_t restore_err = scoped.restore();
         if (restore_err != hipSuccess) {
-            return restore_err;
+            supersonic_gpu_integrity_fail_stop(
+                "split graph owner restore", static_cast<int>(restore_err), owner);
         }
     } else {
         if (cache.exec != nullptr || cache.graph != nullptr || cache.stream != nullptr) {
-            return hipErrorInvalidDevice;
+            supersonic_gpu_integrity_fail_stop(
+                "split graph resources missing owner",
+                static_cast<int>(hipErrorInvalidDevice),
+                owner);
         }
     }
     if (destroy_stream || cache.stream == nullptr) {
@@ -5726,16 +5863,58 @@ static hipEvent_t gqh_ev_gemm[2] = {nullptr, nullptr};
 static bool gqh_ev_gemm_recorded[2] = {false, false};
 static int gqh_resource_device = -1;
 
+struct GqhPendingWorkGuard {
+    int device_ordinal;
+    bool pending = false;
+
+    explicit GqhPendingWorkGuard(int ordinal) : device_ordinal(ordinal) {}
+
+    void mark() { pending = true; }
+    void disarm() { pending = false; }
+
+    void synchronize_or_fail(const char* operation) {
+        if (!pending) {
+            return;
+        }
+        const hipError_t err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                operation, static_cast<int>(err), device_ordinal);
+        }
+        pending = false;
+    }
+
+    ~GqhPendingWorkGuard() {
+        if (pending) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH dequant pending work escaped", static_cast<int>(hipErrorUnknown),
+                device_ordinal);
+        }
+    }
+};
+
 extern "C" int supersonic_gqh_hip_gemm_flush(int device_ordinal) {
     DecodeBridgeLockGuard guard;
     const int owner = gqh_resource_device >= 0 ? gqh_resource_device : device_ordinal;
+    bool pending = false;
+    for (int i = 0; i < 2; ++i) {
+        pending = pending || (gqh_ev_gemm_recorded[i] && gqh_ev_gemm[i] != nullptr);
+    }
     ScopedHipDevice scoped(owner);
     if (!scoped.ok()) {
+        if (pending) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH GEMM flush owner switch", static_cast<int>(scoped.status), owner);
+        }
         return static_cast<int>(scoped.status);
     }
     auto finish = [&](int status) {
         const hipError_t restore_err = scoped.restore();
-        return status != 0 ? status : static_cast<int>(restore_err);
+        if (restore_err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH GEMM owner restore", static_cast<int>(restore_err), owner);
+        }
+        return status;
     };
     // Enqueue a default-stream wait so later default-stream kernels see
     // GEMM output, without blocking the CPU (host EventSynchronize was
@@ -5746,6 +5925,13 @@ extern "C" int supersonic_gqh_hip_gemm_flush(int device_ordinal) {
         if (gqh_ev_gemm_recorded[i] && gqh_ev_gemm[i] != nullptr) {
             const hipError_t err = hipStreamWaitEvent(nullptr, gqh_ev_gemm[i], 0);
             if (err != hipSuccess) {
+                const hipError_t sync_err = hipDeviceSynchronize();
+                if (sync_err != hipSuccess) {
+                    supersonic_gpu_integrity_fail_stop(
+                        "GQH GEMM flush recovery synchronize",
+                        static_cast<int>(sync_err),
+                        owner);
+                }
                 return finish(static_cast<int>(err));
             }
         }
@@ -5783,13 +5969,24 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         k <= 0) {
         return 1;
     }
+    const bool retained_resources = gqh_resource_device >= 0 &&
+        (gqh_s_dq != nullptr || gqh_s_gemm != nullptr || gqh_ev_gemm[0] != nullptr ||
+         gqh_ev_gemm[1] != nullptr);
     ScopedHipDevice scoped(device_ordinal);
     if (!scoped.ok()) {
+        if (retained_resources) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH dequant owner switch", static_cast<int>(scoped.status), device_ordinal);
+        }
         return 2;
     }
     auto finish = [&](int status) {
         const hipError_t restore_err = scoped.restore();
-        return status != 0 ? status : static_cast<int>(restore_err);
+        if (restore_err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH dequant owner restore", static_cast<int>(restore_err), device_ordinal);
+        }
+        return status;
     };
     hipblasHandle_t handle = hipblas_handle_for(device_ordinal);
     if (handle == nullptr) {
@@ -5801,6 +5998,8 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
     static int phase = 0;
     static bool ready = false;
     auto destroy_resources = [&]() -> hipError_t {
+        const int resource_owner =
+            gqh_resource_device >= 0 ? gqh_resource_device : device_ordinal;
         ready = false;
         if (gqh_s_dq == nullptr && gqh_s_gemm == nullptr &&
             ev_dq[0] == nullptr && ev_dq[1] == nullptr &&
@@ -5813,35 +6012,51 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         }
         hipError_t err = hipDeviceSynchronize();
         if (err != hipSuccess) {
-            return err;
+            supersonic_gpu_integrity_fail_stop(
+                "GQH dequant resource synchronize", static_cast<int>(err), resource_owner);
         }
         for (int i = 0; i < 2; ++i) {
             if (ev_dq[i] != nullptr) {
                 err = hipEventDestroy(ev_dq[i]);
-                if (err != hipSuccess) return err;
+                if (err != hipSuccess) {
+                    supersonic_gpu_integrity_fail_stop(
+                        "GQH dequant event destroy", static_cast<int>(err), resource_owner);
+                }
                 ev_dq[i] = nullptr;
             }
             if (gqh_ev_gemm[i] != nullptr) {
                 err = hipEventDestroy(gqh_ev_gemm[i]);
-                if (err != hipSuccess) return err;
+                if (err != hipSuccess) {
+                    supersonic_gpu_integrity_fail_stop(
+                        "GQH GEMM event destroy", static_cast<int>(err), resource_owner);
+                }
                 gqh_ev_gemm[i] = nullptr;
             }
             gqh_ev_gemm_recorded[i] = false;
             if (buf[i] != nullptr) {
                 err = hipFree(buf[i]);
-                if (err != hipSuccess) return err;
+                if (err != hipSuccess) {
+                    supersonic_gpu_integrity_fail_stop(
+                        "GQH dequant buffer free", static_cast<int>(err), resource_owner);
+                }
                 buf[i] = nullptr;
                 cap[i] = 0;
             }
         }
         if (gqh_s_dq != nullptr) {
             err = hipStreamDestroy(gqh_s_dq);
-            if (err != hipSuccess) return err;
+            if (err != hipSuccess) {
+                supersonic_gpu_integrity_fail_stop(
+                    "GQH dequant stream destroy", static_cast<int>(err), resource_owner);
+            }
             gqh_s_dq = nullptr;
         }
         if (gqh_s_gemm != nullptr) {
             err = hipStreamDestroy(gqh_s_gemm);
-            if (err != hipSuccess) return err;
+            if (err != hipSuccess) {
+                supersonic_gpu_integrity_fail_stop(
+                    "GQH GEMM stream destroy", static_cast<int>(err), resource_owner);
+            }
             gqh_s_gemm = nullptr;
         }
         ready = false;
@@ -5850,9 +6065,11 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         return hipSuccess;
     };
     if (gqh_resource_device >= 0 && gqh_resource_device != device_ordinal) {
-        ScopedHipDevice old_owner(gqh_resource_device);
+        const int old_device = gqh_resource_device;
+        ScopedHipDevice old_owner(old_device);
         if (!old_owner.ok()) {
-            return finish(static_cast<int>(old_owner.status));
+            supersonic_gpu_integrity_fail_stop(
+                "GQH old-owner switch", static_cast<int>(old_owner.status), old_device);
         }
         const hipError_t err = destroy_resources();
         if (err != hipSuccess) {
@@ -5860,7 +6077,8 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         }
         const hipError_t restore_err = old_owner.restore();
         if (restore_err != hipSuccess) {
-            return finish(static_cast<int>(restore_err));
+            supersonic_gpu_integrity_fail_stop(
+                "GQH old-owner restore", static_cast<int>(restore_err), old_device);
         }
     }
     if (!ready && gqh_resource_device == device_ordinal &&
@@ -5903,16 +6121,23 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         ready = true;
     }
     const int p = phase & 1;
+    GqhPendingWorkGuard pending(device_ordinal);
     const size_t need = static_cast<size_t>(n) * static_cast<size_t>(k);
     if (need > cap[p] || buf[p] == nullptr) {
         if (buf[p] != nullptr) {
             const hipError_t sync_err = hipDeviceSynchronize();
             if (sync_err != hipSuccess) {
-                return finish(static_cast<int>(sync_err));
+                supersonic_gpu_integrity_fail_stop(
+                    "GQH dequant buffer reuse synchronize",
+                    static_cast<int>(sync_err),
+                    device_ordinal);
             }
             const hipError_t free_err = hipFree(buf[p]);
             if (free_err != hipSuccess) {
-                return finish(static_cast<int>(free_err));
+                supersonic_gpu_integrity_fail_stop(
+                    "GQH dequant buffer reuse free",
+                    static_cast<int>(free_err),
+                    device_ordinal);
             }
             buf[p] = nullptr;
             cap[p] = 0;
@@ -5928,12 +6153,14 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
     if (gqh_ev_gemm_recorded[p]) {
         const hipError_t err = hipEventSynchronize(gqh_ev_gemm[p]);
         if (err != hipSuccess) {
-            return finish(static_cast<int>(err));
+            supersonic_gpu_integrity_fail_stop(
+                "GQH GEMM previous event synchronize", static_cast<int>(err), device_ordinal);
         }
     }
     // Decode on the default stream — same launch path as the known-good
     // sequential dequant. Recording the event there, then having s_gemm
     // wait, is the HIP-safe way to overlap decode(N+1) with GEMM(N).
+    pending.mark();
     const int dec = supersonic_gqh_hip_decode(
         device_ordinal,
         rung,
@@ -5946,21 +6173,25 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         1,
         nullptr);
     if (dec != 0) {
+        pending.synchronize_or_fail("GQH dequant decode recovery synchronize");
         return finish(dec);
     }
     {
         const hipError_t err = hipEventRecord(ev_dq[p], nullptr);
         if (err != hipSuccess) {
+            pending.synchronize_or_fail("GQH dequant event-record recovery synchronize");
             return finish(static_cast<int>(err));
         }
     }
     {
         const hipError_t err = hipStreamWaitEvent(gqh_s_gemm, ev_dq[p], 0);
         if (err != hipSuccess) {
+            pending.synchronize_or_fail("GQH dequant wait recovery synchronize");
             return finish(static_cast<int>(err));
         }
     }
     if (hipblasSetStream(handle, gqh_s_gemm) != HIPBLAS_STATUS_SUCCESS) {
+        pending.synchronize_or_fail("GQH dequant stream-set recovery synchronize");
         return finish(7);
     }
     const float alpha = 1.0f;
@@ -5986,19 +6217,30 @@ extern "C" int supersonic_gqh_hip_dequant_gemm_bf16(
         HIPBLAS_COMPUTE_32F,
         HIPBLAS_GEMM_DEFAULT);
     if (st != HIPBLAS_STATUS_SUCCESS) {
-        (void)hipblasSetStream(handle, nullptr);
+        pending.synchronize_or_fail("GQH GEMM launch recovery synchronize");
+        if (hipblasSetStream(handle, nullptr) != HIPBLAS_STATUS_SUCCESS) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH GEMM handle stream restore", 8, device_ordinal);
+        }
         return finish(8);
     }
     const hipError_t record_err = hipEventRecord(gqh_ev_gemm[p], gqh_s_gemm);
     if (record_err != hipSuccess) {
-        (void)hipblasSetStream(handle, nullptr);
+        pending.synchronize_or_fail("GQH GEMM event-record recovery synchronize");
+        if (hipblasSetStream(handle, nullptr) != HIPBLAS_STATUS_SUCCESS) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH GEMM handle stream restore", static_cast<int>(record_err), device_ordinal);
+        }
         return finish(static_cast<int>(record_err));
     }
     gqh_ev_gemm_recorded[p] = true;
     if (hipblasSetStream(handle, nullptr) != HIPBLAS_STATUS_SUCCESS) {
-        return finish(10);
+        pending.synchronize_or_fail("GQH GEMM handle-stream recovery synchronize");
+        supersonic_gpu_integrity_fail_stop(
+            "GQH GEMM handle stream restore", 10, device_ordinal);
     }
     phase = phase + 1;
+    pending.disarm();
     return finish(0);
 }
 
@@ -9478,10 +9720,18 @@ int persistent_decode_device(
                     const double t_in0 = dec_prof ? (sync_now(), now_ms()) : 0;
                     if (mx.layer_type == 1) {
                         hipStream_t kv_stream = stream;
-                        hipStream_t side =
-                            stream != nullptr ? nullptr : decode_side_stream(device_ordinal);
+                        hipStream_t side = nullptr;
+                        if (stream == nullptr) {
+                            err = decode_side_stream(device_ordinal, &side);
+                            if (err != hipSuccess) {
+                                return err;
+                            }
+                        }
                         if (side != nullptr && mx.k.wire != nullptr) {
-                            decode_fork_side(device_ordinal, stream, side);
+                            err = decode_fork_side(device_ordinal, stream, side);
+                            if (err != hipSuccess) {
+                                return err;
+                            }
                             kv_stream = side;
                         }
                         err = launch_mixer_proj(
@@ -9503,15 +9753,26 @@ int persistent_decode_device(
                                 gemv_ncols, hidden_stride, proj_stride);
                         }
                         if (kv_stream != stream) {
-                            decode_join_side(device_ordinal, stream, kv_stream);
+                            err = decode_join_side(device_ordinal, stream, kv_stream);
+                            if (err != hipSuccess) {
+                                return err;
+                            }
                         }
                     } else {
                         hipStream_t z_stream = stream;
-                        hipStream_t side =
-                            stream != nullptr ? nullptr : decode_side_stream(device_ordinal);
+                        hipStream_t side = nullptr;
+                        if (stream == nullptr) {
+                            err = decode_side_stream(device_ordinal, &side);
+                            if (err != hipSuccess) {
+                                return err;
+                            }
+                        }
                         if (side != nullptr && mx.z.wire != nullptr &&
                             mx.z_out > 0) {
-                            decode_fork_side(device_ordinal, stream, side);
+                            err = decode_fork_side(device_ordinal, stream, side);
+                            if (err != hipSuccess) {
+                                return err;
+                            }
                             z_stream = side;
                         }
                         err = launch_mixer_proj(
@@ -9560,7 +9821,10 @@ int persistent_decode_device(
                     }
                     if (layer == dump_lin) {
                         if (z_pending != nullptr) {
-                            decode_join_side(device_ordinal, stream, z_pending);
+                            err = decode_join_side(device_ordinal, stream, z_pending);
+                            if (err != hipSuccess) {
+                                return err;
+                            }
                             z_pending = nullptr;
                         }
                         if (stream) {
@@ -9690,7 +9954,10 @@ int persistent_decode_device(
                             snap_stride);
                     }
                     if (z_pending != nullptr) {
-                        decode_join_side(device_ordinal, stream, z_pending);
+                        err = decode_join_side(device_ordinal, stream, z_pending);
+                        if (err != hipSuccess) {
+                            return err;
+                        }
                         z_pending = nullptr;
                     }
                     if (dec_prof) {
@@ -9699,7 +9966,10 @@ int persistent_decode_device(
                     }
                 } else {
                     if (z_pending != nullptr) {
-                        decode_join_side(device_ordinal, stream, z_pending);
+                        err = decode_join_side(device_ordinal, stream, z_pending);
+                        if (err != hipSuccess) {
+                            return err;
+                        }
                         z_pending = nullptr;
                     }
                     if ((mid_flags & 256) != 0) {
