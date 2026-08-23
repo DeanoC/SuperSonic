@@ -120,6 +120,51 @@ class SupportMatrixTests(unittest.TestCase):
             "substitution preflight": original_text.replace(
                 preflight, f"{preflight} $(echo bypass)", 1
             ),
+            "duplicate identical preflight assignment": original_text.replace(
+                preflight,
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 "
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 "
+                "python3 tools/check-qwen38-artifacts.py --require-8192",
+                1,
+            ),
+            "contradictory preflight assignment 0 then 1": original_text.replace(
+                preflight,
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=0 "
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 "
+                "python3 tools/check-qwen38-artifacts.py --require-8192",
+                1,
+            ),
+            "contradictory preflight assignment 1 then 0": original_text.replace(
+                preflight,
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 "
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=0 "
+                "python3 tools/check-qwen38-artifacts.py --require-8192",
+                1,
+            ),
+            "duplicate identical crawl assignment": original_text.replace(
+                crawl,
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 "
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 "
+                "RUST_TEST_THREADS=1 cargo test --release -p qwen38 --test "
+                "qwen38_gqh_gguf_crawl -- --include-ignored --test-threads=1",
+                1,
+            ),
+            "contradictory crawl assignment 0 then 1": original_text.replace(
+                crawl,
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=0 "
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 "
+                "RUST_TEST_THREADS=1 cargo test --release -p qwen38 --test "
+                "qwen38_gqh_gguf_crawl -- --include-ignored --test-threads=1",
+                1,
+            ),
+            "contradictory crawl assignment 1 then 0": original_text.replace(
+                crawl,
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 "
+                "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=0 "
+                "RUST_TEST_THREADS=1 cargo test --release -p qwen38 --test "
+                "qwen38_gqh_gguf_crawl -- --include-ignored --test-threads=1",
+                1,
+            ),
         }
 
         for label, manifest_text in mutations.items():

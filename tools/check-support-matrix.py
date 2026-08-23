@@ -114,25 +114,32 @@ def anchors_from_text(text: str) -> set[str]:
     return anchors
 
 
-def _parse_gate_command(command: object) -> tuple[dict[str, str], list[str]]:
+def _parse_gate_command(command: object) -> tuple[dict[str, str], list[str]] | None:
     if not isinstance(command, str):
-        return {}, []
+        return None
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return {}, []
+        return None
     if not tokens or any(token in CONTROL_TOKENS for token in tokens):
-        return {}, []
+        return None
 
-    assignments: dict[str, str] = {}
+    assignment_pairs: list[tuple[str, str]] = []
+    assignment_names: set[str] = set()
     while tokens and ASSIGNMENT_RE.fullmatch(tokens[0]):
         name, value = tokens.pop(0).split("=", 1)
-        assignments[name] = value
-    return assignments, tokens
+        if name in assignment_names:
+            return None
+        assignment_names.add(name)
+        assignment_pairs.append((name, value))
+    return dict(assignment_pairs), tokens
 
 
 def _is_strict_preflight(command: object) -> bool:
-    assignments, tokens = _parse_gate_command(command)
+    parsed = _parse_gate_command(command)
+    if parsed is None:
+        return False
+    assignments, tokens = parsed
     return (
         assignments == PREFLIGHT_ASSIGNMENTS
         and tokens == PREFLIGHT_TOKENS
@@ -140,7 +147,10 @@ def _is_strict_preflight(command: object) -> bool:
 
 
 def _is_serial_crawl(command: object) -> bool:
-    assignments, tokens = _parse_gate_command(command)
+    parsed = _parse_gate_command(command)
+    if parsed is None:
+        return False
+    assignments, tokens = parsed
     required_prefix = [
         "cargo",
         "test",
