@@ -9,6 +9,32 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 
+ACTIVE_DOC_PATHS = (
+    "README.md",
+    "docs/build-and-run.md",
+    "docs/supported-matrix.md",
+    "docs/artifact-format.md",
+    "docs/testing.md",
+    "docs/benchmarks.md",
+    "docs/performance.md",
+    "tools/check-active-docs.py",
+    "tools/check-kernel-groups.py",
+    "tools/check-pr-diff.py",
+    "tools/check-qwen38-artifacts.py",
+    "tools/check-retained-source-terms.py",
+    "tools/check-support-matrix.py",
+    "tools/check-tool-inventory.py",
+    "tools/parse-rocm-smi.py",
+    "tools/select-r9700-device.py",
+    "tests/test_active_docs.py",
+    "tests/test_ci_workflows.py",
+    "tests/test_kernel_groups.py",
+    "tests/test_r9700_helpers.py",
+    "tests/test_pr_diff.py",
+    "tests/test_qwen38_artifact_preflight.py",
+    "tests/test_support_matrix.py",
+)
+
 
 def load_helper(filename: str, module_name: str):
     path = ROOT / "tools" / filename
@@ -30,13 +56,18 @@ class WorkflowContractTests(unittest.TestCase):
                     "gpu_data": [
                         {
                             "gpu": 0,
-                            "asic": {"market_name": "other", "gfx_target_version": "gfx1100"},
+                            "asic": {
+                                "market_name": "AMD Radeon RX 7900 XTX",
+                                "device_id": "0x744c",
+                                "target_graphics_version": "gfx1100",
+                            },
                         },
                         {
                             "gpu": 1,
                             "asic": {
                                 "market_name": "AMD Radeon AI PRO R9700",
-                                "gfx_target_version": "gfx1201",
+                                "device_id": "0x7551",
+                                "target_graphics_version": "gfx1201",
                             },
                         },
                     ]
@@ -66,20 +97,33 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("HIP_VISIBLE_DEVICES", text)
         self.assertNotIn("/dev/kfd", text)
         self.assertNotIn("/dev/dri", text)
-        self.assertRegex(
-            text,
-            re.compile(r"container:\s*\n\s+image:\s+rocm/dev-[^\n]+@sha256:[0-9a-f]{64}"),
-        )
-        self.assertIn("ROCm 6.3.2", text)
+        self.assertNotIn("container:", text)
+        self.assertIn("ROCM_VERSION: \"7.2.4\"", text)
+        self.assertIn("ROCM_HIP_SDK_VERSION: \"7.2.4.70204-93~24.04\"", text)
+        self.assertIn("repo.radeon.com/rocm/apt/${ROCM_VERSION}", text)
+        self.assertIn("rocm-hip-sdk", text)
+        self.assertIn("CA8BB4727A47B4D09B4EE8969386B48A1A693C5C", text)
+        self.assertIn("key_fingerprint", text)
+        self.assertIn("GITHUB_PATH", text)
+        self.assertIn("git --version", text)
+        self.assertIn("python3", text)
+        self.assertIn("python3 --version", text)
+        self.assertIn("import tomllib", text)
         self.assertIn("command -v hipcc", text)
         self.assertIn("hipcc --version", text)
+        self.assertLess(text.index("rocm-hip-sdk"), text.index("hipcc --version"))
+        self.assertLess(text.index("git --version"), text.index("python3"))
         self.assertLess(text.index("hipcc --version"), text.index("command -v cargo"))
         self.assertLess(text.index("hipcc --version"), text.index("cargo fmt --all --check"))
         self.assertIn("fetch-depth: 0", text)
+        self.assertIn("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", text)
+        self.assertNotIn("actions/checkout@v", text)
         self.assertIn("github.event.pull_request.base.sha", text)
         self.assertIn("github.event.pull_request.head.sha", text)
         self.assertIn("python3 tools/check-pr-diff.py", text)
         self.assertIn("git merge-base", text)
+        for path in ACTIVE_DOC_PATHS:
+            self.assertIn(f'      - "{path}"', text, path)
         self.assertIn("HIP_ARCH=gfx1201", text)
         for command in (
             "cargo fmt --all --check",
@@ -110,7 +154,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("HIP_VISIBLE_DEVICES", text)
         self.assertNotIn("|| '0'", text)
         self.assertNotIn(":-0", text)
-        self.assertIn("amd-smi list --json", text)
+        self.assertIn("amd-smi static --asic --json", text)
         self.assertIn("tools/select-r9700-device.py", text)
         self.assertIn("tools/parse-rocm-smi.py", text)
         self.assertIn("GITHUB_ENV", text)
@@ -140,7 +184,9 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("rocm-smi", text)
         self.assertRegex(text, re.compile(r"(?i)gpu.*idle"))
         self.assertIn("continue-on-error: true", text)
-        self.assertIn("actions/upload-artifact@v4", text)
+        self.assertIn("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", text)
+        self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", text)
+        self.assertNotIn("actions/upload-artifact@v", text)
         self.assertRegex(text, re.compile(r"if:\s*always\(\)"))
 
     def test_obsolete_kernel_lab_workflow_is_not_reintroduced(self):

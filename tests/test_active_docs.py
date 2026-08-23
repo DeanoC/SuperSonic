@@ -41,7 +41,8 @@ class ActiveDocsTests(unittest.TestCase):
                 "# Product\n\n"
                 "Run with --backend cuda for Qwen3.5.\n"
                 "SUPERSONIC_BACKENDS=cuda QWEN35_MODEL_DIR=/tmp/Gemma4\n"
-                "KV-FP8 VMM MoE Q4_K_M safetensors --int4\n",
+                "KV-FP8 VMM MoE Q4_K_M safetensors --int4\n"
+                "Gemma 4 Phi 4 Llama 3\n",
                 encoding="utf-8",
             )
 
@@ -54,6 +55,25 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertTrue(any("Gemma4" in violation for violation in violations))
         self.assertTrue(any("KV-FP8" in violation for violation in violations))
         self.assertTrue(any("Q4_K_M" in violation for violation in violations))
+        self.assertTrue(any("Gemma 4" in violation for violation in violations))
+        self.assertTrue(any("Phi 4" in violation for violation in violations))
+        self.assertTrue(any("Llama 3" in violation for violation in violations))
+
+    def test_artifact_doc_matches_cheap_preflight_scope(self):
+        artifact_doc = (ROOT / "docs" / "artifact-format.md").read_text(encoding="utf-8")
+        self.assertIn("existence, readability", artifact_doc)
+        self.assertNotIn("hashes", artifact_doc.lower())
+        self.assertNotIn("metadata", artifact_doc.lower())
+
+    def test_gfx1201_examples_use_validated_physical_selection(self):
+        for relative in ("README.md", "docs/build-and-run.md", "docs/benchmarks.md"):
+            text = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertNotIn("HIP_VISIBLE_DEVICES=0", text, relative)
+            self.assertIn("SUPERSONIC_R9700_GPU_ID", text, relative)
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("amd-smi static --asic --json", readme)
+        self.assertIn("tools/select-r9700-device.py", readme)
+        self.assertIn("SUPERSONIC_R9700_GPU_ARCH", readme)
 
     def test_internal_flm_term_is_allowed_only_in_explicit_internal_section(self):
         checker = load_checker()

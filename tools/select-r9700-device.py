@@ -24,9 +24,10 @@ class Device:
     market_name: str
 
 
-_INDEX_KEYS = ("gpu", "gpu_id", "device_id", "index")
+_INDEX_KEYS = ("gpu", "GPU")
 _ARCH_KEYS = (
     "gfx_target_version",
+    "target_graphics_version",
     "target_graphics_core",
     "gfx_arch",
     "architecture",
@@ -82,11 +83,12 @@ def _direct_market(node: dict[str, Any]) -> str:
 
 
 def parse_devices(output: str) -> list[Device]:
-    """Parse ``amd-smi list --json`` output into uniquely indexed devices.
+    """Parse ``amd-smi static --asic --json`` into indexed devices.
 
-    AMD SMI has used both ``gpu_data`` and ``devices`` containers across
-    releases.  Walking every object while carrying its parent GPU index keeps
-    the parser tolerant of those layouts without accepting a made-up ordinal.
+    The static ASIC schema carries the physical ordinal in ``gpu`` and the
+    architecture under ``asic``.  Walking nested objects while carrying that
+    record ordinal supports both current and older wrappers, but deliberately
+    never treats a PCI/device/subsystem identifier as a physical ordinal.
     """
 
     try:
@@ -105,11 +107,18 @@ def parse_devices(output: str) -> list[Device]:
 
     records: dict[int, dict[str, str | int]] = {}
 
-    def visit(node: Any, inherited_index: int | None = None) -> None:
+    def visit(
+        node: Any,
+        inherited_index: int | None = None,
+        *,
+        record_context: bool = False,
+    ) -> None:
         if isinstance(node, dict):
-            current_index = _direct_index(node)
-            if current_index is None:
-                current_index = inherited_index
+            current_index = inherited_index
+            if record_context:
+                direct_index = _direct_index(node)
+                if direct_index is not None:
+                    current_index = direct_index
             gfx = _direct_gfx(node)
             market = _direct_market(node)
             if current_index is not None and (gfx or market):
@@ -118,13 +127,24 @@ def parse_devices(output: str) -> list[Device]:
                     record["gfx_arch"] = gfx
                 if market:
                     record["market_name"] = market
-            for value in node.values():
-                visit(value, current_index)
+            for key, value in node.items():
+                # Only the device-record containers may introduce a new
+                # physical ordinal.  Nested ASIC/subsystem objects inherit
+                # their record's ordinal and cannot reinterpret identifiers.
+                child_record_context = key in {"gpu_data", "devices"}
+                visit(
+                    value,
+                    current_index,
+                    record_context=child_record_context,
+                )
         elif isinstance(node, list):
             for value in node:
-                visit(value, inherited_index)
+                visit(value, inherited_index, record_context=record_context)
 
-    visit(payload)
+    root_record_context = isinstance(payload, list) or (
+        isinstance(payload, dict) and _direct_index(payload) is not None
+    )
+    visit(payload, record_context=root_record_context)
     devices = [
         Device(
             physical_index=int(record["physical_index"]),

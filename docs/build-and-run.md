@@ -19,7 +19,9 @@ HIP_ARCH=gfx1201 cargo build --release --workspace
 Provide both the model directory and the matching custom GGUF artifact:
 
 ```bash
-HIP_VISIBLE_DEVICES=0 \
+export HIP_VISIBLE_DEVICES="${SUPERSONIC_R9700_GPU_ID:?set to a validated physical R9700 ordinal}"
+
+HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
   ./target/release/supersonic \
   --model qwen3.8-27b \
   --model-dir /data/models/Qwen3.8-27B \
@@ -29,9 +31,11 @@ HIP_VISIBLE_DEVICES=0 \
   --device 0
 ```
 
-The R9700 runner discovers its physical device from AMD SMI output and then
-masks it to logical device zero. A local run should make the same mapping
-explicit; do not assume that physical ordinal zero is the target.
+The R9700 runner discovers its physical device from the AMD SMI static ASIC
+record and then masks it to logical device zero. Use the discovery snippet in
+the [README](../README.md), or set `SUPERSONIC_R9700_GPU_ID` only to a
+previously validated physical ordinal before exporting `HIP_VISIBLE_DEVICES`.
+Do not assume that physical ordinal zero is the target.
 
 For the full pairing and header checks, see
 [artifact format](artifact-format.md). For serial large-artifact gates, see

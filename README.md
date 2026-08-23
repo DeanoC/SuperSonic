@@ -6,10 +6,28 @@ artifacts on HIP. The active support contract is intentionally small: the
 
 ## Quick start
 
+On a R9700 host, discover the physical GPU ordinal first. The selector reads
+the AMD SMI static ASIC record and accepts an override only after validating
+that record; it intentionally does not assume physical GPU zero:
+
+```bash
+amd-smi static --asic --json > /tmp/supersonic-amd-smi-static.json
+while IFS='=' read -r name value; do
+  case "$name" in
+    SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE)
+      export "$name=$value" ;;
+  esac
+done < <(
+  python3 tools/select-r9700-device.py \
+    --input /tmp/supersonic-amd-smi-static.json \
+    --override "${SUPERSONIC_R9700_GPU_ID:-}"
+)
+```
+
 ```bash
 HIP_ARCH=gfx1201 cargo build --release --workspace
 
-HIP_VISIBLE_DEVICES=0 \
+HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
   cargo run --release --bin supersonic -- \
   --model qwen3.8-27b \
   --model-dir /data/models/Qwen3.8-27B \

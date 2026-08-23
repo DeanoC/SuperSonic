@@ -12,6 +12,27 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+AMD_SMI_STATIC_ASIC_FIXTURE = {
+    "gpu_data": [
+        {
+            "gpu": 0,
+            "asic": {
+                "market_name": "AMD Radeon RX 7900 XTX",
+                "device_id": "0x744c",
+                "target_graphics_version": "gfx1100",
+            },
+        },
+        {
+            "gpu": 1,
+            "asic": {
+                "market_name": "AMD Radeon AI PRO R9700",
+                "device_id": "0x7551",
+                "target_graphics_version": "gfx1201",
+            },
+        },
+    ]
+}
+
 
 def load_helper(filename: str, module_name: str):
     path = ROOT / "tools" / filename
@@ -27,27 +48,56 @@ def load_helper(filename: str, module_name: str):
 class R9700SelectionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.selector = load_helper("select-r9700-device.py", "select_r9700_device")
-        self.devices = self.selector.parse_devices(
-            json.dumps(
-                {
-                    "gpu_data": [
-                        {
-                            "gpu": 0,
-                            "asic": {
-                                "market_name": "AMD Radeon RX 7900 XTX",
-                                "gfx_target_version": "gfx1100",
-                            },
-                        },
-                        {
-                            "gpu": 1,
-                            "asic": {
-                                "market_name": "AMD Radeon AI PRO R9700",
-                                "gfx_target_version": "gfx1201",
-                            },
-                        },
-                    ]
-                }
+        self.devices = self.selector.parse_devices(json.dumps(AMD_SMI_STATIC_ASIC_FIXTURE))
+
+    def test_captured_amd_smi_static_schema_uses_gpu_not_device_id(self):
+        self.assertEqual(
+            [(device.physical_index, device.gfx_arch) for device in self.devices],
+            [(0, "gfx1100"), (1, "gfx1201")],
+        )
+        self.assertEqual(self.selector.select_device(self.devices).physical_index, 1)
+
+    def test_list_schema_without_architecture_is_not_treated_as_static_schema(self):
+        with self.assertRaises(ValueError):
+            self.selector.parse_devices(
+                json.dumps({"gpu_data": [{"gpu": 1, "device_id": "0x7551"}]})
             )
+
+    def test_nested_identifiers_cannot_override_record_gpu_ordinal(self):
+        payload = {
+            "gpu_data": [
+                {
+                    "gpu": 1,
+                    "asic": {
+                        "market_name": "AMD Radeon AI PRO R9700",
+                        "device_id": "0x7551",
+                        "target_graphics_version": "gfx1201",
+                        "subsystem": {
+                            "gpu": 99,
+                            "target_graphics_version": "gfx1201",
+                        },
+                    },
+                }
+            ]
+        }
+        devices = self.selector.parse_devices(json.dumps(payload))
+        self.assertEqual(
+            [(device.physical_index, device.gfx_arch) for device in devices],
+            [(1, "gfx1201")],
+        )
+
+    def test_top_level_gpu_key_is_the_only_legacy_wrapper_ordinal(self):
+        payload = {
+            "GPU": "GPU 1",
+            "asic": {
+                "market_name": "AMD Radeon AI PRO R9700",
+                "target_graphics_version": "gfx1201",
+            },
+        }
+        devices = self.selector.parse_devices(json.dumps(payload))
+        self.assertEqual(
+            [(device.physical_index, device.gfx_arch) for device in devices],
+            [(1, "gfx1201")],
         )
 
     def test_discovery_selects_valid_physical_device_and_maps_it_to_logical_zero(self):

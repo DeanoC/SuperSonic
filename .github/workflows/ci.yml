@@ -6,12 +6,35 @@ on:
       - ".github/workflows/ci.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "README.md"
       - "crates/**"
       - "kernels/**"
       - "support/**"
       - "tools/**"
       - "tests/**"
       - "docs/**"
+      - "docs/artifact-format.md"
+      - "docs/benchmarks.md"
+      - "docs/build-and-run.md"
+      - "docs/performance.md"
+      - "docs/supported-matrix.md"
+      - "docs/testing.md"
+      - "tools/check-active-docs.py"
+      - "tools/check-kernel-groups.py"
+      - "tools/check-pr-diff.py"
+      - "tools/check-qwen38-artifacts.py"
+      - "tools/check-retained-source-terms.py"
+      - "tools/check-support-matrix.py"
+      - "tools/check-tool-inventory.py"
+      - "tools/parse-rocm-smi.py"
+      - "tools/select-r9700-device.py"
+      - "tests/test_active_docs.py"
+      - "tests/test_ci_workflows.py"
+      - "tests/test_kernel_groups.py"
+      - "tests/test_qwen38_artifact_preflight.py"
+      - "tests/test_pr_diff.py"
+      - "tests/test_r9700_helpers.py"
+      - "tests/test_support_matrix.py"
   workflow_dispatch:
 
 permissions:
@@ -25,20 +48,71 @@ jobs:
   cpu:
     name: CPU contract and compile gate
     runs-on: ubuntu-24.04
-    # Official AMD ROCm 6.3.2 development image pinned by manifest digest.
-    # It supplies HIP headers/hipcc for compilation only; no GPU device is
-    # requested or required by this job.
-    container:
-      image: rocm/dev-ubuntu-22.04@sha256:bdc3ac031337580aeadf70e4130cd6a20a8a52cc58c4380f84746789653d8c8e
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: "1"
+      ROCM_VERSION: "7.2.4"
+      ROCM_HIP_SDK_VERSION: "7.2.4.70204-93~24.04"
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+
+      - name: Install pinned ROCm HIP development toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates gnupg wget
+          sudo install -d -m 0755 /etc/apt/keyrings
+          key_file="$RUNNER_TEMP/rocm.gpg.key"
+          wget -qO "$key_file" https://repo.radeon.com/rocm/rocm.gpg.key
+          key_fingerprint="$(gpg --show-keys --with-colons "$key_file" \
+            | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test "$key_fingerprint" = "CA8BB4727A47B4D09B4EE8969386B48A1A693C5C"
+          gpg --dearmor < "$key_file" \
+            | sudo tee /etc/apt/keyrings/rocm.gpg >/dev/null
+          sudo tee /etc/apt/sources.list.d/rocm.list >/dev/null <<EOF
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/graphics/${ROCM_VERSION}/ubuntu noble main
+          EOF
+          sudo tee /etc/apt/preferences.d/rocm-pin-600 >/dev/null <<'EOF'
+          Package: *
+          Pin: release o=repo.radeon.com
+          Pin-Priority: 600
+          EOF
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "rocm-hip-sdk=${ROCM_HIP_SDK_VERSION}"
+          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
+          echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
+          echo "HIP_PATH=/opt/rocm" >> "$GITHUB_ENV"
+
+      - name: Verify host tools and pinned HIP toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v git
+          git --version
+          command -v python3
+          python3 --version
+          python3 - <<'PY'
+          import sys
+          import tomllib
+
+          if sys.version_info < (3, 11):
+              raise SystemExit(f"Python >= 3.11 required, got {sys.version}")
+          print(sys.version)
+          print(f"tomllib={tomllib.__name__}")
+          PY
+          command -v hipcc
+          hipcc --version
+          command -v cargo
+          cargo --version
+          command -v rustfmt
+          rustfmt --version
 
       - name: Check actual pull-request patch
         env:
@@ -59,14 +133,6 @@ jobs:
             base="$(git merge-base HEAD^ HEAD)"
             python3 tools/check-pr-diff.py --base "$base" --head HEAD
           fi
-
-      - name: Verify pinned HIP toolchain
-        run: |
-          set -euo pipefail
-          command -v hipcc
-          hipcc --version
-          command -v cargo
-          cargo --version
 
       - name: Check Rust formatting
         run: cargo fmt --all --check

@@ -51,11 +51,12 @@ Python validator suite. It does not set `HIP_VISIBLE_DEVICES` or require
 
 `.github/workflows/qwen38-gfx1201.yml` runs on exactly
 `[self-hosted, linux, rocm, gfx1201]` with a 45-minute timeout. It selects a
-configurable physical GPU ordinal, masks it to test ordinal 0, records
-`rocminfo`/`rocm-smi`, waits for three idle samples, and performs strict
-preflight for the canonical GGUF, optional 8192 GGUF, and model-directory
-files. Canonical defaults are the Task 8 runner paths, with repository or
-organization secret/variable overrides:
+configurable physical GPU ordinal from the bounded AMD SMI static ASIC
+record, masks it to test ordinal 0, records selected-device `rocm-smi`, waits
+for three idle samples, and performs strict preflight for the canonical GGUF,
+optional 8192 GGUF, and model-directory files. Canonical defaults are the
+Task 8 runner paths, with repository or organization secret/variable
+overrides:
 
 ```text
 SUPERSONIC_GQH_GGUF=/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf
@@ -135,15 +136,16 @@ not rely on workflow string presence alone.
 
 ### Fix-round workflow contract
 
-- The CPU job remains on ordinary Ubuntu with no GPU device request, but runs
-  in the pinned official AMD ROCm 6.3.2 `rocm/dev-ubuntu-22.04` development
-  image (manifest digest). It verifies `hipcc --version` before the first
-  cargo command and uses checkout `fetch-depth: 0`.
+- The CPU job remains on stock `ubuntu-24.04` with no GPU device request. It
+  installs the official ROCm 7.2.4 HIP SDK from the versioned AMD apt
+  repositories with the signed key and apt origin pin, exports `/opt/rocm/bin`
+  through `GITHUB_PATH`, and verifies git, Python/tomllib, cargo/rustfmt, and
+  `hipcc --version` before the first cargo command.
 - The CPU patch step uses pull-request base/head SHAs and the PR head ref,
   while non-PR dispatches compute `git merge-base`; `tools/check-pr-diff.py`
   checks that actual revision range rather than the working tree.
 - The R9700 job never defaults to physical GPU zero. A bounded
-  `timeout --foreground 30s amd-smi list --json` probe feeds
+  `timeout --foreground 30s amd-smi static --asic --json` probe feeds
   `tools/select-r9700-device.py`; exactly one validated `gfx1201`/R9700 is
   required unless a runner override is supplied and independently validated.
   The selected physical ordinal is exported as `HIP_VISIBLE_DEVICES`, with
@@ -187,3 +189,76 @@ ci: gate Qwen3.8 GQH on CPU and R9700
 ```
 
 Fix-round implementation commit: `7a7cc23`.
+
+## Task 9 fix round 2
+
+### RED -> GREEN
+
+The second review round began with realistic host-schema and setup-order
+tests. The RED run failed because the selector expected architecture fields in
+`amd-smi list --json`, the workflow still called that list command, the CPU
+job depended on a container, the artifact page overstated preflight checks,
+and the active-doc checker missed spaced `Gemma 4`, `Phi 4`, and `Llama 3`
+forms. The captured fixture now mirrors the host output shape:
+
+```json
+{
+  "gpu_data": [
+    {"gpu": 0, "asic": {"device_id": "0x744c", "target_graphics_version": "gfx1100"}},
+    {"gpu": 1, "asic": {"device_id": "0x7551", "target_graphics_version": "gfx1201"}}
+  ]
+}
+```
+
+GREEN behavior uses only the record `gpu` field for the physical ordinal,
+accepts `target_graphics_version`, and validates both discovery and explicit
+override against the complete ASIC record. `device_id` and list-only records
+cannot become ordinals.
+
+### Fix-round-2 contract
+
+- `qwen38-gfx1201.yml` uses bounded
+  `amd-smi static --asic --json`; it no longer expects architecture data from
+  `amd-smi list --json`.
+- `ci.yml` runs directly on stock `ubuntu-24.04`. Its setup installs the
+  signed, versioned ROCm 7.2.4 apt repositories and the exact
+  `rocm-hip-sdk=7.2.4.70204-93~24.04` package, verifies the AMD repository key
+  fingerprint, adds `/opt/rocm/bin` to `GITHUB_PATH`, then checks git, Python
+  >=3.11 with `tomllib`, cargo, rustfmt, and hipcc before dependent commands.
+  Checkout and artifact upload use immutable action commit refs; no container
+  execution is claimed.
+- The CPU pull-request path filter explicitly includes `README.md`, all seven
+  active docs, every active validator, and every Python test file used by the
+  CPU gate.
+- Active-doc rejection now covers spaced product identities. README, build,
+  and benchmark gfx1201 examples use validated physical selection guidance;
+  none hardcodes `HIP_VISIBLE_DEVICES=0`.
+- The artifact page now states the actual cheap preflight scope: existence,
+  readability, and required model configuration/tokenizer sidecars. Rust
+  startup/artifact tests own GQH header and geometry validation.
+- The report's old `rocminfo` wording was corrected to the actual AMD
+  SMI/static-ASIC and selected-device `rocm-smi` flow.
+- The selector regression fixture includes the host's `device_id` fields and
+  proves that only each record's physical `gpu` ordinal is used; nested
+  subsystem identifiers cannot override it.
+
+### Fix-round-2 verification
+
+```text
+cargo fmt --all --check                         PASS
+git diff --check                                PASS
+python3 tools/check-active-docs.py              PASS
+python3 tools/check-support-matrix.py           PASS (2 entries / 2 arches)
+python3 tools/check-kernel-groups.py            PASS (2 groups)
+python3 tools/check-tool-inventory.py           PASS (1 runner binary)
+python3 -m unittest discover -s tests -p 'test_*.py' -v 43 tests PASS
+```
+
+The hosted CPU workflow and self-hosted R9700 workflow were not executed in
+this environment. No container or R9700 execution result is claimed.
+
+Fix-round-2 implementation remains under the required subject:
+
+```text
+ci: gate Qwen3.8 GQH on CPU and R9700
+```

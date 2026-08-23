@@ -26,7 +26,7 @@ FORBIDDEN_PATTERNS = (
     re.compile(r"--backend\b", re.IGNORECASE),
     re.compile(r"\bSUPERSONIC_BACKENDS?\b"),
     re.compile(r"(?:\b(?:cuda|metal)\b|\b(?:cuda|metal)[_-][a-z0-9_]+)", re.IGNORECASE),
-    re.compile(r"\b(?:gemma|phi|llama)(?:[0-9]|[_-][a-z0-9])", re.IGNORECASE),
+    re.compile(r"\b(?:gemma|phi|llama)(?:\s*[0-9]|[_-][a-z0-9])", re.IGNORECASE),
     re.compile(r"qwen[-_ ]*3[.]?[56](?![0-9])", re.IGNORECASE),
     re.compile(r"\bDFlash\b|\bSpecPrefill\b|\bCertified[-_ ]?KV\b", re.IGNORECASE),
     re.compile(r"\bKV[-_ ]?FP8\b|\bFP8\b|\bVMM\b|\bMoE\b", re.IGNORECASE),
