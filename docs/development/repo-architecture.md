@@ -1,66 +1,65 @@
-# SuperSonic Repository Architecture
+# Repository architecture
 
-This map records the intended ownership boundaries for SuperSonic while the
-project is still an experimental inference engine. It is descriptive first:
-current code may still cross these boundaries, but new work should make those
-crossings rarer and easier to remove.
+This document is contributor guidance for the retained Qwen3.8-27B ROCm/HIP
+product. The public command enters through `crates/runner`, loads a custom GQH
+GGUF with a model-directory sidecar pair, and executes through the runtime,
+HIP kernel bridges, and `gpu-hal`.
 
-## Ownership Boundaries
+## Ownership map
 
-| Area | Owns | Should avoid |
+| Area | Owner | Responsibility |
 | --- | --- | --- |
-| `crates/runner` | CLI orchestration, experiment entrypoints, validation wiring, and compatibility aliases for existing commands. | Becoming the stable library API, owning reusable generation/session contracts, or hiding model/backend policy that server users need. |
-| `crates/runtime` | Stable library and server-facing runtime API. This is the intended home for reusable generation, session, request, and response types. | Depending on `runner`, importing CLI-only code, or depending on lab experiment helpers. |
-| `crates/core` | Shared cross-crate concepts such as model ids, backend ids, architecture ids, registry metadata, and capability/support vocabulary. | Model-specific runtime implementation, CLI parsing, or backend launch details. |
-| Model crates (`crates/qwen35`, `crates/qwen35_dflash`, `crates/qwen3_moe`, `crates/qwen36_moe`, `crates/gemma4`, `crates/phi4`) | Model metadata, weight/state definitions, bake contracts, and model-local helpers. | CLI orchestration, global device probing policy, or unrelated backend selection logic. |
-| `crates/kernel-ffi` | Typed host/FFI wrappers, kernel launch wrappers, profiling hooks, and error translation for backend kernels. | High-level model orchestration, benchmark policy, or CLI experiment routing. |
-| `kernels` | Backend kernels grouped by model/backend until later split work proves coverage. | Rust ownership of model/session state or command-line behavior. |
-| `crates/gpu-hal` | Backend memory/device abstractions, buffers, device selection primitives, and low-level synchronization helpers. | Model-specific scheduling policy or benchmark reporting. |
-| `crates/model-store` | Bake discovery, versioning, download layout, and local artifact storage contracts. | Runtime generation loops or backend kernel selection. |
-| `crates/bench` and `crates/kernel-lab` | Repeatable benchmarks, kernel task definitions, candidate-vs-baseline comparison, and lab-grade performance artifacts. | Replacing user-facing CLI entrypoints or becoming an implicit release dependency. |
-| `tests/` | Architecture and workload validation scripts, smoke tests, parity checks, and reproducible benchmark harnesses. | Long optimization narratives, ad hoc one-off logs, or hidden production entrypoints. |
-| `docs/` | Operator docs, support matrix, testing gates, benchmark recipes, development maps, plans, and historical bring-up notes. | Source of runtime truth that cannot be validated by code or scripts. |
+| Model identity | `crates/core` | Qwen3.8 identity and `gfx1100`/`gfx1201` registry data |
+| Device operations | `crates/gpu-hal` | HIP allocation, copies, events, and device queries |
+| Kernel bridge | `crates/kernel-ffi` | HIP decode/prefill, GQH codec, and NextN/MTP FFI |
+| Artifact loading | `crates/model-store` | Custom GGUF/GQH readers and codec foundations |
+| Model state | `crates/qwen38` | Configuration, weights, descriptors, and model state |
+| Generation | `crates/runtime` | Tokenization, chat rendering, prefill, decode, and MTP state |
+| Product entry point | `crates/runner` | CLI, host-side validation, generation, and structured output |
 
-## Current Boundary Debt
+Validators under `tools/` own the support matrix, kernel groups, artifact
+preflight, device selection, tool inventory, and active documentation checks.
+The CPU workflow and serial `gfx1201` workflow are the executable definitions
+of the two test tiers described in [testing](../testing.md).
 
-These are known seams to clean up after this documentation foundation lands:
+## Runtime flow
 
-- `runner` still carries compatibility shims and larger model-specific runtime
-  paths while public APIs settle. Keep moving stable generation/session code
-  toward `runtime` or a small shared crate so the runtime boundary stays
-  library-first.
-- `crates/runner/src/bin/*` contains stable-ish validation tools, true
-  microbenches, diagnostics, and lab experiments in one flat namespace. Command
-  names must keep working, but the repo needs a classification layer before
-  files move.
-- The main runner still carries model-specific wiring and temporary module
-  aliases for Qwen3.6 MoE bring-up. Those are acceptable while APIs settle, but
-  should not become the long-term extension model.
-- `crates/kernel-ffi/build.rs` compiles a broad bridge surface. Later PRs should
-  introduce explicit model/backend feature groups while preserving the default
-  build behavior until coverage is proven.
-- Support status, benchmark artifacts, and per-architecture gates are mostly
-  documented separately. The long-term goal is a single capability/support data
-  source that docs and tests can share where practical.
+```text
+runner CLI
+  -> model-directory and GQH preflight
+  -> qwen38 loader and model state
+  -> runtime prefill/decode and optional NextN/MTP
+  -> kernel-ffi HIP bridges
+  -> gpu-hal HIP device operations
+```
 
-## Change Rules
+The loader is intentionally strict. `config.json`, tokenizer data, and the
+chat template come from `--model-dir`; weights and GQH sidecars come from
+`--gguf-file`. A missing role or incompatible geometry fails before a large
+device allocation where practical.
 
-- Keep existing command names, test scripts, and CLI flags working until
-  replacement commands are documented, validated, and wrapper aliases exist.
-- Promote a model/backend/architecture path only when the support matrix, test
-  gate, and benchmark recipe are all named.
-- Treat lab and microbench tools as first-class development tools, but keep them
-  out of stable runtime contracts.
-- Prefer narrow extraction PRs over broad moves. A move should have an explicit
-  owner, validation gate, and rollback path.
-- Do not split kernel build behavior until the old default path and the new
-  grouped path can be compared on at least one representative backend.
+## ABI notes
 
-## Related Docs
+The public product name does not imply that every private symbol has already
+been renamed. A small number of wire keys and helper names retain historical
+spellings for compatibility with the GQH artifact and C++ bridge. In
+particular, the descriptor builder helper that creates INT4 scale descriptors
+also carries GQH header pointers. Preserve its layout and the corresponding
+FFI assertions until a dedicated rename changes both sides together.
 
-- [Supported matrix](../supported-matrix.md)
-- [Testing gates](../testing.md)
-- [Benchmark recipes](../benchmarks.md)
-- [Kernel lab](kernel-lab.md)
-- [Kernel build groups](kernel-build-groups.md)
-- [Consolidation roadmap](consolidation-roadmap.md)
+When changing a descriptor, kernel argument, qtype mapping, or sidecar pointer:
+
+1. add a focused CPU-safe layout or codec test;
+2. run the GQH pointer/header tests;
+3. run the serial artifact gate on `gfx1201` when an artifact is configured;
+4. document any historical wire spelling in the code comment and review.
+
+## Internal FLM foundation
+
+The model-store FLM codec is compile-tested contributor background. It is not a
+public runner input and must not become reachable through an implicit startup
+fallback. Changes to this foundation need CPU-safe round-trip coverage and
+must preserve the GQH reader boundary.
+
+For public behavior and review commands, see [AGENTS.md](../../AGENTS.md),
+[build and run](../build-and-run.md), and [testing](../testing.md).

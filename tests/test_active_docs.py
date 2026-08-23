@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -199,6 +200,97 @@ class ActiveDocsTests(unittest.TestCase):
             violations = checker.find_violations(root)
 
         self.assertTrue(any("missing" in violation for violation in violations))
+
+    def test_public_positioning_is_measured_performance_first(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        performance = (ROOT / "docs" / "performance.md").read_text(encoding="utf-8")
+
+        self.assertIn("performance-specialized", readme.lower())
+        self.assertIn("maximum measured performance", readme.lower())
+        self.assertIn("reproducible", performance.lower())
+        self.assertNotIn("megakernel", readme.lower())
+
+    def test_direct_gqh_quickstart_names_both_artifact_roles(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("## Quick start", readme)
+        self.assertIn("cargo run --release --bin supersonic", readme)
+        self.assertIn("--model qwen3.8-27b", readme)
+        self.assertIn("--model-dir", readme)
+        self.assertIn("--gguf-file", readme)
+        self.assertIn("config.json", readme)
+        self.assertIn("tokenizer", readme.lower())
+        self.assertIn("chat template", readme.lower())
+
+    def test_performance_number_is_omitted_or_fully_qualified(self):
+        public_text = "\n".join(
+            (ROOT / relative).read_text(encoding="utf-8")
+            for relative in load_checker().ACTIVE_DOCS
+        )
+        if not re.search(r"37\.2\s*tok/s", public_text, re.IGNORECASE):
+            return
+
+        lowered = public_text.lower()
+        self.assertRegex(lowered, r"commit\s*[:=]?\s*[0-9a-f]{7,40}")
+        self.assertIn("artifact", lowered)
+        self.assertRegex(lowered, r"gfx1100|gfx1201")
+        self.assertRegex(lowered, r"prompt|workload")
+        self.assertRegex(lowered, r"correctness|parity")
+
+    def test_contributor_guidance_is_canonical_and_complete(self):
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        lowered = agents.lower()
+        for crate in (
+            "crates/core",
+            "crates/gpu-hal",
+            "crates/kernel-ffi",
+            "crates/model-store",
+            "crates/qwen38",
+            "crates/runtime",
+            "crates/runner",
+        ):
+            self.assertIn(crate, lowered)
+        self.assertIn("internal flm foundation", lowered)
+        self.assertIn("abi", lowered)
+        self.assertRegex(lowered, r"cpu[- ]safe|test tiers?|testing tiers?")
+        self.assertRegex(lowered, r"unsupported .*fail|fail .*unsupported")
+
+        claude = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertRegex(claude.lower(), r"canonical guidance|see .*agents\.md|agents\.md")
+        self.assertLessEqual(len(claude.splitlines()), 12)
+
+    def test_obsolete_documentation_is_removed_from_active_tree(self):
+        obsolete = (
+            "docs/bake-distribution.md",
+            "docs/detailed_performance.md",
+            "docs/dflash.md",
+            "docs/feature-compatibility.md",
+            "docs/lowlevel-memory.md",
+            "docs/quality.md",
+            "docs/server.md",
+            "docs/specprefill.md",
+            "docs/development/consolidation-roadmap.md",
+            "docs/development/kernel-build-groups.md",
+            "docs/development/kernel-lab.md",
+        )
+        for relative in obsolete:
+            self.assertFalse((ROOT / relative).exists(), relative)
+
+        for directory in ("docs/bringup", "docs/optimization", "docs/papers", "docs/plans", "docs/research"):
+            self.assertFalse((ROOT / directory).exists(), directory)
+
+        superpowers_root = ROOT / "docs" / "superpowers"
+        for path in superpowers_root.glob("specs/*.md"):
+            self.assertEqual(
+                path.name,
+                "2026-08-23-qwen38-rocm-product-slimming-design.md",
+                path.as_posix(),
+            )
+        for path in superpowers_root.glob("plans/*.md"):
+            self.assertEqual(
+                path.name,
+                "2026-08-23-qwen38-rocm-product-slimming.md",
+                path.as_posix(),
+            )
 
 
 if __name__ == "__main__":

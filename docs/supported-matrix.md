@@ -1,32 +1,37 @@
 # Supported matrix
 
-The active matrix contains one model, one custom artifact source, one GQH
-quantization lane, and two HIP architectures. Rows are correctness claims;
-performance measurements belong in [performance](performance.md).
+SuperSonic has one public model and one public weight source. The rows below
+are the complete product contract, not a promise of compatibility with
+unlisted artifacts or devices.
 
 The machine-readable source is [`support/matrix.toml`](../support/matrix.toml).
 Run `python3 tools/check-support-matrix.py` after changing a row.
 
-## Active contract
-
-| Model | Source | Quantization | Architecture | Gate |
+| Model | Weight source | Architecture | Generation | Correctness gate |
 | --- | --- | --- | --- | --- |
-| `qwen3.8-27b` | `gqh-gguf` | `gqh` | `gfx1100` | `qwen38-gqh-correctness` |
-| `qwen3.8-27b` | `gqh-gguf` | `gqh` | `gfx1201` | `qwen38-gqh-correctness` |
+| `qwen3.8-27b` | custom `gqh-gguf` | `gfx1100` | single-sequence greedy, optional NextN/MTP | `qwen38-gqh-correctness` |
+| `qwen3.8-27b` | custom `gqh-gguf` | `gfx1201` | single-sequence greedy, optional NextN/MTP | `qwen38-gqh-correctness` |
 
-### HIP on `gfx1100`
+## HIP on `gfx1100`
 
-The `gfx1100` row is the component and bring-up lane. Its named gate uses
-the full serial GQH artifact crawl with ignored tests enabled.
+The `gfx1100` row is a supported ROCm/HIP target for component and artifact
+correctness. Its named gate uses the serial GQH artifact tests with ignored
+correctness cases selected explicitly.
 
-### HIP on `gfx1201`
+## HIP on `gfx1201`
 
-The `gfx1201` row is the R9700 serial lane. Its workflow validates the
-physical device, waits for selected-device idleness, builds a release
-workspace, crawls the artifact, and compares ordinary and MTP tokens.
+The `gfx1201` row is the self-hosted R9700 lane. Its workflow validates the
+physical device, waits for selected-device idleness, builds with
+`HIP_ARCH=gfx1201`, checks the configured artifact pair, and compares ordinary
+and NextN/MTP token arrays.
 
-## Status vocabulary
+## Failure boundary
 
-`experimental` means the row is wired to a named correctness gate and is
-still subject to promotion from runner evidence. A row is not implied to be
-portable to an architecture absent from this document.
+The `--model` value must be `qwen3.8-27b`; the model directory and custom GQH
+GGUF must be supplied together. Unlisted model names, architectures, artifact
+sources, multi-sequence requests, and non-greedy controls fail explicitly.
+There is no silent fallback to another row or loader.
+
+The workflow's throughput telemetry is diagnostic until repeated measurements
+establish variance and a separately documented threshold. Correctness gates
+remain authoritative for support status.

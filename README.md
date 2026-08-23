@@ -1,8 +1,16 @@
 # SuperSonic
 
-SuperSonic is the product path for Qwen3.8-27B inference with custom GQH
-artifacts on HIP. The active support contract is intentionally small: the
-`gfx1100` and `gfx1201` lanes share the same model and artifact roles.
+SuperSonic is a performance-specialized ROCm/HIP inference engine for
+Qwen3.8-27B. Its narrow product surface is built around maximum measured performance,
+reproducible correctness, and a custom GQH GGUF artifact on
+supported AMD GPUs.
+
+The supported contract is one Qwen3.8-27B sequence at a time with deterministic
+greedy generation, optional Qwen3.8 NextN/MTP generation, and the
+`gfx1100` and `gfx1201` ROCm targets. The model directory and the weight
+artifact are separate inputs: `--model-dir` supplies `config.json`, tokenizer
+data, and the chat template; `--gguf-file` supplies the matching custom GQH
+GGUF weights.
 
 ## Quick start
 
@@ -53,9 +61,13 @@ export HIP_VISIBLE_DEVICES="${selected[HIP_VISIBLE_DEVICES]}"
 export SUPERSONIC_DEVICE="${selected[SUPERSONIC_DEVICE]}"
 ```
 
+Build for the selected ROCm target, then run the one direct GQH path:
+
 ```bash
 HIP_ARCH=gfx1201 cargo build --release --workspace
+```
 
+```bash
 HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
   cargo run --release --bin supersonic -- \
   --model qwen3.8-27b \
@@ -66,9 +78,15 @@ HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
   --device 0
 ```
 
-The GGUF and model directory are separate roles. Keep the artifact pair on a
-local filesystem and follow the [artifact contract](docs/artifact-format.md)
-before running a correctness gate.
+The model directory must contain `config.json`, `tokenizer.json`, and the
+chat template in `tokenizer_config.json`. The GGUF must be the matching
+project-specific GQH artifact; generic GGUF files are not part of this
+contract. See the [artifact contract](docs/artifact-format.md) before running
+a correctness gate.
+
+Any unlisted model, architecture, artifact format, or non-greedy generation
+combination fails explicitly. A configured GPU or artifact that cannot be
+validated fails closed before the correctness run starts.
 
 ## Active documentation
 
@@ -85,3 +103,8 @@ Validate the checked product boundaries with:
 python3 tools/check-support-matrix.py
 python3 tools/check-active-docs.py
 ```
+
+Performance numbers are published only when the exact commit, GPU target,
+artifact, workload, measurement method, and correctness result are recorded.
+Until that evidence is attached, this page intentionally makes no standalone
+throughput claim.
