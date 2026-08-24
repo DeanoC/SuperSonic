@@ -105,8 +105,10 @@ The harness records `cold-load` and `warm-resident` separately and keeps
 their adapter transitions are verified. `uncontrolled-clocks` results may be
 retained for diagnosis but are excluded from headline and peer speedup claims.
 The candidate directory is diagnostic until a reviewer checks raw samples,
-the validator/renderer-derived median/MAD/count, correctness, cache/clock evidence, artifact digests, and
-comparability, then promotes only portable records in a code-reviewed change.
+the validator's raw-sample value/count/completeness checks, the renderer's
+deterministically derived median/MAD/count, correctness, cache/clock evidence,
+artifact digests, and comparability, then promotes only portable records in a
+code-reviewed change.
 
 ## Failure policy
 

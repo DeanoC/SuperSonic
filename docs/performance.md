@@ -19,15 +19,17 @@ record identifies all of the following:
   decoding, stop policy, and timing boundary;
 - explicit cache state and process state, with `process_reuse=false` for the
   current one-shot evidence;
-- raw measured samples; the validator and renderer derive sample count,
-  statistic, and dispersion from those samples; and
+- raw measured samples; the validator validates their values, exact count,
+  and bundle completeness, while the renderer derives sample count, statistic,
+  and dispersion from validated raw samples; and
 - correctness, including ordinary-versus-MTP token equality where applicable.
 
 The representative statistic is the median. Raw samples in measured order are
-the source of truth. The validator and renderer deterministically derive and
-show minimum, maximum, median absolute deviation (MAD), and sample count from
-those samples; those summaries are not stored source fields. Never select the
-best observed sample as the headline value. A quality
+the source of truth. The validator checks their values, exact count, and bundle
+completeness; the renderer deterministically derives and shows minimum,
+maximum, median absolute deviation (MAD), and sample count from those
+validated raw samples. Those summaries are not stored source fields. Never
+select the best observed sample as the headline value. A quality
 failure, missing sample, unexplained token mismatch, incomplete suite, or
 unverified clock is a publication blocker.
 

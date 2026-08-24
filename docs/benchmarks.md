@@ -132,8 +132,9 @@ pinned_peer_version="$(grep -v '^#' tools/external/llama-cpp-version.txt | grep 
 test "$(llama-cli --version)" = "$pinned_peer_version"
 ```
 
-The workflow supplies the actual peer path and binary pin; a local invocation
-must provide the corresponding `--peer-artifact` path.
+The workflow supplies the actual peer path and binary pin. The local command
+must pass the exact readable artifact that the preflight checked:
+`--peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT"`.
 
 ```bash
 set -euo pipefail
@@ -143,7 +144,7 @@ RUST_TEST_THREADS=1 timeout --foreground 21660s \
   --suite full \
   --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
   --artifact "$SUPERSONIC_GQH_GGUF" \
-  --peer-artifact /path/to/pinned-peer-artifact.gguf \
+  --peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT" \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
   --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
   --rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt" \
@@ -193,9 +194,10 @@ Every candidate record retains the commit and dirty state, engine/version,
 ROCm/HIP versions, static physical GPU provenance, logical mapping, artifact
 identity and digest, prompt/workload, cache/process state, clock evidence,
 correctness and ordinary-versus-MTP equality, and raw measured samples in
-measurement order. The validator and renderer deterministically derive sample
+measurement order. The validator validates raw sample values, exact sample
+count, and bundle completeness. The renderer deterministically derives sample
 count, median, minimum, maximum, and median absolute deviation (MAD) from
-those raw samples; no stored summary replaces the raw source.
+those validated raw samples; no stored summary replaces the raw source.
 
 The reviewer runs validation and, for a peer comparison, the implemented
 comparator. A mismatch remains visible with reasons but produces no speedup:

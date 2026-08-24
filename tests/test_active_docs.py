@@ -57,7 +57,12 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertIn('run_id="full-manual-', text)
         self.assertIn("command -v llama-cli", text)
         self.assertIn('test -r "$SUPERSONIC_LLAMA_CPP_ARTIFACT"', text)
-        self.assertIn("validator and renderer deterministically derive", text)
+        self.assertIn("The validator validates raw sample values", text)
+        self.assertIn("The renderer deterministically derives sample", text)
+        full = text.split("## Full candidate", 1)[1].split("## Cache and clock terminology", 1)[0]
+        self.assertIn('export SUPERSONIC_LLAMA_CPP_ARTIFACT=', full)
+        self.assertIn('--peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT"', full)
+        self.assertNotIn("--peer-artifact /path/to/pinned-peer-artifact.gguf", full)
         testing = (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")
         self.assertIn('run_id="quick-manual-', testing)
         self.assertIn('--run-id "$run_id"', testing)
