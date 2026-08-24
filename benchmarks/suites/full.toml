@@ -33,6 +33,7 @@ mode = "ordinary"
 cache_state = "cold-load"
 timeout_seconds = 90
 decoding_policy = "greedy"
+engines = ["supersonic", "llama-cpp"]
 
 [[performance_cases]]
 id = "full-short-warm-ordinary"
@@ -44,6 +45,7 @@ mode = "ordinary"
 cache_state = "warm-resident"
 timeout_seconds = 60
 decoding_policy = "greedy"
+engines = ["supersonic", "llama-cpp"]
 
 [[performance_cases]]
 id = "full-long-cold-ordinary"
@@ -55,6 +57,7 @@ mode = "ordinary"
 cache_state = "cold-load"
 timeout_seconds = 180
 decoding_policy = "greedy"
+engines = ["supersonic", "llama-cpp"]
 
 [[performance_cases]]
 id = "full-long-warm-ordinary"
@@ -66,6 +69,7 @@ mode = "ordinary"
 cache_state = "warm-resident"
 timeout_seconds = 180
 decoding_policy = "greedy"
+engines = ["supersonic", "llama-cpp"]
 
 [[performance_cases]]
 id = "full-short-cold-mtp"
@@ -77,6 +81,7 @@ mode = "mtp"
 cache_state = "cold-load"
 timeout_seconds = 90
 decoding_policy = "greedy"
+engines = ["supersonic"]
 
 [[performance_cases]]
 id = "full-short-warm-mtp"
@@ -88,6 +93,7 @@ mode = "mtp"
 cache_state = "warm-resident"
 timeout_seconds = 60
 decoding_policy = "greedy"
+engines = ["supersonic"]
 
 [[performance_cases]]
 id = "full-long-cold-mtp"
@@ -99,6 +105,7 @@ mode = "mtp"
 cache_state = "cold-load"
 timeout_seconds = 180
 decoding_policy = "greedy"
+engines = ["supersonic"]
 
 [[performance_cases]]
 id = "full-long-warm-mtp"
@@ -110,3 +117,40 @@ mode = "mtp"
 cache_state = "warm-resident"
 timeout_seconds = 180
 decoding_policy = "greedy"
+engines = ["supersonic"]
+
+[[performance_cases]]
+id = "full-short-prefix-empty-ordinary"
+prompt = "Emit one sentence describing a benchmark run that starts with an empty prefix cache."
+max_new_tokens = 32
+warmups = 0
+repetitions = 7
+mode = "ordinary"
+cache_state = "prefix-cache-empty"
+timeout_seconds = 90
+decoding_policy = "greedy"
+engines = ["supersonic"]
+
+[[performance_cases]]
+id = "full-short-prefix-populated-ordinary"
+prompt = "Emit one sentence describing a benchmark run that reuses a populated prefix cache."
+max_new_tokens = 32
+warmups = 1
+repetitions = 7
+mode = "ordinary"
+cache_state = "prefix-cache-populated"
+timeout_seconds = 90
+decoding_policy = "greedy"
+engines = ["supersonic"]
+
+[[performance_cases]]
+id = "full-short-prefix-reset-ordinary"
+prompt = "Emit one sentence describing a benchmark run that verifies a reset prefix cache before measurement."
+max_new_tokens = 32
+warmups = 0
+repetitions = 7
+mode = "ordinary"
+cache_state = "prefix-cache-reset"
+timeout_seconds = 90
+decoding_policy = "greedy"
+engines = ["supersonic"]

@@ -34,6 +34,7 @@ PERFORMANCE_CASE_KEYS = {
     "cache_state",
     "timeout_seconds",
     "decoding_policy",
+    "engines",
 }
 QUALITY_KEYS = {"version", "categories", "cases"}
 QUALITY_CASE_KEYS = {
@@ -47,7 +48,13 @@ QUALITY_CASE_KEYS = {
 }
 ENGINE_BASE_KEYS = {"version", "name", "binary", "version_command", "supported_modes"}
 ALLOWED_MODES = {"ordinary", "mtp"}
-ALLOWED_CACHE_STATES = {"cold-load", "warm-resident"}
+ALLOWED_CACHE_STATES = {
+    "cold-load",
+    "warm-resident",
+    "prefix-cache-empty",
+    "prefix-cache-populated",
+    "prefix-cache-reset",
+}
 ALLOWED_SCORERS = {"exact_text", "exact_tokens", "structured_json"}
 APPROVED_CATEGORIES = {
     "instruction-following",
@@ -95,23 +102,18 @@ def load_suite_path(path: Path) -> SuiteManifest:
     if not isinstance(raw_cases, list) or not raw_cases:
         raise ValueError(f"suite {path.name} performance_cases must be a non-empty array")
     performance_cases = tuple(
-        _parse_performance_case(entry, suite_name=name, suite_decoding_policy=decoding_policy)
+        _parse_performance_case(
+            entry,
+            suite_name=name,
+            suite_decoding_policy=decoding_policy,
+            suite_engines=engines,
+            engine_manifests=engine_manifests,
+        )
         for entry in raw_cases
     )
     case_ids = [case.id for case in performance_cases]
     if len(case_ids) != len(set(case_ids)):
         raise ValueError(f"suite {path.name} performance case ids must be unique")
-    unsupported_modes = sorted(
-        {
-            case.mode
-            for case in performance_cases
-            if not any(case.mode in engine.supported_modes for engine in engine_manifests)
-        }
-    )
-    if unsupported_modes:
-        raise ValueError(
-            f"suite {path.name} has modes unsupported by configured engines: {unsupported_modes}"
-        )
 
     return SuiteManifest(
         version=version,
@@ -204,7 +206,14 @@ def load_engine(name: str) -> EngineManifest:
     )
 
 
-def _parse_performance_case(data: object, *, suite_name: str, suite_decoding_policy: str) -> PerformanceCase:
+def _parse_performance_case(
+    data: object,
+    *,
+    suite_name: str,
+    suite_decoding_policy: str,
+    suite_engines: tuple[str, ...],
+    engine_manifests: tuple[EngineManifest, ...],
+) -> PerformanceCase:
     if not isinstance(data, dict):
         raise ValueError(f"suite {suite_name} performance case entries must be tables")
     _require_exact_keys(data, PERFORMANCE_CASE_KEYS, f"suite {suite_name} performance case")
@@ -221,6 +230,24 @@ def _parse_performance_case(data: object, *, suite_name: str, suite_decoding_pol
     )
     if decoding_policy != suite_decoding_policy:
         raise ValueError(f"suite {suite_name} performance case decoding policy mismatch")
+    scoped_engines = _require_str_tuple(data, "engines", minimum_items=1)
+    if len(scoped_engines) != len(set(scoped_engines)):
+        raise ValueError(f"suite {suite_name} performance case engines must be unique")
+    unknown_engines = sorted(set(scoped_engines) - set(suite_engines))
+    if unknown_engines:
+        raise ValueError(
+            f"suite {suite_name} performance case references engines not declared by the suite: {unknown_engines}"
+        )
+    engines_by_name = {engine.name: engine for engine in engine_manifests}
+    unsupported_engines = sorted(
+        engine_name
+        for engine_name in scoped_engines
+        if mode not in engines_by_name[engine_name].supported_modes
+    )
+    if unsupported_engines:
+        raise ValueError(
+            f"suite {suite_name} performance case mode {mode!r} is unsupported by engines: {unsupported_engines}"
+        )
     return PerformanceCase(
         id=_require_nonempty_str(data, "id"),
         prompt=_require_nonempty_str(data, "prompt"),
@@ -231,6 +258,7 @@ def _parse_performance_case(data: object, *, suite_name: str, suite_decoding_pol
         cache_state=cache_state,
         timeout_seconds=_require_int(data, "timeout_seconds", minimum=1),
         decoding_policy=decoding_policy,
+        engines=scoped_engines,
     )
 
 

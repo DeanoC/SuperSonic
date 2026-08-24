@@ -19,6 +19,7 @@ class PerformanceCase:
     cache_state: str
     timeout_seconds: int
     decoding_policy: str
+    engines: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)

@@ -25,6 +25,7 @@ mode = "ordinary"
 cache_state = "warm-resident"
 timeout_seconds = 45
 decoding_policy = "greedy"
+engines = ["supersonic"]
 
 [[performance_cases]]
 id = "quick-long-warm-ordinary"
@@ -36,3 +37,4 @@ mode = "ordinary"
 cache_state = "warm-resident"
 timeout_seconds = 90
 decoding_policy = "greedy"
+engines = ["supersonic"]

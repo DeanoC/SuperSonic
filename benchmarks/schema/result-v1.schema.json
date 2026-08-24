@@ -194,7 +194,10 @@
           "type": "string",
           "enum": [
             "cold-load",
-            "warm-resident"
+            "warm-resident",
+            "prefix-cache-empty",
+            "prefix-cache-populated",
+            "prefix-cache-reset"
           ]
         },
         "warmups": {
@@ -215,8 +218,10 @@
       "type": "object",
       "required": [
         "clock_policy",
-        "power_cap_watts",
-        "cache_control"
+        "requested",
+        "observed_before",
+        "observed_after",
+        "telemetry_samples"
       ],
       "properties": {
         "clock_policy": {
@@ -226,12 +231,163 @@
             "uncontrolled-clocks"
           ]
         },
-        "power_cap_watts": {
-          "type": "integer",
-          "minimum": 0
+        "requested": {
+          "type": "object",
+          "required": [
+            "gpu_clock_mhz",
+            "memory_clock_mhz",
+            "power_cap_watts",
+            "performance_level"
+          ],
+          "properties": {
+            "gpu_clock_mhz": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "memory_clock_mhz": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "power_cap_watts": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "performance_level": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
         },
-        "cache_control": {
-          "type": "string"
+        "observed_before": {
+          "type": "object",
+          "required": [
+            "gpu_clock_mhz",
+            "memory_clock_mhz",
+            "power_watts",
+            "temperature_celsius",
+            "gpu_utilization_percent",
+            "memory_utilization_percent",
+            "performance_level"
+          ],
+          "properties": {
+            "gpu_clock_mhz": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "memory_clock_mhz": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "power_watts": {
+              "type": "number",
+              "minimum": 0
+            },
+            "temperature_celsius": {
+              "type": "number"
+            },
+            "gpu_utilization_percent": {
+              "type": "number",
+              "minimum": 0
+            },
+            "memory_utilization_percent": {
+              "type": "number",
+              "minimum": 0
+            },
+            "performance_level": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "observed_after": {
+          "type": "object",
+          "required": [
+            "gpu_clock_mhz",
+            "memory_clock_mhz",
+            "power_watts",
+            "temperature_celsius",
+            "gpu_utilization_percent",
+            "memory_utilization_percent",
+            "performance_level"
+          ],
+          "properties": {
+            "gpu_clock_mhz": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "memory_clock_mhz": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "power_watts": {
+              "type": "number",
+              "minimum": 0
+            },
+            "temperature_celsius": {
+              "type": "number"
+            },
+            "gpu_utilization_percent": {
+              "type": "number",
+              "minimum": 0
+            },
+            "memory_utilization_percent": {
+              "type": "number",
+              "minimum": 0
+            },
+            "performance_level": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "telemetry_samples": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "offset_seconds",
+              "gpu_clock_mhz",
+              "memory_clock_mhz",
+              "power_watts",
+              "temperature_celsius",
+              "gpu_utilization_percent",
+              "memory_utilization_percent",
+              "performance_level"
+            ],
+            "properties": {
+              "offset_seconds": {
+                "type": "number",
+                "minimum": 0
+              },
+              "gpu_clock_mhz": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "memory_clock_mhz": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "power_watts": {
+                "type": "number",
+                "minimum": 0
+              },
+              "temperature_celsius": {
+                "type": "number"
+              },
+              "gpu_utilization_percent": {
+                "type": "number",
+                "minimum": 0
+              },
+              "memory_utilization_percent": {
+                "type": "number",
+                "minimum": 0
+              },
+              "performance_level": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
         }
       },
       "additionalProperties": false

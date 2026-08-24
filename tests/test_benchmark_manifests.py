@@ -20,6 +20,13 @@ APPROVED_CATEGORIES = {
     "repeated-run-determinism",
     "ordinary-vs-mtp-token-equality",
 }
+CACHE_STATES = {
+    "cold-load",
+    "warm-resident",
+    "prefix-cache-empty",
+    "prefix-cache-populated",
+    "prefix-cache-reset",
+}
 
 
 def load_manifest_module():
@@ -67,21 +74,64 @@ class BenchmarkManifestTests(unittest.TestCase):
         engines = {engine.name: engine for engine in map(manifest.load_engine, full.engines)}
         suite_modes = {case.mode for case in full.performance_cases}
         self.assertEqual(suite_modes, {"ordinary", "mtp"})
+        self.assertTrue(CACHE_STATES.issubset({case.cache_state for case in full.performance_cases}))
         for case in full.performance_cases:
             self.assertGreaterEqual(case.warmups, 0)
             self.assertGreater(case.repetitions, 0)
             self.assertGreater(case.timeout_seconds, 0)
             self.assertEqual(case.decoding_policy, "greedy")
-            self.assertIn(case.cache_state, {"cold-load", "warm-resident"})
-            self.assertTrue(
-                any(case.mode in engine.supported_modes for engine in engines.values()),
-                msg=f"no engine supports mode {case.mode}",
-            )
+            self.assertIn(case.cache_state, CACHE_STATES)
+            self.assertTrue(case.engines, msg=f"{case.id} must scope at least one engine")
+            self.assertLessEqual(set(case.engines), set(full.engines))
+            for engine_name in case.engines:
+                self.assertIn(
+                    case.mode,
+                    engines[engine_name].supported_modes,
+                    msg=f"{engine_name} does not support {case.mode} for {case.id}",
+                )
+            if case.mode == "mtp":
+                self.assertEqual(case.engines, ("supersonic",))
 
         quick = manifest.load_suite("quick")
         self.assertTrue(all(case.warmups == 1 for case in quick.performance_cases))
         self.assertTrue(all(case.repetitions == 3 for case in quick.performance_cases))
         self.assertTrue(all(case.mode == "ordinary" for case in quick.performance_cases))
+        self.assertTrue(all(case.engines == ("supersonic",) for case in quick.performance_cases))
+
+    def test_scoped_engine_case_matrix_rejects_unsupported_combinations(self):
+        manifest = load_manifest_module()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bad_root = Path(temporary)
+            bad_manifest = bad_root / "bad-suite.toml"
+            bad_manifest.write_text(
+                """
+version = 1
+name = "bad"
+budget_seconds = 600
+quality_version = "v1"
+quality_case_ids = ["instruction-following-1"]
+engines = ["supersonic", "llama-cpp"]
+decoding_policy = "greedy"
+
+[[performance_cases]]
+id = "bad-mtp-case"
+prompt = "hello"
+max_new_tokens = 8
+warmups = 1
+repetitions = 3
+mode = "mtp"
+cache_state = "warm-resident"
+timeout_seconds = 30
+decoding_policy = "greedy"
+engines = ["llama-cpp"]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "llama-cpp|supports|unsupported"):
+                manifest.load_suite_path(bad_manifest)
 
     def test_quality_corpus_has_required_categories_and_unique_ids(self):
         manifest = load_manifest_module()
@@ -158,6 +208,70 @@ class BenchmarkManifestTests(unittest.TestCase):
         )
         self.assertEqual(set(schema["properties"]), set(schema["required"]))
         self.assertEqual(schema["properties"]["run"]["properties"]["schema_version"]["const"], 1)
+        self.assertEqual(
+            schema["properties"]["workload"]["properties"]["cache_state"]["enum"],
+            [
+                "cold-load",
+                "warm-resident",
+                "prefix-cache-empty",
+                "prefix-cache-populated",
+                "prefix-cache-reset",
+            ],
+        )
+        self.assertEqual(
+            set(schema["properties"]["environment"]["required"]),
+            {
+                "clock_policy",
+                "requested",
+                "observed_before",
+                "observed_after",
+                "telemetry_samples",
+            },
+        )
+        self.assertEqual(
+            set(schema["properties"]["environment"]["properties"]["requested"]["required"]),
+            {
+                "gpu_clock_mhz",
+                "memory_clock_mhz",
+                "power_cap_watts",
+                "performance_level",
+            },
+        )
+        observed_required = {
+            "gpu_clock_mhz",
+            "memory_clock_mhz",
+            "power_watts",
+            "temperature_celsius",
+            "gpu_utilization_percent",
+            "memory_utilization_percent",
+            "performance_level",
+        }
+        self.assertEqual(
+            set(schema["properties"]["environment"]["properties"]["observed_before"]["required"]),
+            observed_required,
+        )
+        self.assertEqual(
+            set(schema["properties"]["environment"]["properties"]["observed_after"]["required"]),
+            observed_required,
+        )
+        sample_required = {
+            "offset_seconds",
+            "gpu_clock_mhz",
+            "memory_clock_mhz",
+            "power_watts",
+            "temperature_celsius",
+            "gpu_utilization_percent",
+            "memory_utilization_percent",
+            "performance_level",
+        }
+        self.assertEqual(
+            set(
+                schema["properties"]["environment"]["properties"]["telemetry_samples"]["items"][
+                    "required"
+                ]
+            ),
+            sample_required,
+        )
 
     def test_canonical_json_is_sorted_and_compact(self):
         manifest = load_manifest_module()
@@ -196,6 +310,7 @@ mode = "ordinary"
 cache_state = "unknown"
 timeout_seconds = 30
 decoding_policy = "greedy"
+engines = ["supersonic"]
 """.strip()
                 + "\n",
                 encoding="utf-8",
@@ -229,6 +344,7 @@ decoding_policy = "greedy"
             "cache_state",
             "timeout_seconds",
             "decoding_policy",
+            "engines",
         }
 
         for raw_suite in (quick, full):
