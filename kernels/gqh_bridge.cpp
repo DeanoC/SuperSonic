@@ -42,12 +42,19 @@ std::unordered_set<GqhWireKey, GqhWireKeyHash> g_gqh_ileave;
 std::unordered_map<GqhWireKey, uint8_t*, GqhWireKeyHash> g_gqh_padded;
 int g_gqh_row_off = 0;
 
-// Defined with the gate/up fusion block below. Issues any launch that block is
-// holding back; every bridge entry point calls it before doing anything else.
+// Private bridge ABI status: host allocation failed before any tracked state
+// was touched. Keep it outside HIP's status range so Rust can recover this
+// exact pre-state condition without ever treating a post-state HIP error as
+// recoverable.
+constexpr int kGqhUnregisterPrestateOom = -0x47510001;
+
+// Stable ordering hook retained for callers and teardown. Stream GEMV does
+// not retain launches between calls, so this is currently a no-op.
 int gqh_gemv_flush();
 
 #ifdef SUPERSONIC_FAILURE_INJECTION
 int g_test_unregister_sync_failure = 0;
+int g_test_unregister_prestate_failure = 0;
 int g_test_post_enqueue_failure = 0;
 #endif
 }  // namespace
@@ -136,6 +143,11 @@ extern "C" void supersonic_gqh_test_track_wire(int device_ordinal, const void* w
 extern "C" void supersonic_gqh_test_inject_unregister_sync_failure(int status) {
     GqhBridgeLockGuard guard;
     g_test_unregister_sync_failure = status;
+}
+
+extern "C" void supersonic_gqh_test_inject_unregister_prestate_failure() {
+    GqhBridgeLockGuard guard;
+    g_test_unregister_prestate_failure = 1;
 }
 
 extern "C" void supersonic_gqh_test_trigger_post_enqueue_failure(int status);
@@ -1211,9 +1223,9 @@ extern "C" int supersonic_gqh_hip_matvec(
 }
 
 namespace {
-// The un-fused single-tensor GEMV launch. This used to be the body of
-// supersonic_gqh_hip_matvec_stream; the extern "C" entry point below wraps it
-// with the mixed-rung gate/up pairing.
+// The single-tensor GEMV launch used by matvec_stream. Gate/up pairing is
+// explicit at the public matvec_stream_pair entry point; this path always
+// enqueues one launch before returning success.
 int gqh_gemv_launch_single(
     int device_ordinal,
     int rung,
@@ -1299,223 +1311,14 @@ int gqh_gemv_launch_single(
     return launch_result(device_ordinal, "GQH GEMV launch");
 }
 
-// --- mixed-rung MLP gate/up fusion ---------------------------------------
-//
-// full_attention_bridge_4b.cpp takes the fused gate/up path only when
-// `gate_h.rung == up_h.rung`. On Qwen3.8-27B GQH ~28.5 of 64 layers per token
-// have gate=GQH3 and up=GQH2H, so they fall into the else branch: two separate
-// matvec_stream launches plus a host swiglu_f32. The fused kernel and its
-// <3,2h> / <2h,3> dispatch arms already exist and are dead code today. That
-// call site is not in this file, so recover the fusion here -- hold the first
-// launch of a pair that has already been *observed*, and when its partner
-// arrives issue gqh_matvec_pair_swiglu_kernel<..., kFuse=false> instead of the
-// two singles.
-//
-// Bit-exact: kFuse=false writes both fp32 accumulators (y = A.x, y_b = B.x)
-// with the same per-row product order as the singles, so the host's own
-// swiglu_f32 still runs on identical inputs. gfx1201, in=5120 out=17408
-// nsb=20 warps=4: 118.1 us fused vs 131.9 us for the two singles (+11.7%).
-//
-// Safety, in order of how much it matters:
-//  * A call is held only if its wire has already been seen being immediately
-//    followed by a pairable partner. The first occurrence of any pair runs
-//    unfused, so the pattern is learned, never assumed.
-//  * "Immediately followed" is enforced by clearing g_gemv_prev in every other
-//    bridge entry point -- all of which also flush a held launch first, so the
-//    stream order a caller sees is never reordered.
-//  * A call is held only if it would have passed every validation the single
-//    path applies, so holding cannot swallow an error status.
-//  * Held state is per-process and single-threaded, like g_gqh_tight above.
-struct GqhGemvArgs {
-    int device_ordinal;
-    int rung;
-    const void* wire;
-    const void* x;
-    void* y;
-    int in_dim;
-    int out_dim;
-    int ncols;
-    int64_t x_col_stride;
-    int64_t y_col_stride;
-    float tensor_scale;
-    int grid_code;
-    void* stream;
-    int row_off;
-};
-
-GqhGemvArgs g_gemv_prev{};
-bool g_gemv_prev_valid = false;
-GqhGemvArgs g_gemv_held{};
-bool g_gemv_held_valid = false;
-std::unordered_set<GqhWireKey, GqhWireKeyHash> g_gemv_fusable;
-
-int gqh_gemv_launch_args(const GqhGemvArgs& a) {
-    return gqh_gemv_launch_single(
-        a.device_ordinal, a.rung, a.wire, a.x, a.y, a.in_dim, a.out_dim,
-        a.ncols, a.x_col_stride, a.y_col_stride, a.tensor_scale, a.grid_code,
-        a.stream);
-}
-
-// Everything the fused kernel needs from one half, plus everything the single
-// path validates -- so a held call can never turn into a late error.
-bool gqh_gemv_fusable(const GqhGemvArgs& a) {
-    if (!g_gqh_allow_tight || a.ncols != 1 || a.row_off != 0) {
-        return false;
-    }
-    if (a.rung != GQH_RUNG_GQH3 && a.rung != GQH_RUNG_GQH2_H) {
-        return false;
-    }
-    if (validate_shape(a.rung, a.out_dim, a.in_dim, a.grid_code) != 0) {
-        return false;
-    }
-    if (a.wire == nullptr || a.x == nullptr || a.y == nullptr) {
-        return false;
-    }
-    // nsb=20 only. gqh_matvec_pair_swiglu_kernel has compile-time kNsb arms
-    // for 20 and nothing else; falling through to the runtime-nsb kNsb=0
-    // instantiation costs ~18% (iteration 4), which would swamp the fusion.
-    if (a.in_dim != 20 * GQH_SUPERBLOCK) {
-        return false;
-    }
-    if (a.x_col_stride < a.in_dim || a.y_col_stride < a.out_dim) {
-        return false;
-    }
-    if ((reinterpret_cast<uintptr_t>(a.x) % sizeof(float4)) != 0 ||
-        ((a.x_col_stride * static_cast<int64_t>(sizeof(float))) %
-         static_cast<int64_t>(sizeof(float4))) != 0) {
-        return false;
-    }
-    return true;
-}
-
-// One kernel, one grid, one x: the two halves must agree on everything except
-// which weight tensor they read and where they write.
-bool gqh_gemv_pairable(const GqhGemvArgs& a, const GqhGemvArgs& b) {
-    return gqh_gemv_fusable(a) && gqh_gemv_fusable(b) &&
-        a.device_ordinal == b.device_ordinal && a.stream == b.stream &&
-        a.x == b.x && a.in_dim == b.in_dim && a.out_dim == b.out_dim &&
-        a.x_col_stride == b.x_col_stride &&
-        a.y_col_stride == b.y_col_stride && a.wire != b.wire && a.y != b.y;
-}
-
-// 0 on launch, 1 when the fused arm is unavailable and the caller must fall
-// back to the two singles, or an encoded HIP failure after the pair launch.
-int gqh_gemv_launch_pair(const GqhGemvArgs& a, const GqhGemvArgs& b) {
-    ScopedHipDevice scoped(a.device_ordinal);
-    if (!scoped.ok()) {
-        return backend_failure(421, scoped.status);
-    }
-    hipStream_t hs = static_cast<hipStream_t>(a.stream);
-    auto* pa = static_cast<const uint8_t*>(a.wire);
-    auto* pb = static_cast<const uint8_t*>(b.wire);
-    gqh_ensure_tight(
-        a.device_ordinal, const_cast<uint8_t*>(pa), a.in_dim, a.out_dim, a.rung, hs);
-    gqh_ensure_tight(
-        b.device_ordinal, const_cast<uint8_t*>(pb), b.in_dim, b.out_dim, b.rung, hs);
-    // The pair kernel is tight-only, has no padded-AoS or interleaved arm, and
-    // !padded means gqh_decode_wire() is the identity here.
-    if (!gqh_is_tight(a.device_ordinal, pa) ||
-        !gqh_is_tight(b.device_ordinal, pb) ||
-        gqh_is_padded(a.device_ordinal, pa) ||
-        gqh_is_padded(b.device_ordinal, pb) ||
-        gqh_is_ileave(a.device_ordinal, pa) ||
-        gqh_is_ileave(b.device_ordinal, pb)) {
-        return 1;
-    }
-    // Mirror the single path's wave count so a fused pair never launches at a
-    // different occupancy than the two launches it replaces (GQH2H nsb=20 with
-    // out_dim >= 65536 -- the lm_head shape -- prefers 8).
-    // 2-wave blocks when either half is GQH3 (iteration 14; see the narrow2
-    // note on the tight singles for why this is not an occupancy change and
-    // why it is bit-exact). Measured on the shipped decode shape, nsb=20
-    // out=17408: pss<2h,3> 552.8 -> 558.5 GB/s (+1.03%). in_dim is pinned to
-    // nsb=20 by gqh_gemv_fusable() and this site is kCols=1 only, so the gate
-    // matches the measured arm exactly. A 2H/2H pair keeps its old count.
-    const bool narrow2 =
-        a.in_dim == 5120 &&
-        (a.rung == GQH_RUNG_GQH3 || b.rung == GQH_RUNG_GQH3);
-    const int kSwigluWarps =
-        (a.rung == GQH_RUNG_GQH2_H && b.rung == GQH_RUNG_GQH2_H &&
-         a.out_dim >= 65536)
-        ? 8
-        : (narrow2 ? 2 : 4);
-    dim3 sblocks(
-        static_cast<unsigned int>(
-            (a.out_dim + kSwigluWarps - 1) / kSwigluWarps),
-        1,
-        1);
-    if (sblocks.x == 0) {
-        sblocks.x = 1;
-    }
-    const dim3 sthreads(GQH_WARP * kSwigluWarps, 1, 1);
-    const bool a3 = a.rung == GQH_RUNG_GQH3;
-    const bool b3 = b.rung == GQH_RUNG_GQH3;
-    const float4 mag_a =
-        a3 ? load_gqh3_mag(a.grid_code) : load_gqh2h_mag(a.grid_code);
-    const float4 mag_b =
-        b3 ? load_gqh3_mag(b.grid_code) : load_gqh2h_mag(b.grid_code);
-    auto* xv = static_cast<const float*>(a.x);
-    auto* ya = static_cast<float*>(a.y);
-    auto* yb = static_cast<float*>(b.y);
-    // One line per distinct (a3, b3, out_dim) signature: the learned set is
-    // not just gate/up (k/v in the layer_type==1 branch pair too), so a single
-    // run has to say which arms actually fused.
-    static std::unordered_set<int64_t> dumped_split;
-    const int64_t sig = ((int64_t)a.out_dim << 2) | (a3 ? 2 : 0) | (b3 ? 1 : 0);
-    bool first_split_signature = false;
-    try {
-        first_split_signature = dumped_split.insert(sig).second;
-    } catch (...) {
-        supersonic_gpu_integrity_fail_stop(
-            "GQH pair diagnostics allocation", -1, a.device_ordinal);
-    }
-    if (first_split_signature) {
-        std::fprintf(
-            stderr,
-            "[gqh-gemv] split-pair fused a=%s b=%s in=%d out=%d warps=%d\n",
-            a3 ? "3" : "2h",
-            b3 ? "3" : "2h",
-            a.in_dim,
-            a.out_dim,
-            kSwigluWarps);
-    }
-    // in_dim is pinned to nsb=20 by gqh_gemv_fusable(), so these four arms are
-    // the whole dispatch.
-#define GQH_LAUNCH_SPLIT_PAIR(A, B)                                           \
-    hipLaunchKernelGGL(                                                       \
-        HIP_KERNEL_NAME(                                                      \
-            (gqh_matvec_pair_swiglu_kernel<A, B, 20, 1, false>)),              \
-        sblocks, sthreads, 0, hs, pa, pb, xv, ya, yb, a.in_dim, a.out_dim,     \
-        a.tensor_scale, b.tensor_scale, mag_a, mag_b, a.x_col_stride,          \
-        a.y_col_stride, 1)
-    if (a3 && b3) {
-        GQH_LAUNCH_SPLIT_PAIR(true, true);
-    } else if (a3) {
-        GQH_LAUNCH_SPLIT_PAIR(true, false);
-    } else if (b3) {
-        GQH_LAUNCH_SPLIT_PAIR(false, true);
-    } else {
-        GQH_LAUNCH_SPLIT_PAIR(false, false);
-    }
-#undef GQH_LAUNCH_SPLIT_PAIR
-    // Keep launch/error inspection on the owning device. The scope must not
-    // end before hipGetLastError()/maybe_sync: those calls inspect the launch
-    // state of the current device.
-    return launch_result(a.device_ordinal, "GQH pair GEMV launch");
-}
-
+// Learned stream-side gate/up pairing was removed because the public caller
+// has no pending-work contract: returning success while holding a launch lets
+// an unrelated consumer read the output before the partner call arrives. The
+// explicit matvec_stream_pair entry point below remains the only pair path.
 int gqh_gemv_flush() {
-    g_gemv_prev_valid = false;
-    if (!g_gemv_held_valid) {
-        return 0;
-    }
-    const GqhGemvArgs held = g_gemv_held;
-    g_gemv_held_valid = false;
-    const int status = gqh_gemv_launch_args(held);
-    if (status != 0) {
-        supersonic_gpu_integrity_fail_stop(
-            "GQH held GEMV flush", status, held.device_ordinal);
-    }
+    // Stream GEMV no longer retains work between public calls. Keep this
+    // internal hook as a no-op ordering boundary for existing callers and
+    // teardown paths.
     return 0;
 }
 }  // namespace
@@ -1526,6 +1329,16 @@ extern "C" int supersonic_gqh_hip_unregister_wires(
     if (wires == nullptr || count == 0) {
         return 0;
     }
+
+#ifdef SUPERSONIC_FAILURE_INJECTION
+    // Deterministic test seam for the only recoverable failure class. This is
+    // before vector/set construction and therefore cannot leave bridge state
+    // partially changed.
+    if (g_test_unregister_prestate_failure != 0) {
+        g_test_unregister_prestate_failure = 0;
+        return kGqhUnregisterPrestateOom;
+    }
+#endif
 
     std::vector<GqhWireKey> keys;
     std::unordered_set<GqhWireKey, GqhWireKeyHash> unique;
@@ -1545,7 +1358,7 @@ extern "C" int supersonic_gqh_hip_unregister_wires(
         // No bridge state has been touched yet, so an allocator failure can
         // safely be reported to the Rust caller without exposing an exception
         // across the extern-C ABI.
-        return static_cast<int>(hipErrorOutOfMemory);
+        return kGqhUnregisterPrestateOom;
     }
     if (keys.empty()) {
         return 0;
@@ -1556,11 +1369,7 @@ extern "C" int supersonic_gqh_hip_unregister_wires(
     for (const GqhWireKey& key : keys) {
         needs_sync = needs_sync || g_gqh_tight.find(key) != g_gqh_tight.end() ||
             g_gqh_ileave.find(key) != g_gqh_ileave.end() ||
-            g_gqh_padded.find(key) != g_gqh_padded.end() ||
-            (g_gemv_held_valid && g_gemv_held.device_ordinal == device_ordinal &&
-             g_gemv_held.wire == key.wire) ||
-            (g_gemv_prev_valid && g_gemv_prev.device_ordinal == device_ordinal &&
-             g_gemv_prev.wire == key.wire);
+            g_gqh_padded.find(key) != g_gqh_padded.end();
     }
 
     auto remove_metadata = [&]() -> hipError_t {
@@ -1577,15 +1386,6 @@ extern "C" int supersonic_gqh_hip_unregister_wires(
                 }
                 g_gqh_padded.erase(padded);
             }
-            if (g_gemv_held_valid && g_gemv_held.device_ordinal == device_ordinal &&
-                g_gemv_held.wire == key.wire) {
-                g_gemv_held_valid = false;
-            }
-            if (g_gemv_prev_valid && g_gemv_prev.device_ordinal == device_ordinal &&
-                g_gemv_prev.wire == key.wire) {
-                g_gemv_prev_valid = false;
-            }
-            g_gemv_fusable.erase(key);
             g_gqh_tight.erase(key);
             g_gqh_ileave.erase(key);
         }
@@ -1612,25 +1412,6 @@ extern "C" int supersonic_gqh_hip_unregister_wires(
                 "gqh unregister synchronize", status, device_ordinal);
         }
 #endif
-        bool held_matches = false;
-        for (const GqhWireKey& key : keys) {
-            held_matches = held_matches ||
-                (g_gemv_held_valid && g_gemv_held.device_ordinal == device_ordinal &&
-                 g_gemv_held.wire == key.wire);
-        }
-        if (held_matches) {
-            const int flush_status = gqh_gemv_flush();
-            if (flush_status != 0) {
-                supersonic_gpu_integrity_fail_stop(
-                    "gqh unregister held GEMV flush", flush_status, device_ordinal);
-            }
-        }
-        for (const GqhWireKey& key : keys) {
-            if (g_gemv_prev_valid && g_gemv_prev.device_ordinal == device_ordinal &&
-                g_gemv_prev.wire == key.wire) {
-                g_gemv_prev_valid = false;
-            }
-        }
         const hipError_t sync_err = hipDeviceSynchronize();
         if (sync_err != hipSuccess) {
             supersonic_gpu_integrity_fail_stop(
@@ -1683,50 +1464,25 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
     int grid_code,
     void* stream) {
     GqhBridgeLockGuard guard;
-    const GqhGemvArgs cur{device_ordinal, rung,          wire,
-                          x,              y,             in_dim,
-                          out_dim,        ncols,         x_col_stride,
-                          y_col_stride,   tensor_scale,  grid_code,
-                          stream,         g_gqh_row_off};
-    if (g_gemv_held_valid) {
-        const GqhGemvArgs held = g_gemv_held;
-        g_gemv_held_valid = false;
-        g_gemv_prev_valid = false;
-        if (gqh_gemv_pairable(held, cur)) {
-            const int pair_status = gqh_gemv_launch_pair(held, cur);
-            if (pair_status == 0) {
-                return 0;
-            }
-            if (pair_status != 1) {
-                return pair_status;
-            }
-            const int st = gqh_gemv_launch_args(held);
-            return st != 0 ? st : gqh_gemv_launch_args(cur);
-        }
-        const int st = gqh_gemv_launch_args(held);
-        if (st != 0) {
-            return st;
-        }
-    }
-    if (g_gemv_prev_valid && gqh_gemv_pairable(g_gemv_prev, cur)) {
-        try {
-            g_gemv_fusable.insert({g_gemv_prev.device_ordinal, g_gemv_prev.wire});
-        } catch (...) {
-            supersonic_gpu_integrity_fail_stop(
-                "GQH fusable metadata allocation", -1, device_ordinal);
-        }
-    }
-    if (gqh_gemv_fusable(cur) &&
-        g_gemv_fusable.find({cur.device_ordinal, cur.wire}) != g_gemv_fusable.end()) {
-        g_gemv_held = cur;
-        g_gemv_held_valid = true;
-        g_gemv_prev_valid = false;
-        return 0;
-    }
-    const int st = gqh_gemv_launch_args(cur);
-    g_gemv_prev = cur;
-    g_gemv_prev_valid = st == 0;
-    return st;
+    // Every successful call enqueues its GEMV before returning. The old
+    // learned gate/up path could return success while retaining a launch for
+    // a later call; its callers have no explicit pending-work contract and
+    // may consume the output immediately, so keep pairing on the explicit
+    // matvec_stream_pair entry point only.
+    return gqh_gemv_launch_single(
+        device_ordinal,
+        rung,
+        wire,
+        x,
+        y,
+        in_dim,
+        out_dim,
+        ncols,
+        x_col_stride,
+        y_col_stride,
+        tensor_scale,
+        grid_code,
+        stream);
 }
 
 extern "C" int supersonic_gqh_hip_matvec_stream_acc(

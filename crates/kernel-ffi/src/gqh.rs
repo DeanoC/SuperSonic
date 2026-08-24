@@ -102,6 +102,13 @@ fn unregister_many_ffi(ordinal: usize, ptrs: &[usize]) -> Result<(), GpuError> {
     let status = unsafe {
         supersonic_gqh_hip_unregister_wires(ordinal as c_int, wires.as_ptr(), wires.len())
     };
+    if status == GQH_UNREGISTER_PRESTATE_OOM {
+        return Err(backend_error(
+            Backend::Hip,
+            "gqh unregister pre-state allocation",
+            status,
+        ));
+    }
     if status != 0 {
         unsafe {
             supersonic_gpu_integrity_fail_stop(
@@ -379,6 +386,11 @@ pub const RUNG_GQH2_C: i32 = 2;
 pub const RUNG_GQH4: i32 = 3;
 
 pub const SUPERBLOCK: usize = 256;
+
+// This private bridge status means host allocation failed before any tracked
+// state was touched. It is deliberately outside HIP's status range so a
+// post-state HIP error can never be mistaken for a recoverable Rust error.
+const GQH_UNREGISTER_PRESTATE_OOM: c_int = -0x4751_0001;
 
 unsafe extern "C" {
     fn supersonic_gqh_hip_decode(
@@ -737,6 +749,7 @@ mod tests {
     #[cfg(supersonic_failure_injection)]
     unsafe extern "C" {
         fn supersonic_gqh_test_track_wire(device_ordinal: c_int, wire: *const c_void);
+        fn supersonic_gqh_test_inject_unregister_prestate_failure();
         fn supersonic_gqh_test_inject_unregister_sync_failure(status: c_int);
         fn supersonic_gqh_test_trigger_post_enqueue_failure(status: c_int);
     }
@@ -881,6 +894,39 @@ mod tests {
             .status()
             .expect("spawn post-enqueue child");
         assert_eq!(status.signal(), Some(6));
+    }
+
+    #[cfg(supersonic_failure_injection)]
+    #[test]
+    fn prestate_unregister_error_preserves_metadata_and_guards_for_retry() {
+        let registration_ptr = 0x7_5000usize as *const c_void;
+        register_header(0, registration_ptr, 12.5, 3);
+        let mut registration = Registration::new(0, registration_ptr);
+        unsafe { supersonic_gqh_test_inject_unregister_prestate_failure() };
+        let err = registration
+            .try_unregister()
+            .expect_err("pre-state failure must be recoverable");
+        assert!(format!("{err}").contains("pre-state"));
+        assert!(lookup_header(0, registration_ptr).is_some());
+        registration
+            .try_unregister()
+            .expect("retry after pre-state failure");
+        assert!(lookup_header(0, registration_ptr).is_none());
+
+        let batch_ptr = 0x7_6000usize as *const c_void;
+        register_header(0, batch_ptr, 13.5, 4);
+        let mut batch = RegistrationBatch::new();
+        batch.stage_header(0, batch_ptr, 13.5, 4);
+        batch.commit();
+        unsafe { supersonic_gqh_test_inject_unregister_prestate_failure() };
+        batch
+            .try_clear()
+            .expect_err("batch pre-state failure must be recoverable");
+        assert!(lookup_header(0, batch_ptr).is_some());
+        batch
+            .try_clear()
+            .expect("batch retry after pre-state failure");
+        assert!(lookup_header(0, batch_ptr).is_none());
     }
 
     #[test]
