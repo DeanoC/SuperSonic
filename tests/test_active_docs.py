@@ -589,12 +589,12 @@ printf 'cargo|%s|GQH=%s|MODEL=%s|8192=%s|REQ=%s\\n' "$*" \
         }
         for path in superpowers_root.glob("specs/*.md"):
             self.assertIn(path.name, retained_specs, path.as_posix())
+        retained_plans = {
+            "2026-08-23-qwen38-rocm-product-slimming.md",
+            "2026-08-24-reproducible-benchmark-pages.md",
+        }
         for path in superpowers_root.glob("plans/*.md"):
-            self.assertEqual(
-                path.name,
-                "2026-08-23-qwen38-rocm-product-slimming.md",
-                path.as_posix(),
-            )
+            self.assertIn(path.name, retained_plans, path.as_posix())
 
 
 if __name__ == "__main__":
