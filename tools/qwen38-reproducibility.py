@@ -38,6 +38,8 @@ ROCM_VERSION_RE = re.compile(
 )
 GFX_RE = re.compile(r"\bgfx[0-9]+\b", re.I)
 ABSOLUTE_PATH_RE = re.compile(r"(?<![\w])/(?:[^\s/]+/)*[^\s/]+")
+EXPECTED_WARMUP_RUNS = 1
+EXPECTED_MEASURED_RUNS = 3
 
 
 def _safe_name(path: Path) -> str:
@@ -332,8 +334,16 @@ def build_record(
     ]
     if measured_tokens and len(set(measured_tokens)) != 1:
         raise ValueError("measured runs disagree on generated token count")
-    if not timings["measured"] or not measured_tokens or timings["median_ms_per_tok"] is None:
-        raise ValueError("at least one measured telemetry run is required")
+    if (
+        timings["warmup_runs"] != EXPECTED_WARMUP_RUNS
+        or timings["measured_runs"] != EXPECTED_MEASURED_RUNS
+        or timings.get("status") != "complete"
+        or not measured_tokens
+        or timings["median_ms_per_tok"] is None
+    ):
+        raise ValueError(
+            "reproducibility record requires exactly one warmup and three complete measured runs"
+        )
     token_count = measured_tokens[0] if measured_tokens else comparison.get("ordinary_token_count")
 
     hip_version = _hip_version(hip_version_file)
@@ -452,8 +462,13 @@ def validate_record(record: dict[str, Any]) -> None:
         timings.get("measured"), list
     ):
         raise ValueError("reproducibility record has incomplete timing data")
-    if timings.get("measured_runs", 0) < 1 or timings.get("median_ms_per_tok") is None:
-        raise ValueError("measured telemetry is required")
+    if (
+        timings.get("warmup_runs") != EXPECTED_WARMUP_RUNS
+        or timings.get("measured_runs") != EXPECTED_MEASURED_RUNS
+        or timings.get("status") != "complete"
+        or timings.get("median_ms_per_tok") is None
+    ):
+        raise ValueError("exactly one warmup and three complete measured runs are required")
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:

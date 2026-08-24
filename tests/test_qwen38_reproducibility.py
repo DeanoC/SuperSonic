@@ -197,6 +197,52 @@ class Qwen38ReproducibilityTests(unittest.TestCase):
                 }
             )
 
+    def test_validator_rejects_partial_or_mismatched_telemetry_counts(self):
+        tool = load_tool()
+        valid = {
+            "schema_version": 1,
+            "commit": "a" * 40,
+            "toolchain": {"hip_version": "7.2.4", "rocm_version": "7.2.4"},
+            "target_architecture": "gfx1201",
+            "physical_gpu": {"id": "1", "architecture": "gfx1201", "name": "R9700"},
+            "artifact": {"name": "qwen38.gguf", "sha256": "0" * 64},
+            "model_directory": {"name": "Qwen3.8-27B", "required_files": {}},
+            "workload": {"prompt": "Hello", "token_count": 3, "max_new_tokens": 3},
+            "correctness": {
+                "correctness_hash": "0" * 64,
+                "ordinary_vs_mtp": {
+                    "applicable": True,
+                    "equal": True,
+                    "ordinary_hash": "0" * 64,
+                    "mtp_hash": "0" * 64,
+                },
+            },
+            "timings": {
+                "warmup_runs": 1,
+                "measured_runs": 3,
+                "warmup": [{}],
+                "measured": [{}, {}, {}],
+                "median_ms_per_tok": 1.0,
+                "status": "complete",
+            },
+        }
+        for warmup_runs, measured_runs, warmup, measured in (
+            (0, 3, [], [{}, {}, {}]),
+            (1, 1, [{}], [{}]),
+            (1, 4, [{}], [{}, {}, {}, {}]),
+        ):
+            candidate = json.loads(json.dumps(valid))
+            candidate["timings"].update(
+                {
+                    "warmup_runs": warmup_runs,
+                    "measured_runs": measured_runs,
+                    "warmup": warmup,
+                    "measured": measured,
+                }
+            )
+            with self.assertRaises(ValueError):
+                tool.validate_record(candidate)
+
 
 if __name__ == "__main__":
     unittest.main()

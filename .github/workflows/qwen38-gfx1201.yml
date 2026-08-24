@@ -219,6 +219,7 @@ jobs:
             --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR"
             --gguf-file "$SUPERSONIC_GQH_GGUF"
             --prompt "Hello"
+            --chat
             --max-new-tokens 8
             --ignore-eos
             --emit-generated-json
