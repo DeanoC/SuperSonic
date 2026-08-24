@@ -1,0 +1,20 @@
+{
+  "gpu_data": [
+    {
+      "gpu": 0,
+      "bdf": "0000:03:00.0",
+      "enumeration": {
+        "hip_id": 1,
+        "hip_uuid": "GPU-rx7900-logical"
+      }
+    },
+    {
+      "gpu": 1,
+      "bdf": "0000:65:00.0",
+      "enumeration": {
+        "hip_id": 0,
+        "hip_uuid": "GPU-r9700-logical"
+      }
+    }
+  ]
+}

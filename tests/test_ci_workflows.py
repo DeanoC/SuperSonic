@@ -2,6 +2,7 @@ import importlib.util
 import json
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -62,7 +63,9 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("--suite quick", text)
         self.assertIn("concurrency:", text)
         self.assertIn("RUST_TEST_THREADS: \"1\"", text)
-        self.assertIn("amd-smi static --asic --json", text)
+        self.assertIn("amd-smi static --asic --bus --json", text)
+        self.assertIn("amd-smi list -e --json", text)
+        self.assertIn("merge-amd-smi-provenance.py", text)
         self.assertIn("tools/select-r9700-device.py", text)
         self.assertIn("HIP_VISIBLE_DEVICES", text)
         self.assertIn("SUPERSONIC_DEVICE", text)
@@ -99,6 +102,10 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("tools/external/llama-cpp-version.txt", text)
         self.assertIn("SUPERSONIC_LLAMA_CPP", text)
         self.assertIn("SUPERSONIC_LLAMA_CPP_ARTIFACT", text)
+        self.assertIn("amd-smi static --asic --bus --json", text)
+        self.assertIn("amd-smi list -e --json", text)
+        self.assertIn("merge-amd-smi-provenance.py", text)
+        self.assertIn("amd-smi-provenance.json", text)
         self.assertIn("--clock-policy locked", text)
         self.assertIn("RUST_TEST_THREADS: \"1\"", text)
         self.assertIn("if: always()", text)
@@ -126,12 +133,74 @@ class WorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(action, text)
 
+    def test_pages_readme_only_results_skip_baseline_cleanly(self):
+        workflow = WORKFLOWS / "benchmark-pages.yml"
+        text = workflow.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "benchmarks" / "results"
+            results.mkdir(parents=True)
+            (results / "README.md").write_text(
+                "Results are produced by the GPU workflow.\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(tuple(results.rglob("*.json")), ())
+
+        self.assertIn("id: detect-results", text)
+        self.assertIn("has_results", text)
+        self.assertIn("No committed benchmark baseline", text)
+        self.assertIn("steps.detect-results.outputs.has_results", text)
+        self.assertRegex(text, re.compile(r"has_results\s*==\s*['\"]true['\"]"))
+
+    def test_pages_malformed_first_record_remains_blocking(self):
+        workflow = WORKFLOWS / "benchmark-pages.yml"
+        text = workflow.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "benchmarks" / "results"
+            results.mkdir(parents=True)
+            malformed = results / "000-malformed.json"
+            malformed.write_text("{not-json\n", encoding="utf-8")
+            (results / "001-valid.json").write_text(
+                (ROOT / "tests" / "benchmark_fixtures" / "valid-result-v1.json").read_text(
+                    encoding="utf-8"
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                tuple(sorted(results.rglob("*.json"))),
+                (malformed, results / "001-valid.json"),
+            )
+            from tools.benchmark import validation
+
+            with self.assertRaises(ValueError):
+                validation.validate_bundle(results, require_complete=True)
+
+        self.assertIn("find benchmarks/results -type f -name '*.json'", text)
+        self.assertIn("validate --publishable benchmarks/results", text)
+        self.assertNotIn("head -n 1", text)
+
+    def test_gpu_workflows_share_one_serial_per_device_group(self):
+        paths = (
+            WORKFLOWS / "benchmark-quick.yml",
+            WORKFLOWS / "benchmark-full.yml",
+            WORKFLOWS / "qwen38-gfx1201.yml",
+        )
+        groups = []
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            match = re.search(r"^  group:\s*(.+)$", text, re.MULTILINE)
+            self.assertIsNotNone(match, path)
+            groups.append(match.group(1).strip())
+            self.assertRegex(text, re.compile(r"^  cancel-in-progress:\s*false\s*$", re.MULTILINE))
+        self.assertEqual(len(set(groups)), 1)
+        self.assertIn("gfx1201", groups[0])
+
     def test_cpu_ci_validates_benchmark_fixtures_without_gpu(self):
         workflow = WORKFLOWS / "ci.yml"
         text = workflow.read_text(encoding="utf-8")
         self.assertIn("python3 tools/supersonic-bench.py render tests/benchmark_fixtures", text)
         self.assertIn("tests.test_benchmark_manifests", text)
         self.assertIn("tests.test_benchmark_validation", text)
+        self.assertIn("tests.test_amd_smi_provenance", text)
         self.assertNotIn("self-hosted", text)
 
     def test_r9700_workflow_data_flow_validates_physical_to_logical_mapping(self):
@@ -244,7 +313,9 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("HIP_VISIBLE_DEVICES", text)
         self.assertNotIn("|| '0'", text)
         self.assertNotIn(":-0", text)
-        self.assertIn("amd-smi static --asic --json", text)
+        self.assertIn("amd-smi static --asic --bus --json", text)
+        self.assertIn("amd-smi list -e --json", text)
+        self.assertIn("merge-amd-smi-provenance.py", text)
         self.assertIn("tools/select-r9700-device.py", text)
         self.assertIn("tools/parse-rocm-smi.py", text)
         self.assertIn("GITHUB_ENV", text)

@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: qwen38-gfx1201-${{ github.workflow }}
+  group: benchmark-gfx1201-device-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -58,10 +58,16 @@ jobs:
           set -euo pipefail
           mkdir -p "$CI_OUTPUT_ROOT"
           command -v amd-smi
-          timeout --foreground 30s amd-smi static --asic --json \
-            | tee "$CI_OUTPUT_ROOT/amd-smi-static-asic.json"
+          timeout --foreground 30s amd-smi static --asic --bus --json \
+            | tee "$CI_OUTPUT_ROOT/amd-smi-static-asic-bus.json"
+          timeout --foreground 30s amd-smi list -e --json \
+            | tee "$CI_OUTPUT_ROOT/amd-smi-enumeration.json"
+          python3 tools/merge-amd-smi-provenance.py \
+            --asic-bus "$CI_OUTPUT_ROOT/amd-smi-static-asic-bus.json" \
+            --enumeration "$CI_OUTPUT_ROOT/amd-smi-enumeration.json" \
+            --output "$CI_OUTPUT_ROOT/amd-smi-provenance.json"
           selection="$(python3 tools/select-r9700-device.py \
-            --input "$CI_OUTPUT_ROOT/amd-smi-static-asic.json" \
+            --input "$CI_OUTPUT_ROOT/amd-smi-provenance.json" \
             --override "${SUPERSONIC_R9700_GPU_ID:-}")"
           printf '%s\n' "$selection" | tee "$CI_OUTPUT_ROOT/device-selection.log"
           while IFS='=' read -r name value; do
@@ -278,7 +284,7 @@ jobs:
             --commit "$(git rev-parse HEAD)" \
             --hip-version-file "$CI_OUTPUT_ROOT/hipcc-version.txt" \
             --rocm-version-file "$CI_OUTPUT_ROOT/rocm-driver-version.txt" \
-            --gpu-json "$CI_OUTPUT_ROOT/amd-smi-static-asic.json" \
+            --gpu-json "$CI_OUTPUT_ROOT/amd-smi-provenance.json" \
             --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
             --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
             --artifact "$SUPERSONIC_GQH_GGUF" \

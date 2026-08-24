@@ -182,6 +182,7 @@ jobs:
           python3 tools/supersonic-bench.py validate tests/benchmark_fixtures/valid-result-v1.json
           python3 tools/supersonic-bench.py render tests/benchmark_fixtures target/benchmarks/site-fixtures
           python3 -m unittest \
+            tests.test_amd_smi_provenance \
             tests.test_benchmark_manifests \
             tests.test_benchmark_validation \
             tests.test_benchmark_render \

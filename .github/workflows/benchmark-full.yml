@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: benchmark-full-${{ github.repository }}
+  group: benchmark-gfx1201-device-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -61,10 +61,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          timeout --foreground 30s amd-smi static --asic --json \
-            | tee "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic.json"
+          timeout --foreground 30s amd-smi static --asic --bus --json \
+            | tee "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic-bus.json"
+          timeout --foreground 30s amd-smi list -e --json \
+            | tee "$BENCHMARK_OUTPUT_ROOT/amd-smi-enumeration.json"
+          python3 tools/merge-amd-smi-provenance.py \
+            --asic-bus "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic-bus.json" \
+            --enumeration "$BENCHMARK_OUTPUT_ROOT/amd-smi-enumeration.json" \
+            --output "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json"
           selection="$(python3 tools/select-r9700-device.py \
-            --input "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic.json" \
+            --input "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
             --override "${SUPERSONIC_R9700_GPU_ID:-}")"
           printf '%s\n' "$selection" | tee "$BENCHMARK_OUTPUT_ROOT/device-selection.log"
           while IFS='=' read -r name value; do
@@ -225,7 +231,7 @@ jobs:
             --artifact "$SUPERSONIC_GQH_GGUF" \
             --peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT" \
             --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
-            --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic.json" \
+            --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
             --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
             --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
             --device "$SUPERSONIC_DEVICE" \

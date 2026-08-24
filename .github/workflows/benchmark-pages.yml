@@ -31,19 +31,38 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    outputs:
+      has_results: ${{ steps.detect-results.outputs.has_results }}
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 1
 
+      - name: Detect committed benchmark baseline
+        id: detect-results
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d benchmarks/results ]] && find benchmarks/results -type f -name '*.json' -print -quit | grep -q .; then
+            echo "has_results=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report missing benchmark baseline
+        if: steps.detect-results.outputs.has_results == 'false'
+        run: echo "No committed benchmark baseline; skipping validation, render, upload, and deploy."
+
       - name: Verify committed records are publishable
+        if: steps.detect-results.outputs.has_results == 'true'
         shell: bash
         run: |
           set -euo pipefail
           python3 tools/supersonic-bench.py validate --publishable benchmarks/results
 
       - name: Render deterministic benchmark site
+        if: steps.detect-results.outputs.has_results == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -52,6 +71,7 @@ jobs:
           test -s target/benchmarks/site/methodology.html
 
       - name: Upload validated Pages artifact
+        if: steps.detect-results.outputs.has_results == 'true'
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: target/benchmarks/site
@@ -59,7 +79,7 @@ jobs:
   deploy:
     name: Deploy validated benchmark Pages site
     needs: validate-and-render
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: needs.validate-and-render.outputs.has_results == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       pages: write
