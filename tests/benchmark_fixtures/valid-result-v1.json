@@ -3,7 +3,7 @@
     "schema_version": 1,
     "suite": "quick",
     "suite_version": 1,
-    "quality_version": "v1",
+    "quality_version": "v2",
     "case_id": "quick-short-warm-ordinary",
     "run_id": "quick-short-warm-ordinary-supersonic-0001",
     "commit": "0123456789abcdef0123456789abcdef01234567",
@@ -17,7 +17,7 @@
   "engine": {
     "name": "supersonic",
     "version": "supersonic 0.1.0",
-    "adapter_version": 1
+    "adapter_version": 2
   },
   "hardware": {
     "identity": "0000:65:00.0",

@@ -100,8 +100,11 @@ class WorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("--peer-artifact", text)
         self.assertIn("tools/external/llama-cpp-version.txt", text)
-        self.assertIn("SUPERSONIC_LLAMA_CPP", text)
+        self.assertIn("SUPERSONIC_LLAMA_CPP_SERVER", text)
         self.assertIn("SUPERSONIC_LLAMA_CPP_ARTIFACT", text)
+        self.assertIn('test "$(basename "$llama_server")" = "llama-server"', text)
+        self.assertIn('export PATH="$(dirname "$SUPERSONIC_LLAMA_CPP_SERVER"):$PATH"', text)
+        self.assertIn('"$llama_server" --version 2>&1 | head -n 1', text)
         self.assertIn("amd-smi static --asic --bus --json", text)
         self.assertIn("amd-smi list -e --json", text)
         self.assertIn("merge-amd-smi-provenance.py", text)
@@ -212,6 +215,19 @@ class WorkflowContractTests(unittest.TestCase):
                 self.assertIn('--hip-version-file "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt"', text)
                 self.assertIn("run_id=", text)
                 self.assertIn('--run-id "$run_id"', text)
+
+    def test_benchmark_workflows_fail_closed_on_non_q3kxl_artifact_digests(self):
+        digest = "c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98"
+        for name in ("benchmark-quick.yml", "benchmark-full.yml"):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text(encoding="utf-8")
+                self.assertIn(f'expected_q3kxl_sha256="{digest}"', text)
+                self.assertIn('test "$SUPERSONIC_GQH_GGUF_SHA256" = "$expected_q3kxl_sha256"', text)
+        full = (WORKFLOWS / "benchmark-full.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            'test "$SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256" = "$expected_q3kxl_sha256"',
+            full,
+        )
 
     def test_cpu_ci_validates_benchmark_fixtures_without_gpu(self):
         workflow = WORKFLOWS / "ci.yml"

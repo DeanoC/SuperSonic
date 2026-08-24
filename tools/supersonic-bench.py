@@ -30,6 +30,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model-dir", type=Path, required=True)
     run.add_argument("--artifact", type=Path, required=True)
     run.add_argument("--peer-artifact", type=Path)
+    run.add_argument("--artifact-semantic-id", required=True)
+    run.add_argument("--artifact-quantization", required=True)
+    run.add_argument("--tokenizer-sha256", required=True)
+    run.add_argument("--chat-template-sha256", required=True)
     run.add_argument("--physical-gpu", required=True)
     run.add_argument(
         "--gpu-static-json",
@@ -151,6 +155,10 @@ def _run(args: argparse.Namespace) -> int:
         seed=args.seed,
         run_id=args.run_id,
         run_quality=True,
+        artifact_semantic_id=args.artifact_semantic_id,
+        artifact_quantization=args.artifact_quantization,
+        tokenizer_sha256=args.tokenizer_sha256,
+        chat_template_sha256=args.chat_template_sha256,
     )
     status = run_suite(config)
     payload = {

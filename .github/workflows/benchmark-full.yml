@@ -30,7 +30,7 @@ jobs:
       SUPERSONIC_GQH_8192_GGUF: ${{ secrets.SUPERSONIC_GQH_8192_GGUF || vars.SUPERSONIC_GQH_8192_GGUF || '/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf' }}
       SUPERSONIC_GQH_8192_GGUF_SHA256: ${{ secrets.SUPERSONIC_GQH_8192_GGUF_SHA256 || vars.SUPERSONIC_GQH_8192_GGUF_SHA256 }}
       SUPERSONIC_QWEN38_MODEL_DIR: ${{ secrets.SUPERSONIC_QWEN38_MODEL_DIR || vars.SUPERSONIC_QWEN38_MODEL_DIR || '/data/models/Qwen3.8-27B' }}
-      SUPERSONIC_LLAMA_CPP: ${{ secrets.SUPERSONIC_LLAMA_CPP || vars.SUPERSONIC_LLAMA_CPP || 'llama-cli' }}
+      SUPERSONIC_LLAMA_CPP_SERVER: ${{ secrets.SUPERSONIC_LLAMA_CPP_SERVER || vars.SUPERSONIC_LLAMA_CPP_SERVER || '/home/deano/llama.cpp-gqh-qtypes/build-hip/bin/llama-server' }}
       SUPERSONIC_LLAMA_CPP_ARTIFACT: ${{ secrets.SUPERSONIC_LLAMA_CPP_ARTIFACT || vars.SUPERSONIC_LLAMA_CPP_ARTIFACT || '/home/deano/models/qwen38-gqh-shaped.gguf' }}
       SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256: ${{ secrets.SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256 || vars.SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256 }}
       SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ }}
@@ -195,22 +195,25 @@ jobs:
           : "${SUPERSONIC_GQH_8192_GGUF_SHA256:?8192 artifact SHA-256 must be configured}"
           : "${SUPERSONIC_LLAMA_CPP_ARTIFACT:?llama.cpp peer artifact must be configured}"
           : "${SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256:?llama.cpp peer artifact SHA-256 must be configured}"
+          expected_q3kxl_sha256="c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98"
+          test "$SUPERSONIC_GQH_GGUF_SHA256" = "$expected_q3kxl_sha256"
+          test "$SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256" = "$expected_q3kxl_sha256"
           test "$(sha256sum "$SUPERSONIC_GQH_GGUF" | awk '{print $1}')" = "$SUPERSONIC_GQH_GGUF_SHA256"
           test "$(sha256sum "$SUPERSONIC_GQH_8192_GGUF" | awk '{print $1}')" = "$SUPERSONIC_GQH_8192_GGUF_SHA256"
           test -s "$SUPERSONIC_LLAMA_CPP_ARTIFACT"
           test "$(sha256sum "$SUPERSONIC_LLAMA_CPP_ARTIFACT" | awk '{print $1}')" = "$SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256"
-          if [[ "$SUPERSONIC_LLAMA_CPP" == */* ]]; then
-            llama_binary="$SUPERSONIC_LLAMA_CPP"
-            test -x "$llama_binary"
-            export PATH="$(dirname "$llama_binary"):$PATH"
+          if [[ "$SUPERSONIC_LLAMA_CPP_SERVER" == */* ]]; then
+            llama_server="$SUPERSONIC_LLAMA_CPP_SERVER"
+            test -x "$llama_server"
+            export PATH="$(dirname "$llama_server"):$PATH"
           else
-            llama_binary="$(command -v "$SUPERSONIC_LLAMA_CPP" || true)"
-            test -n "$llama_binary"
-            test -x "$llama_binary"
+            llama_server="$(command -v "$SUPERSONIC_LLAMA_CPP_SERVER" || true)"
+            test -n "$llama_server"
+            test -x "$llama_server"
           fi
-          test "$(basename "$llama_binary")" = "llama-cli"
+          test "$(basename "$llama_server")" = "llama-server"
           pinned="$(grep -v '^#' tools/external/llama-cpp-version.txt | grep -v '^$' | head -n 1)"
-          actual="$(timeout --foreground 30s "$llama_binary" --version)"
+          actual="$(timeout --foreground 30s "$llama_server" --version 2>&1 | head -n 1)"
           test "$actual" = "$pinned"
           printf '%s\n' "$actual" | tee "$BENCHMARK_OUTPUT_ROOT/llama-cpp-version.txt"
 
@@ -226,12 +229,16 @@ jobs:
         run: |
           set -euo pipefail
           run_id="full-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          export PATH="$(dirname "$SUPERSONIC_LLAMA_CPP"):$PATH"
+          export PATH="$(dirname "$SUPERSONIC_LLAMA_CPP_SERVER"):$PATH"
           RUST_TEST_THREADS=1 timeout --foreground 21660s python3 tools/supersonic-bench.py run \
             --suite full \
             --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
             --artifact "$SUPERSONIC_GQH_GGUF" \
             --peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT" \
+            --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
+            --artifact-quantization GQH-Q3KXL \
+            --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
+            --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
             --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
             --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
             --rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt" \

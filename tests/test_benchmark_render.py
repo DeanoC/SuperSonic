@@ -207,7 +207,7 @@ class BenchmarkRenderTests(unittest.TestCase):
             "gfx1201",
             "reproduce",
             "supersonic",
-            "v1",
+            "v2",
         ):
             self.assertIn(value, page)
         self.assertNotIn("generation timestamp", page.lower())

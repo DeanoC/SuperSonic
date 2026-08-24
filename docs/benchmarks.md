@@ -88,6 +88,10 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --suite quick \
   --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
   --artifact "$SUPERSONIC_GQH_GGUF" \
+  --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
+  --artifact-quantization GQH-Q3KXL \
+  --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
+  --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
   --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
   --rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt" \
@@ -125,7 +129,7 @@ peer engine. Both engines consume the exact local copy of
 verified as SHA-256
 `c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98`.
 Do not substitute the similarly named `qwen38-gqh-32gb-a.gguf`; it is a
-different artifact. Before a local full run, `llama-cli` must be on `PATH`, must
+different artifact. Before a local full run, `llama-server` must be on `PATH`, must
 match the first non-comment line in `tools/external/llama-cpp-version.txt`,
 and the peer artifact must be readable:
 
@@ -134,16 +138,25 @@ export SUPERSONIC_GQH_GGUF=/home/deano/models/qwen38-gqh-shaped.gguf
 export SUPERSONIC_LLAMA_CPP_ARTIFACT="$SUPERSONIC_GQH_GGUF"
 export SUPERSONIC_GQH_GGUF_SHA256=c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98
 export SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256="$SUPERSONIC_GQH_GGUF_SHA256"
-command -v llama-cli
+command -v llama-server
 test -r "$SUPERSONIC_LLAMA_CPP_ARTIFACT"
 test "$(sha256sum "$SUPERSONIC_GQH_GGUF" | awk '{print $1}')" = "$SUPERSONIC_GQH_GGUF_SHA256"
 pinned_peer_version="$(grep -v '^#' tools/external/llama-cpp-version.txt | grep -v '^$' | head -n 1)"
-test "$(llama-cli --version)" = "$pinned_peer_version"
+test "$(llama-server --version 2>&1 | head -n 1)" = "$pinned_peer_version"
 ```
 
-The workflow supplies the actual peer path and binary pin. The local command
+The one-shot peer adapter starts a fresh `llama-server` for every invocation,
+passes `cache_prompt=false`, disables the server warmup, reads exact JSON token
+counts and timings, and stops the server before returning. The workflow supplies
+the actual peer path and binary pin. The local command
 must pass the exact readable artifact that the preflight checked:
 `--peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT"`.
+
+Performance cases ignore EOS so every measured sample decodes the declared
+token count. Quality cases instead honor EOS and treat `max_new_tokens` as a
+cap, matching ordinary answer generation while retaining deterministic greedy
+sampling. Both engines explicitly disable Qwen3.8 thinking in the shared chat
+template for these cases.
 
 ```bash
 set -euo pipefail
@@ -154,6 +167,10 @@ RUST_TEST_THREADS=1 timeout --foreground 21660s \
   --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
   --artifact "$SUPERSONIC_GQH_GGUF" \
   --peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT" \
+  --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
+  --artifact-quantization GQH-Q3KXL \
+  --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
+  --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
   --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
   --rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt" \

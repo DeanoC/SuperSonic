@@ -9,7 +9,7 @@ import re
 from .model import EngineManifest, PerformanceCase
 
 
-ADAPTER_VERSION = 1
+ADAPTER_VERSION = 2
 MODEL_NAME = "qwen3.8-27b"
 DEFAULT_DEVICE = 0
 DEFAULT_SAMPLING_SEED = 42
@@ -26,24 +26,7 @@ STAGE_TIMINGS_RE = re.compile(
     r"^\[stage-timings\]\s+steps=(?P<steps>[0-9]+)\b.*?\btotal_native_decode_ms=(?P<total>[-+A-Za-z0-9.]+)\b.*$",
     re.MULTILINE,
 )
-LLAMA_CPP_TIMING_PREFIX_RE = re.compile(r"^llama_perf_context_print:\s+")
-LLAMA_CPP_PROMPT_EVAL_RE = re.compile(
-    r"^llama_perf_context_print:\s+prompt eval time\s+=\s+(?P<ms>[-+A-Za-z0-9.]+)\s+ms\s+/\s+"
-    r"(?P<count>[0-9]+)\s+tokens\s+\(\s*(?P<per_tok>[-+A-Za-z0-9.]+)\s+ms per token,\s+"
-    r"(?P<tps>[-+A-Za-z0-9.]+)\s+tokens per second\)$",
-    re.MULTILINE,
-)
-LLAMA_CPP_EVAL_RE = re.compile(
-    r"^llama_perf_context_print:\s+eval time\s+=\s+(?P<ms>[-+A-Za-z0-9.]+)\s+ms\s+/\s+"
-    r"(?P<count>[0-9]+)\s+runs\s+\(\s*(?P<per_tok>[-+A-Za-z0-9.]+)\s+ms per token,\s+"
-    r"(?P<tps>[-+A-Za-z0-9.]+)\s+tokens per second\)$",
-    re.MULTILINE,
-)
-LLAMA_CPP_TOTAL_RE = re.compile(
-    r"^llama_perf_context_print:\s+total time\s+=\s+(?P<ms>[-+A-Za-z0-9.]+)\s+ms\s+/\s+"
-    r"(?P<count>[0-9]+)\s+tokens$",
-    re.MULTILINE,
-)
+LLAMA_CPP_JSON_RE = re.compile(r"^\[llama_cpp_json\]\s+(?P<value>.+)$", re.MULTILINE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +37,8 @@ class AdapterInputs:
     chat: bool = False
     device: int = DEFAULT_DEVICE
     context_size: int | None = None
+    fixed_token_count: bool = True
+    sampling_seed: int = DEFAULT_SAMPLING_SEED
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,16 +71,17 @@ def build_command(
 
 def parse_output(engine_name: str, stdout: str, stderr: str = "") -> ParsedOutput:
     if engine_name == "supersonic":
-        return _parse_common_output(engine_name, stdout, engine_version=None)
+        combined = _combine_streams(stdout, stderr)
+        return _parse_common_output(engine_name, combined, engine_version=None)
     if engine_name == "llama-cpp":
         from .manifest import load_engine
 
-        combined = _combine_llama_streams(stdout, stderr)
+        combined = _combine_streams(stdout, stderr)
         return _parse_llama_cpp_output(combined, engine_version=load_engine(engine_name).pinned_version)
     raise ValueError(f"unsupported engine adapter: {engine_name}")
 
 
-def _combine_llama_streams(stdout: str, stderr: str) -> str:
+def _combine_streams(stdout: str, stderr: str) -> str:
     if not stderr:
         return stdout
     if not stdout:
@@ -120,12 +106,15 @@ def _build_supersonic_command(
         case.prompt,
         "--max-new-tokens",
         str(case.max_new_tokens),
-        "--ignore-eos",
         "--emit-generated-json",
         "--emit-stage-timings",
         "--device",
         str(_require_non_negative_int(inputs.device, "device")),
+        "--sampling-seed",
+        str(_require_non_negative_int(inputs.sampling_seed, "sampling_seed")),
     ]
+    if inputs.fixed_token_count:
+        args.append("--ignore-eos")
     if inputs.chat:
         args.append("--chat")
     if inputs.context_size is not None:
@@ -145,31 +134,23 @@ def _build_llama_cpp_command(
 
     args = [
         engine.binary,
+        "--server-binary",
+        "llama-server",
         "--model",
         str(inputs.peer_artifact),
         "--prompt",
         case.prompt,
-        "--n-predict",
+        "--max-new-tokens",
         str(case.max_new_tokens),
-        "--ignore-eos",
-        "--perf",
-        "--show-timings",
-        "--no-display-prompt",
-        "--temp",
-        "0",
-        "--top-k",
-        "0",
-        "--top-p",
-        "1",
         "--seed",
-        str(DEFAULT_SAMPLING_SEED),
+        str(_require_non_negative_int(inputs.sampling_seed, "sampling_seed")),
     ]
     if inputs.chat:
-        args.extend(["--conversation", "--single-turn"])
-    else:
-        args.append("--no-conversation")
+        args.append("--chat")
+    if not inputs.fixed_token_count:
+        args.append("--honor-eos")
     if inputs.context_size is not None:
-        args.extend(["--ctx-size", str(_require_positive_int(inputs.context_size, "context_size"))])
+        args.extend(["--context-size", str(_require_positive_int(inputs.context_size, "context_size"))])
     return tuple(args)
 
 
@@ -224,32 +205,30 @@ def _parse_common_output(
 
 
 def _parse_llama_cpp_output(stdout: str, *, engine_version: str | None) -> ParsedOutput:
-    prompt_match = _extract_match_exactly_one(LLAMA_CPP_PROMPT_EVAL_RE, stdout, "prompt eval time line")
-    eval_match = _extract_match_exactly_one(LLAMA_CPP_EVAL_RE, stdout, "eval time line")
-    total_match = _extract_match_exactly_one(LLAMA_CPP_TOTAL_RE, stdout, "total time line")
-
-    generated_text = _parse_llama_cpp_generated_text(stdout)
-    if not generated_text:
+    raw = _extract_exactly_one(LLAMA_CPP_JSON_RE, stdout, "llama_cpp_json line")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("llama_cpp_json must be valid JSON") from exc
+    required = {
+        "decode_ms",
+        "generated_text",
+        "generated_tokens",
+        "ms_per_tok",
+        "prompt_tokens",
+        "tokens_per_second",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError("llama_cpp_json must contain exactly the normalized peer fields")
+    generated_text = payload["generated_text"]
+    if not isinstance(generated_text, str) or not generated_text:
         raise ValueError("llama-cpp output must contain deterministic generated text")
-
-    prompt_tokens = int(prompt_match.group("count"))
-    prompt_ms = _require_finite_positive(float(prompt_match.group("ms")), "prompt_eval_ms")
-    prompt_ms_per_tok = _require_finite_positive(float(prompt_match.group("per_tok")), "prompt_eval_ms_per_tok")
-    prompt_tps = _require_finite_positive(float(prompt_match.group("tps")), "prompt_eval_tokens_per_second")
-    _require_rate_consistency(prompt_ms, prompt_tokens, prompt_ms_per_tok, prompt_tps, "prompt eval time")
-
-    generated_tokens = int(eval_match.group("count"))
-    decode_ms = _require_finite_positive(float(eval_match.group("ms")), "decode_ms")
-    ms_per_tok = _require_finite_positive(float(eval_match.group("per_tok")), "ms_per_tok")
-    tokens_per_second = _require_finite_positive(float(eval_match.group("tps")), "tokens_per_second")
-    _require_rate_consistency(decode_ms, generated_tokens, ms_per_tok, tokens_per_second, "eval time")
-
-    total_tokens = int(total_match.group("count"))
-    total_ms = _require_finite_positive(float(total_match.group("ms")), "total_ms")
-    if total_tokens != prompt_tokens + generated_tokens:
-        raise ValueError("llama-cpp total time token count is inconsistent with prompt and generated counts")
-    if not math.isclose(total_ms, prompt_ms + decode_ms, rel_tol=0.05, abs_tol=2.0):
-        raise ValueError("llama-cpp total time is inconsistent with prompt and eval time")
+    prompt_tokens = _require_positive_int(payload["prompt_tokens"], "prompt_tokens")
+    generated_tokens = _require_positive_int(payload["generated_tokens"], "generated_tokens")
+    decode_ms = _require_finite_positive(payload["decode_ms"], "decode_ms")
+    ms_per_tok = _require_finite_positive(payload["ms_per_tok"], "ms_per_tok")
+    tokens_per_second = _require_finite_positive(payload["tokens_per_second"], "tokens_per_second")
+    _require_rate_consistency(decode_ms, generated_tokens, ms_per_tok, tokens_per_second, "peer timing")
 
     return ParsedOutput(
         engine_name="llama-cpp",
@@ -298,11 +277,6 @@ def _parse_result(stdout: str) -> tuple[int, int, float, float]:
     return prompt_tokens, generated_tokens, decode_ms, ms_per_tok
 
 
-def _parse_llama_cpp_generated_text(stdout: str) -> str:
-    lines = [line for line in stdout.splitlines() if not LLAMA_CPP_TIMING_PREFIX_RE.match(line)]
-    return "\n".join(lines)
-
-
 def _extract_exactly_one(pattern: re.Pattern[str], text: str, label: str) -> str:
     matches = pattern.findall(text)
     if len(matches) != 1:
@@ -341,10 +315,19 @@ def _require_non_negative_int(value: int, label: str) -> int:
     return value
 
 
-def _require_finite_positive(value: float, label: str) -> float:
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{label} must be finite and positive")
+def _require_positive_int(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
     return value
+
+
+def _require_finite_positive(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError(f"{label} must be finite and positive")
+    return result
 
 
 def _require_rate_consistency(

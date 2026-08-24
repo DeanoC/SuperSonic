@@ -1,7 +1,7 @@
 version = 1
 name = "quick"
 budget_seconds = 600
-quality_version = "v1"
+quality_version = "v2"
 quality_case_ids = [
   "instruction-following-1",
   "structured-extraction-1",

@@ -44,7 +44,7 @@ class BenchmarkAdapterTests(unittest.TestCase):
             device=0,
         )
         self.supersonic_log = (FIXTURES / "supersonic-run.log").read_text(encoding="utf-8")
-        self.llama_log = (FIXTURES / "llama-cpp-run.log").read_text(encoding="utf-8")
+        self.llama_log = (FIXTURES / "llama-cpp-peer-run.log").read_text(encoding="utf-8")
 
     def test_supersonic_argv_uses_public_contract(self):
         argv = self.adapters.build_command(self.supersonic, self.supersonic_case, self.inputs)
@@ -65,12 +65,14 @@ class BenchmarkAdapterTests(unittest.TestCase):
             chat=True,
             device=3,
             context_size=2048,
+            sampling_seed=7,
         )
         argv = self.adapters.build_command(self.supersonic, self.mtp_case, inputs)
         self.assertIn("--chat", argv)
         self.assertIn("--speculative-decode", argv)
         self.assertEqual(argv[argv.index("--device") + 1], "3")
         self.assertEqual(argv[argv.index("--context-size") + 1], "2048")
+        self.assertEqual(argv[argv.index("--sampling-seed") + 1], "7")
 
     def test_build_command_fails_closed_for_out_of_scope_engine_or_mode(self):
         with self.assertRaisesRegex(ValueError, "case.*engine|outside|scope"):
@@ -83,17 +85,14 @@ class BenchmarkAdapterTests(unittest.TestCase):
                 self.inputs,
             )
 
-    def test_llama_cpp_argv_uses_peer_artifact_and_ordinary_mode(self):
+    def test_llama_cpp_argv_uses_one_shot_server_adapter_and_peer_artifact(self):
         argv = self.adapters.build_command(self.llama_cpp, self.llama_case, self.inputs)
-        self.assertEqual(argv[0], "llama-cli")
+        self.assertEqual(argv[0], "tools/llama-cpp-peer.py")
+        self.assertEqual(argv[argv.index("--server-binary") + 1], "llama-server")
         self.assertNotIn(str(self.inputs.artifact), argv)
         self.assertIn(str(self.inputs.peer_artifact), argv)
-        self.assertIn("--perf", argv)
-        self.assertIn("--no-display-prompt", argv)
-        self.assertIn("--no-conversation", argv)
-        self.assertNotIn("--conversation", argv)
-        self.assertIn("--ignore-eos", argv)
-        self.assertIn("--temp", argv)
+        self.assertNotIn("--chat", argv)
+        self.assertIn("--max-new-tokens", argv)
         self.assertIn("--seed", argv)
 
     def test_llama_cpp_chat_argv_is_explicit_single_turn_conversation(self):
@@ -103,12 +102,21 @@ class BenchmarkAdapterTests(unittest.TestCase):
             peer_artifact=self.inputs.peer_artifact,
             chat=True,
             context_size=4096,
+            sampling_seed=7,
         )
         argv = self.adapters.build_command(self.llama_cpp, self.llama_case, inputs)
-        self.assertIn("--conversation", argv)
-        self.assertIn("--single-turn", argv)
-        self.assertNotIn("--no-conversation", argv)
-        self.assertEqual(argv[argv.index("--ctx-size") + 1], "4096")
+        self.assertIn("--chat", argv)
+        self.assertEqual(argv[argv.index("--context-size") + 1], "4096")
+        self.assertEqual(argv[argv.index("--seed") + 1], "7")
+
+    def test_quality_commands_honor_eos_instead_of_forcing_the_token_cap(self):
+        inputs = replace(self.inputs, chat=True, fixed_token_count=False)
+
+        supersonic = self.adapters.build_command(self.supersonic, self.supersonic_case, inputs)
+        peer = self.adapters.build_command(self.llama_cpp, self.llama_case, inputs)
+
+        self.assertNotIn("--ignore-eos", supersonic)
+        self.assertIn("--honor-eos", peer)
 
     def test_supersonic_parser_extracts_generated_text_tokens_and_timings(self):
         parsed = self.adapters.parse_output("supersonic", self.supersonic_log)
@@ -122,6 +130,19 @@ class BenchmarkAdapterTests(unittest.TestCase):
         self.assertEqual(parsed.ms_per_tok, 3.0)
         self.assertAlmostEqual(parsed.tokens_per_second, 333.3333333333333)
 
+    def test_supersonic_parser_combines_real_split_stdout_and_stderr(self):
+        stdout = '[generated_json] "ready"\n[tokens] 2232\n'
+        stderr = (
+            "[result] prompt_tokens=19 generated_tokens=1 decode_ms=49 ms_per_tok=49\n"
+            "[stage-timings] steps=1 total_native_decode_ms=48.244\n"
+        )
+
+        parsed = self.adapters.parse_output("supersonic", stdout, stderr)
+
+        self.assertEqual(parsed.generated_text, "ready")
+        self.assertEqual(parsed.prompt_tokens, 19)
+        self.assertEqual(parsed.generated_tokens, 1)
+
     def test_llama_cpp_parser_keeps_version_identity(self):
         parsed = self.adapters.parse_output("llama-cpp", self.llama_log)
         self.assertEqual(parsed.engine_version, self.llama_cpp.pinned_version)
@@ -134,13 +155,12 @@ class BenchmarkAdapterTests(unittest.TestCase):
         self.assertAlmostEqual(parsed.tokens_per_second, 250.0)
 
     def test_llama_cpp_parser_combines_stdout_and_stderr_streams(self):
-        text_line = "text emitted by llama"
         parsed = self.adapters.parse_output(
             "llama-cpp",
-            text_line,
-            self.llama_log.split("\n", 1)[1],
+            "",
+            self.llama_log,
         )
-        self.assertEqual(parsed.generated_text, text_line)
+        self.assertEqual(parsed.generated_text, " world")
         self.assertEqual(parsed.token_ids, None)
         self.assertEqual(parsed.decode_ms, 12.0)
 
@@ -148,17 +168,17 @@ class BenchmarkAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             self.adapters.parse_output("supersonic", self.supersonic_log + self.supersonic_log)
 
-    def test_llama_cpp_raw_timing_lines_must_be_complete_and_consistent(self):
-        with self.assertRaisesRegex(ValueError, "exactly one.*prompt eval time"):
+    def test_llama_cpp_normalized_timing_must_be_complete_and_consistent(self):
+        with self.assertRaisesRegex(ValueError, "exactly.*normalized peer fields"):
             self.adapters.parse_output(
                 "llama-cpp",
-                self.llama_log.replace("prompt eval time", "prefill eval time"),
+                self.llama_log.replace(',"prompt_tokens":7', ""),
             )
 
         with self.assertRaisesRegex(ValueError, "inconsistent"):
             self.adapters.parse_output(
                 "llama-cpp",
-                self.llama_log.replace("eval time =      12.00 ms /     3 runs", "eval time =      13.00 ms /     3 runs"),
+                self.llama_log.replace('"decode_ms":12.0', '"decode_ms":13.0'),
             )
 
     def test_non_finite_negative_and_inconsistent_values_fail(self):
@@ -167,7 +187,7 @@ class BenchmarkAdapterTests(unittest.TestCase):
             self.supersonic_log.replace("decode_ms=9", "decode_ms=-1"),
             self.supersonic_log.replace("generated_tokens=3", "generated_tokens=4"),
             self.supersonic_log.replace('[generated_json] " world"\n', ""),
-            self.llama_log.replace("eval time =      12.00 ms", "eval time =      nan ms"),
+            self.llama_log.replace('"decode_ms":12.0', '"decode_ms":"nan"'),
         )
         for log in bad_logs:
             with self.assertRaises(ValueError):

@@ -55,7 +55,7 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertIn("--hip-version-file", text)
         self.assertIn('run_id="quick-manual-', text)
         self.assertIn('run_id="full-manual-', text)
-        self.assertIn("command -v llama-cli", text)
+        self.assertIn("command -v llama-server", text)
         self.assertIn('test -r "$SUPERSONIC_LLAMA_CPP_ARTIFACT"', text)
         self.assertIn("The validator validates raw sample values", text)
         self.assertIn("The renderer deterministically derives sample", text)

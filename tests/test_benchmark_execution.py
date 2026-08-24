@@ -214,6 +214,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.assertEqual(record["environment"]["rocm_version"], "ROCm 6.4.2")
         self.assertEqual(record["environment"]["hip_version"], "HIP 6.4.2")
         self.assertTrue(record["engine"]["version"].startswith("source-"))
+        self.assertEqual(record["engine"]["adapter_version"], 2)
         self.assertNotIn(str(self.rocm_version_file), json.dumps(record))
         self.assertNotIn(str(self.hip_version_file), json.dumps(record))
 
@@ -231,6 +232,36 @@ class BenchmarkExecutionTests(unittest.TestCase):
         oversized.write_text("HIP 6.4.2\n" + ("x" * 4096), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "4096"):
             parser(oversized, "HIP")
+
+    def test_hip_version_parser_accepts_unknown_in_standard_target_triple(self):
+        capture = self.root / "hipcc-version.txt"
+        capture.write_text(
+            "HIP version: 7.14.60850-0000000\n"
+            "AMD clang version 23.0.0git\n"
+            "Target: x86_64-unknown-linux-gnu\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            self.execution._read_version_file(capture, "HIP"),
+            "HIP 7.14.60850-0000000",
+        )
+
+    def test_pinned_peer_version_accepts_real_two_line_stderr_shape(self):
+        self.peer_binary.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"--version\" ]; then\n"
+            "  echo 'version: 5 (f8dd7c3)' >&2\n"
+            "  echo 'built with GNU 14.2.0 for Linux x86_64' >&2\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+
+        run_manifest = self.execution.preflight(self.config(suite="full", include_peer=True))
+
+        peer = next(engine for engine in run_manifest.engines if engine.name == "llama-cpp")
+        self.assertEqual(peer.pinned_version, "version: 5 (f8dd7c3)")
 
     def test_performance_failures_are_report_only_but_quality_failures_block(self):
         config = self.config(run_quality=False)
@@ -254,16 +285,23 @@ class BenchmarkExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MTP|exact_tokens|manifest"):
             self.execution._validate_mtp_quality_case(non_mtp)
 
+    def test_quality_timeout_allows_bounded_fresh_process_model_load(self):
+        quality_case = self.execution.manifest.load_quality("v1")[0]
+
+        timeout = self.execution._quality_timeout(quality_case, 600.0, FakeClock([0.0]))
+
+        self.assertEqual(timeout, 180.0)
+
     def test_peer_artifact_identity_is_not_copied_from_supersonic(self):
         config = self.config(suite="full", include_peer=True, run_quality=False)
-        llama_log = (FIXTURES / "llama-cpp-run.log").read_text(encoding="utf-8")
+        llama_log = (FIXTURES / "llama-cpp-peer-run.log").read_text(encoding="utf-8")
 
         class SplitRunner(FakeRunner):
             def __call__(self, argv, timeout=None, engine_name=None, **kwargs):
                 if engine_name == "llama-cpp":
                     self.calls.append((tuple(argv), timeout))
                     self.started_case_ids.append(str(argv[argv.index("--prompt") + 1]))
-                    return {"returncode": 0, "stdout": llama_log.split("\n", 1)[0], "stderr": llama_log.split("\n", 1)[1]}
+                    return {"returncode": 0, "stdout": llama_log, "stderr": ""}
                 return super().__call__(argv, timeout=timeout, engine_name=engine_name, **kwargs)
 
         status = self.execution.run_suite(config, FakeClock([0] + list(range(1, 500))), SplitRunner())
@@ -282,6 +320,27 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.assertFalse(comparison.comparable)
         self.assertIsNone(comparison.speedup)
         self.assertIn("sha256", comparison.reasons)
+
+    def test_byte_identical_peer_artifact_shares_only_weight_identity(self):
+        config = self.config(suite="full", include_peer=True, run_quality=False)
+        config = self.execution.replace_config(
+            config,
+            peer_artifact=self.artifact,
+            artifact_semantic_id="qwen3.8-27b-gqh-q3kxl",
+            artifact_quantization="GQH-Q3KXL",
+        )
+        run_manifest = self.execution.preflight(config)
+        supersonic = next(engine for engine in run_manifest.engines if engine.name == "supersonic")
+        peer = next(engine for engine in run_manifest.engines if engine.name == "llama-cpp")
+
+        primary_identity = self.execution._artifact_identity(config, supersonic)
+        peer_identity = self.execution._artifact_identity(config, peer)
+
+        self.assertEqual(peer_identity["sha256"], primary_identity["sha256"])
+        self.assertEqual(peer_identity["semantic_id"], "qwen3.8-27b-gqh-q3kxl")
+        self.assertEqual(peer_identity["quantization"], "GQH-Q3KXL")
+        self.assertIsNone(peer_identity["tokenizer_sha256"])
+        self.assertIsNone(peer_identity["chat_template_sha256"])
 
     def test_fractional_deadline_timeout_is_never_rounded_up(self):
         config = self.config(run_quality=False)
@@ -376,7 +435,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["status"]["state"], status.state)
         self.assertNotIn(str(self.root), json.dumps(payload))
-        self.assertEqual(payload["seed"], config.seed)
+        self.assertIsNone(payload["seed"])
         self.assertEqual(payload["budgets"]["suite_seconds"], 600)
 
     def test_interrupted_run_updates_manifest_to_incomplete(self):

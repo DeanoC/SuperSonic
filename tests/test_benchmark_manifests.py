@@ -48,10 +48,12 @@ class BenchmarkManifestTests(unittest.TestCase):
 
         quick = manifest.load_suite("quick")
         full = manifest.load_suite("full")
-        quality_cases = manifest.load_quality("v1")
+        quality_cases = manifest.load_quality(full.quality_version)
 
         self.assertEqual(quick.version, 1)
         self.assertEqual(full.version, 1)
+        self.assertEqual(quick.quality_version, "v2")
+        self.assertEqual(full.quality_version, "v2")
         self.assertEqual(quick.decoding_policy, "greedy")
         self.assertEqual(full.decoding_policy, "greedy")
         self.assertEqual(quick.budget_seconds, 600)
@@ -142,7 +144,7 @@ engines = ["llama-cpp"]
     def test_quality_corpus_has_required_categories_and_unique_ids(self):
         manifest = load_manifest_module()
 
-        quality_cases = manifest.load_quality("v1")
+        quality_cases = manifest.load_quality("v2")
 
         case_ids = [case.id for case in quality_cases]
         self.assertEqual(len(case_ids), len(set(case_ids)))
@@ -182,6 +184,8 @@ engines = ["llama-cpp"]
         self.assertIsNone(supersonic.version_pin_file)
         self.assertEqual(llama_cpp.version_pin_file, "tools/external/llama-cpp-version.txt")
         self.assertEqual(llama_cpp.pinned_version, "version: 5 (f8dd7c3)")
+        self.assertEqual(llama_cpp.binary, "tools/llama-cpp-peer.py")
+        self.assertEqual(llama_cpp.version_command, ("llama-server", "--version"))
 
         supersonic_raw = tomllib.loads(
             (BENCHMARKS / "engines" / "supersonic.toml").read_text(encoding="utf-8")

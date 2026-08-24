@@ -63,6 +63,14 @@ class BenchmarkCliTests(unittest.TestCase):
                 "/model",
                 "--artifact",
                 "/artifact",
+                "--artifact-semantic-id",
+                "test-artifact",
+                "--artifact-quantization",
+                "GQH-Q3KXL",
+                "--tokenizer-sha256",
+                "a" * 64,
+                "--chat-template-sha256",
+                "b" * 64,
                 "--physical-gpu",
                 "0",
                 "--gpu-static-json",
@@ -108,6 +116,43 @@ class BenchmarkCliTests(unittest.TestCase):
                     "forged",
                 ]
             )
+
+    def test_run_accepts_explicit_artifact_and_model_component_identities(self):
+        cli = load_cli_module()
+        args = cli.build_parser().parse_args(
+            [
+                "run",
+                "--suite",
+                "quick",
+                "--model-dir",
+                "/model",
+                "--artifact",
+                "/artifact",
+                "--artifact-semantic-id",
+                "qwen3.8-27b-gqh-q3kxl",
+                "--artifact-quantization",
+                "GQH-Q3KXL",
+                "--tokenizer-sha256",
+                "a" * 64,
+                "--chat-template-sha256",
+                "b" * 64,
+                "--physical-gpu",
+                "0",
+                "--gpu-static-json",
+                "/tmp/amd-smi-static.json",
+                "--rocm-version-file",
+                "/tmp/rocm-version.txt",
+                "--hip-version-file",
+                "/tmp/hip-version.txt",
+                "--gpu-arch",
+                "gfx1201",
+            ]
+        )
+
+        self.assertEqual(args.artifact_semantic_id, "qwen3.8-27b-gqh-q3kxl")
+        self.assertEqual(args.artifact_quantization, "GQH-Q3KXL")
+        self.assertEqual(args.tokenizer_sha256, "a" * 64)
+        self.assertEqual(args.chat_template_sha256, "b" * 64)
 
 
 if __name__ == "__main__":

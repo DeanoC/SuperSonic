@@ -72,6 +72,10 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --suite quick \
   --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
   --artifact "$SUPERSONIC_GQH_GGUF" \
+  --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
+  --artifact-quantization GQH-Q3KXL \
+  --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
+  --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
   --gpu-static-json target/benchmarks/manual/amd-smi-provenance.json \
   --rocm-version-file target/benchmarks/manual/rocm-driver-version.txt \

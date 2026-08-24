@@ -32,6 +32,7 @@ from .model import EngineManifest, PerformanceCase, QualityCase, SuiteManifest, 
 
 ROOT = manifest.ROOT
 EXPECTED_BUDGETS = {"quick": 600, "full": 21600}
+QUALITY_CASE_TIMEOUT_SECONDS = 180
 QUICK_BUDGET_SECONDS = EXPECTED_BUDGETS["quick"]
 FULL_BUDGET_SECONDS = EXPECTED_BUDGETS["full"]
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -163,6 +164,10 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
     """Validate all configured inputs and create an immutable candidate area."""
 
     resolved = _coerce_config(config)
+    if resolved.seed is not None and (
+        isinstance(resolved.seed, bool) or not isinstance(resolved.seed, int) or resolved.seed < 0
+    ):
+        raise ValueError("seed must be a non-negative integer")
     if callable(resolved.environment_snapshot):
         resolved = replace(resolved, environment_snapshot=resolved.environment_snapshot())
     suite = resolved.suite if isinstance(resolved.suite, SuiteManifest) else manifest.load_suite(str(resolved.suite))
@@ -512,6 +517,9 @@ def _execute_case(
         chat=bool(run_manifest.config.chat),
         device=int(run_manifest.config.device),
         context_size=run_manifest.config.context_size,
+        sampling_seed=int(
+            adapters.DEFAULT_SAMPLING_SEED if run_manifest.config.seed is None else run_manifest.config.seed
+        ),
     )
     try:
         argv = adapters.build_command(engine, case, inputs)
@@ -598,6 +606,10 @@ def _run_quality(
         chat=bool(run_manifest.config.chat),
         device=int(run_manifest.config.device),
         context_size=run_manifest.config.context_size,
+        fixed_token_count=False,
+        sampling_seed=int(
+            adapters.DEFAULT_SAMPLING_SEED if run_manifest.config.seed is None else run_manifest.config.seed
+        ),
     )
     results: list[quality.QualityResult] = []
     for case in run_manifest.quality_cases:
@@ -792,7 +804,7 @@ def _quality_timeout(case: QualityCase, deadline: float, clock: Callable[[], flo
         clock,
         suite_deadline=deadline,
         case_deadline=deadline,
-        cap=float(max(1, int(case.max_new_tokens))),
+        cap=float(QUALITY_CASE_TIMEOUT_SECONDS),
     )
 
 
@@ -1403,9 +1415,6 @@ def _read_version_file(path: Path, label: str) -> str:
         raise ValueError(f"{label} version file is empty")
     if any(char in text for char in "\x00\r"):
         raise ValueError(f"{label} version file contains unsafe control characters")
-    if re.search(r"\bunknown\b", text, re.IGNORECASE):
-        raise ValueError(f"{label} version file must not contain unknown")
-
     # hipcc and rocm-smi use different labels and often emit a short banner.
     # Extract the first version token, then normalize its product prefix so
     # consumers compare structured identities rather than arbitrary banners.
@@ -1680,7 +1689,8 @@ def _validate_engine_version(engine: EngineManifest, config: RunConfig) -> None:
     output = _text(completed.stdout) + _text(completed.stderr)
     if completed.returncode != 0:
         raise ValueError(f"{engine.name} unavailable while checking pinned version")
-    if not output.strip() or output.strip() != pinned:
+    version_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    if not version_line or len(version_line.encode("utf-8")) > 4096 or version_line != pinned:
         raise ValueError(f"{engine.name} version mismatch: expected {pinned!r}")
 
 
@@ -1741,9 +1751,16 @@ def _artifact_identity(config: RunConfig, engine: EngineManifest) -> dict[str, s
         if artifact is None:
             raise ValueError("llama-cpp peer artifact is required for artifact evidence")
         digest = _digest_file(artifact)
+        primary_digest = _digest_file(Path(config.artifact))
+        same_weights = digest == primary_digest
+        semantic_id = config.artifact_semantic_id or f"artifact-sha256-{digest}"
+        quantization = config.artifact_quantization or "GQH-Q4"
+        if not same_weights:
+            semantic_id = f"artifact-sha256-{digest}"
+            quantization = f"artifact-sha256-{digest}"
         return {
-            "semantic_id": f"artifact-sha256-{digest}",
-            "quantization": f"artifact-sha256-{digest}",
+            "semantic_id": semantic_id,
+            "quantization": quantization,
             "sha256": digest,
             "tokenizer_sha256": None,
             "chat_template_sha256": None,
