@@ -181,7 +181,7 @@ engines = ["llama-cpp"]
         self.assertEqual(tuple(llama_cpp.supported_modes), ("ordinary",))
         self.assertIsNone(supersonic.version_pin_file)
         self.assertEqual(llama_cpp.version_pin_file, "tools/external/llama-cpp-version.txt")
-        self.assertEqual(llama_cpp.pinned_version, "version: 9430 (d48a56eff)")
+        self.assertEqual(llama_cpp.pinned_version, "version: 5 (f8dd7c3)")
 
         supersonic_raw = tomllib.loads(
             (BENCHMARKS / "engines" / "supersonic.toml").read_text(encoding="utf-8")

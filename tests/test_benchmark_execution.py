@@ -102,7 +102,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.binary.chmod(0o755)
         self.peer_binary = self.root / "llama-cli"
         self.peer_binary.write_text(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'version: 9430 (d48a56eff)'; fi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'version: 5 (f8dd7c3)'; fi\nexit 0\n",
             encoding="utf-8",
         )
         self.peer_binary.chmod(0o755)
@@ -271,7 +271,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
         records = [json.loads(path.read_text(encoding="utf-8")) for path in status.records]
         supersonic = next(record for record in records if record["engine"]["name"] == "supersonic")
         peer = next(record for record in records if record["engine"]["name"] == "llama-cpp")
-        self.assertEqual(peer["engine"]["version"], "version: 9430 (d48a56eff)")
+        self.assertEqual(peer["engine"]["version"], "version: 5 (f8dd7c3)")
         self.assertNotEqual(peer["engine"]["version"].lower(), "unknown")
         self.assertEqual(peer["artifact"]["sha256"], self.execution._digest_file(self.peer_artifact))
         self.assertNotEqual(supersonic["artifact"]["sha256"], peer["artifact"]["sha256"])

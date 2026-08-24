@@ -120,14 +120,23 @@ python3 tools/supersonic-bench.py validate --publishable "$bundle"
 ## Full candidate
 
 The full workflow is the same CLI with the full suite and its separate pinned
-peer artifact. Before a local full run, `llama-cli` must be on `PATH`, must
+peer engine. Both engines consume the exact local copy of
+[Qwen3.8-27B-GQH-Q3KXL.gguf](https://huggingface.co/Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF/blob/91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4/Qwen3.8-27B-GQH-Q3KXL.gguf),
+verified as SHA-256
+`c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98`.
+Do not substitute the similarly named `qwen38-gqh-32gb-a.gguf`; it is a
+different artifact. Before a local full run, `llama-cli` must be on `PATH`, must
 match the first non-comment line in `tools/external/llama-cpp-version.txt`,
 and the peer artifact must be readable:
 
 ```bash
-export SUPERSONIC_LLAMA_CPP_ARTIFACT=/path/to/pinned-peer-artifact.gguf
+export SUPERSONIC_GQH_GGUF=/home/deano/models/qwen38-gqh-shaped.gguf
+export SUPERSONIC_LLAMA_CPP_ARTIFACT="$SUPERSONIC_GQH_GGUF"
+export SUPERSONIC_GQH_GGUF_SHA256=c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98
+export SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256="$SUPERSONIC_GQH_GGUF_SHA256"
 command -v llama-cli
 test -r "$SUPERSONIC_LLAMA_CPP_ARTIFACT"
+test "$(sha256sum "$SUPERSONIC_GQH_GGUF" | awk '{print $1}')" = "$SUPERSONIC_GQH_GGUF_SHA256"
 pinned_peer_version="$(grep -v '^#' tools/external/llama-cpp-version.txt | grep -v '^$' | head -n 1)"
 test "$(llama-cli --version)" = "$pinned_peer_version"
 ```

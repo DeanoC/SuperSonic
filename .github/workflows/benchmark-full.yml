@@ -25,13 +25,13 @@ jobs:
       SUPERSONIC_REQUIRE_GQH_ARTIFACTS: "1"
       SUPERSONIC_R9700_GPU_ID: ${{ vars.SUPERSONIC_R9700_GPU_ID }}
       SUPERSONIC_DEVICE: "0"
-      SUPERSONIC_GQH_GGUF: ${{ secrets.SUPERSONIC_GQH_GGUF || vars.SUPERSONIC_GQH_GGUF || '/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf' }}
+      SUPERSONIC_GQH_GGUF: ${{ secrets.SUPERSONIC_GQH_GGUF || vars.SUPERSONIC_GQH_GGUF || '/home/deano/models/qwen38-gqh-shaped.gguf' }}
       SUPERSONIC_GQH_GGUF_SHA256: ${{ secrets.SUPERSONIC_GQH_GGUF_SHA256 || vars.SUPERSONIC_GQH_GGUF_SHA256 }}
       SUPERSONIC_GQH_8192_GGUF: ${{ secrets.SUPERSONIC_GQH_8192_GGUF || vars.SUPERSONIC_GQH_8192_GGUF || '/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf' }}
       SUPERSONIC_GQH_8192_GGUF_SHA256: ${{ secrets.SUPERSONIC_GQH_8192_GGUF_SHA256 || vars.SUPERSONIC_GQH_8192_GGUF_SHA256 }}
       SUPERSONIC_QWEN38_MODEL_DIR: ${{ secrets.SUPERSONIC_QWEN38_MODEL_DIR || vars.SUPERSONIC_QWEN38_MODEL_DIR || '/data/models/Qwen3.8-27B' }}
       SUPERSONIC_LLAMA_CPP: ${{ secrets.SUPERSONIC_LLAMA_CPP || vars.SUPERSONIC_LLAMA_CPP || 'llama-cli' }}
-      SUPERSONIC_LLAMA_CPP_ARTIFACT: ${{ secrets.SUPERSONIC_LLAMA_CPP_ARTIFACT || vars.SUPERSONIC_LLAMA_CPP_ARTIFACT }}
+      SUPERSONIC_LLAMA_CPP_ARTIFACT: ${{ secrets.SUPERSONIC_LLAMA_CPP_ARTIFACT || vars.SUPERSONIC_LLAMA_CPP_ARTIFACT || '/home/deano/models/qwen38-gqh-shaped.gguf' }}
       SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256: ${{ secrets.SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256 || vars.SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256 }}
       SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ }}
       SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ }}
@@ -159,8 +159,8 @@ jobs:
 
           text = Path(sys.argv[1]).read_text(encoding="utf-8")
           checks = {
-              "SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ": r"GPU\s+Clock\s+Level\s*:\s*([0-9]+)\s*MHz",
-              "SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ": r"Memory\s+Clock\s+Level\s*:\s*([0-9]+)\s*MHz",
+              "SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ": r"(?:GPU|sclk)\s+Clock\s+Level\s*:\s*(?:[A-Za-z0-9_-]+\s*:\s*)?\(?([0-9]+)\s*MHz",
+              "SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ": r"(?:Memory|mclk)\s+Clock\s+Level\s*:\s*(?:[A-Za-z0-9_-]+\s*:\s*)?\(?([0-9]+)\s*MHz",
               "SUPERSONIC_BENCHMARK_POWER_CAP_WATTS": r"(?:Max|Power\s+Cap)\s+Graphics\s+Package\s+Power\s+\(W\)\s*:\s*([0-9]+(?:\.[0-9]+)?)",
           }
           for name, pattern in checks.items():

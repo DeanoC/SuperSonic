@@ -246,6 +246,23 @@ class EnvironmentPolicyTests(unittest.TestCase):
         self.assertFalse(snapshot.headline_eligible)
         self.assertIn("power cap", " ".join(snapshot.evidence_notes).lower())
 
+    def test_installed_rocm_smi_clock_labels_are_parsed(self):
+        # Captured from this benchmark host's installed rocm-smi --showallinfo.
+        # A parser that only accepts the synthetic "GPU Clock Level" wording
+        # would silently make every locked-clock candidate ineligible.
+        observed = self.environment._parse_showallinfo(
+            """\
+GPU[1]        : sclk clock level: S: (70Mhz)
+GPU[1]        : mclk clock level: 0: (96Mhz)
+GPU[1]        : Performance Level: auto
+GPU[1]        : Max Graphics Package Power (W): 300.0
+""",
+            [],
+        )
+
+        self.assertEqual(observed.gpu_clock_mhz, 70)
+        self.assertEqual(observed.memory_clock_mhz, 96)
+
 
 if __name__ == "__main__":
     unittest.main()

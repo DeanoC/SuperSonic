@@ -39,8 +39,14 @@ _SHOWALLINFO_COMMAND_PREFIX = (
 )
 _DEFAULT_CPU_GOVERNOR_PATH = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
 
-_GPU_CLOCK_RE = re.compile(r"GPU\s+Clock\s+Level\s*:\s*([0-9]+)\s*MHz", re.IGNORECASE)
-_MEMORY_CLOCK_RE = re.compile(r"Memory\s+Clock\s+Level\s*:\s*([0-9]+)\s*MHz", re.IGNORECASE)
+_GPU_CLOCK_RE = re.compile(
+    r"(?:GPU|sclk)\s+Clock\s+Level\s*:\s*(?:[A-Za-z0-9_-]+\s*:\s*)?\(?([0-9]+)\s*MHz",
+    re.IGNORECASE,
+)
+_MEMORY_CLOCK_RE = re.compile(
+    r"(?:Memory|mclk)\s+Clock\s+Level\s*:\s*(?:[A-Za-z0-9_-]+\s*:\s*)?\(?([0-9]+)\s*MHz",
+    re.IGNORECASE,
+)
 _POWER_RE = re.compile(
     r"Average\s+Graphics\s+Package\s+Power\s+\(W\)\s*:\s*([0-9]+(?:\.[0-9]+)?)",
     re.IGNORECASE,

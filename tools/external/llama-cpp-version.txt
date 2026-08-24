@@ -1,3 +1,3 @@
 # First non-comment line must exactly match `llama-cli --version`.
-# Update this after installing the local llama.cpp build used for published refs.
-version: 9430 (d48a56eff)
+# GeometricAGI/llama.cpp PR 1 head f8dd7c36da283cf587cef3133b9287fd3a5b6fdb.
+version: 5 (f8dd7c3)
