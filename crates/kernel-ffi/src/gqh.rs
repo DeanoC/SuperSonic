@@ -752,6 +752,10 @@ mod tests {
         fn supersonic_gqh_test_inject_unregister_prestate_failure();
         fn supersonic_gqh_test_inject_unregister_sync_failure(status: c_int);
         fn supersonic_gqh_test_trigger_post_enqueue_failure(status: c_int);
+        fn supersonic_qwen35_4b_test_trigger_persistent_decode_failure(
+            launch_status: c_int,
+            sync_status: c_int,
+        );
     }
 
     fn vector_dir() -> PathBuf {
@@ -893,6 +897,50 @@ mod tests {
             .env("SUPERSONIC_GPU_FAILURE_CHILD", "1")
             .status()
             .expect("spawn post-enqueue child");
+        assert_eq!(status.signal(), Some(6));
+    }
+
+    #[cfg(supersonic_failure_injection)]
+    #[test]
+    fn fatal_4b_persistent_decode_launch_failure_aborts_in_child() {
+        if std::env::var_os("SUPERSONIC_GPU_FAILURE_CHILD").is_some() {
+            unsafe {
+                supersonic_qwen35_4b_test_trigger_persistent_decode_failure(907, 0);
+            }
+            panic!("injected 4B persistent launch failure returned");
+        }
+
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "gqh::tests::fatal_4b_persistent_decode_launch_failure_aborts_in_child",
+                "--nocapture",
+            ])
+            .env("SUPERSONIC_GPU_FAILURE_CHILD", "1")
+            .status()
+            .expect("spawn 4B persistent launch child");
+        assert_eq!(status.signal(), Some(6));
+    }
+
+    #[cfg(supersonic_failure_injection)]
+    #[test]
+    fn fatal_4b_persistent_decode_sync_failure_aborts_in_child() {
+        if std::env::var_os("SUPERSONIC_GPU_FAILURE_CHILD").is_some() {
+            unsafe {
+                supersonic_qwen35_4b_test_trigger_persistent_decode_failure(0, 908);
+            }
+            panic!("injected 4B persistent synchronize failure returned");
+        }
+
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "gqh::tests::fatal_4b_persistent_decode_sync_failure_aborts_in_child",
+                "--nocapture",
+            ])
+            .env("SUPERSONIC_GPU_FAILURE_CHILD", "1")
+            .status()
+            .expect("spawn 4B persistent synchronize child");
         assert_eq!(status.signal(), Some(6));
     }
 

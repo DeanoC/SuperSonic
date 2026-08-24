@@ -8989,6 +8989,44 @@ extern "C" int supersonic_qwen35_4b_hip_standalone_matvec(
     }
 }
 
+// Once persistent decode has enqueued work that references model-owned
+// buffers, a launch or owning-device synchronization failure is unrecoverable:
+// returning an ordinary status would let Rust drop those buffers while the
+// device may still dereference them. Keep this check separate from validation
+// and allocation failures, which remain ordinary return paths.
+int persistent_decode_post_enqueue_status(
+    hipError_t launch_err, hipError_t sync_err, int device_ordinal) {
+    if (launch_err != hipSuccess) {
+        std::fprintf(
+            stderr,
+            "[decode] persistent launch failure status=%d ordinal=%d\n",
+            static_cast<int>(launch_err),
+            device_ordinal);
+        supersonic_gpu_integrity_fail_stop(
+            "persistent decode launch", static_cast<int>(launch_err), device_ordinal);
+    }
+    if (sync_err != hipSuccess) {
+        std::fprintf(
+            stderr,
+            "[decode] persistent synchronize failure status=%d ordinal=%d\n",
+            static_cast<int>(sync_err),
+            device_ordinal);
+        supersonic_gpu_integrity_fail_stop(
+            "persistent decode synchronize", static_cast<int>(sync_err), device_ordinal);
+    }
+    return 0;
+}
+
+#ifdef SUPERSONIC_FAILURE_INJECTION
+extern "C" void supersonic_qwen35_4b_test_trigger_persistent_decode_failure(
+    int launch_status, int sync_status) {
+    (void)persistent_decode_post_enqueue_status(
+        static_cast<hipError_t>(launch_status),
+        static_cast<hipError_t>(sync_status),
+        0);
+}
+#endif
+
 template <typename T>
 int persistent_decode_device(
     int device_ordinal,
@@ -10796,24 +10834,9 @@ int persistent_decode_device(
         launch_err = hipGetLastError();
     }
 
-    hipError_t sync_err = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) {
-        std::fprintf(
-            stderr,
-            "[decode] launch_err=%s (%d)\n",
-            hipGetErrorString(launch_err),
-            static_cast<int>(launch_err));
-        return 254;
-    }
-    if (sync_err != hipSuccess) {
-        std::fprintf(
-            stderr,
-            "[decode] sync_err=%s (%d)\n",
-            hipGetErrorString(sync_err),
-            static_cast<int>(sync_err));
-        return 255;
-    }
-    return 0;
+    const hipError_t sync_err = hipDeviceSynchronize();
+    return persistent_decode_post_enqueue_status(
+        launch_err, sync_err, device_ordinal);
 }
 
 // Restore conv+rec after fused B>1 verify to the prefix of `commit_len`
@@ -11000,47 +11023,20 @@ extern "C" int supersonic_qwen35_4b_hip_quantize_kv_to_fp8(
     int head_dim,
     int max_T,
     int pos_offset) {
-    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
-
-    const int num_blocks = num_kv_heads * seq_len;
-    constexpr int block_size = 256;
-    const size_t shared_bytes = block_size * sizeof(float);
-
-    switch (dtype) {
-    case 2:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(quantize_kv_to_fp8_kernel<hip_bfloat16>),
-            dim3(static_cast<unsigned int>(num_blocks)),
-            dim3(block_size),
-            shared_bytes,
-            0,
-            static_cast<const hip_bfloat16*>(src),
-            static_cast<uint8_t*>(dst_fp8),
-            dst_scale,
-            num_kv_heads, seq_len, head_dim, max_T, pos_offset);
-        break;
-    default:
-        return 256;
-    }
-    hipError_t launch_err = hipGetLastError();
-    hipError_t sync_err = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) {
-        std::fprintf(
-            stderr,
-            "[decode] launch_err=%s (%d)\n",
-            hipGetErrorString(launch_err),
-            static_cast<int>(launch_err));
-        return 254;
-    }
-    if (sync_err != hipSuccess) {
-        std::fprintf(
-            stderr,
-            "[decode] sync_err=%s (%d)\n",
-            hipGetErrorString(sync_err),
-            static_cast<int>(sync_err));
-        return 255;
-    }
-    return 0;
+    // KV-FP8 is outside the narrowed Qwen3.8 product contract. Keep this
+    // historical symbol as a linker-visible rejection so retained exploratory
+    // callers fail explicitly without enqueueing work on model-owned buffers.
+    (void)dtype;
+    (void)device_ordinal;
+    (void)src;
+    (void)dst_fp8;
+    (void)dst_scale;
+    (void)num_kv_heads;
+    (void)seq_len;
+    (void)head_dim;
+    (void)max_T;
+    (void)pos_offset;
+    return 256;
 }
 
 // supersonic_query_gpu_info is in the 0.8B bridge, not duplicated here

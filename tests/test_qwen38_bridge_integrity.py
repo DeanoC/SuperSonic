@@ -1,0 +1,40 @@
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BRIDGE = ROOT / "kernels" / "full_attention_bridge_4b.cpp"
+
+
+class Qwen38BridgeIntegrityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = BRIDGE.read_text(encoding="utf-8")
+
+    def test_persistent_decode_joins_final_launch_and_sync_fail_stop(self):
+        start = self.source.index("int persistent_decode_device(")
+        end = self.source.index("// Restore conv+rec", start)
+        body = self.source[start:end]
+
+        self.assertRegex(
+            body,
+            r"const hipError_t sync_err = hipDeviceSynchronize\(\);\s+"
+            r"return persistent_decode_post_enqueue_status\(",
+        )
+        final_check = body[body.rindex("const hipError_t sync_err") :]
+        self.assertNotRegex(final_check, r"return\s+25[45]\s*;")
+
+    def test_unsupported_kv_fp8_bridge_does_not_enqueue_work(self):
+        start = self.source.index(
+            "extern \"C\" int supersonic_qwen35_4b_hip_quantize_kv_to_fp8("
+        )
+        body = self.source[start:]
+
+        self.assertIn("KV-FP8 is outside the narrowed Qwen3.8 product contract", body)
+        self.assertIn("return 256;", body)
+        self.assertNotIn("quantize_kv_to_fp8_kernel", body)
+        self.assertNotIn("hipLaunchKernelGGL", body)
+
+
+if __name__ == "__main__":
+    unittest.main()
