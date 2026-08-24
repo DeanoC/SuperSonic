@@ -95,6 +95,7 @@
         "identity",
         "architecture",
         "physical_gpu",
+        "logical_gpu",
         "clock_policy"
       ],
       "properties": {
@@ -106,6 +107,9 @@
           "pattern": "^gfx[0-9]+$"
         },
         "physical_gpu": {
+          "type": "string"
+        },
+        "logical_gpu": {
           "type": "string"
         },
         "clock_policy": {
@@ -139,11 +143,17 @@
           "pattern": "^[0-9a-f]{64}$"
         },
         "tokenizer_sha256": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[0-9a-f]{64}$"
         },
         "chat_template_sha256": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[0-9a-f]{64}$"
         }
       },
@@ -254,19 +264,31 @@
           ],
           "properties": {
             "gpu_clock_mhz": {
-              "type": "integer",
+              "type": [
+                "integer",
+                "null"
+              ],
               "minimum": 0
             },
             "memory_clock_mhz": {
-              "type": "integer",
+              "type": [
+                "integer",
+                "null"
+              ],
               "minimum": 0
             },
             "power_cap_watts": {
-              "type": "integer",
+              "type": [
+                "integer",
+                "null"
+              ],
               "minimum": 0
             },
             "performance_level": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "additionalProperties": false
@@ -285,11 +307,17 @@
           ],
           "properties": {
             "gpu_clock_mhz": {
-              "type": "integer",
+              "type": [
+                "integer",
+                "null"
+              ],
               "minimum": 0
             },
             "memory_clock_mhz": {
-              "type": "integer",
+              "type": [
+                "integer",
+                "null"
+              ],
               "minimum": 0
             },
             "power_cap_watts": {
@@ -300,22 +328,37 @@
               "minimum": 0
             },
             "power_watts": {
-              "type": "number",
+              "type": [
+                "number",
+                "null"
+              ],
               "minimum": 0
             },
             "temperature_celsius": {
-              "type": "number"
+              "type": [
+                "number",
+                "null"
+              ]
             },
             "gpu_utilization_percent": {
-              "type": "number",
+              "type": [
+                "number",
+                "null"
+              ],
               "minimum": 0
             },
             "memory_utilization_percent": {
-              "type": "number",
+              "type": [
+                "number",
+                "null"
+              ],
               "minimum": 0
             },
             "performance_level": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "additionalProperties": false
@@ -334,11 +377,17 @@
           ],
           "properties": {
             "gpu_clock_mhz": {
-              "type": "integer",
+              "type": [
+                "integer",
+                "null"
+              ],
               "minimum": 0
             },
             "memory_clock_mhz": {
-              "type": "integer",
+              "type": [
+                "integer",
+                "null"
+              ],
               "minimum": 0
             },
             "power_cap_watts": {
@@ -349,22 +398,37 @@
               "minimum": 0
             },
             "power_watts": {
-              "type": "number",
+              "type": [
+                "number",
+                "null"
+              ],
               "minimum": 0
             },
             "temperature_celsius": {
-              "type": "number"
+              "type": [
+                "number",
+                "null"
+              ]
             },
             "gpu_utilization_percent": {
-              "type": "number",
+              "type": [
+                "number",
+                "null"
+              ],
               "minimum": 0
             },
             "memory_utilization_percent": {
-              "type": "number",
+              "type": [
+                "number",
+                "null"
+              ],
               "minimum": 0
             },
             "performance_level": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "additionalProperties": false
@@ -389,14 +453,20 @@
                 "type": "number",
                 "minimum": 0
               },
-              "gpu_clock_mhz": {
-                "type": "integer",
-                "minimum": 0
-              },
-              "memory_clock_mhz": {
-                "type": "integer",
-                "minimum": 0
-              },
+            "gpu_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
               "power_cap_watts": {
                 "type": [
                   "integer",
@@ -404,23 +474,38 @@
                 ],
                 "minimum": 0
               },
-              "power_watts": {
-                "type": "number",
-                "minimum": 0
-              },
-              "temperature_celsius": {
-                "type": "number"
-              },
-              "gpu_utilization_percent": {
-                "type": "number",
-                "minimum": 0
-              },
-              "memory_utilization_percent": {
-                "type": "number",
-                "minimum": 0
-              },
-              "performance_level": {
-                "type": "string"
+            "power_watts": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "temperature_celsius": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "gpu_utilization_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_utilization_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "performance_level": {
+              "type": [
+                "string",
+                "null"
+              ]
               }
             },
             "additionalProperties": false

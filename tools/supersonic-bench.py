@@ -31,11 +31,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--artifact", type=Path, required=True)
     run.add_argument("--peer-artifact", type=Path)
     run.add_argument("--physical-gpu", required=True)
+    run.add_argument("--gpu-identity", required=True)
+    run.add_argument("--gpu-identity-verified", action="store_true")
+    run.add_argument("--logical-gpu")
     run.add_argument("--gpu-arch", default=None)
     run.add_argument("--device", type=int, default=0)
     run.add_argument("--context-size", type=int, default=32768)
     run.add_argument("--chat", action="store_true")
     run.add_argument("--clock-policy", choices=("locked", "uncontrolled-clocks"), default="uncontrolled-clocks")
+    run.add_argument("--gpu-clock-mhz", type=int)
+    run.add_argument("--memory-clock-mhz", type=int)
+    run.add_argument("--power-cap-watts", type=int)
+    run.add_argument("--performance-level")
     run.add_argument("--output", type=Path, default=Path("target/benchmarks/candidate"))
     run.add_argument("--seed", type=int)
     run.add_argument("--run-id")
@@ -73,6 +80,22 @@ def _run(args: argparse.Namespace) -> int:
     gpu_arch = args.gpu_arch or _environment_arch()
     if not gpu_arch:
         raise ValueError("gpu_arch is required explicitly or through HIP_ARCH")
+    import os
+
+    selector_verified = (
+        os.environ.get("SUPERSONIC_R9700_GPU_ID") == str(args.physical_gpu)
+        and os.environ.get("SUPERSONIC_R9700_GPU_ARCH") == gpu_arch
+    )
+    gpu_identity_verified = bool(args.gpu_identity_verified or selector_verified)
+    clock_policy: object = args.clock_policy
+    if args.clock_policy == "locked":
+        clock_policy = {
+            "name": "locked",
+            "gpu_clock_mhz": args.gpu_clock_mhz,
+            "memory_clock_mhz": args.memory_clock_mhz,
+            "power_cap_watts": args.power_cap_watts,
+            "performance_level": args.performance_level,
+        }
     config = RunConfig(
         suite=args.suite,
         model_dir=args.model_dir,
@@ -80,11 +103,23 @@ def _run(args: argparse.Namespace) -> int:
         peer_artifact=args.peer_artifact,
         physical_gpu=args.physical_gpu,
         gpu_arch=gpu_arch,
+        gpu_identity=args.gpu_identity,
+        gpu_identity_verified=gpu_identity_verified,
+        gpu_identity_evidence=(
+            {
+                "source": "select-r9700-device",
+                "physical_gpu": str(args.physical_gpu),
+                "architecture": gpu_arch,
+            }
+            if gpu_identity_verified
+            else None
+        ),
+        logical_gpu=args.logical_gpu or os.environ.get("SUPERSONIC_DEVICE", str(args.device)),
         output_dir=args.output,
         device=args.device,
         context_size=args.context_size,
         chat=args.chat,
-        clock_policy=args.clock_policy,
+        clock_policy=clock_policy,
         seed=args.seed,
         run_id=args.run_id,
         run_quality=True,

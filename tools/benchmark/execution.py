@@ -53,6 +53,10 @@ class RunConfig:
     artifact: Path | None
     physical_gpu: str | None
     gpu_arch: str | None
+    gpu_identity: str | None = None
+    gpu_identity_verified: bool = False
+    gpu_identity_evidence: Mapping[str, object] | str | None = None
+    logical_gpu: str | None = None
     output_dir: Path = Path("target/benchmarks/candidate")
     peer_artifact: Path | None = None
     device: int = 0
@@ -69,11 +73,14 @@ class RunConfig:
     run_id: str | None = None
     seed: int | None = None
     run_quality: bool = True
-    artifact_semantic_id: str = "qwen3.8-27b-gqh"
-    artifact_quantization: str = "GQH-Q4"
+    artifact_semantic_id: str | None = None
+    artifact_quantization: str | None = None
     tokenizer_sha256: str | None = None
     chat_template_sha256: str | None = None
     strict_environment: bool = False
+    environment_command_runner: Callable[[tuple[str, ...]], str] | None = None
+    environment_sample_count: int = 0
+    cpu_governor_reader: Callable[[], str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,13 +157,18 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
     """Validate all configured inputs and create an immutable candidate area."""
 
     resolved = _coerce_config(config)
+    if callable(resolved.environment_snapshot):
+        resolved = replace(resolved, environment_snapshot=resolved.environment_snapshot())
     suite = resolved.suite if isinstance(resolved.suite, SuiteManifest) else manifest.load_suite(str(resolved.suite))
     expected_budget = EXPECTED_BUDGETS.get(suite.name)
     if expected_budget is not None and suite.budget_seconds != expected_budget:
         raise ValueError(f"suite {suite.name} budget must be exactly {expected_budget} seconds")
+    _validate_active_cases(suite)
 
     model_dir = _required_path(resolved.model_dir, "model_dir", directory=True)
-    artifact = _required_path(resolved.artifact, "artifact", directory=False)
+    _validate_model_files(model_dir, chat=bool(resolved.chat))
+    artifact = _required_path(resolved.artifact, "artifact", directory=False, nonempty=True)
+    _validate_model_digests(model_dir, resolved)
     physical_gpu = _required_text(resolved.physical_gpu, "physical_gpu")
     if not physical_gpu.isdigit():
         raise ValueError("physical_gpu must be a numeric GPU ordinal")
@@ -167,9 +179,23 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         raise ValueError("device must be non-negative")
     if resolved.context_size is not None and resolved.context_size <= 0:
         raise ValueError("context_size must be positive")
+    gpu_identity = _required_text(resolved.gpu_identity, "gpu_identity")
+    if gpu_identity.lower() in {"unknown", "unknown-gpu", "n/a", "na"}:
+        raise ValueError("gpu_identity must be a verified physical identity")
+    if not bool(resolved.gpu_identity_verified) and not resolved.gpu_identity_evidence:
+        raise ValueError("gpu_identity must include verified physical identity evidence")
+    _validate_gpu_identity_evidence(resolved.gpu_identity_evidence, gpu_identity, physical_gpu, gpu_arch)
+    logical_gpu = _required_text(resolved.logical_gpu or str(resolved.device), "logical_gpu")
     clock_policy_name = _clock_policy_name(resolved.clock_policy)
-    if clock_policy_name == "locked" and resolved.environment_snapshot is None:
-        raise ValueError("locked clock policy requires verified environment_snapshot")
+    if resolved.environment_sample_count < 0:
+        raise ValueError("environment_sample_count must be non-negative")
+    if clock_policy_name == "locked":
+        _validate_locked_policy(resolved.clock_policy)
+    if resolved.environment_snapshot is not None:
+        snapshot_policy = _snapshot_policy_name(resolved.environment_snapshot)
+        if snapshot_policy != clock_policy_name:
+            raise ValueError("environment_snapshot clock policy does not match configured clock policy")
+        _validate_snapshot_policy_values(resolved.environment_snapshot, resolved.clock_policy)
 
     engines = tuple(_engine_with_override(engine, resolved) for engine in (manifest.load_engine(name) for name in suite.engines))
     _validate_peer_artifact(suite, resolved)
@@ -197,9 +223,22 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
     if len(quality_cases) != len(suite.quality_case_ids):
         missing = sorted(set(suite.quality_case_ids) - {case.id for case in quality_cases})
         raise ValueError(f"suite references missing quality cases: {missing}")
-    return RunManifest(
+    resolved_config = replace(
+        resolved,
+        model_dir=model_dir,
+        artifact=artifact,
+        physical_gpu=physical_gpu,
+        gpu_arch=gpu_arch,
+        gpu_identity=gpu_identity,
+        logical_gpu=logical_gpu,
+    )
+    if resolved_config.environment_snapshot is None and (
+        clock_policy_name == "locked" or resolved_config.environment_command_runner is not None
+    ):
+        resolved_config = replace(resolved_config, environment_snapshot=_collect_environment_snapshot(resolved_config, suite))
+    result = RunManifest(
         suite=suite,
-        config=replace(resolved, model_dir=model_dir, artifact=artifact, physical_gpu=physical_gpu, gpu_arch=gpu_arch),
+        config=resolved_config,
         engines=engines,
         quality_cases=quality_cases,
         run_id=run_id,
@@ -207,6 +246,8 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         commit=commit,
         dirty=dirty,
     )
+    _persist_bundle_manifest(result, ordered_cases(result))
+    return result
 
 
 def ordered_cases(
@@ -219,6 +260,8 @@ def ordered_cases(
     engines_by_name = {engine.name: engine for engine in run_manifest.engines}
     entries: list[tuple[PerformanceCase, EngineManifest]] = []
     for case in run_manifest.suite.performance_cases:
+        if case.cache_state.startswith("prefix-cache-"):
+            raise ValueError(f"prefix cache case {case.id!r} is not executable before adapter verification")
         for engine_name in case.engines:
             engine = engines_by_name.get(engine_name)
             if engine is None:
@@ -279,6 +322,8 @@ def run_suite(
         # allowing partial performance evidence to be inspected.
         placeholder = _quality_placeholder_summary(run_manifest.quality_cases)
         quality_summaries = {engine.name: placeholder for engine in run_manifest.engines}
+        quality_failed = True
+        _append_error(errors, "quality_failed")
 
     scheduled = ordered_cases(run_manifest)
     expected_count = len(scheduled)
@@ -289,14 +334,19 @@ def run_suite(
         if now >= deadline:
             _append_error(errors, "budget_exhausted")
             break
-        remaining = max(1, int(math.ceil(deadline - now)))
-        timeout = min(case.timeout_seconds, remaining)
+        case_deadline = min(deadline, now + float(case.timeout_seconds))
+        # _execute_case recomputes the positive remainder immediately before
+        # every warmup/repetition subprocess.  Passing only the case cap here
+        # avoids spending a stale timeout between scheduling and invocation.
+        timeout = float(case.timeout_seconds)
         try:
             result = _execute_case(
                 run_manifest,
                 case,
                 engine,
                 timeout=timeout,
+                suite_deadline=deadline,
+                case_deadline=case_deadline,
                 clock=clock,
                 command_runner=runner,
                 quality_summary=quality_summaries.get(engine.name, _quality_placeholder_summary(run_manifest.quality_cases)),
@@ -344,7 +394,7 @@ def run_suite(
         state = "incomplete"
     else:
         state = "complete"
-    return BundleStatus(
+    status = BundleStatus(
         state=state,
         bundle=run_manifest.bundle,
         errors=tuple(errors),
@@ -352,18 +402,22 @@ def run_suite(
         quality_failed=quality_failed,
         performance_report_only=True,
     )
+    _update_bundle_manifest(run_manifest, status)
+    return status
 
 
 def run_process(
     argv: Sequence[str],
     *,
-    timeout: int,
+    timeout: float,
     cwd: str | Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> ProcessResult:
     """Run one public CLI with an argv vector and bounded timeout."""
 
     vector = tuple(str(item) for item in argv)
+    if not math.isfinite(float(timeout)) or float(timeout) <= 0.0:
+        raise ValueError("process timeout must be positive")
     started = time.monotonic()
     try:
         completed = subprocess.run(
@@ -371,7 +425,7 @@ def run_process(
             shell=False,
             cwd=str(cwd) if cwd is not None else None,
             env=dict(env) if env is not None else None,
-            timeout=max(1, int(timeout)),
+            timeout=float(timeout),
             capture_output=True,
             text=True,
             check=False,
@@ -401,12 +455,32 @@ class _CaseError(RuntimeError):
         super().__init__(self.message)
 
 
+def _remaining_timeout(
+    clock: Callable[[], float],
+    *,
+    suite_deadline: float,
+    case_deadline: float,
+    cap: float,
+) -> float:
+    now = float(clock())
+    remaining_suite = float(suite_deadline) - now
+    remaining_case = float(case_deadline) - now
+    remaining = min(remaining_suite, remaining_case, float(cap))
+    if not math.isfinite(remaining) or remaining <= 0.0:
+        if remaining_suite <= 0.0:
+            raise _CaseError("budget_exhausted", "suite deadline reached")
+        raise _CaseError("case_timeout", "case deadline reached")
+    return remaining
+
+
 def _execute_case(
     run_manifest: RunManifest,
     case: PerformanceCase,
     engine: EngineManifest,
     *,
-    timeout: int,
+    timeout: float,
+    suite_deadline: float | None = None,
+    case_deadline: float | None = None,
     clock: Callable[[], float],
     command_runner: Callable[..., object],
     quality_summary: Mapping[str, object],
@@ -429,10 +503,18 @@ def _execute_case(
     for index in range(invocation_count):
         measured = index >= case.warmups
         label = f"run-{index - case.warmups + 1}" if measured else f"warmup-{index + 1}"
+        active_timeout = timeout
+        if suite_deadline is not None and case_deadline is not None:
+            active_timeout = _remaining_timeout(
+                clock,
+                suite_deadline=suite_deadline,
+                case_deadline=case_deadline,
+                cap=float(case.timeout_seconds),
+            )
         result = _invoke_process(
             command_runner,
             argv,
-            timeout=timeout,
+            timeout=active_timeout,
             case_id=case.id,
             engine_name=engine.name,
         )
@@ -440,11 +522,11 @@ def _execute_case(
         if result.interrupted:
             raise KeyboardInterrupt
         if result.timed_out:
-            raise _CaseError("case_timeout", f"{case.id}/{engine.name} exceeded {timeout}s timeout")
+            raise _CaseError("case_timeout", f"{case.id}/{engine.name} exceeded {active_timeout}s timeout")
         if result.returncode != 0:
             raise _CaseError("process_failed", f"{case.id}/{engine.name} exited with {result.returncode}")
         try:
-            parsed = adapters.parse_output(engine.name, result.stdout)
+            parsed = adapters.parse_output(engine.name, result.stdout, result.stderr)
         except ValueError as exc:
             raise _CaseError("invalid_output", str(exc)) from exc
         if measured:
@@ -511,6 +593,8 @@ def _run_quality(
                     mode="ordinary",
                     inputs=inputs,
                     timeout=_quality_timeout(case, deadline, clock),
+                    suite_deadline=deadline,
+                    clock=clock,
                     command_runner=command_runner,
                     suffix="ordinary",
                 )
@@ -520,6 +604,8 @@ def _run_quality(
                     mode="mtp",
                     inputs=inputs,
                     timeout=_quality_timeout(case, deadline, clock),
+                    suite_deadline=deadline,
+                    clock=clock,
                     command_runner=command_runner,
                     suffix="mtp",
                 )
@@ -533,6 +619,8 @@ def _run_quality(
                     primary,
                     argv,
                     timeout=_quality_timeout(case, deadline, clock),
+                    suite_deadline=deadline,
+                    clock=clock,
                     command_runner=command_runner,
                     suffix="ordinary",
                 )
@@ -582,6 +670,8 @@ def _run_quality(
                     peer,
                     argv,
                     timeout=_quality_timeout(case, deadline, clock),
+                    suite_deadline=deadline,
+                    clock=clock,
                     command_runner=command_runner,
                     suffix=f"{peer.name}-ordinary",
                 )
@@ -615,7 +705,9 @@ def _quality_output(
     *,
     mode: str,
     inputs: adapters.AdapterInputs,
-    timeout: int,
+    timeout: float,
+    suite_deadline: float | None = None,
+    clock: Callable[[], float] | None = None,
     command_runner: Callable[..., object],
     suffix: str,
 ) -> adapters.ParsedOutput:
@@ -628,6 +720,8 @@ def _quality_output(
         primary,
         argv,
         timeout=timeout,
+        suite_deadline=suite_deadline,
+        clock=clock,
         command_runner=command_runner,
         suffix=suffix,
     )
@@ -639,14 +733,24 @@ def _quality_process(
     engine: EngineManifest,
     argv: tuple[str, ...],
     *,
-    timeout: int,
+    timeout: float,
+    suite_deadline: float | None = None,
+    clock: Callable[[], float] | None = None,
     command_runner: Callable[..., object],
     suffix: str,
 ) -> adapters.ParsedOutput:
+    active_timeout = float(timeout)
+    if suite_deadline is not None and clock is not None:
+        active_timeout = _remaining_timeout(
+            clock,
+            suite_deadline=suite_deadline,
+            case_deadline=suite_deadline,
+            cap=active_timeout,
+        )
     result = _invoke_process(
         command_runner,
         argv,
-        timeout=timeout,
+        timeout=active_timeout,
         case_id=f"quality-{quality_case.id}-{suffix}",
         engine_name=engine.name,
     )
@@ -658,14 +762,18 @@ def _quality_process(
     if result.returncode != 0:
         raise _CaseError("process_failed", f"quality case {quality_case.id} exited with {result.returncode}")
     try:
-        return adapters.parse_output(engine.name, result.stdout)
+        return adapters.parse_output(engine.name, result.stdout, result.stderr)
     except ValueError as exc:
         raise _CaseError("invalid_output", str(exc)) from exc
 
 
-def _quality_timeout(case: QualityCase, deadline: float, clock: Callable[[], float]) -> int:
-    remaining = max(1, int(math.ceil(deadline - clock())))
-    return min(max(1, int(case.max_new_tokens)), remaining)
+def _quality_timeout(case: QualityCase, deadline: float, clock: Callable[[], float]) -> float:
+    return _remaining_timeout(
+        clock,
+        suite_deadline=deadline,
+        case_deadline=deadline,
+        cap=float(max(1, int(case.max_new_tokens))),
+    )
 
 
 def _quality_performance_case(case: QualityCase, *, mode: str, engine: EngineManifest) -> PerformanceCase:
@@ -727,11 +835,8 @@ def _build_record(
     quality_summary: Mapping[str, object],
 ) -> dict[str, object]:
     config = run_manifest.config
-    artifact = Path(config.artifact)
-    model_dir = Path(config.model_dir)
     snapshot = _environment_record(config, case)
-    tokenizer_digest = config.tokenizer_sha256 or _digest_first(model_dir, ("tokenizer.json", "tokenizer.model"))
-    chat_digest = config.chat_template_sha256 or _digest_first(model_dir, ("tokenizer_config.json", "chat_template.jinja"))
+    artifact_info = _artifact_identity(config, engine)
     return {
         "run": {
             "schema_version": 1,
@@ -746,22 +851,17 @@ def _build_record(
         },
         "engine": {
             "name": engine.name,
-            "version": config.engine_versions.get(engine.name) or engine.pinned_version or "unknown",
+            "version": engine.pinned_version or config.engine_versions.get(engine.name) or "unknown",
             "adapter_version": adapters.ADAPTER_VERSION,
         },
         "hardware": {
-            "identity": str(_config_value(config, "gpu_identity", "unknown-gpu")),
+            "identity": str(config.gpu_identity),
             "architecture": str(config.gpu_arch),
             "physical_gpu": str(config.physical_gpu),
+            "logical_gpu": str(config.logical_gpu),
             "clock_policy": snapshot["clock_policy"],
         },
-        "artifact": {
-            "semantic_id": config.artifact_semantic_id,
-            "quantization": config.artifact_quantization,
-            "sha256": _digest_file(artifact),
-            "tokenizer_sha256": tokenizer_digest,
-            "chat_template_sha256": chat_digest,
-        },
+        "artifact": artifact_info,
         "workload": {
             "case_id": case.id,
             "prompt_sha256": hashlib.sha256(case.prompt.encode("utf-8")).hexdigest(),
@@ -795,14 +895,14 @@ def _environment_record(config: RunConfig, case: PerformanceCase) -> dict[str, o
         policy = _clock_policy_name(config.clock_policy)
         requested = _policy_mapping(config.clock_policy)
         observed = {
-            "gpu_clock_mhz": int(requested.get("gpu_clock_mhz") or 0),
-            "memory_clock_mhz": int(requested.get("memory_clock_mhz") or 0),
-            "power_cap_watts": int(requested.get("power_cap_watts") or 0),
-            "power_watts": 0.0,
-            "temperature_celsius": 0.0,
-            "gpu_utilization_percent": 0.0,
-            "memory_utilization_percent": 0.0,
-            "performance_level": str(requested.get("performance_level") or "unknown"),
+            "gpu_clock_mhz": None,
+            "memory_clock_mhz": None,
+            "power_cap_watts": None,
+            "power_watts": None,
+            "temperature_celsius": None,
+            "gpu_utilization_percent": None,
+            "memory_utilization_percent": None,
+            "performance_level": None,
         }
         sample = {
             "offset_seconds": 0.0,
@@ -816,10 +916,10 @@ def _environment_record(config: RunConfig, case: PerformanceCase) -> dict[str, o
         return {
             "clock_policy": policy,
             "requested": {
-                "gpu_clock_mhz": int(requested.get("gpu_clock_mhz") or 0),
-                "memory_clock_mhz": int(requested.get("memory_clock_mhz") or 0),
-                "power_cap_watts": int(requested.get("power_cap_watts") or 0),
-                "performance_level": str(requested.get("performance_level") or "unknown"),
+                "gpu_clock_mhz": _optional_policy_int(requested.get("gpu_clock_mhz")),
+                "memory_clock_mhz": _optional_policy_int(requested.get("memory_clock_mhz")),
+                "power_cap_watts": _optional_policy_int(requested.get("power_cap_watts")),
+                "performance_level": _optional_policy_text(requested.get("performance_level")),
             },
             "requested_at": _utc_timestamp(),
             "observed_before": dict(observed),
@@ -829,7 +929,7 @@ def _environment_record(config: RunConfig, case: PerformanceCase) -> dict[str, o
             "telemetry_samples": [sample],
             "headline_eligible": policy == "locked",
             "physical_gpu": str(config.physical_gpu),
-            "logical_gpu": str(config.device),
+            "logical_gpu": str(config.logical_gpu or config.device),
             "cpu_governor": None,
             "allowlisted_environment": _safe_environment(config.environment or os.environ),
             "cache_state": case.cache_state,
@@ -850,6 +950,12 @@ def _environment_record(config: RunConfig, case: PerformanceCase) -> dict[str, o
         raise ValueError("process_reuse must remain false for one-shot evidence")
     value["process_reuse"] = False
     value["headline_eligible"] = bool(value.get("headline_eligible", False))
+    value["physical_gpu"] = str(config.physical_gpu)
+    value["logical_gpu"] = str(config.logical_gpu or config.device)
+    if value.get("clock_policy") == "uncontrolled-clocks" and not value.get("verification_errors"):
+        value["verification_errors"] = ["headline eligibility requires locked clock_policy"]
+    if value.get("clock_policy") == "uncontrolled-clocks":
+        value["headline_eligible"] = False
     value["allowlisted_environment"] = _safe_environment(value.get("allowlisted_environment", {}))
     return value
 
@@ -896,6 +1002,129 @@ def _atomic_promote_record(record: Mapping[str, object], target: Path) -> None:
         raise
 
 
+def _atomic_json_write(payload: Mapping[str, object], target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(canonical_json(dict(payload)))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(target)
+        _fsync_directory(target.parent)
+    except Exception:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
+def _persist_bundle_manifest(
+    run_manifest: RunManifest,
+    entries: Sequence[tuple[PerformanceCase, EngineManifest]],
+) -> None:
+    config = run_manifest.config
+    artifact_entries: dict[str, object] = {}
+    for engine in run_manifest.engines:
+        if engine.name == "llama-cpp":
+            path = Path(config.peer_artifact) if config.peer_artifact is not None else None
+        else:
+            path = Path(config.artifact)
+        if path is None:
+            continue
+        digest = _digest_file(path)
+        artifact_entries[engine.name] = {
+            "name": path.name,
+            "sha256": digest,
+            "semantic_id": _artifact_identity(config, engine)["semantic_id"],
+        }
+    model_files = {
+        name: _digest_file(Path(config.model_dir) / name)
+        for name in ("config.json", "tokenizer.json", "tokenizer_config.json")
+        if (Path(config.model_dir) / name).is_file()
+    }
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": run_manifest.run_id,
+        "suite": {
+            "name": run_manifest.suite.name,
+            "version": run_manifest.suite.version,
+            "quality_version": run_manifest.suite.quality_version,
+            "budget_seconds": run_manifest.suite.budget_seconds,
+        },
+        "seed": config.seed,
+        "budgets": {
+            "suite_seconds": run_manifest.suite.budget_seconds,
+            "case_seconds": {case.id: case.timeout_seconds for case, _ in entries},
+        },
+        "commit": run_manifest.commit,
+        "dirty": run_manifest.dirty,
+        "gpu": {
+            "identity": config.gpu_identity,
+            "architecture": config.gpu_arch,
+            "physical_gpu": config.physical_gpu,
+            "logical_gpu": config.logical_gpu,
+            "verified": bool(config.gpu_identity_verified or config.gpu_identity_evidence),
+            "evidence": _safe_evidence(config.gpu_identity_evidence),
+        },
+        "model": {"files": model_files},
+        "artifacts": artifact_entries,
+        "engines": [
+            {
+                "name": engine.name,
+                "binary": Path(engine.binary).name,
+                "version": engine.pinned_version,
+                "adapter_version": adapters.ADAPTER_VERSION,
+            }
+            for engine in run_manifest.engines
+        ],
+        "cases": [
+            {
+                "id": case.id,
+                "engine": engine.name,
+                "mode": case.mode,
+                "cache_state": case.cache_state,
+                "warmups": case.warmups,
+                "repetitions": case.repetitions,
+                "timeout_seconds": case.timeout_seconds,
+            }
+            for case, engine in entries
+        ],
+        "status": {"state": "running", "errors": [], "records": []},
+    }
+    _atomic_json_write(payload, run_manifest.bundle / "manifest.json")
+
+
+def _update_bundle_manifest(run_manifest: RunManifest, status: BundleStatus) -> None:
+    path = run_manifest.bundle / "manifest.json"
+    if not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return
+        payload["status"] = {
+            "state": status.state,
+            "errors": list(status.errors),
+            "records": [record.name for record in status.records],
+            "quality_failed": status.quality_failed,
+            "performance_report_only": status.performance_report_only,
+        }
+        _atomic_json_write(payload, path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        # A result status is still returned to the caller; the raw bundle is
+        # retained for diagnosis if a filesystem update itself fails.
+        return
+
+
 def _record_filename(case: PerformanceCase, engine: EngineManifest) -> str:
     if len(case.engines) == 1:
         return f"{case.id}.json"
@@ -934,7 +1163,7 @@ def _invoke_process(
     runner: Callable[..., object],
     argv: Sequence[str],
     *,
-    timeout: int,
+    timeout: float,
     case_id: str,
     engine_name: str,
 ) -> ProcessResult:
@@ -1023,6 +1252,10 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
                 "physical_gpu",
                 "gpu_arch",
                 "architecture",
+                "gpu_identity",
+                "gpu_identity_verified",
+                "gpu_identity_evidence",
+                "logical_gpu",
                 "output_dir",
                 "output",
                 "device",
@@ -1044,6 +1277,9 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
                 "tokenizer_sha256",
                 "chat_template_sha256",
                 "strict_environment",
+                "environment_command_runner",
+                "environment_sample_count",
+                "cpu_governor_reader",
             )
             if hasattr(config, name)
         }
@@ -1072,11 +1308,18 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
         "run_id": None,
         "seed": None,
         "run_quality": True,
-        "artifact_semantic_id": "qwen3.8-27b-gqh",
-        "artifact_quantization": "GQH-Q4",
+        "gpu_identity": None,
+        "gpu_identity_verified": False,
+        "gpu_identity_evidence": None,
+        "logical_gpu": None,
+        "artifact_semantic_id": None,
+        "artifact_quantization": None,
         "tokenizer_sha256": None,
         "chat_template_sha256": None,
         "strict_environment": False,
+        "environment_command_runner": None,
+        "environment_sample_count": 0,
+        "cpu_governor_reader": None,
     }
     for key, value in defaults.items():
         source.setdefault(key, value)
@@ -1084,7 +1327,13 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
     return {key: value for key, value in source.items() if key in allowed}
 
 
-def _required_path(value: Path | str | None, label: str, *, directory: bool) -> Path:
+def _required_path(
+    value: Path | str | None,
+    label: str,
+    *,
+    directory: bool,
+    nonempty: bool = False,
+) -> Path:
     if value is None or str(value).strip() == "":
         raise ValueError(f"{label} is required")
     path = Path(value).expanduser()
@@ -1092,7 +1341,138 @@ def _required_path(value: Path | str | None, label: str, *, directory: bool) -> 
         raise ValueError(f"{label} unavailable: {path}")
     if not os.access(path, os.R_OK):
         raise ValueError(f"{label} unavailable: unreadable")
+    if nonempty and path.stat().st_size <= 0:
+        raise ValueError(f"{label} unavailable: empty file")
     return path.resolve()
+
+
+def _validate_model_files(model_dir: Path, *, chat: bool) -> None:
+    required = ["config.json", "tokenizer.json"]
+    if chat:
+        required.append("tokenizer_config.json")
+    for name in required:
+        _required_path(model_dir / name, f"model file {name}", directory=False, nonempty=True)
+
+
+def _validate_model_digests(model_dir: Path, config: RunConfig) -> None:
+    actual_tokenizer = _digest_file(model_dir / "tokenizer.json")
+    if config.tokenizer_sha256 and config.tokenizer_sha256 != actual_tokenizer:
+        raise ValueError("tokenizer_sha256 does not match tokenizer.json")
+    if config.chat_template_sha256:
+        template = model_dir / "tokenizer_config.json"
+        if not template.is_file():
+            raise ValueError("chat_template_sha256 requires tokenizer_config.json")
+        if config.chat_template_sha256 != _digest_file(template):
+            raise ValueError("chat_template_sha256 does not match tokenizer_config.json")
+
+
+def _validate_active_cases(suite: SuiteManifest) -> None:
+    prefix_cases = [case.id for case in suite.performance_cases if case.cache_state.startswith("prefix-cache-")]
+    if prefix_cases:
+        raise ValueError(
+            "prefix cache cases are not executable until adapter transitions are verified: "
+            + ", ".join(prefix_cases)
+        )
+
+
+def _validate_locked_policy(policy: object) -> None:
+    requested = _policy_mapping(policy)
+    required = ("gpu_clock_mhz", "memory_clock_mhz", "power_cap_watts")
+    missing = [key for key in required if requested.get(key) in (None, "")]
+    if missing:
+        raise ValueError("locked clock policy requires requested " + ", ".join(missing))
+    for key in required:
+        value = requested[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(f"locked clock policy {key} must be positive")
+
+
+def _validate_gpu_identity_evidence(
+    evidence: Mapping[str, object] | str | None,
+    identity: str,
+    physical_gpu: str,
+    gpu_arch: str,
+) -> None:
+    if not isinstance(evidence, Mapping):
+        return
+    for key, expected in (
+        ("physical_gpu", physical_gpu),
+        ("physical_index", physical_gpu),
+        ("architecture", gpu_arch),
+        ("gfx_arch", gpu_arch),
+        ("identity", identity),
+        ("market_name", identity),
+    ):
+        if key in evidence and str(evidence[key]) != str(expected):
+            raise ValueError(f"gpu identity evidence {key} does not match configured identity")
+
+
+def _snapshot_policy_name(snapshot: object) -> str:
+    if isinstance(snapshot, Mapping):
+        value = snapshot.get("clock_policy")
+    else:
+        value = getattr(snapshot, "clock_policy", None)
+    return str(value or "")
+
+
+def _validate_snapshot_policy_values(snapshot: object, policy: object) -> None:
+    if _clock_policy_name(policy) != "locked":
+        return
+    if isinstance(snapshot, Mapping):
+        requested = snapshot.get("requested")
+    else:
+        requested = getattr(snapshot, "requested", None)
+    if hasattr(requested, "__dataclass_fields__"):
+        requested = asdict(requested)
+    if not isinstance(requested, Mapping):
+        raise ValueError("locked environment_snapshot is missing requested telemetry")
+    configured = _policy_mapping(policy)
+    for key in ("gpu_clock_mhz", "memory_clock_mhz", "power_cap_watts", "performance_level"):
+        if configured.get(key) is not None and requested.get(key) != configured.get(key):
+            raise ValueError(f"environment_snapshot requested {key} does not match clock policy")
+
+
+def _default_environment_probe_runner(argv: tuple[str, ...]) -> str:
+    result = subprocess.run(
+        tuple(str(value) for value in argv),
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+        check=False,
+    )
+    output = _text(result.stdout) + _text(result.stderr)
+    if result.returncode != 0:
+        raise ValueError(f"environment probe failed with exit code {result.returncode}")
+    if not output.strip():
+        raise ValueError("environment probe returned empty evidence")
+    return output
+
+
+def _collect_environment_snapshot(config: RunConfig, suite: SuiteManifest) -> environment.EnvironmentSnapshot:
+    cache_state = suite.performance_cases[0].cache_state if suite.performance_cases else "warm-resident"
+    configured_runner = config.environment_command_runner or _default_environment_probe_runner
+
+    def runner(command: tuple[str, ...]) -> str:
+        raw = configured_runner(command)
+        if isinstance(raw, ProcessResult):
+            if raw.returncode != 0:
+                raise ValueError(f"environment probe failed with exit code {raw.returncode}")
+            return raw.stdout + raw.stderr
+        return _text(raw)
+
+    return environment.collect_snapshot(
+        physical_gpu=str(config.physical_gpu),
+        clock_policy=config.clock_policy,
+        cache_state=cache_state,
+        command_runner=runner,
+        cache_evidence={"process_state": "fresh-process", "process_reuse": False},
+        environment_map=config.environment or os.environ,
+        cpu_governor_reader=config.cpu_governor_reader,
+        sample_count=max(1, int(config.environment_sample_count))
+        if _clock_policy_name(config.clock_policy) == "locked"
+        else int(config.environment_sample_count),
+    )
 
 
 def _required_text(value: object, label: str) -> str:
@@ -1105,7 +1485,7 @@ def _validate_peer_artifact(suite: SuiteManifest, config: RunConfig) -> None:
     needs_peer = any("llama-cpp" in case.engines for case in suite.performance_cases)
     if config.peer_artifact is not None:
         try:
-            _required_path(config.peer_artifact, "llama-cpp peer artifact", directory=False)
+            _required_path(config.peer_artifact, "llama-cpp peer artifact", directory=False, nonempty=True)
         except ValueError as exc:
             raise ValueError(f"llama-cpp peer artifact unavailable: {config.peer_artifact}") from exc
         return
@@ -1163,18 +1543,21 @@ def _validate_engine_version(engine: EngineManifest, config: RunConfig) -> None:
     if pinned is None:
         return
     supplied = config.engine_versions.get(engine.name)
+    # A configured string is metadata only.  The pinned peer must still emit
+    # the exact non-empty version identity from its own --version command.
+    if engine.name == "llama-cpp":
+        supplied = None
     if supplied is not None:
-        if supplied != pinned:
+        if not str(supplied).strip() or str(supplied).strip() != pinned:
             raise ValueError(f"{engine.name} version mismatch: expected {pinned!r}, got {supplied!r}")
         return
     output = config.version_outputs.get(engine.name)
+    if engine.name == "llama-cpp":
+        output = None
     if output is not None:
-        if pinned not in output:
+        if not str(output).strip() or str(output).strip() != pinned:
             raise ValueError(f"{engine.name} version mismatch: expected {pinned!r}")
         return
-    # Test doubles and custom binaries often expose no version output.  They
-    # still passed the executable preflight; a real pinned binary is checked
-    # when its command returns a non-empty identity.
     try:
         completed = subprocess.run(
             tuple(engine.version_command),
@@ -1190,7 +1573,7 @@ def _validate_engine_version(engine: EngineManifest, config: RunConfig) -> None:
     output = _text(completed.stdout) + _text(completed.stderr)
     if completed.returncode != 0:
         raise ValueError(f"{engine.name} unavailable while checking pinned version")
-    if output.strip() and pinned not in output:
+    if not output.strip() or output.strip() != pinned:
         raise ValueError(f"{engine.name} version mismatch: expected {pinned!r}")
 
 
@@ -1237,15 +1620,45 @@ def _digest_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _digest_first(root: Path, names: Sequence[str]) -> str:
-    for name in names:
-        path = root / name
-        if path.is_file():
-            return _digest_file(path)
-    # The schema requires a digest.  The absence is represented by the stable
-    # hash of an empty byte stream; preflight still records the model directory
-    # explicitly and never invents an absolute path.
-    return hashlib.sha256(b"").hexdigest()
+def _artifact_identity(config: RunConfig, engine: EngineManifest) -> dict[str, str | None]:
+    """Return only evidence belonging to the artifact consumed by *engine*.
+
+    A peer adapter gets no semantic, tokenizer, or template identity from the
+    SuperSonic configuration.  Its artifact digest is the conservative local
+    identity for every field whose equivalence would otherwise be an
+    unverified assertion.
+    """
+
+    if engine.name == "llama-cpp":
+        artifact = Path(config.peer_artifact) if config.peer_artifact is not None else None
+        if artifact is None:
+            raise ValueError("llama-cpp peer artifact is required for artifact evidence")
+        digest = _digest_file(artifact)
+        return {
+            "semantic_id": f"artifact-sha256-{digest}",
+            "quantization": f"artifact-sha256-{digest}",
+            "sha256": digest,
+            "tokenizer_sha256": None,
+            "chat_template_sha256": None,
+        }
+
+    artifact = Path(config.artifact)
+    digest = _digest_file(artifact)
+    model_dir = Path(config.model_dir)
+    tokenizer_digest = config.tokenizer_sha256 or _digest_file(model_dir / "tokenizer.json")
+    if config.chat_template_sha256:
+        chat_digest = config.chat_template_sha256
+    elif (model_dir / "tokenizer_config.json").is_file():
+        chat_digest = _digest_file(model_dir / "tokenizer_config.json")
+    else:
+        chat_digest = hashlib.sha256(b"").hexdigest()
+    return {
+        "semantic_id": config.artifact_semantic_id or f"artifact-sha256-{digest}",
+        "quantization": config.artifact_quantization or "GQH-Q4",
+        "sha256": digest,
+        "tokenizer_sha256": tokenizer_digest,
+        "chat_template_sha256": chat_digest,
+    }
 
 
 def _safe_argv(argv: Sequence[str]) -> tuple[str, ...]:
@@ -1272,6 +1685,16 @@ def _safe_environment(values: Mapping[str, object]) -> dict[str, str]:
     return result
 
 
+def _safe_evidence(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _safe_evidence(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_evidence(item) for item in value]
+    if isinstance(value, str) and (value.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", value)):
+        return Path(value).name or "path"
+    return value
+
+
 def _clock_policy_name(policy: object) -> str:
     name = policy.get("name") if isinstance(policy, Mapping) else getattr(policy, "name", policy)
     text = str(name)
@@ -1289,8 +1712,18 @@ def _policy_mapping(policy: object) -> Mapping[str, object]:
     }
 
 
-def _config_value(config: RunConfig, name: str, default: object) -> object:
-    return getattr(config, name, default)
+def _optional_policy_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("clock policy integer values must be numeric")
+    return int(value)
+
+
+def _optional_policy_text(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
 
 
 def _utc_timestamp() -> str:

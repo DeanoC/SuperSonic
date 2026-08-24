@@ -133,6 +133,17 @@ class BenchmarkAdapterTests(unittest.TestCase):
         self.assertEqual(parsed.ms_per_tok, 4.0)
         self.assertAlmostEqual(parsed.tokens_per_second, 250.0)
 
+    def test_llama_cpp_parser_combines_stdout_and_stderr_streams(self):
+        text_line = "text emitted by llama"
+        parsed = self.adapters.parse_output(
+            "llama-cpp",
+            text_line,
+            self.llama_log.split("\n", 1)[1],
+        )
+        self.assertEqual(parsed.generated_text, text_line)
+        self.assertEqual(parsed.token_ids, None)
+        self.assertEqual(parsed.decode_ms, 12.0)
+
     def test_duplicate_result_line_fails(self):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             self.adapters.parse_output("supersonic", self.supersonic_log + self.supersonic_log)

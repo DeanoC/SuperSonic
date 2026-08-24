@@ -151,7 +151,14 @@ def _bundle_paths(path: Path) -> tuple[Path, ...]:
         return (path,)
     if not path.is_dir():
         raise ValueError(f"bundle path does not exist: {path}")
-    paths = tuple(sorted(candidate for candidate in path.rglob("*.json") if candidate.is_file()))
+    metadata_names = {"manifest.json", "run-manifest.json", "comparison.json"}
+    paths = tuple(
+        sorted(
+            candidate
+            for candidate in path.rglob("*.json")
+            if candidate.is_file() and candidate.name not in metadata_names
+        )
+    )
     if not paths:
         raise ValueError(f"benchmark bundle contains no JSON results: {path}")
     return paths
@@ -296,6 +303,13 @@ def _validate_record_consistency(record: dict[str, object]) -> None:
     hardware = record["hardware"]
     if not isinstance(run, dict) or not isinstance(engine_info, dict) or not isinstance(workload, dict):
         raise ValueError("record sections must be objects")
+    identity = str(hardware.get("identity", "")) if isinstance(hardware, Mapping) else ""
+    if not identity.strip() or identity.lower() in {"unknown", "unknown-gpu", "n/a", "na"}:
+        raise ValueError("hardware identity must be a verified physical identity")
+    physical = str(hardware.get("physical_gpu", ""))
+    logical = str(hardware.get("logical_gpu", ""))
+    if not physical.strip() or not physical.isdigit() or not logical.strip():
+        raise ValueError("hardware must carry physical and logical GPU mappings")
     suite = load_suite(str(run["suite"]))
     if run["suite_version"] != suite.version:
         raise ValueError("run suite_version does not match suite manifest")
@@ -325,6 +339,8 @@ def _validate_record_consistency(record: dict[str, object]) -> None:
 
     if env["cache_state"] != workload["cache_state"]:
         raise ValueError("environment cache_state must match workload cache_state")
+    if env["physical_gpu"] != hardware["physical_gpu"] or env["logical_gpu"] != hardware["logical_gpu"]:
+        raise ValueError("environment GPU mapping must match hardware mapping")
     if env["clock_policy"] != hardware["clock_policy"]:
         raise ValueError("environment clock_policy must match hardware clock_policy")
     environment.validate_cache_evidence(str(env["cache_state"]), env["cache_evidence"])

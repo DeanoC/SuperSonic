@@ -77,7 +77,10 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.binary.chmod(0o755)
         self.peer_binary = self.root / "llama-cli"
-        self.peer_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.peer_binary.write_text(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'version: 9430 (d48a56eff)'; fi\nexit 0\n",
+            encoding="utf-8",
+        )
         self.peer_binary.chmod(0o755)
 
     def config(self, *, suite="quick", include_peer=False, run_quality=False, output=None):
@@ -88,6 +91,9 @@ class BenchmarkExecutionTests(unittest.TestCase):
             peer_artifact=self.peer_artifact if include_peer else None,
             physical_gpu="0",
             gpu_arch="gfx1201",
+            gpu_identity="AMD Radeon AI PRO R9700",
+            gpu_identity_verified=True,
+            logical_gpu="0",
             output_dir=Path(output or self.root / "candidate"),
             engine_binaries={
                 "supersonic": self.binary,
@@ -119,7 +125,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
     def test_budget_stops_scheduling_and_marks_incomplete(self):
         config = self.config(run_quality=False)
         runner = FakeRunner()
-        status = self.execution.run_suite(config, FakeClock([0, 599, 601]), runner)
+        status = self.execution.run_suite(config, FakeClock([0, 599, 599.5, 601]), runner)
         self.assertEqual(status.state, "incomplete")
         self.assertIn("budget_exhausted", status.errors)
         self.assertEqual(set(runner.started_case_ids), {"quick-short-warm-ordinary"})
@@ -194,6 +200,159 @@ class BenchmarkExecutionTests(unittest.TestCase):
         non_mtp = next(case for case in quality_cases if case.scorer != "exact_tokens")
         with self.assertRaisesRegex(ValueError, "MTP|exact_tokens|manifest"):
             self.execution._validate_mtp_quality_case(non_mtp)
+
+    def test_peer_artifact_identity_is_not_copied_from_supersonic(self):
+        config = self.config(suite="full", include_peer=True, run_quality=False)
+        llama_log = (FIXTURES / "llama-cpp-run.log").read_text(encoding="utf-8")
+
+        class SplitRunner(FakeRunner):
+            def __call__(self, argv, timeout=None, engine_name=None, **kwargs):
+                if engine_name == "llama-cpp":
+                    self.calls.append((tuple(argv), timeout))
+                    self.started_case_ids.append(str(argv[argv.index("--prompt") + 1]))
+                    return {"returncode": 0, "stdout": llama_log.split("\n", 1)[0], "stderr": llama_log.split("\n", 1)[1]}
+                return super().__call__(argv, timeout=timeout, engine_name=engine_name, **kwargs)
+
+        status = self.execution.run_suite(config, FakeClock([0] + list(range(1, 500))), SplitRunner())
+        self.assertTrue(status.records)
+        records = [json.loads(path.read_text(encoding="utf-8")) for path in status.records]
+        supersonic = next(record for record in records if record["engine"]["name"] == "supersonic")
+        peer = next(record for record in records if record["engine"]["name"] == "llama-cpp")
+        self.assertEqual(peer["artifact"]["sha256"], self.execution._digest_file(self.peer_artifact))
+        self.assertNotEqual(supersonic["artifact"]["sha256"], peer["artifact"]["sha256"])
+        self.assertNotEqual(supersonic["artifact"]["semantic_id"], peer["artifact"]["semantic_id"])
+        from tools.benchmark.compare import compare_records
+
+        comparison = compare_records(supersonic, peer)
+        self.assertFalse(comparison.comparable)
+        self.assertIsNone(comparison.speedup)
+        self.assertIn("sha256", comparison.reasons)
+
+    def test_fractional_deadline_timeout_is_never_rounded_up(self):
+        config = self.config(run_quality=False)
+
+        class FractionalClock:
+            def __init__(self):
+                self.value = 0.0
+                self.calls = 0
+
+            def __call__(self):
+                self.calls += 1
+                if self.calls == 2:
+                    self.value = 599.9
+                return self.value
+
+        clock = FractionalClock()
+        class DeadlineRunner(FakeRunner):
+            def __call__(self, argv, timeout=None, **kwargs):
+                result = super().__call__(argv, timeout=timeout, **kwargs)
+                clock.value = 600.0
+                return result
+
+        runner = DeadlineRunner()
+        status = self.execution.run_suite(config, clock, runner)
+        self.assertTrue(runner.calls)
+        self.assertLessEqual(runner.calls[0][1], 0.1 + 1e-9)
+        self.assertNotEqual(status.state, "complete")
+
+    def test_deadline_rechecked_between_invocations(self):
+        config = self.config(run_quality=False)
+
+        class AdvancingClock:
+            def __init__(self):
+                self.value = 0.0
+                self.phase = 0
+
+            def __call__(self):
+                if self.phase == 1:
+                    self.value = 599.95
+                self.phase += 1
+                return self.value
+
+        clock = AdvancingClock()
+
+        class AdvancingRunner(FakeRunner):
+            def __call__(self, argv, timeout=None, **kwargs):
+                result = super().__call__(argv, timeout=timeout, **kwargs)
+                clock.value += 0.1
+                return result
+
+        runner = AdvancingRunner()
+        status = self.execution.run_suite(config, clock, runner)
+        self.assertIn("budget_exhausted", status.errors)
+        self.assertLess(len(runner.calls), 4)
+
+    def test_missing_required_model_files_fail_preflight(self):
+        for name in ("config.json", "tokenizer.json"):
+            (self.model_dir / name).unlink()
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, name):
+                self.execution.preflight(self.config())
+            (self.model_dir / name).write_text("{}", encoding="utf-8")
+        (self.model_dir / "tokenizer_config.json").unlink()
+        with self.assertRaisesRegex(ValueError, "tokenizer_config.json"):
+            self.execution.preflight(self.execution.replace_config(self.config(), chat=True))
+
+    def test_prefix_cases_are_rejected_at_execution_boundary(self):
+        suite = self.execution.manifest.load_suite("quick")
+        from dataclasses import replace
+        from tools.benchmark.model import PerformanceCase
+
+        prefix_case = PerformanceCase(
+            id="quick-prefix-rejected",
+            prompt="prefix",
+            max_new_tokens=1,
+            warmups=0,
+            repetitions=1,
+            mode="ordinary",
+            cache_state="prefix-cache-empty",
+            timeout_seconds=1,
+            decoding_policy="greedy",
+            engines=("supersonic",),
+        )
+        custom_suite = replace(suite, performance_cases=(prefix_case,))
+        with self.assertRaisesRegex(ValueError, "prefix"):
+            self.execution.preflight(self.execution.replace_config(self.config(suite=custom_suite)))
+
+    def test_manifest_is_atomic_and_final_status_is_persisted(self):
+        config = self.config(run_quality=False)
+        status = self.execution.run_suite(config, FakeClock([0] + list(range(1, 100))), FakeRunner())
+        manifest_path = status.bundle / "manifest.json"
+        self.assertTrue(manifest_path.is_file())
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"]["state"], status.state)
+        self.assertNotIn(str(self.root), json.dumps(payload))
+        self.assertEqual(payload["seed"], config.seed)
+        self.assertEqual(payload["budgets"]["suite_seconds"], 600)
+
+    def test_interrupted_run_updates_manifest_to_incomplete(self):
+        config = self.config(run_quality=False)
+
+        class InterruptRunner(FakeRunner):
+            def __call__(self, argv, timeout=None, **kwargs):
+                raise KeyboardInterrupt
+
+        status = self.execution.run_suite(config, FakeClock([0, 1, 2]), InterruptRunner())
+        payload = json.loads((status.bundle / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"]["state"], "incomplete")
+
+    def test_environment_snapshot_is_serialized_without_fabricated_telemetry(self):
+        snapshot = json.loads((FIXTURES / "valid-result-v1.json").read_text(encoding="utf-8"))["environment"]
+        config = self.execution.replace_config(
+            self.config(run_quality=False),
+            clock_policy={
+                "name": "locked",
+                "gpu_clock_mhz": 2400,
+                "memory_clock_mhz": 1249,
+                "power_cap_watts": 295,
+                "performance_level": "manual",
+            },
+            environment_snapshot=snapshot,
+        )
+        status = self.execution.run_suite(config, FakeClock([0] + list(range(1, 100))), FakeRunner())
+        record = json.loads(status.records[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["environment"]["observed_before"]["gpu_clock_mhz"], 2400)
+        self.assertEqual(record["environment"]["logical_gpu"], "0")
+        self.assertFalse(record["environment"]["process_reuse"])
 
 
 if __name__ == "__main__":

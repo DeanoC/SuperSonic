@@ -43,6 +43,38 @@ class BenchmarkCliTests(unittest.TestCase):
         self.assertNotIn("--model qwen3.8-27b", text)
         self.assertNotIn("--gguf-file", text)
 
+    def test_locked_clock_policy_accepts_requested_telemetry_values(self):
+        cli = load_cli_module()
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "run",
+                "--suite",
+                "quick",
+                "--model-dir",
+                "/model",
+                "--artifact",
+                "/artifact",
+                "--physical-gpu",
+                "0",
+                "--gpu-identity",
+                "R9700",
+                "--gpu-arch",
+                "gfx1201",
+                "--clock-policy",
+                "locked",
+                "--gpu-clock-mhz",
+                "2600",
+                "--memory-clock-mhz",
+                "1800",
+                "--power-cap-watts",
+                "300",
+            ]
+        )
+        self.assertEqual(args.gpu_clock_mhz, 2600)
+        self.assertEqual(args.memory_clock_mhz, 1800)
+        self.assertEqual(args.power_cap_watts, 300)
+
 
 if __name__ == "__main__":
     unittest.main()

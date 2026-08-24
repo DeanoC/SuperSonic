@@ -83,6 +83,26 @@ class BenchmarkCompareTests(unittest.TestCase):
         self.assertIsNone(result.speedup)
         self.assertIn("headline_eligible", result.reasons)
 
+    def test_different_artifact_digest_never_computes_speedup(self):
+        left = copy.deepcopy(self.locked_warm)
+        right = copy.deepcopy(self.locked_warm)
+        right["artifact"]["sha256"] = "f" * 64
+        right["artifact"]["semantic_id"] = "llama-cpp-artifact-sha256-" + ("f" * 64)
+        result = self.compare.compare_records(left, right)
+        self.assertFalse(result.comparable)
+        self.assertIsNone(result.speedup)
+        self.assertIn("sha256", result.reasons)
+
+    def test_cross_physical_gpu_records_never_compute_speedup(self):
+        left = copy.deepcopy(self.locked_warm)
+        right = copy.deepcopy(self.locked_warm)
+        right["hardware"]["physical_gpu"] = "2"
+        right["environment"]["physical_gpu"] = "2"
+        result = self.compare.compare_records(left, right)
+        self.assertFalse(result.comparable)
+        self.assertIsNone(result.speedup)
+        self.assertIn("physical_gpu", result.reasons)
+
     def test_drifted_locked_record_never_computes_speedup(self):
         drifted = copy.deepcopy(self.locked_warm)
         drifted["environment"]["observed_after"]["gpu_clock_mhz"] = 2300

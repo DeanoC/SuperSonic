@@ -10,8 +10,11 @@ from . import validation
 COMPARABILITY_FIELDS = (
     "hardware.identity",
     "hardware.architecture",
+    "hardware.physical_gpu",
+    "hardware.logical_gpu",
     "artifact.semantic_id",
     "artifact.quantization",
+    "artifact.sha256",
     "artifact.tokenizer_sha256",
     "artifact.chat_template_sha256",
     "workload.case_id",
@@ -135,6 +138,8 @@ def _reason_name(field: str) -> str:
         return "cache_state"
     if field == "environment.power_cap_watts":
         return "power_cap_watts"
+    if field == "artifact.sha256":
+        return "sha256"
     return field.rsplit(".", 1)[-1]
 
 

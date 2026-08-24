@@ -23,7 +23,8 @@
     "identity": "AMD Radeon RX 9070 XT",
     "architecture": "gfx1201",
     "physical_gpu": "1",
-    "clock_policy": "locked"
+    "clock_policy": "locked",
+    "logical_gpu": "0"
   },
   "artifact": {
     "semantic_id": "qwen3.8-27b-gqh",

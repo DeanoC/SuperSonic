@@ -84,14 +84,23 @@ def build_command(
     raise ValueError(f"unsupported engine adapter: {engine.name}")
 
 
-def parse_output(engine_name: str, stdout: str) -> ParsedOutput:
+def parse_output(engine_name: str, stdout: str, stderr: str = "") -> ParsedOutput:
     if engine_name == "supersonic":
         return _parse_common_output(engine_name, stdout, engine_version=None)
     if engine_name == "llama-cpp":
         from .manifest import load_engine
 
-        return _parse_llama_cpp_output(stdout, engine_version=load_engine(engine_name).pinned_version)
+        combined = _combine_llama_streams(stdout, stderr)
+        return _parse_llama_cpp_output(combined, engine_version=load_engine(engine_name).pinned_version)
     raise ValueError(f"unsupported engine adapter: {engine_name}")
+
+
+def _combine_llama_streams(stdout: str, stderr: str) -> str:
+    if not stderr:
+        return stdout
+    if not stdout:
+        return stderr
+    return f"{stdout.rstrip(chr(10))}\n{stderr.lstrip(chr(10))}"
 
 
 def _build_supersonic_command(

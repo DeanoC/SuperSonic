@@ -23,6 +23,10 @@ APPROVED_CATEGORIES = {
 CACHE_STATES = {
     "cold-load",
     "warm-resident",
+}
+SUPPORTED_CACHE_STATES = {
+    "cold-load",
+    "warm-resident",
     "prefix-cache-empty",
     "prefix-cache-populated",
     "prefix-cache-reset",
@@ -74,13 +78,15 @@ class BenchmarkManifestTests(unittest.TestCase):
         engines = {engine.name: engine for engine in map(manifest.load_engine, full.engines)}
         suite_modes = {case.mode for case in full.performance_cases}
         self.assertEqual(suite_modes, {"ordinary", "mtp"})
-        self.assertTrue(CACHE_STATES.issubset({case.cache_state for case in full.performance_cases}))
+        active_cache_states = {case.cache_state for case in full.performance_cases}
+        self.assertTrue(CACHE_STATES.issubset(active_cache_states))
+        self.assertFalse(active_cache_states & (SUPPORTED_CACHE_STATES - CACHE_STATES))
         for case in full.performance_cases:
             self.assertGreaterEqual(case.warmups, 0)
             self.assertGreater(case.repetitions, 0)
             self.assertGreater(case.timeout_seconds, 0)
             self.assertEqual(case.decoding_policy, "greedy")
-            self.assertIn(case.cache_state, CACHE_STATES)
+            self.assertIn(case.cache_state, SUPPORTED_CACHE_STATES)
             self.assertTrue(case.engines, msg=f"{case.id} must scope at least one engine")
             self.assertLessEqual(set(case.engines), set(full.engines))
             for engine_name in case.engines:
