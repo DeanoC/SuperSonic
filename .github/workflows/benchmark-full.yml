@@ -1,0 +1,261 @@
+name: Reproducible benchmark full candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-full-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  full:
+    name: Full gfx1201 benchmark candidate
+    runs-on: [self-hosted, linux, rocm, gfx1201]
+    # The harness owns the exact 21600-second suite budget.  This job timeout
+    # includes checkout, device preflight, and the release build as well.
+    timeout-minutes: 390
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      HIP_ARCH: gfx1201
+      RUST_TEST_THREADS: "1"
+      SUPERSONIC_REQUIRE_GQH_ARTIFACTS: "1"
+      SUPERSONIC_R9700_GPU_ID: ${{ vars.SUPERSONIC_R9700_GPU_ID }}
+      SUPERSONIC_DEVICE: "0"
+      SUPERSONIC_GQH_GGUF: ${{ secrets.SUPERSONIC_GQH_GGUF || vars.SUPERSONIC_GQH_GGUF || '/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf' }}
+      SUPERSONIC_GQH_GGUF_SHA256: ${{ secrets.SUPERSONIC_GQH_GGUF_SHA256 || vars.SUPERSONIC_GQH_GGUF_SHA256 }}
+      SUPERSONIC_GQH_8192_GGUF: ${{ secrets.SUPERSONIC_GQH_8192_GGUF || vars.SUPERSONIC_GQH_8192_GGUF || '/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf' }}
+      SUPERSONIC_GQH_8192_GGUF_SHA256: ${{ secrets.SUPERSONIC_GQH_8192_GGUF_SHA256 || vars.SUPERSONIC_GQH_8192_GGUF_SHA256 }}
+      SUPERSONIC_QWEN38_MODEL_DIR: ${{ secrets.SUPERSONIC_QWEN38_MODEL_DIR || vars.SUPERSONIC_QWEN38_MODEL_DIR || '/data/models/Qwen3.8-27B' }}
+      SUPERSONIC_LLAMA_CPP: ${{ secrets.SUPERSONIC_LLAMA_CPP || vars.SUPERSONIC_LLAMA_CPP || 'llama-cli' }}
+      SUPERSONIC_LLAMA_CPP_ARTIFACT: ${{ secrets.SUPERSONIC_LLAMA_CPP_ARTIFACT || vars.SUPERSONIC_LLAMA_CPP_ARTIFACT }}
+      SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256: ${{ secrets.SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256 || vars.SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256 }}
+      SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ }}
+      SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ }}
+      SUPERSONIC_BENCHMARK_POWER_CAP_WATTS: ${{ vars.SUPERSONIC_BENCHMARK_POWER_CAP_WATTS }}
+      SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL: ${{ vars.SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL }}
+      BENCHMARK_OUTPUT_ROOT: target/benchmarks/full
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Verify host tools and capture versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$BENCHMARK_OUTPUT_ROOT"
+          command -v amd-smi
+          command -v rocm-smi
+          command -v hipcc
+          command -v cargo
+          command -v python3
+          timeout --foreground 30s hipcc --version | tee "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt"
+
+      - name: Capture static AMD SMI identity and select physical GPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s amd-smi static --asic --json \
+            | tee "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic.json"
+          selection="$(python3 tools/select-r9700-device.py \
+            --input "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic.json" \
+            --override "${SUPERSONIC_R9700_GPU_ID:-}")"
+          printf '%s\n' "$selection" | tee "$BENCHMARK_OUTPUT_ROOT/device-selection.log"
+          while IFS='=' read -r name value; do
+            case "$name" in
+              SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|SUPERSONIC_GPU_IDENTITY|SUPERSONIC_GPU_IDENTITY_KIND|SUPERSONIC_GPU_LOGICAL|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE)
+                printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
+                export "$name=$value"
+                ;;
+              *)
+                echo "unexpected selector output: $name" >&2
+                exit 1
+                ;;
+            esac
+          done <<< "$selection"
+          physical_gpu="${SUPERSONIC_R9700_GPU_ID:?device selection did not export a physical GPU}"
+          [[ "$HIP_VISIBLE_DEVICES" == "$physical_gpu" ]]
+          [[ "$SUPERSONIC_DEVICE" == "0" ]]
+          [[ -n "$SUPERSONIC_GPU_IDENTITY" ]]
+          [[ "$SUPERSONIC_GPU_IDENTITY_KIND" == "pci_bdf" || "$SUPERSONIC_GPU_IDENTITY_KIND" == "uuid" ]]
+          [[ "$SUPERSONIC_GPU_LOGICAL" == "$SUPERSONIC_DEVICE" ]]
+          timeout --foreground 30s rocm-smi -d "$physical_gpu" --showdriverversion \
+            | tee "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt"
+          timeout --foreground 30s rocm-smi -d "$physical_gpu" \
+            --showproductname --showuse --showmemuse --showtemp \
+            | tee "$BENCHMARK_OUTPUT_ROOT/rocm-smi-initial.txt"
+
+      - name: Verify GPU idle before benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_wait_seconds=900
+          interval_seconds=15
+          required_idle_samples=3
+          max_gpu_use_percent=10
+          max_vram_use_percent=20
+          idle_samples=0
+          deadline=$(( $(date +%s) + max_wait_seconds ))
+          physical_gpu="${SUPERSONIC_R9700_GPU_ID:?device selection did not export a physical GPU}"
+          while :; do
+            now="$(date +%s)"
+            if (( now >= deadline )); then
+              echo "timed out waiting for GPU ${physical_gpu} idle" >&2
+              exit 1
+            fi
+            remaining=$((deadline - now))
+            probe_timeout=$(( remaining < 30 ? remaining : 30 ))
+            probe_file="$BENCHMARK_OUTPUT_ROOT/rocm-smi-idle-${now}.txt"
+            timeout --foreground "${probe_timeout}s" rocm-smi -d "$physical_gpu" \
+              --showuse --showmemuse --showtemp | tee "$probe_file"
+            utilization="$(python3 tools/parse-rocm-smi.py --input "$probe_file")"
+            gpu_use="$(awk '{for (i=1; i<=NF; i++) if ($i ~ /^gpu_use_percent=/) {sub(/^[^=]*=/, "", $i); print $i}}' <<< "$utilization")"
+            vram_use="$(awk '{for (i=1; i<=NF; i++) if ($i ~ /^vram_use_percent=/) {sub(/^[^=]*=/, "", $i); print $i}}' <<< "$utilization")"
+            if awk -v gpu="$gpu_use" -v vram="$vram_use" \
+              -v max_gpu="$max_gpu_use_percent" -v max_vram="$max_vram_use_percent" \
+              'BEGIN { exit !(gpu <= max_gpu && vram <= max_vram) }'; then
+              idle_samples=$((idle_samples + 1))
+              echo "GPU idle sample ${idle_samples}/${required_idle_samples}: gpu=${gpu_use}% vram=${vram_use}%"
+            else
+              idle_samples=0
+              echo "GPU busy: gpu=${gpu_use}% vram=${vram_use}%"
+            fi
+            if (( idle_samples >= required_idle_samples )); then
+              break
+            fi
+            sleep "$(( interval_seconds < remaining ? interval_seconds : remaining ))"
+          done
+
+      - name: Verify configured locked clocks and cache policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ:?GPU clock must be configured by the host operator}"
+          : "${SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ:?memory clock must be configured by the host operator}"
+          : "${SUPERSONIC_BENCHMARK_POWER_CAP_WATTS:?power cap must be configured by the host operator}"
+          : "${SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL:?performance level must be configured by the host operator}"
+          physical_gpu="${SUPERSONIC_R9700_GPU_ID:?device selection did not export a physical GPU}"
+          timeout --foreground 30s rocm-smi -d "$physical_gpu" --showallinfo \
+            | tee "$BENCHMARK_OUTPUT_ROOT/rocm-smi-clock-before.txt"
+          python3 - "$BENCHMARK_OUTPUT_ROOT/rocm-smi-clock-before.txt" <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text(encoding="utf-8")
+          checks = {
+              "SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ": r"GPU\s+Clock\s+Level\s*:\s*([0-9]+)\s*MHz",
+              "SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ": r"Memory\s+Clock\s+Level\s*:\s*([0-9]+)\s*MHz",
+              "SUPERSONIC_BENCHMARK_POWER_CAP_WATTS": r"(?:Max|Power\s+Cap)\s+Graphics\s+Package\s+Power\s+\(W\)\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+          }
+          for name, pattern in checks.items():
+              expected = os.environ[name]
+              matches = re.findall(pattern, text, re.IGNORECASE)
+              if not matches:
+                  raise SystemExit(f"{name} was not present in rocm-smi --showallinfo")
+              if float(matches[-1]) != float(expected):
+                  raise SystemExit(f"{name} mismatch: observed {matches[-1]}, expected {expected}")
+          level = re.findall(r"Performance\s+Level\s*:\s*([A-Za-z0-9_-]+)", text, re.IGNORECASE)
+          if not level or level[-1] != os.environ["SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL"]:
+              raise SystemExit("configured performance level was not verified")
+          PY
+          python3 - <<'PY'
+          from tools.benchmark.manifest import load_suite
+
+          suite = load_suite("full")
+          allowed = {"cold-load", "warm-resident", "prefix-cache-empty", "prefix-cache-populated", "prefix-cache-reset"}
+          if any(case.cache_state not in allowed for case in suite.performance_cases):
+              raise SystemExit("full suite contains an unknown cache state")
+          if any(case.warmups < 0 or case.repetitions < 1 for case in suite.performance_cases):
+              raise SystemExit("full suite contains invalid cache/sample controls")
+          print(f"verified suite={suite.name} budget_seconds={suite.budget_seconds} cache states")
+          PY
+
+      - name: Strict Qwen3.8 and pinned peer artifact preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/check-qwen38-artifacts.py --require-8192
+          : "${SUPERSONIC_GQH_GGUF_SHA256:?Qwen3.8 artifact SHA-256 must be configured}"
+          : "${SUPERSONIC_GQH_8192_GGUF_SHA256:?8192 artifact SHA-256 must be configured}"
+          : "${SUPERSONIC_LLAMA_CPP_ARTIFACT:?llama.cpp peer artifact must be configured}"
+          : "${SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256:?llama.cpp peer artifact SHA-256 must be configured}"
+          test "$(sha256sum "$SUPERSONIC_GQH_GGUF" | awk '{print $1}')" = "$SUPERSONIC_GQH_GGUF_SHA256"
+          test "$(sha256sum "$SUPERSONIC_GQH_8192_GGUF" | awk '{print $1}')" = "$SUPERSONIC_GQH_8192_GGUF_SHA256"
+          test -s "$SUPERSONIC_LLAMA_CPP_ARTIFACT"
+          test "$(sha256sum "$SUPERSONIC_LLAMA_CPP_ARTIFACT" | awk '{print $1}')" = "$SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256"
+          if [[ "$SUPERSONIC_LLAMA_CPP" == */* ]]; then
+            llama_binary="$SUPERSONIC_LLAMA_CPP"
+            test -x "$llama_binary"
+            export PATH="$(dirname "$llama_binary"):$PATH"
+          else
+            llama_binary="$(command -v "$SUPERSONIC_LLAMA_CPP" || true)"
+            test -n "$llama_binary"
+            test -x "$llama_binary"
+          fi
+          test "$(basename "$llama_binary")" = "llama-cli"
+          pinned="$(grep -v '^#' tools/external/llama-cpp-version.txt | grep -v '^$' | head -n 1)"
+          actual="$(timeout --foreground 30s "$llama_binary" --version)"
+          test "$actual" = "$pinned"
+          printf '%s\n' "$actual" | tee "$BENCHMARK_OUTPUT_ROOT/llama-cpp-version.txt"
+
+      - name: Build release workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          HIP_ARCH=gfx1201 cargo build --release --workspace \
+            2>&1 | tee "$BENCHMARK_OUTPUT_ROOT/release-build.log"
+
+      - name: Run exact six-hour full harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id="full-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export PATH="$(dirname "$SUPERSONIC_LLAMA_CPP"):$PATH"
+          RUST_TEST_THREADS=1 timeout --foreground 21660s python3 tools/supersonic-bench.py run \
+            --suite full \
+            --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
+            --artifact "$SUPERSONIC_GQH_GGUF" \
+            --peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT" \
+            --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
+            --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic.json" \
+            --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
+            --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
+            --device "$SUPERSONIC_DEVICE" \
+            --chat \
+            --clock-policy locked \
+            --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+            --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
+            --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
+            --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
+            --seed 1 \
+            --run-id "$run_id" \
+            --output "$BENCHMARK_OUTPUT_ROOT/candidate" \
+            2>&1 | tee "$BENCHMARK_OUTPUT_ROOT/harness.log"
+
+      - name: Validate full candidate for diagnosis
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$(find "$BENCHMARK_OUTPUT_ROOT/candidate" -mindepth 1 -maxdepth 1 -type d -name 'full-*' -print 2>/dev/null | sort | tail -n 1 || true)"
+          if [[ -z "$bundle" ]]; then
+            echo "no full candidate bundle was produced" >&2
+            exit 1
+          fi
+          python3 tools/supersonic-bench.py validate --publishable "$bundle"
+
+      - name: Upload full candidate and diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-full-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/benchmarks/full
+          if-no-files-found: warn

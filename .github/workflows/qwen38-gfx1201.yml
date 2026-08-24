@@ -209,7 +209,11 @@ jobs:
             --mtp "$CI_OUTPUT_ROOT/token-equivalence/mtp.log" \
             --output "$CI_OUTPUT_ROOT/token-equivalence/comparison.json"
 
-      - name: Throughput telemetry (non-blocking)
+      # Retain this legacy diagnostic until benchmark-quick records expose
+      # complete parity with warmup_runs, measured_runs, and ms_per_tok.  It
+      # is deliberately not a publication path and remains separate from the
+      # validated benchmark candidate artifacts.
+      - name: Legacy throughput telemetry (diagnostic only)
         if: always()
         continue-on-error: true
         shell: bash

@@ -48,6 +48,92 @@ def load_helper(filename: str, module_name: str):
 
 
 class WorkflowContractTests(unittest.TestCase):
+    def test_quick_benchmark_is_serial_gpu_candidate_job(self):
+        workflow = WORKFLOWS / "benchmark-quick.yml"
+        self.assertTrue(workflow.is_file(), workflow)
+        text = workflow.read_text(encoding="utf-8")
+
+        self.assertIn("workflow_dispatch:", text)
+        self.assertRegex(
+            text,
+            re.compile(r"runs-on:\s*\[self-hosted,\s*linux,\s*rocm,\s*gfx1201\]"),
+        )
+        self.assertIn("timeout-minutes: 30", text)
+        self.assertIn("--suite quick", text)
+        self.assertIn("concurrency:", text)
+        self.assertIn("RUST_TEST_THREADS: \"1\"", text)
+        self.assertIn("amd-smi static --asic --json", text)
+        self.assertIn("tools/select-r9700-device.py", text)
+        self.assertIn("HIP_VISIBLE_DEVICES", text)
+        self.assertIn("SUPERSONIC_DEVICE", text)
+        self.assertRegex(text, re.compile(r"(?i)gpu.*idle"))
+        self.assertIn("--clock-policy locked", text)
+        self.assertIn("--gpu-clock-mhz", text)
+        self.assertIn("--memory-clock-mhz", text)
+        self.assertIn("--power-cap-watts", text)
+        self.assertIn("--gpu-static-json", text)
+        self.assertIn("SUPERSONIC_GQH_GGUF", text)
+        self.assertIn("SUPERSONIC_QWEN38_MODEL_DIR", text)
+        self.assertIn("if: always()", text)
+        self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", text)
+        self.assertNotIn("actions/upload-artifact@v", text)
+        self.assertNotRegex(text, re.compile(r"\bgit\s+(?:commit|push)\b"))
+        self.assertNotIn("deploy-pages", text)
+        self.assertNotIn("continue-on-error: true", text)
+
+    def test_full_is_manual_serial_and_six_hours(self):
+        workflow = WORKFLOWS / "benchmark-full.yml"
+        self.assertTrue(workflow.is_file(), workflow)
+        text = workflow.read_text(encoding="utf-8")
+
+        self.assertIn("workflow_dispatch:", text)
+        self.assertIn("timeout-minutes: 390", text)
+        self.assertIn("concurrency:", text)
+        self.assertIn("--suite full", text)
+        self.assertNotIn("continue-on-error: true", text)
+        self.assertRegex(
+            text,
+            re.compile(r"runs-on:\s*\[self-hosted,\s*linux,\s*rocm,\s*gfx1201\]"),
+        )
+        self.assertIn("--peer-artifact", text)
+        self.assertIn("tools/external/llama-cpp-version.txt", text)
+        self.assertIn("SUPERSONIC_LLAMA_CPP", text)
+        self.assertIn("SUPERSONIC_LLAMA_CPP_ARTIFACT", text)
+        self.assertIn("--clock-policy locked", text)
+        self.assertIn("RUST_TEST_THREADS: \"1\"", text)
+        self.assertIn("if: always()", text)
+        self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", text)
+        self.assertNotRegex(text, re.compile(r"\bgit\s+(?:commit|push)\b"))
+        self.assertNotIn("deploy-pages", text)
+
+    def test_pages_validates_before_deploy(self):
+        workflow = WORKFLOWS / "benchmark-pages.yml"
+        self.assertTrue(workflow.is_file(), workflow)
+        text = workflow.read_text(encoding="utf-8")
+
+        self.assertLess(text.index("validate --publishable"), text.index(" render "))
+        self.assertLess(text.index(" render "), text.index("deploy-pages"))
+        self.assertNotIn("pull_request_target", text)
+        self.assertIn("pull_request:", text)
+        self.assertIn("pages: write", text)
+        self.assertIn("id-token: write", text)
+        self.assertRegex(text, re.compile(r"github\.ref\s*==\s*['\"]refs/heads/main['\"]"))
+        for action in (
+            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+            "actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b",
+            "actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa",
+            "actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e",
+        ):
+            self.assertIn(action, text)
+
+    def test_cpu_ci_validates_benchmark_fixtures_without_gpu(self):
+        workflow = WORKFLOWS / "ci.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("python3 tools/supersonic-bench.py render tests/benchmark_fixtures", text)
+        self.assertIn("tests.test_benchmark_manifests", text)
+        self.assertIn("tests.test_benchmark_validation", text)
+        self.assertNotIn("self-hosted", text)
+
     def test_r9700_workflow_data_flow_validates_physical_to_logical_mapping(self):
         selector = load_helper("select-r9700-device.py", "workflow_select_r9700")
         devices = selector.parse_devices(
