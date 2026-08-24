@@ -125,7 +125,9 @@ python3 tools/supersonic-bench.py validate --publishable "$bundle"
 ## Full candidate
 
 The full workflow is the same CLI with the full suite and its separate pinned
-peer engine. Both engines consume the exact local copy of
+peer engine. Before performance, it runs the complete serial `gfx1201`
+artifact gate from [Testing](testing.md#gfx1201-artifact-gate) and
+reverifies that the GPU is idle. Both engines consume the exact local copy of
 [Qwen3.8-27B-GQH-Q3KXL.gguf](https://huggingface.co/Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF/blob/91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4/Qwen3.8-27B-GQH-Q3KXL.gguf),
 verified as SHA-256
 `c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98`.

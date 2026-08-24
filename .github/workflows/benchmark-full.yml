@@ -15,8 +15,9 @@ jobs:
     name: Full gfx1201 benchmark candidate
     runs-on: [self-hosted, linux, rocm, gfx1201]
     # The harness owns the exact 21600-second suite budget.  This job timeout
-    # includes checkout, device preflight, and the release build as well.
-    timeout-minutes: 390
+    # includes checkout, the serial correctness gate, device preflight, and
+    # the release build as well.
+    timeout-minutes: 450
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: "1"
@@ -226,6 +227,37 @@ jobs:
           set -euo pipefail
           HIP_ARCH=gfx1201 cargo build --release --workspace \
             2>&1 | tee "$BENCHMARK_OUTPUT_ROOT/release-build.log"
+
+      - name: Run serial gfx1201 artifact correctness gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_TEST_THREADS=1 cargo test --release -p kernel-ffi --lib 'gqh::tests::' \
+            -- --include-ignored --test-threads=1 --nocapture \
+            2>&1 | tee "$BENCHMARK_OUTPUT_ROOT/kernel-ffi-gqh.log"
+          RUST_TEST_THREADS=1 cargo test --release -p qwen38 --test qwen38_gqh_gguf_crawl \
+            -- --include-ignored --test-threads=1 --nocapture \
+            2>&1 | tee "$BENCHMARK_OUTPUT_ROOT/qwen38-gqh-crawl.log"
+          RUST_TEST_THREADS=1 cargo test --release -p supersonic-runtime \
+            --test qwen38_gqh_decode_rung11 -- --include-ignored --test-threads=1 --nocapture \
+            2>&1 | tee "$BENCHMARK_OUTPUT_ROOT/qwen38-gqh-decode.log"
+
+      - name: Reverify GPU idle after correctness
+        shell: bash
+        run: |
+          set -euo pipefail
+          physical_gpu="${SUPERSONIC_R9700_GPU_ID:?device selection did not export a physical GPU}"
+          for sample in 1 2 3; do
+            probe_file="$BENCHMARK_OUTPUT_ROOT/rocm-smi-post-correctness-${sample}.txt"
+            timeout --foreground 30s rocm-smi -d "$physical_gpu" \
+              --showuse --showmemuse --showtemp | tee "$probe_file"
+            utilization="$(python3 tools/parse-rocm-smi.py --input "$probe_file")"
+            gpu_use="$(awk '{for (i=1; i<=NF; i++) if ($i ~ /^gpu_use_percent=/) {sub(/^[^=]*=/, "", $i); print $i}}' <<< "$utilization")"
+            vram_use="$(awk '{for (i=1; i<=NF; i++) if ($i ~ /^vram_use_percent=/) {sub(/^[^=]*=/, "", $i); print $i}}' <<< "$utilization")"
+            awk -v gpu="$gpu_use" -v vram="$vram_use" \
+              'BEGIN { exit !(gpu <= 10 && vram <= 20) }'
+            if (( sample < 3 )); then sleep 15; fi
+          done
 
       - name: Run exact six-hour full harness
         shell: bash

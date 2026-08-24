@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn opens_qwen38_gqh_q2kxl_gptq_gguf() {
+    fn opens_qwen38_gqh_q3kxl_gguf() {
         let Some(path) = qwen38_gguf() else {
             return;
         };
@@ -428,14 +428,14 @@ mod tests {
         // Historical GGUF wire ID retained for the custom GQH schema.
         assert_eq!(file.kv("general.architecture"), Some("qwen35"));
         assert_eq!(file.kv("general.basename"), Some("qwen38"));
-        assert_eq!(file.gqh_header_count(), 350);
+        assert_eq!(file.gqh_header_count(), 396);
         let qkv = file.tensor("blk.0.attn_qkv.weight").expect("qkv");
         assert_eq!(qkv.dims, vec![5120, 10240]);
-        assert_eq!(qkv.tensor_type, gqh::GGML_TYPE_GQH2_H);
+        assert_eq!(qkv.tensor_type, gqh::GGML_TYPE_GQH4);
         assert!(file.gqh_header("blk.0.attn_qkv.weight").is_some());
-        assert!(file.gqh_header("output.weight").is_some());
+        assert!(file.gqh_header("output.weight").is_none());
         let embed = file.tensor("token_embd.weight").expect("embed");
-        assert_eq!(embed.tensor_type, 10);
+        assert_eq!(embed.tensor_type, 11);
         assert_eq!(embed.dims, vec![5120, 248320]);
     }
 }
