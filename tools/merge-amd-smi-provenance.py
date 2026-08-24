@@ -34,7 +34,8 @@ _BDF_KEYS = (
     "bus_address",
     "location",
 )
-_UUID_KEYS = ("uuid", "gpu_uuid", "gpu_uuid_id", "unique_id", "hip_uuid")
+_STANDARD_UUID_KEYS = ("uuid", "gpu_uuid", "gpu_uuid_id", "unique_id")
+_HIP_UUID_KEYS = ("hip_uuid",)
 _ARCH_KEYS = (
     "gfx_target_version",
     "target_graphics_version",
@@ -131,7 +132,7 @@ def _normal_identity(value: Any, kind: str) -> str:
         if _BDF_RE.fullmatch(identity) is None:
             raise ValueError(f"invalid PCI BDF identity {value!r}")
     elif identity in {"unknown", "n/a", "na", "none", "null"} or _UUID_RE.fullmatch(identity) is None:
-        raise ValueError(f"invalid UUID identity {value!r}")
+        raise ValueError(f"invalid {kind} identity {value!r}")
     return identity
 
 
@@ -140,7 +141,8 @@ def _identities(node: Any) -> dict[str, str]:
 
     result: dict[str, str] = {}
     bdfs = [_normal_identity(value, "pci_bdf") for value in _find_values(node, _BDF_KEYS)]
-    uuids = [_normal_identity(value, "uuid") for value in _find_values(node, _UUID_KEYS)]
+    uuids = [_normal_identity(value, "uuid") for value in _find_values(node, _STANDARD_UUID_KEYS)]
+    hip_uuids = [_normal_identity(value, "hip_uuid") for value in _find_values(node, _HIP_UUID_KEYS)]
     if bdfs:
         if len(set(bdfs)) != 1:
             raise ValueError("AMD SMI record contains conflicting PCI BDF identities")
@@ -149,6 +151,10 @@ def _identities(node: Any) -> dict[str, str]:
         if len(set(uuids)) != 1:
             raise ValueError("AMD SMI record contains conflicting UUID identities")
         result["uuid"] = uuids[0]
+    if hip_uuids:
+        if len(set(hip_uuids)) != 1:
+            raise ValueError("AMD SMI record contains conflicting HIP UUID identities")
+        result["hip_uuid"] = hip_uuids[0]
     if not result:
         raise ValueError("AMD SMI record is missing a stable PCI BDF or UUID identity")
     return result
@@ -299,12 +305,16 @@ def merge_sources(
     for identity in sorted(physical_by_key, key=lambda value: physical_by_key[value]["physical_index"]):
         item = physical_by_key[identity]
         enum = logical_by_key[identity]
-        asic: dict[str, str] = {
+        asic: dict[str, Any] = {
             "market_name": item["market_name"],
             "target_graphics_version": item["gfx_arch"],
         }
         for kind, value in item["identities"].items():
-            asic[kind] = value
+            if kind != "hip_uuid":
+                asic[kind] = value
+        hip_uuid = enum["identities"].get("hip_uuid")
+        if hip_uuid is not None:
+            asic["enumeration"] = {"hip_uuid": hip_uuid}
         devices.append(
             {
                 "gpu": item["physical_index"],

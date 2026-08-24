@@ -167,3 +167,76 @@ diagnostic telemetry remains retained until complete parity is proven. The
 self-hosted GPU jobs remain unexecuted locally because this worktree has no AMD
 SMI device or configured Qwen/peer artifacts; missing configured inputs fail
 closed.
+
+## Round-two fix RED evidence
+
+The fixture was updated to the installed host shape: `amd-smi list -e --json`
+is a top-level list whose records carry both a standard `uuid` and a distinct
+`hip_uuid`, alongside `bdf`, `hip_id`, and the other enumeration fields. Before
+the merger fix, the new exact-shape and negative tests demonstrated the bug:
+
+```text
+python3 -m unittest tests.test_amd_smi_provenance -v
+Ran 8 tests ...
+FAILED (failures=4, errors=2)
+```
+
+The valid records failed with `AMD SMI record contains conflicting UUID
+identities`, while the mismatch and duplicate-logical cases were masked by the
+same incorrect standard/HIP UUID conflation. The workflow contract also
+initially failed because it required the raw HIP ordinal to equal the
+runner-visible device ordinal.
+
+## Round-two fix GREEN evidence
+
+The merger now validates standard UUID and HIP UUID as separate identity kinds,
+uses the validated PCI BDF as the physical-to-enumeration join key, preserves
+the HIP UUID under separate enumeration evidence, and rejects same-kind
+conflicts, duplicate physical BDFs, duplicate logical mappings, and BDF
+mismatches. The selector and benchmark provenance resolver consume the merged
+document without fabricating a mapping. The workflows preserve raw AMD SMI
+`SUPERSONIC_GPU_LOGICAL` while accepting the intentional
+`HIP_VISIBLE_DEVICES` remap to visible device `0`.
+
+```text
+python3 -m unittest tests.test_ci_workflows tests.test_amd_smi_provenance -v
+Ran 20 tests in 0.026s
+OK
+
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+Ran 210 tests in 0.947s
+OK
+
+workflow shell syntax: 30 run blocks OK
+cargo fmt --all --check
+HIP_ARCH=gfx1201 cargo check --workspace --all-targets
+Finished `dev` profile [unoptimized + debuginfo] in 0.05s
+git diff --check
+python3 tools/check-active-docs.py
+active public documentation check passed
+python3 tools/check-tool-inventory.py
+tool inventory ok: 1 runner binaries classified
+```
+
+The exact bounded host capture was also run locally with the installed
+`amd-smi`:
+
+```text
+timeout --foreground 30s amd-smi static --asic --bus --json
+timeout --foreground 30s amd-smi list -e --json
+python3 tools/merge-amd-smi-provenance.py --asic-bus ... --enumeration ... --output ...
+python3 tools/select-r9700-device.py --input ...
+SUPERSONIC_R9700_GPU_ID=1
+SUPERSONIC_R9700_GPU_ARCH=gfx1201
+SUPERSONIC_GPU_IDENTITY=0000:85:00.0
+SUPERSONIC_GPU_IDENTITY_KIND=pci_bdf
+SUPERSONIC_GPU_LOGICAL=1
+HIP_VISIBLE_DEVICES=1
+SUPERSONIC_DEVICE=0
+exact host capture + merge + selection: OK
+```
+
+The host emitted only its known missing `scsi_host` diagnostic on stderr; both
+JSON captures, the merger, and selector completed successfully. Source files
+and SHA-256 digests remain in the candidate output, and no workflow commit,
+push, or deploy behavior was added.

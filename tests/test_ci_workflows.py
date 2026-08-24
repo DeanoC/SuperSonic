@@ -194,6 +194,16 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(len(set(groups)), 1)
         self.assertIn("gfx1201", groups[0])
 
+    def test_gpu_workflows_keep_raw_hip_mapping_separate_from_visible_device(self):
+        for path in (
+            WORKFLOWS / "benchmark-quick.yml",
+            WORKFLOWS / "benchmark-full.yml",
+            WORKFLOWS / "qwen38-gfx1201.yml",
+        ):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('[[ "$SUPERSONIC_GPU_LOGICAL" =~ ^[0-9]+$ ]]', text)
+            self.assertNotIn('[[ "$SUPERSONIC_GPU_LOGICAL" == "$SUPERSONIC_DEVICE" ]]', text)
+
     def test_cpu_ci_validates_benchmark_fixtures_without_gpu(self):
         workflow = WORKFLOWS / "ci.yml"
         text = workflow.read_text(encoding="utf-8")

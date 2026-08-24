@@ -1,20 +1,30 @@
-{
-  "gpu_data": [
-    {
-      "gpu": 0,
-      "bdf": "0000:03:00.0",
-      "enumeration": {
-        "hip_id": 1,
-        "hip_uuid": "GPU-rx7900-logical"
-      }
-    },
-    {
-      "gpu": 1,
-      "bdf": "0000:65:00.0",
-      "enumeration": {
-        "hip_id": 0,
-        "hip_uuid": "GPU-r9700-logical"
-      }
-    }
-  ]
-}
+[
+  {
+    "gpu": 0,
+    "bdf": "0000:04:00.0",
+    "uuid": "6300744c-0000-1000-80e8-1b58a39ea1f3",
+    "kfd_id": 45220,
+    "node_id": 1,
+    "partition_id": 0,
+    "render": "renderD128",
+    "card": "card0",
+    "hsa_id": 1,
+    "hip_id": 0,
+    "hip_uuid": "GPU-63e81b58a39ea1f3",
+    "oam_id": "N/A"
+  },
+  {
+    "gpu": 1,
+    "bdf": "0000:85:00.0",
+    "uuid": "73007551-0000-1000-80f8-101733408480",
+    "kfd_id": 22980,
+    "node_id": 2,
+    "partition_id": 0,
+    "render": "renderD129",
+    "card": "card1",
+    "hsa_id": 2,
+    "hip_id": 1,
+    "hip_uuid": "GPU-73f8101733408480",
+    "oam_id": "N/A"
+  }
+]

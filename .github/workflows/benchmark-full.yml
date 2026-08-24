@@ -90,7 +90,9 @@ jobs:
           [[ "$SUPERSONIC_DEVICE" == "0" ]]
           [[ -n "$SUPERSONIC_GPU_IDENTITY" ]]
           [[ "$SUPERSONIC_GPU_IDENTITY_KIND" == "pci_bdf" || "$SUPERSONIC_GPU_IDENTITY_KIND" == "uuid" ]]
-          [[ "$SUPERSONIC_GPU_LOGICAL" == "$SUPERSONIC_DEVICE" ]]
+          # AMD SMI's raw HIP ordinal is retained for provenance; HIP_VISIBLE_DEVICES
+          # remaps the selected physical GPU to the runner-visible device 0.
+          [[ "$SUPERSONIC_GPU_LOGICAL" =~ ^[0-9]+$ ]]
           timeout --foreground 30s rocm-smi -d "$physical_gpu" --showdriverversion \
             | tee "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt"
           timeout --foreground 30s rocm-smi -d "$physical_gpu" \

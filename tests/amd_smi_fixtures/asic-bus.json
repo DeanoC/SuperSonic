@@ -7,7 +7,7 @@
         "target_graphics_version": "gfx1100"
       },
       "bus": {
-        "bdf": "0000:03:00.0"
+        "bdf": "0000:04:00.0"
       }
     },
     {
@@ -17,7 +17,7 @@
         "target_graphics_version": "gfx1201"
       },
       "bus": {
-        "bdf": "0000:65:00.0"
+        "bdf": "0000:85:00.0"
       }
     }
   ]

@@ -46,21 +46,51 @@ class AmdSmiProvenanceTests(unittest.TestCase):
         devices = self.selector.parse_devices(json.dumps(merged))
         selected = self.selector.select_device(devices)
         self.assertEqual(selected.physical_index, 1)
-        self.assertEqual(selected.stable_identity, "0000:65:00.0")
-        self.assertEqual(selected.logical_gpu, "0")
+        self.assertEqual(selected.stable_identity, "0000:85:00.0")
+        self.assertEqual(selected.logical_gpu, "1")
+        self.assertEqual(
+            merged["gpu_data"][1]["asic"]["enumeration"]["hip_uuid"],
+            "gpu-73f8101733408480",
+        )
         self.assertEqual(merged["provenance"]["join_key"], "pci_bdf")
+
+    def test_installed_capture_with_distinct_uuid_and_hip_uuid_selects_by_bdf(self):
+        merged = self.tool.merge_sources(ASIC_BUS, ENUMERATION)
+        devices = self.selector.parse_devices(json.dumps(merged))
+        selected = self.selector.select_device(devices)
+        self.assertEqual(selected.physical_index, 1)
+        self.assertEqual(selected.stable_identity, "0000:85:00.0")
+        self.assertEqual(selected.logical_gpu, "1")
+        self.assertEqual(
+            merged["gpu_data"][1]["asic"]["pci_bdf"],
+            "0000:85:00.0",
+        )
 
     def test_merge_rejects_bus_and_enumeration_identity_mismatch(self):
         enumeration = json.loads(json.dumps(ENUMERATION))
-        enumeration["gpu_data"][1]["bdf"] = "0000:66:00.0"
+        enumeration[1]["bdf"] = "0000:66:00.0"
         with self.assertRaisesRegex(ValueError, "mismatch|matching|BDF"):
             self.tool.merge_sources(ASIC_BUS, enumeration)
 
     def test_merge_rejects_duplicate_physical_bus_identity(self):
         asic_bus = json.loads(json.dumps(ASIC_BUS))
-        asic_bus["gpu_data"][1]["bus"]["bdf"] = "0000:03:00.0"
+        asic_bus["gpu_data"][1]["bus"]["bdf"] = "0000:04:00.0"
         with self.assertRaisesRegex(ValueError, "duplicate|ambiguous"):
             self.tool.merge_sources(asic_bus, ENUMERATION)
+
+    def test_merge_rejects_conflicting_same_kind_standard_uuids(self):
+        enumeration = json.loads(json.dumps(ENUMERATION))
+        enumeration[1]["nested_duplicate"] = {
+            "uuid": "73007551-0000-1000-80f8-conflicting"
+        }
+        with self.assertRaisesRegex(ValueError, "conflicting UUID"):
+            self.tool.merge_sources(ASIC_BUS, enumeration)
+
+    def test_merge_rejects_duplicate_logical_mapping(self):
+        enumeration = json.loads(json.dumps(ENUMERATION))
+        enumeration[1]["hip_id"] = 0
+        with self.assertRaisesRegex(ValueError, "duplicate logical"):
+            self.tool.merge_sources(ASIC_BUS, enumeration)
 
     def test_merge_records_source_digests_in_canonical_output(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -115,10 +145,10 @@ class AmdSmiProvenanceTests(unittest.TestCase):
                 output_path,
                 physical_gpu="1",
                 gpu_arch="gfx1201",
-                logical_gpu="0",
+                logical_gpu="1",
             )
-            self.assertEqual(provenance.identity, "0000:65:00.0")
-            self.assertEqual(provenance.logical_gpu, "0")
+            self.assertEqual(provenance.identity, "0000:85:00.0")
+            self.assertEqual(provenance.logical_gpu, "1")
 
 
 if __name__ == "__main__":
