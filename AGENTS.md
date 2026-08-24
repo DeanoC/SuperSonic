@@ -40,6 +40,27 @@ or manifest validation with an actionable error. Do not reintroduce a broad
 model registry, alternate weight source, multi-sequence path, or unvalidated
 device fallback merely to make a test pass.
 
+## Slim evolution policy
+
+Keep SuperSonic intentionally slim: support a few actively optimized models
+and backend features without making current work pay the maintenance cost of
+obsolete paths. Maintain one implementation for each concern. When a better
+version replaces an existing model path, backend feature, kernel, loader, or
+tool, do not keep both implementations active indefinitely.
+
+Before removing a superseded implementation, tag the last commit that contains
+it and push that tag to GitHub. Git history and release tags are the archive;
+the active tree is not. After the tag is available, remove the replaced code,
+tests, documentation, CLI options, environment variables, and compatibility
+branches together so they cannot drift into a second implementation.
+
+Backward compatibility is not the default. Do not add migrations, deprecated
+aliases, legacy configuration parsing, or compatibility shims unless a current
+use case justifies their ongoing complexity. New models and backend features
+must earn their permanent maintenance cost through active use, correctness,
+and measured value; when they supersede older work, prefer replacement and
+removal over accumulation.
+
 ## Internal FLM foundation
 
 FLM codec and model-store foundations remain contributor-only background work.

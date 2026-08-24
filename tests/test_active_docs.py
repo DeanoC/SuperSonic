@@ -548,6 +548,12 @@ printf 'cargo|%s|GQH=%s|MODEL=%s|8192=%s|REQ=%s\\n' "$*" \
         ):
             self.assertIn(crate, lowered)
         self.assertIn("internal flm foundation", lowered)
+        self.assertIn("slim evolution policy", lowered)
+        self.assertRegex(lowered, r"one (maintained )?implementation")
+        self.assertRegex(lowered, r"tag .*before .*remov|before .*remov.*tag")
+        self.assertIn("github", lowered)
+        self.assertRegex(lowered, r"backward compatibility .*not .*default|no backward compatibility")
+        self.assertRegex(lowered, r"maintenance cost")
         self.assertIn("abi", lowered)
         self.assertRegex(lowered, r"cpu[- ]safe|test tiers?|testing tiers?")
         self.assertRegex(lowered, r"unsupported .*fail|fail .*unsupported")
