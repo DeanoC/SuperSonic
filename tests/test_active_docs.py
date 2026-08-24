@@ -85,6 +85,25 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertTrue(any("phi" in violation.lower() for violation in violations))
         self.assertTrue(any("llama" in violation.lower() for violation in violations))
 
+    def test_removed_stream_gemv_lifecycle_terms_are_rejected(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative_path in checker.ACTIVE_DOCS:
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Product\n\nCurrent GQH guidance.\n", encoding="utf-8")
+            (root / "docs" / "testing.md").write_text(
+                "# Testing\n\n"
+                "The bridge has held GEMV arguments and a learned gate/up path.\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        self.assertTrue(any("held GEMV" in violation for violation in violations))
+        self.assertTrue(any("learned gate/up" in violation for violation in violations))
+
     def test_artifact_doc_matches_cheap_preflight_scope(self):
         artifact_doc = (ROOT / "docs" / "artifact-format.md").read_text(encoding="utf-8")
         self.assertIn("existence, readability", artifact_doc)

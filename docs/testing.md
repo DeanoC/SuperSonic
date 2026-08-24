@@ -65,8 +65,8 @@ local skip; the configured workflow must fail closed.
 
 ### GPU integrity fail-stop policy
 
-The HIP bridges own process-global GQH metadata, held GEMV arguments, streams,
-events, scratch allocations, and decode graphs. If a device switch,
+The HIP bridges own process-global GQH metadata, streams, events, scratch
+allocations, dequant resources, and decode graphs. If a device switch,
 synchronization, event/stream operation, free/destroy, or device restoration
 fails after one of those objects can reference a model allocation, the bridge
 logs the operation, HIP status, and device ordinal and deliberately aborts the

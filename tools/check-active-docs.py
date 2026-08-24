@@ -35,6 +35,9 @@ FORBIDDEN_PATTERNS = (
     re.compile(r"--flm(?:-file)?\b|\bflm[_-]file\b", re.IGNORECASE),
     re.compile(r"--q4km\b|\bq4[_-]k[_-]m\b", re.IGNORECASE),
     re.compile(r"--(?:int4|bf16|fp8|batch-size|force-kernel-decode)\b", re.IGNORECASE),
+    # Stream GEMV no longer retains a launch between public calls. Keep this
+    # lifecycle wording out of active docs while allowing ordinary GEMV prose.
+    re.compile(r"\bheld\s+GEMV\b|\blearned\s+(?:GEMV|gate/up)\b", re.IGNORECASE),
 )
 FLM_RE = re.compile(r"\bFLM\b|--flm(?:-file)?\b|\bflm[_-]file\b", re.IGNORECASE)
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)\s]+)")
