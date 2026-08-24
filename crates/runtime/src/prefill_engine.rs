@@ -2264,37 +2264,8 @@ fn prefill_inner(
     })
 }
 
-/// Replay the full token history through the validated GPU prefill path and
-/// return last-token logits. Slower than incremental decode, but much closer to
-/// the native path than the experimental component decode oracle.
-pub fn gpu_reference_replay_step(
-    weights: &Qwen38Weights,
-    rotary: &RotaryTables,
-    token_ids: &[u32],
-    ordinal: usize,
-    kv_chunk_size: usize,
-    prefill_chunk_size: usize,
-    use_4b_kernel: bool,
-) -> Result<Vec<f32>> {
-    let mut replay_state = ModelState::new(&weights.config, ordinal)
-        .map_err(|e| anyhow::anyhow!("gpu replay state init: {e}"))?;
-    let result = prefill(
-        weights,
-        &mut replay_state,
-        rotary,
-        token_ids,
-        ordinal,
-        kv_chunk_size,
-        prefill_chunk_size,
-        use_4b_kernel,
-        false,
-        None,
-    )?;
-    Ok(result.logits)
-}
-
 /// Append a contiguous Qwen3.8 MTP verify block to the live target state using
-/// the prefill component kernels, returning logits for every appended position.
+/// the prefill component kernels.
 ///
 /// Unlike the position-zero helper, this does not assume position zero. The caller
 /// supplies the absolute `pos_offset`; full-attention KV is written at
@@ -2302,33 +2273,6 @@ pub fn gpu_reference_replay_step(
 /// while linear-attention state is mutated in place. The Qwen3.8 MTP driver
 /// snapshots/restores linear state around this call, just as it does for the
 /// persistent fused verifier.
-pub fn prefill_append_logits(
-    weights: &Qwen38Weights,
-    state: &mut ModelState,
-    rotary: &RotaryTables,
-    token_ids: &[u32],
-    pos_offset: usize,
-    ordinal: usize,
-    kv_chunk_size: usize,
-    use_4b_kernel: bool,
-) -> Result<Vec<Vec<f32>>> {
-    let mut cache = MtpPrefillAppendCache::new(&weights.config, token_ids.len(), ordinal)?;
-    Ok(prefill_append_verify_cached(
-        weights,
-        state,
-        rotary,
-        token_ids,
-        pos_offset,
-        ordinal,
-        kv_chunk_size,
-        use_4b_kernel,
-        false,
-        None,
-        &mut cache,
-    )?
-    .logits)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_append_verify_cached(
     weights: &Qwen38Weights,
@@ -2373,7 +2317,7 @@ fn prefill_append_verify_impl(
     cache: Option<&mut MtpPrefillAppendCache>,
 ) -> Result<PrefillAppendVerifyResult> {
     if token_ids.is_empty() {
-        return Err(anyhow::anyhow!("prefill_append_logits: token_ids is empty"));
+        return Err(anyhow::anyhow!("prefill_append_verify: token_ids is empty"));
     }
 
     let config = &weights.config;

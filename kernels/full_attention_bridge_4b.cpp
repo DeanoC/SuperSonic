@@ -9074,6 +9074,12 @@ int persistent_decode_device(
     const void* batch_descs,
     const void* int4_scales
 ) {
+    // Dynamic KV quantization is not part of the Qwen3.8 product path. Reject
+    // a non-null descriptor at the ABI boundary before any device work or
+    // process-global decode state can be touched.
+    if (kv_fp8_descs != nullptr) {
+        return 256;
+    }
     DecodeBridgeLockGuard guard;
     ScopedHipDevice scoped(device_ordinal);
     if (!scoped.ok()) {

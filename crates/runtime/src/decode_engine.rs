@@ -1437,43 +1437,6 @@ impl DecodeEngine {
         Ok(result)
     }
 
-    /// Rebuild the single-sequence state from scratch by replaying native GPU
-    /// prefill over the provided token history.
-    pub fn rebuild_prefill_state(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        self.state = ModelState::new(&self.weights.config, self.ordinal)
-            .map_err(|e| anyhow::anyhow!("rebuild model state init: {e}"))?;
-        self.prefill_native(token_ids)
-    }
-
-    pub fn rebuild_prefill_state_greedy_token(&mut self, token_ids: &[u32]) -> Result<u32> {
-        let logits = self.rebuild_prefill_state(token_ids)?;
-        Ok(Self::greedy_sample(&logits))
-    }
-
-    pub fn prefill_native_with_trace(
-        &mut self,
-        prompt_ids: &[u32],
-    ) -> Result<prefill_engine::PrefillResult> {
-        let result = prefill_engine::prefill(
-            &self.weights,
-            &mut self.state,
-            &self.rotary,
-            prompt_ids,
-            self.ordinal,
-            self.kv_chunk_size,
-            self.prefill_chunk_size,
-            self.use_4b_kernel,
-            true,
-            None,
-        )?;
-
-        self.scratch
-            .reset_sync()
-            .map_err(|e| anyhow::anyhow!("reset sync after prefill: {e}"))?;
-
-        Ok(result)
-    }
-
     fn sync_stage_if_requested(&self, enabled: bool, stage: &str) -> Result<()> {
         if !enabled {
             return Ok(());
@@ -1701,24 +1664,6 @@ impl DecodeEngine {
     /// between the incremental decode path and replay-prefill path.
     pub fn backend(&self) -> gpu_hal::Backend {
         self.hidden_io.backend()
-    }
-
-    /// Replay-prefill decode: runs prefill from scratch over the full
-    /// `token_history` (prompt + everything emitted so far, including the
-    /// freshly sampled token whose logits we need next), and returns the
-    /// last-position logits. O(N²) per generated token but reuses the
-    /// validated prefill pipeline. Non-destructive
-    /// to engine state (allocates a throwaway `ModelState`).
-    pub fn decode_step_replay(&self, token_history: &[u32]) -> Result<Vec<f32>> {
-        prefill_engine::gpu_reference_replay_step(
-            &self.weights,
-            &self.rotary,
-            token_history,
-            self.ordinal,
-            self.kv_chunk_size,
-            self.prefill_chunk_size,
-            self.use_4b_kernel,
-        )
     }
 
     /// Forced single-sequence 4B kernel path with native stage timings.

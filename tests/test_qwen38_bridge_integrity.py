@@ -35,6 +35,15 @@ class Qwen38BridgeIntegrityTests(unittest.TestCase):
         self.assertNotIn("quantize_kv_to_fp8_kernel", body)
         self.assertNotIn("hipLaunchKernelGGL", body)
 
+    def test_persistent_decode_rejects_kv_fp8_descriptors_before_device_work(self):
+        start = self.source.index("int persistent_decode_device(")
+        body = self.source[start:]
+        guard = body.index("if (kv_fp8_descs != nullptr)")
+        prefix = body[:guard]
+        self.assertIn("return 256;", body[guard : guard + 180])
+        self.assertNotIn("DecodeBridgeLockGuard guard", prefix)
+        self.assertNotIn("hipLaunchKernelGGL", body[guard : guard + 180])
+
     def test_prepare_only_sync_failures_use_integrity_policy(self):
         start = self.source.index("int persistent_decode_device(")
         end = self.source.index("// Restore conv+rec", start)

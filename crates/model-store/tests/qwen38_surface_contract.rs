@@ -18,6 +18,7 @@ fn read(relative: &str) -> String {
 fn qwen38_runtime_exposes_no_removed_validation_or_batch_routes() {
     let runtime_lib = read("crates/runtime/src/lib.rs");
     let decode = read("crates/runtime/src/decode_engine.rs");
+    let prefill = read("crates/runtime/src/prefill_engine.rs");
 
     assert!(!runtime_lib.contains("pub mod oracle;"));
     assert!(!workspace_root()
@@ -40,6 +41,26 @@ fn qwen38_runtime_exposes_no_removed_validation_or_batch_routes() {
         );
     }
     assert!(!decode.contains("extra_states"));
+    for removed in [
+        "pub fn decode_step_replay",
+        "pub fn rebuild_prefill_state",
+        "pub fn rebuild_prefill_state_greedy_token",
+        "pub fn prefill_native_with_trace",
+    ] {
+        assert!(
+            !decode.contains(removed),
+            "removed replay/validation route remains: {removed}"
+        );
+    }
+    for removed in [
+        "pub fn gpu_reference_replay_step",
+        "pub fn prefill_append_logits",
+    ] {
+        assert!(
+            !prefill.contains(removed),
+            "removed prefill route remains: {removed}"
+        );
+    }
 }
 
 #[test]
@@ -51,6 +72,7 @@ fn qwen38_product_drops_kv_fp8_vmm_and_broad_capability_surfaces() {
     let qwen_descs = read("crates/qwen38/src/desc_builder.rs");
     let runtime_scratch = read("crates/qwen38/src/scratch.rs");
     let kernel_lib = read("crates/kernel-ffi/src/lib.rs");
+    let prefill_ffi = read("crates/kernel-ffi/src/prefill_ffi.rs");
 
     assert!(!core_lib.contains("pub mod capabilities;"));
     assert!(!root.join("crates/core/src/capabilities.rs").exists());
@@ -66,6 +88,8 @@ fn qwen38_product_drops_kv_fp8_vmm_and_broad_capability_surfaces() {
     assert!(!runtime_scratch.contains("KVCacheFp8Desc"));
     assert!(!runtime_scratch.contains("kv_fp8_desc"));
     assert!(!kernel_lib.contains("KVCacheFp8Desc"));
+    assert!(!prefill_ffi.contains("pub fn quantize_kv_to_fp8"));
+    assert!(!prefill_ffi.contains("supersonic_qwen35_4b_hip_quantize_kv_to_fp8"));
 }
 
 #[test]

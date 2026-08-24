@@ -752,20 +752,6 @@ unsafe extern "C" {
         out_supported: *mut c_int,
     ) -> c_int;
 
-    // BF16 → FP8 KV cache quantization
-    fn supersonic_qwen35_4b_hip_quantize_kv_to_fp8(
-        dtype: c_int,
-        device_ordinal: usize,
-        src: *const c_void,
-        dst_fp8: *mut c_void,
-        dst_scale: *mut c_void,
-        num_kv_heads: c_int,
-        seq_len: c_int,
-        head_dim: c_int,
-        max_T: c_int,
-        pos_offset: c_int,
-    ) -> c_int;
-
     // ---- Original prefill kernel declarations ----
 
     fn supersonic_qwen35_hip_embedding_lookup(
@@ -3486,44 +3472,6 @@ pub fn repeat_interleave_transpose_hsd(
             "repeat_interleave_transpose_hsd",
             status,
         )?;
-        Ok(())
-    })
-}
-
-/// Quantize BF16 K or V tensor to FP8 E4M3 KV cache with per-head-per-position absmax scaling.
-/// src: contiguous [num_kv_heads, seq_len, head_dim] BF16
-/// dst_fp8: KV cache [num_kv_heads, max_T, head_dim] U8 (written at positions pos_offset..pos_offset+seq_len)
-/// dst_scale: scale buffer [num_kv_heads, max_T] F32 (written at same positions)
-pub fn quantize_kv_to_fp8(
-    ordinal: usize,
-    dtype: ScalarType,
-    src: &GpuBuffer,
-    dst_fp8: &mut GpuBuffer,
-    dst_scale: &mut GpuBuffer,
-    num_kv_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-    max_t: usize,
-    pos_offset: usize,
-) -> Result<(), GpuError> {
-    ffi_profile_time_result("qwen.quantize_kv_to_fp8", ordinal, || {
-        let status = unsafe {
-            supersonic_qwen35_4b_hip_quantize_kv_to_fp8(
-                dtype.kernel_dtype_code(),
-                ordinal,
-                src.as_ptr(),
-                dst_fp8.as_mut_ptr(),
-                dst_scale.as_mut_ptr() as *mut c_void,
-                num_kv_heads as c_int,
-                seq_len as c_int,
-                head_dim as c_int,
-                max_t as c_int,
-                pos_offset as c_int,
-            )
-        };
-        if status != 0 {
-            return Err(ffi_error(format!("quantize_kv_to_fp8 failed: {status}")));
-        }
         Ok(())
     })
 }
