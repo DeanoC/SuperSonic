@@ -144,7 +144,4 @@ def _append_reason(reasons: list[str], reason: str) -> None:
 
 
 def _headline_eligible(record: dict[str, object]) -> bool:
-    environment = record.get("environment")
-    if not isinstance(environment, dict):
-        return False
-    return environment.get("headline_eligible") is True and not environment.get("verification_errors")
+    return validation.has_verified_headline(record)

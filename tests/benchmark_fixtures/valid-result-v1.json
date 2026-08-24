@@ -94,8 +94,8 @@
     "allowlisted_environment": {
       "HIP_ARCH": "gfx1201",
       "HIP_VISIBLE_DEVICES": "1",
-      "ROCM_PATH": "/opt/rocm",
-      "HIP_PATH": "/opt/rocm/hip",
+      "ROCM_PATH": "rocm",
+      "HIP_PATH": "rocm/hip",
       "SUPERSONIC_DEVICE": "0",
       "RUSTFLAGS": "-C target-cpu=native"
     },

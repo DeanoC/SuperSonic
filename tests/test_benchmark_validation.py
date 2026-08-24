@@ -104,6 +104,46 @@ class BenchmarkValidationTests(unittest.TestCase):
         record["environment"]["verification_errors"] = ["clock drift"]
         self.assert_bundle_invalid(record, "headline|verification")
 
+    def test_headline_eligibility_is_derived_not_trusted(self):
+        record = copy.deepcopy(self.valid_record)
+        record["environment"]["clock_policy"] = "uncontrolled-clocks"
+        record["hardware"]["clock_policy"] = "uncontrolled-clocks"
+        record["environment"]["headline_eligible"] = True
+        record["environment"]["verification_errors"] = []
+        self.assert_record_invalid(record, "headline|locked|uncontrolled")
+
+        record = copy.deepcopy(self.valid_record)
+        record["environment"]["observed_before"]["gpu_clock_mhz"] = 2300
+        record["environment"]["headline_eligible"] = True
+        record["environment"]["verification_errors"] = []
+        self.assert_record_invalid(record, "headline|clock drift")
+
+        record = copy.deepcopy(self.valid_record)
+        record["environment"]["telemetry_samples"][0]["power_cap_watts"] = None
+        record["environment"]["headline_eligible"] = True
+        record["environment"]["verification_errors"] = []
+        self.assert_record_invalid(record, "headline|power cap")
+
+    def test_publishability_rejects_uncontrolled_missing_and_drifted_headline_records(self):
+        record = copy.deepcopy(self.valid_record)
+        record["environment"]["clock_policy"] = "uncontrolled-clocks"
+        record["hardware"]["clock_policy"] = "uncontrolled-clocks"
+        record["environment"]["headline_eligible"] = True
+        record["environment"]["verification_errors"] = []
+        self.assert_bundle_invalid(record, "headline|locked|uncontrolled")
+
+        record = copy.deepcopy(self.valid_record)
+        record["environment"]["observed_after"]["power_cap_watts"] = None
+        record["environment"]["headline_eligible"] = True
+        record["environment"]["verification_errors"] = []
+        self.assert_bundle_invalid(record, "headline|power cap")
+
+        record = copy.deepcopy(self.valid_record)
+        record["environment"]["telemetry_samples"][0]["memory_clock_mhz"] = 1200
+        record["environment"]["headline_eligible"] = True
+        record["environment"]["verification_errors"] = []
+        self.assert_bundle_invalid(record, "headline|memory clock drift")
+
     def test_configured_missing_inputs_and_secret_like_values_fail_closed(self):
         record = copy.deepcopy(self.valid_record)
         record["errors"] = [{"code": "missing-configured-input", "message": "artifact missing"}]
@@ -116,6 +156,19 @@ class BenchmarkValidationTests(unittest.TestCase):
         record = copy.deepcopy(self.valid_record)
         record["environment"]["allowlisted_environment"]["OPENAI_API_KEY"] = "redacted"
         self.assert_record_invalid(record, "secret")
+
+    def test_all_absolute_paths_are_rejected_but_ordinary_slashes_are_allowed(self):
+        record = copy.deepcopy(self.valid_record)
+        record["run"]["command"] = ["/usr/local/bin/supersonic"]
+        self.assert_record_invalid(record, "absolute path")
+
+        record = copy.deepcopy(self.valid_record)
+        record["run"]["command"] = ["C:\\Users\\deano\\supersonic.exe"]
+        self.assert_record_invalid(record, "absolute path")
+
+        record = copy.deepcopy(self.valid_record)
+        record["quality"]["cases"][0]["actual_value"] = "The prompt asks about A/B/C ratios."
+        self.validation.validate_record(record)
 
 
 if __name__ == "__main__":

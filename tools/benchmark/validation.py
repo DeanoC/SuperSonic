@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import math
 import re
+from typing import Mapping
 
 from . import environment
 from .manifest import ROOT, load_suite
@@ -44,14 +45,7 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[a-z0-9][a-z0-9_-]{8,}", re.IGNORECASE),
     re.compile(r"\b(?:ghp|github_pat|hf)_[a-z0-9_]{8,}", re.IGNORECASE),
 )
-_SAFE_ABSOLUTE_PREFIXES = (
-    "/bin/",
-    "/dev/",
-    "/etc/",
-    "/opt/rocm",
-    "/sbin/",
-    "/usr/",
-)
+_WINDOWS_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)")
 
 
 def validate_record(record: object) -> None:
@@ -75,6 +69,48 @@ def validate_bundle(path: str | Path, require_complete: bool) -> tuple[Path, ...
             _validate_publishable(record, result_path)
         _validate_complete_bundle(records)
     return paths
+
+
+def headline_verification_errors(record: Mapping[str, object]) -> tuple[str, ...]:
+    try:
+        env = record["environment"]
+        if not isinstance(env, Mapping):
+            return ("environment evidence must be an object",)
+        if env.get("clock_policy") != "locked":
+            return ("headline eligibility requires locked clock_policy",)
+
+        requested = _required_mapping(env, "requested")
+        observed_before = _observed(_required_mapping(env, "observed_before"))
+        telemetry = env.get("telemetry_samples")
+        if not isinstance(telemetry, list) or not telemetry:
+            return ("missing telemetry samples for headline verification",)
+        observed_samples = tuple(_observed(_mapping(sample, "telemetry sample")) for sample in telemetry)
+        observed_after = _observed(_required_mapping(env, "observed_after"))
+        policy = {
+            "name": env.get("clock_policy"),
+            "gpu_clock_mhz": requested.get("gpu_clock_mhz"),
+            "memory_clock_mhz": requested.get("memory_clock_mhz"),
+            "power_cap_watts": requested.get("power_cap_watts"),
+            "performance_level": requested.get("performance_level"),
+        }
+        return environment.verify_clock_policy(observed_before, list(observed_samples), observed_after, policy)
+    except (KeyError, TypeError, ValueError) as exc:
+        return (f"incomplete headline verification evidence: {exc}",)
+
+
+def has_verified_headline(record: Mapping[str, object]) -> bool:
+    try:
+        env = record["environment"]
+    except KeyError:
+        return False
+    if not isinstance(env, Mapping):
+        return False
+    if env.get("headline_eligible") is not True:
+        return False
+    stored_errors = env.get("verification_errors")
+    if stored_errors != []:
+        return False
+    return headline_verification_errors(record) == ()
 
 
 def _load_schema() -> dict[str, object]:
@@ -228,16 +264,10 @@ def _reject_unsafe_json(value: object, path: str) -> None:
 
 
 def _reject_unsafe_string(value: str, path: str) -> None:
-    if value.startswith("/") and not _safe_absolute_path(value):
+    if value.startswith("/") or _WINDOWS_ABSOLUTE_PATH.match(value):
         raise ValueError(f"{path} contains unsafe absolute path")
     if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
         raise ValueError(f"{path} contains secret-like value")
-
-
-def _safe_absolute_path(value: str) -> bool:
-    if value in ("/bin", "/dev", "/etc", "/opt/rocm", "/sbin", "/usr"):
-        return True
-    return any(value.startswith(prefix) for prefix in _SAFE_ABSOLUTE_PREFIXES)
 
 
 def _secret_like_key(key: str) -> bool:
@@ -300,6 +330,7 @@ def _validate_record_consistency(record: dict[str, object]) -> None:
     environment.validate_cache_evidence(str(env["cache_state"]), env["cache_evidence"])
     if env["process_reuse"] is not False:
         raise ValueError("process_reuse must remain false")
+    _validate_headline_consistency(record)
 
     _validate_quality_summary(quality, suite.quality_case_ids)
 
@@ -348,7 +379,7 @@ def _validate_publishable(record: dict[str, object], path: Path) -> None:
         raise ValueError(f"{path} has failing quality cases")
     if record["quality"]["missing_case_ids"]:
         raise ValueError(f"{path} has missing quality cases")
-    if record["environment"]["headline_eligible"] is not True or record["environment"]["verification_errors"]:
+    if not has_verified_headline(record):
         raise ValueError(f"{path} lacks verified headline eligibility")
 
 
@@ -368,3 +399,72 @@ def _validate_complete_bundle(records: list[tuple[Path, dict[str, object]]]) -> 
         missing = sorted(expected - actual)
         if missing:
             raise ValueError(f"incomplete benchmark bundle for suite {suite_name}: missing {missing}")
+
+
+def _validate_headline_consistency(record: Mapping[str, object]) -> None:
+    env = _required_mapping(record, "environment")
+    derived_errors = headline_verification_errors(record)
+    stored_errors = env.get("verification_errors")
+    if stored_errors != list(derived_errors):
+        raise ValueError(
+            "verification_errors are inconsistent with derived headline verification: "
+            + "; ".join(derived_errors or ("no derived violations",))
+        )
+    derived_eligible = env.get("clock_policy") == "locked" and not derived_errors
+    if env.get("headline_eligible") != derived_eligible:
+        raise ValueError(
+            "headline_eligible is inconsistent with derived headline verification: "
+            + "; ".join(derived_errors or ("eligible",))
+        )
+
+
+def _required_mapping(parent: Mapping[str, object], key: str) -> Mapping[str, object]:
+    return _mapping(parent[key], key)
+
+
+def _mapping(value: object, context: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context} must be an object")
+    return value
+
+
+def _observed(value: Mapping[str, object]) -> environment.ObservedTelemetry:
+    return environment.ObservedTelemetry(
+        gpu_clock_mhz=_optional_int(value, "gpu_clock_mhz"),
+        memory_clock_mhz=_optional_int(value, "memory_clock_mhz"),
+        power_cap_watts=_optional_int(value, "power_cap_watts"),
+        power_watts=_optional_float(value, "power_watts"),
+        temperature_celsius=_optional_float(value, "temperature_celsius"),
+        gpu_utilization_percent=_optional_float(value, "gpu_utilization_percent"),
+        memory_utilization_percent=_optional_float(value, "memory_utilization_percent"),
+        performance_level=_optional_str(value, "performance_level"),
+    )
+
+
+def _optional_int(value: Mapping[str, object], key: str) -> int | None:
+    item = value.get(key)
+    if item is None:
+        return None
+    if isinstance(item, bool) or not isinstance(item, int):
+        raise ValueError(f"{key} must be an integer or null")
+    return item
+
+
+def _optional_float(value: Mapping[str, object], key: str) -> float | None:
+    item = value.get(key)
+    if item is None:
+        return None
+    if isinstance(item, bool) or not isinstance(item, (int, float)):
+        raise ValueError(f"{key} must be a number or null")
+    if isinstance(item, float) and not math.isfinite(item):
+        raise ValueError(f"{key} must be finite")
+    return float(item)
+
+
+def _optional_str(value: Mapping[str, object], key: str) -> str | None:
+    item = value.get(key)
+    if item is None:
+        return None
+    if not isinstance(item, str):
+        raise ValueError(f"{key} must be a string or null")
+    return item

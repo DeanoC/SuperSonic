@@ -63,6 +63,43 @@ class BenchmarkCompareTests(unittest.TestCase):
         self.assertEqual(result.right.median, 15.0)
         self.assertEqual(result.speedup, 2.0)
 
+    def test_forged_uncontrolled_records_never_compute_speedup(self):
+        left = copy.deepcopy(self.locked_warm)
+        right = copy.deepcopy(self.locked_warm)
+        for record in (left, right):
+            record["environment"]["clock_policy"] = "uncontrolled-clocks"
+            record["hardware"]["clock_policy"] = "uncontrolled-clocks"
+            record["environment"]["headline_eligible"] = True
+            record["environment"]["verification_errors"] = []
+        right["samples"] = [
+            {"decode_ms": 15.0, "tokens_per_second": 2133.3333333333},
+            {"decode_ms": 14.0, "tokens_per_second": 2285.7142857143},
+            {"decode_ms": 16.0, "tokens_per_second": 2000.0},
+        ]
+
+        result = self.compare.compare_records(left, right)
+
+        self.assertFalse(result.comparable)
+        self.assertIsNone(result.speedup)
+        self.assertIn("headline_eligible", result.reasons)
+
+    def test_drifted_locked_record_never_computes_speedup(self):
+        drifted = copy.deepcopy(self.locked_warm)
+        drifted["environment"]["observed_after"]["gpu_clock_mhz"] = 2300
+        drifted["environment"]["headline_eligible"] = True
+        drifted["environment"]["verification_errors"] = []
+        drifted["samples"] = [
+            {"decode_ms": 15.0, "tokens_per_second": 2133.3333333333},
+            {"decode_ms": 14.0, "tokens_per_second": 2285.7142857143},
+            {"decode_ms": 16.0, "tokens_per_second": 2000.0},
+        ]
+
+        result = self.compare.compare_records(self.locked_warm, drifted)
+
+        self.assertFalse(result.comparable)
+        self.assertIsNone(result.speedup)
+        self.assertIn("headline_eligible", result.reasons)
+
     def test_semantic_mismatches_are_validator_owned(self):
         mutations = {
             "hardware.identity": ("hardware", "identity", "Different GPU"),
