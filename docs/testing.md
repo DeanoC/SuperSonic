@@ -97,10 +97,12 @@ python3 tools/supersonic-bench.py validate --publishable \
   "target/benchmarks/candidate/$run_id"
 ```
 
-The quick harness budget is exactly 600 seconds (10 minutes), while its
+The quick harness has a 600-second (10-minute) hard budget, while its
 workflow job cap is 30 minutes. The explicitly manual full workflow uses the
-same evidence contract with `--suite full` and `--peer-artifact`; its exact
-budget is 21,600 seconds (six hours) and its workflow cap is 450 minutes.
+same evidence contract with `--suite full` and `--peer-artifact`; it has a
+20,700-second minimum inside a 21,600-second hard budget and its workflow cap
+is 450 minutes. Full measurements run in complete balanced rounds and reserve
+the budget tail for the last round and manifest finalization.
 These caps include checkout, static provenance, idle checks, artifact
 preflight, and the release build. A full run is never silently substituted for
 the quick gate.

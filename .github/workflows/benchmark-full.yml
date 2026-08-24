@@ -14,7 +14,8 @@ jobs:
   full:
     name: Full gfx1201 benchmark candidate
     runs-on: [self-hosted, linux, rocm, gfx1201]
-    # The harness owns the exact 21600-second suite budget.  This job timeout
+    # The harness owns a 20700-second minimum inside its 21600-second hard budget.
+    # A final balanced round and manifest finalization use the reserved tail. This job timeout
     # includes checkout, the serial correctness gate, device preflight, and
     # the release build as well.
     timeout-minutes: 450
@@ -182,12 +183,21 @@ jobs:
           from tools.benchmark.manifest import load_suite
 
           suite = load_suite("full")
+          if suite.budget_seconds != 21600:
+              raise SystemExit("full suite hard budget must remain 21600 seconds")
+          if suite.minimum_duration_seconds != 20700:
+              raise SystemExit("full suite minimum duration must remain 20700 seconds")
           allowed = {"cold-load", "warm-resident", "prefix-cache-empty", "prefix-cache-populated", "prefix-cache-reset"}
           if any(case.cache_state not in allowed for case in suite.performance_cases):
               raise SystemExit("full suite contains an unknown cache state")
           if any(case.warmups < 0 or case.repetitions < 1 for case in suite.performance_cases):
               raise SystemExit("full suite contains invalid cache/sample controls")
-          print(f"verified suite={suite.name} budget_seconds={suite.budget_seconds} cache states")
+          if any(case.timeout_seconds != 60 for case in suite.performance_cases):
+              raise SystemExit("full suite subprocess timeouts must remain 60 seconds")
+          print(
+              f"verified suite={suite.name} minimum_duration_seconds="
+              f"{suite.minimum_duration_seconds} budget_seconds={suite.budget_seconds} cache states"
+          )
           PY
 
       - name: Strict Qwen3.8 and pinned peer artifact preflight
@@ -283,7 +293,7 @@ jobs:
             sleep "$(( interval_seconds < remaining ? interval_seconds : remaining ))"
           done
 
-      - name: Run exact six-hour full harness
+      - name: Run six-hour balanced full harness
         shell: bash
         run: |
           set -euo pipefail

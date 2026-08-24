@@ -115,7 +115,9 @@ class BenchmarkCompareTests(unittest.TestCase):
 
     def test_drifted_locked_record_never_computes_speedup(self):
         drifted = copy.deepcopy(self.locked_warm)
-        drifted["environment"]["telemetry_samples"][0]["gpu_clock_mhz"] = 2300
+        drift_sample = copy.deepcopy(drifted["environment"]["telemetry_samples"][0])
+        drift_sample["gpu_clock_mhz"] = 2300
+        drifted["environment"]["telemetry_samples"] = [copy.deepcopy(drift_sample) for _ in range(3)]
         drifted["environment"]["headline_eligible"] = True
         drifted["environment"]["verification_errors"] = []
         drifted["samples"] = [

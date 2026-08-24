@@ -17,6 +17,7 @@ SUITE_KEYS = {
     "version",
     "name",
     "budget_seconds",
+    "minimum_duration_seconds",
     "quality_version",
     "quality_case_ids",
     "engines",
@@ -80,6 +81,11 @@ def load_suite_path(path: Path) -> SuiteManifest:
         raise ValueError(f"suite {path.name} must use version 1")
     name = _require_nonempty_str(data, "name")
     budget_seconds = _require_int(data, "budget_seconds", minimum=1)
+    minimum_duration_seconds = _require_int(data, "minimum_duration_seconds", minimum=0)
+    if minimum_duration_seconds > budget_seconds:
+        raise ValueError(
+            f"suite {path.name} minimum_duration_seconds must not exceed budget_seconds"
+        )
     quality_version = _require_nonempty_str(data, "quality_version")
     decoding_policy = _require_greedy(data, "decoding_policy", f"suite {path.name}")
 
@@ -118,6 +124,7 @@ def load_suite_path(path: Path) -> SuiteManifest:
         version=version,
         name=name,
         budget_seconds=budget_seconds,
+        minimum_duration_seconds=minimum_duration_seconds,
         quality_version=quality_version,
         quality_case_ids=quality_case_ids,
         engines=engines,

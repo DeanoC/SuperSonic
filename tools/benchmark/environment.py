@@ -375,6 +375,7 @@ def _clock_violations(samples: tuple[ObservedTelemetry, ...], policy) -> list[st
     gpu_tolerance = int(_policy_value(policy, "clock_tolerance_mhz") or 0)
     memory_tolerance = int(_policy_value(policy, "memory_clock_tolerance_mhz") or gpu_tolerance)
     loaded_gpu_samples = 0
+    consecutive_gpu_clock_violations = 0
     for index, sample in enumerate(samples):
         gpu_is_loaded = (
             sample.gpu_utilization_percent is not None
@@ -384,11 +385,19 @@ def _clock_violations(samples: tuple[ObservedTelemetry, ...], policy) -> list[st
             loaded_gpu_samples += 1
             if sample.gpu_clock_mhz is None:
                 errors.append(f"missing GPU clock verification at sample {index}")
+                consecutive_gpu_clock_violations = 0
             elif abs(sample.gpu_clock_mhz - requested_gpu) > gpu_tolerance:
-                errors.append(
-                    f"clock drift at sample {index}: observed {sample.gpu_clock_mhz} MHz, "
-                    f"expected {requested_gpu}±{gpu_tolerance}"
-                )
+                consecutive_gpu_clock_violations += 1
+                if consecutive_gpu_clock_violations == 3:
+                    errors.append(
+                        f"sustained clock drift through sample {index}: observed "
+                        f"{sample.gpu_clock_mhz} MHz, expected {requested_gpu}±{gpu_tolerance} "
+                        "for 3 consecutive loaded samples"
+                    )
+            else:
+                consecutive_gpu_clock_violations = 0
+        elif requested_gpu is not None:
+            consecutive_gpu_clock_violations = 0
         if requested_memory is not None:
             if sample.memory_clock_mhz is None:
                 errors.append(f"missing memory clock verification at sample {index}")

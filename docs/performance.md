@@ -19,13 +19,13 @@ record identifies all of the following:
   decoding, stop policy, and timing boundary;
 - explicit cache state and process state, with `process_reuse=false` for the
   current one-shot evidence;
-- raw measured samples; the validator validates their values, exact count,
-  and bundle completeness, while the renderer derives sample count, statistic,
+- raw measured samples; the validator validates their values, suite-required
+  count or balanced-round count, and bundle completeness, while the renderer derives sample count, statistic,
   and dispersion from validated raw samples; and
 - correctness, including ordinary-versus-MTP token equality where applicable.
 
 The representative statistic is the median. Raw samples in measured order are
-the source of truth. The validator checks their values, exact count, and bundle
+the source of truth. The validator checks their values, required count, and bundle
 completeness; the renderer deterministically derives and shows minimum,
 maximum, median absolute deviation (MAD), and sample count from those
 validated raw samples. Those summaries are not stored source fields. Never
@@ -35,9 +35,12 @@ unverified clock is a publication blocker.
 
 `uncontrolled-clocks` is a valid diagnostic policy, not a headline policy. Its
 recorded telemetry remains useful for troubleshooting, but it is excluded from
-headline numbers and peer speedup claims. The [benchmark procedure](benchmarks.md)
-defines the exact 600-second quick and 21,600-second full budgets and the
-30/390-minute workflow caps.
+headline numbers and peer speedup claims. For locked evidence, isolated GPU
+clock transients remain visible but sustained drift means three consecutive loaded
+samples outside tolerance; memory clock, power cap, and performance level remain
+strict checks. The [benchmark procedure](benchmarks.md) defines the 600-second
+quick hard budget and the full 20,700-second minimum within its
+21,600-second hard budget, plus the 30/450-minute workflow caps.
 
 ## Comparability ruling
 

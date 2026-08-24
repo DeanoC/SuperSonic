@@ -60,6 +60,7 @@ class SuiteManifest:
     version: int
     name: str
     budget_seconds: int
+    minimum_duration_seconds: int
     quality_version: str
     quality_case_ids: tuple[str, ...]
     engines: tuple[str, ...]

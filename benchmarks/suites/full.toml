@@ -1,6 +1,7 @@
 version = 1
 name = "full"
 budget_seconds = 21600
+minimum_duration_seconds = 20700
 quality_version = "v2"
 quality_case_ids = [
   "instruction-following-1",
@@ -31,7 +32,7 @@ warmups = 0
 repetitions = 7
 mode = "ordinary"
 cache_state = "cold-load"
-timeout_seconds = 90
+timeout_seconds = 60
 decoding_policy = "greedy"
 engines = ["supersonic", "llama-cpp"]
 
@@ -55,7 +56,7 @@ warmups = 0
 repetitions = 7
 mode = "ordinary"
 cache_state = "cold-load"
-timeout_seconds = 180
+timeout_seconds = 60
 decoding_policy = "greedy"
 engines = ["supersonic", "llama-cpp"]
 
@@ -67,7 +68,7 @@ warmups = 1
 repetitions = 7
 mode = "ordinary"
 cache_state = "warm-resident"
-timeout_seconds = 180
+timeout_seconds = 60
 decoding_policy = "greedy"
 engines = ["supersonic", "llama-cpp"]
 
@@ -79,7 +80,7 @@ warmups = 0
 repetitions = 7
 mode = "mtp"
 cache_state = "cold-load"
-timeout_seconds = 90
+timeout_seconds = 60
 decoding_policy = "greedy"
 engines = ["supersonic"]
 
@@ -103,7 +104,7 @@ warmups = 0
 repetitions = 7
 mode = "mtp"
 cache_state = "cold-load"
-timeout_seconds = 180
+timeout_seconds = 60
 decoding_policy = "greedy"
 engines = ["supersonic"]
 
@@ -115,6 +116,6 @@ warmups = 1
 repetitions = 7
 mode = "mtp"
 cache_state = "warm-resident"
-timeout_seconds = 180
+timeout_seconds = 60
 decoding_policy = "greedy"
 engines = ["supersonic"]
