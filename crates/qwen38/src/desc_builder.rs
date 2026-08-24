@@ -1,6 +1,4 @@
-use kernel_ffi::{
-    BatchSeqDesc, DecodeLayerDesc, FP8ScaleDesc, INT4ScaleDesc, KVCacheFp8Desc, MAX_BATCH_SIZE,
-};
+use kernel_ffi::{BatchSeqDesc, DecodeLayerDesc, FP8ScaleDesc, INT4ScaleDesc, MAX_BATCH_SIZE};
 
 use crate::state::ModelState;
 use crate::weights::{infer_lowbit_type, LayerKind, Qwen38Weights};
@@ -104,17 +102,6 @@ pub fn build_layer_descs(
                 if let Some(ptr) = ls.kv_cache_v_ptr() {
                     d.kv_cache_v = ptr;
                 }
-                if let Some(ref shadow_k) = ls.kv_shadow_k {
-                    d.kv_shadow_k = shadow_k.as_ptr() as *mut _;
-                }
-                if let Some(ref shadow_v) = ls.kv_shadow_v {
-                    d.kv_shadow_v = shadow_v.as_ptr() as *mut _;
-                }
-                d.kv_shadow_start = if ls.kv_shadow_start == usize::MAX {
-                    -1
-                } else {
-                    ls.kv_shadow_start as i32
-                };
             }
         }
 
@@ -325,15 +312,10 @@ pub fn build_int4_scale_descs(weights: &Qwen38Weights) -> Option<Vec<INT4ScaleDe
     Some(descs)
 }
 
-/// Build batch sequence descriptors for batched decode.
-/// One BatchSeqDesc per layer, containing per-sequence state pointers for all batch items.
-/// `states`: slice of ModelStates (one per batch item).
-/// `seqlen_offsets`: per-sequence position offsets.
-/// Returns None if batch_size <= 1.
+/// Build the internal B-slot descriptors used by Qwen3.8 MTP verification.
 pub fn build_batch_seq_descs(
     states: &[&ModelState],
     seqlen_offsets: &[usize],
-    kv_fp8: bool,
 ) -> Option<Vec<BatchSeqDesc>> {
     let batch_size = states.len();
     if batch_size <= 1 {
@@ -365,25 +347,6 @@ pub fn build_batch_seq_descs(
                         d.kv_cache_v[b] = v.as_ptr() as *mut _;
                     }
                     d.kv_len[b] = seqlen_offsets[b] as i32;
-                    if kv_fp8 {
-                        if let Some(ref sk) = ls.kv_scale_k {
-                            d.kv_scale_k[b] = sk.as_ptr() as *mut _;
-                        }
-                        if let Some(ref sv) = ls.kv_scale_v {
-                            d.kv_scale_v[b] = sv.as_ptr() as *mut _;
-                        }
-                        if let Some(ref shadow_k) = ls.kv_shadow_k {
-                            d.kv_shadow_k[b] = shadow_k.as_ptr() as *mut _;
-                        }
-                        if let Some(ref shadow_v) = ls.kv_shadow_v {
-                            d.kv_shadow_v[b] = shadow_v.as_ptr() as *mut _;
-                        }
-                        d.kv_shadow_start[b] = if ls.kv_shadow_start == usize::MAX {
-                            -1
-                        } else {
-                            ls.kv_shadow_start as i32
-                        };
-                    }
                 }
                 LayerKind::Linear => {
                     if let Some(ref cs) = ls.conv_state {
@@ -394,27 +357,6 @@ pub fn build_batch_seq_descs(
                     }
                 }
             }
-        }
-        descs.push(d);
-    }
-    Some(descs)
-}
-
-/// Build KV cache FP8 scale descriptors (parallel to layer descs).
-/// Returns None if `kv_fp8` is false.
-pub fn build_kv_fp8_descs(state: &ModelState, kv_fp8: bool) -> Option<Vec<KVCacheFp8Desc>> {
-    if !kv_fp8 {
-        return None;
-    }
-
-    let mut descs = Vec::with_capacity(state.layers.len());
-    for ls in &state.layers {
-        let mut d = KVCacheFp8Desc::default();
-        if let Some(ref sk) = ls.kv_scale_k {
-            d.kv_scale_k = sk.as_ptr() as *mut _;
-        }
-        if let Some(ref sv) = ls.kv_scale_v {
-            d.kv_scale_v = sv.as_ptr() as *mut _;
         }
         descs.push(d);
     }

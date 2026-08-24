@@ -46,8 +46,6 @@ pub(crate) fn load_qwen38_engine(
         params.kv_chunk_size,
         params.use_4b_kernel,
         cli.prefill_chunk_size,
-        false,
-        1,
     )?;
     engine.set_decode_context_limit(context_tokens);
     if cli.speculative_decode {

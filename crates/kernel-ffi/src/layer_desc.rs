@@ -61,10 +61,11 @@ pub struct DecodeLayerDesc {
     pub kv_cache_v: *mut c_void,
     pub kv_len: c_int,
     pub kv_max_t: c_int,
-    // Optional BF16 sidecar for KV-FP8 bring-up / parity-sensitive reads.
-    pub kv_shadow_k: *mut c_void,
-    pub kv_shadow_v: *mut c_void,
-    pub kv_shadow_start: c_int,
+    // Optional BF16 sidecar retained in the bridge ABI; the product path
+    // leaves these fields null and uses BF16 KV directly.
+    kv_shadow_k: *mut c_void,
+    kv_shadow_v: *mut c_void,
+    kv_shadow_start: c_int,
     // Optional linear Step-B debug export. When non-null on a linear layer,
     // the kernel writes one selected channel's post-update conv-state taps,
     // followed by qkv and conv_out scalars, into this F32 buffer.
@@ -112,28 +113,6 @@ unsafe impl Send for FP8ScaleDesc {}
 unsafe impl Sync for FP8ScaleDesc {}
 
 impl Default for FP8ScaleDesc {
-    fn default() -> Self {
-        unsafe { std::mem::zeroed() }
-    }
-}
-
-/// Per-layer KV cache FP8 scale pointers for dynamic quantization.
-/// Parallel struct to DecodeLayerDesc — one per layer, passed as a separate
-/// kernel argument (same pattern as FP8ScaleDesc).
-/// Only meaningful for full-attention layers; linear-attention layers use null pointers.
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct KVCacheFp8Desc {
-    /// Per-head-per-position absmax scale for K cache: [num_kv_heads, max_T] F32
-    pub kv_scale_k: *mut c_void,
-    /// Per-head-per-position absmax scale for V cache: [num_kv_heads, max_T] F32
-    pub kv_scale_v: *mut c_void,
-}
-
-unsafe impl Send for KVCacheFp8Desc {}
-unsafe impl Sync for KVCacheFp8Desc {}
-
-impl Default for KVCacheFp8Desc {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
     }
@@ -236,16 +215,18 @@ pub struct BatchSeqDesc {
     pub kv_cache_v: [*mut c_void; MAX_BATCH_SIZE],
     pub kv_len: [c_int; MAX_BATCH_SIZE],
     pub kv_max_t: [c_int; MAX_BATCH_SIZE],
-    // Optional BF16 sidecar for KV-FP8 bring-up / parity-sensitive reads.
-    pub kv_shadow_k: [*mut c_void; MAX_BATCH_SIZE],
-    pub kv_shadow_v: [*mut c_void; MAX_BATCH_SIZE],
-    pub kv_shadow_start: [c_int; MAX_BATCH_SIZE],
+    // ABI-reserved BF16 sidecar slots; internal MTP B-slot verification leaves
+    // them null and uses BF16 KV directly.
+    kv_shadow_k: [*mut c_void; MAX_BATCH_SIZE],
+    kv_shadow_v: [*mut c_void; MAX_BATCH_SIZE],
+    kv_shadow_start: [c_int; MAX_BATCH_SIZE],
     // --- Linear attention per-sequence state ---
     pub conv_state: [*mut c_void; MAX_BATCH_SIZE],
     pub recurrent_state: [*mut c_void; MAX_BATCH_SIZE],
-    // --- FP8 KV cache per-sequence scale buffers ---
-    pub kv_scale_k: [*mut c_void; MAX_BATCH_SIZE],
-    pub kv_scale_v: [*mut c_void; MAX_BATCH_SIZE],
+    // ABI-reserved KV scale slots; dynamic KV quantization is not a product
+    // capability and these remain null.
+    kv_scale_k: [*mut c_void; MAX_BATCH_SIZE],
+    kv_scale_v: [*mut c_void; MAX_BATCH_SIZE],
 }
 
 unsafe impl Send for BatchSeqDesc {}

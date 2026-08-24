@@ -72,7 +72,8 @@ unsafe extern "C" {
         attn_scratch_floats: usize,
         enable_attention_trace: c_int,
         fp8_scales: *const c_void,
-        kv_fp8_descs: *const c_void,
+        // ABI-reserved slot; Qwen3.8 always passes null for dynamic KV data.
+        _reserved_kv_descs: *const c_void,
         batch_size: usize,
         batch_descs: *const c_void,
         int4_scales: *const c_void,
@@ -231,7 +232,6 @@ pub fn persistent_decode_4b(
     proj_buf_floats: usize,
     attn_scratch_floats: usize,
     fp8_scale_descs: Option<&GpuBuffer>,
-    kv_fp8_descs: Option<&GpuBuffer>,
     batch_size: usize,
     batch_descs: Option<&GpuBuffer>,
     int4_scale_descs: Option<&GpuBuffer>,
@@ -247,9 +247,6 @@ pub fn persistent_decode_4b(
         std::ptr::null_mut()
     };
     let fp8_scales_ptr = fp8_scale_descs
-        .map(|buffer| buffer.as_ptr())
-        .unwrap_or(std::ptr::null());
-    let kv_fp8_ptr = kv_fp8_descs
         .map(|buffer| buffer.as_ptr())
         .unwrap_or(std::ptr::null());
     let batch_descs_ptr = batch_descs
@@ -280,7 +277,7 @@ pub fn persistent_decode_4b(
             attn_scratch_floats,
             if enable_attention_trace { 1 } else { 0 },
             fp8_scales_ptr,
-            kv_fp8_ptr,
+            std::ptr::null(),
             batch_size,
             batch_descs_ptr,
             int4_scales_ptr,

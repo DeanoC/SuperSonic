@@ -4,7 +4,6 @@ mod error;
 mod hip_sys;
 mod ops;
 mod scalar_type;
-mod vmm;
 
 pub use backend::{
     current_backend, current_buffer_policy, current_memory_architecture, current_strategy_for,
@@ -21,7 +20,3 @@ pub use ops::{
     RegisteredHostBuffer,
 };
 pub use scalar_type::ScalarType;
-pub use vmm::{
-    vmm_is_supported, VirtualAllocation, VirtualAllocationRole, VirtualAllocationStats,
-    VirtualArena, VirtualArenaStats, VirtualBacking, VirtualBuffer, VirtualBufferStats,
-};

@@ -7,6 +7,5 @@
 pub mod chat_template;
 pub mod decode_engine;
 pub mod mtp;
-pub mod oracle;
 pub mod prefill_engine;
 pub mod tensor_bytes;

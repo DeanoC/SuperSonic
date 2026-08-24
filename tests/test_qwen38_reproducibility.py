@@ -104,6 +104,43 @@ class Qwen38ReproducibilityTests(unittest.TestCase):
                 chat=False,
                 max_new_tokens=3,
             )
+            (model_dir / "tokenizer_config.json").unlink()
+            non_chat_record = tool.build_record(
+                commit="a" * 40,
+                hip_version_file=hip_version,
+                rocm_version="unknown",
+                rocm_version_file=rocm_version,
+                gpu_json=gpu_json,
+                physical_gpu="1",
+                gpu_arch="gfx1201",
+                artifact=artifact,
+                model_dir=model_dir,
+                ordinary_log=ordinary,
+                mtp_log=mtp,
+                telemetry_root=telemetry,
+                prompt="Hello",
+                chat=False,
+                max_new_tokens=3,
+            )
+            self.assertEqual(non_chat_record["model_directory"]["name"], "Qwen3.8-27B")
+            with self.assertRaises(ValueError):
+                tool.build_record(
+                    commit="a" * 40,
+                    hip_version_file=hip_version,
+                    rocm_version="unknown",
+                    rocm_version_file=rocm_version,
+                    gpu_json=gpu_json,
+                    physical_gpu="1",
+                    gpu_arch="gfx1201",
+                    artifact=artifact,
+                    model_dir=model_dir,
+                    ordinary_log=ordinary,
+                    mtp_log=mtp,
+                    telemetry_root=telemetry,
+                    prompt="Hello",
+                    chat=True,
+                    max_new_tokens=3,
+                )
 
         self.assertEqual(record["commit"], "a" * 40)
         self.assertEqual(record["toolchain"]["hip_version"], "7.2.4")

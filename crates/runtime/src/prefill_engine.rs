@@ -10,7 +10,7 @@ use gpu_hal::{copy_h2d, Backend, GpuBuffer, ScalarType};
 
 use qwen38::config::TextConfig;
 use qwen38::rotary::RotaryTables;
-use qwen38::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
+use qwen38::state::ModelState;
 use qwen38::weights::Qwen38Weights;
 
 use crate::mtp::{MtpPrefillAppendCache, MtpVerifyScratch};
@@ -1787,7 +1787,6 @@ pub fn prefill(
     ordinal: usize,
     kv_chunk_size: usize,
     prefill_chunk_size: usize,
-    kv_fp8: bool,
     use_4b_kernel: bool,
     trace_layers: bool,
     debug_linear_layer: Option<usize>,
@@ -1800,7 +1799,6 @@ pub fn prefill(
         ordinal,
         kv_chunk_size,
         prefill_chunk_size,
-        kv_fp8,
         use_4b_kernel,
         trace_layers,
         debug_linear_layer,
@@ -1915,7 +1913,6 @@ fn prefill_inner(
     ordinal: usize,
     kv_chunk_size: usize,
     prefill_chunk_size: usize,
-    kv_fp8: bool,
     use_4b_kernel: bool,
     trace_layers: bool,
     debug_linear_layer: Option<usize>,
@@ -2255,13 +2252,6 @@ fn prefill_inner(
             .map_err(|e| anyhow::anyhow!("final norm D2H: {e}"))?,
     );
 
-    // Post-prefill: convert BF16 KV caches to FP8 if requested.
-    // During prefill we use BF16 KV so the attention kernel can read them directly.
-    // Now convert to FP8 for subsequent decode steps.
-    if kv_fp8 {
-        convert_kv_caches_to_fp8(state, config, ordinal)?;
-    }
-
     Ok(PrefillResult {
         logits,
         final_norm_trace,
@@ -2272,124 +2262,6 @@ fn prefill_inner(
         layer_hidden_trace,
         linear_debug_trace,
     })
-}
-
-/// Convert all full-attention KV caches from BF16 to FP8 E4M3 in-place.
-/// Allocates new FP8 cache + scale buffers, quantizes, replaces the BF16 caches.
-pub fn convert_kv_caches_to_fp8(
-    state: &mut ModelState,
-    config: &TextConfig,
-    ordinal: usize,
-) -> Result<()> {
-    let num_kv_heads = config.num_key_value_heads;
-    let head_dim = config.head_dim;
-
-    for (idx, ls) in state.layers.iter_mut().enumerate() {
-        if !config.is_full_attention(idx) {
-            continue;
-        }
-        let kv_len = ls.kv_filled;
-        if kv_len == 0 {
-            continue;
-        }
-
-        // Source: BF16 cache [1, nkv, cap, hd]. Preserve it as the exact BF16
-        // sidecar used by KV-FP8 decode, and quantize from a contiguous view.
-        let bf16_k = ls.kv_cache_k.take().unwrap();
-        let bf16_v = ls.kv_cache_v.take().unwrap();
-        let cap = bf16_k.shape()[2];
-
-        let elem_bytes = ScalarType::BF16.size_in_bytes();
-        let k_contig =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                .map_err(|e| anyhow::anyhow!("kv fp8 convert K contig layer {idx}: {e}"))?;
-        let v_contig =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                .map_err(|e| anyhow::anyhow!("kv fp8 convert V contig layer {idx}: {e}"))?;
-        let cap_stride = cap * head_dim * elem_bytes;
-        let contig_stride = kv_len * head_dim * elem_bytes;
-        for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
-                ordinal,
-                k_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
-                bf16_k.offset_ptr(h * cap_stride),
-                kv_len * head_dim * elem_bytes,
-            )
-            .map_err(|e| anyhow::anyhow!("kv fp8 convert K assemble h={h}: {e}"))?;
-            gpu_hal::copy_d2d(
-                ordinal,
-                v_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
-                bf16_v.offset_ptr(h * cap_stride),
-                kv_len * head_dim * elem_bytes,
-            )
-            .map_err(|e| anyhow::anyhow!("kv fp8 convert V assemble h={h}: {e}"))?;
-        }
-
-        // Allocate FP8 cache and scale buffers with same capacity
-        let fp8_cap = cap; // keep same capacity for alignment
-        let mut fp8_k = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::U8,
-            &[1, num_kv_heads, fp8_cap, head_dim],
-        )
-        .map_err(|e| anyhow::anyhow!("fp8 K alloc layer {idx}: {e}"))?;
-        let mut fp8_v = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::U8,
-            &[1, num_kv_heads, fp8_cap, head_dim],
-        )
-        .map_err(|e| anyhow::anyhow!("fp8 V alloc layer {idx}: {e}"))?;
-        let mut scale_k = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, fp8_cap])
-            .map_err(|e| anyhow::anyhow!("scale K alloc layer {idx}: {e}"))?;
-        let mut scale_v = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, fp8_cap])
-            .map_err(|e| anyhow::anyhow!("scale V alloc layer {idx}: {e}"))?;
-
-        // Quantize using GPU kernel
-        kernel_ffi::prefill_ffi::quantize_kv_to_fp8(
-            ordinal,
-            ScalarType::BF16,
-            &k_contig,
-            &mut fp8_k,
-            &mut scale_k,
-            num_kv_heads,
-            kv_len,
-            head_dim,
-            fp8_cap,
-            0,
-        )
-        .map_err(|e| anyhow::anyhow!("fp8 K quant layer {idx}: {e}"))?;
-
-        kernel_ffi::prefill_ffi::quantize_kv_to_fp8(
-            ordinal,
-            ScalarType::BF16,
-            &v_contig,
-            &mut fp8_v,
-            &mut scale_v,
-            num_kv_heads,
-            kv_len,
-            head_dim,
-            fp8_cap,
-            0,
-        )
-        .map_err(|e| anyhow::anyhow!("fp8 V quant layer {idx}: {e}"))?;
-
-        ls.kv_cache_k = Some(fp8_k);
-        ls.kv_cache_v = Some(fp8_v);
-        ls.kv_scale_k = Some(scale_k);
-        ls.kv_scale_v = Some(scale_v);
-        if kv_fp8_bf16_sidecar_enabled() {
-            ls.kv_shadow_k = Some(bf16_k);
-            ls.kv_shadow_v = Some(bf16_v);
-            ls.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
-                .map(|window| kv_len.saturating_sub(window))
-                .unwrap_or(0);
-        } else {
-            ls.kv_shadow_k = None;
-            ls.kv_shadow_v = None;
-            ls.kv_shadow_start = usize::MAX;
-        }
-    }
-    Ok(())
 }
 
 /// Replay the full token history through the validated GPU prefill path and
@@ -2414,7 +2286,6 @@ pub fn gpu_reference_replay_step(
         ordinal,
         kv_chunk_size,
         prefill_chunk_size,
-        false,
         use_4b_kernel,
         false,
         None,
@@ -3286,13 +3157,13 @@ fn prefill_full_attention_layer(
 
     // 8/9. Write this chunk's K/V to KV cache BEFORE attention (so attention can read from it).
     //      The HIP fast path transposes directly into the persistent cache; fallback keeps the
-    //      scratch transpose plus per-head copy path for virtual caches and debug A/B runs.
+    //      scratch transpose plus per-head copy path for debug A/B runs.
     let mut kv_capacity_prepared = false;
     let kv_cache_written = if gpu_hal::current_backend() == Backend::Hip {
-        ls.ensure_kv_capacity(kv_len - 1, ordinal, config, kv_chunk_size, false)
+        ls.ensure_kv_capacity(kv_len - 1, ordinal, config, kv_chunk_size)
             .map_err(|e| anyhow::anyhow!("layer {idx} KV alloc: {e}"))?;
         kv_capacity_prepared = true;
-        if !ls.has_virtual_kv_cache() && ls.kv_cache_k.is_some() && ls.kv_cache_v.is_some() {
+        if ls.kv_cache_k.is_some() && ls.kv_cache_v.is_some() {
             let cap = ls.kv_capacity();
             let k_cache = ls
                 .kv_cache_k
@@ -3355,7 +3226,7 @@ fn prefill_full_attention_layer(
         .map_err(|e| anyhow::anyhow!("layer {idx} V transpose: {e}"))?;
 
         if !kv_capacity_prepared {
-            ls.ensure_kv_capacity(kv_len - 1, ordinal, config, kv_chunk_size, false)
+            ls.ensure_kv_capacity(kv_len - 1, ordinal, config, kv_chunk_size)
                 .map_err(|e| anyhow::anyhow!("layer {idx} KV alloc: {e}"))?;
         }
 
@@ -3422,7 +3293,7 @@ fn prefill_full_attention_layer(
     let attn_k_ref: &GpuBuffer;
     let attn_v_ref: &GpuBuffer;
 
-    if !ls.has_virtual_kv_cache() && cap == kv_len {
+    if cap == kv_len {
         let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
         let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
         // No padding - cache is already contiguous, use directly.
@@ -3430,8 +3301,6 @@ fn prefill_full_attention_layer(
         attn_v_ref = cache_v_ref;
     } else {
         // Capacity > kv_len - copy each head's kv_len entries into contiguous buffers.
-        // Virtual KV also uses this path because the prefill attention FFI takes
-        // `GpuBuffer` wrappers, while the virtual cache is represented by raw VA.
         let (kv_k_contig, kv_v_contig) =
             scratch.take_kv_assemble(ordinal, num_kv_heads, kv_len, head_dim)?;
         let cap_stride = cap * head_dim * elem_bytes;

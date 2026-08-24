@@ -279,6 +279,7 @@ jobs:
             --mtp "$CI_OUTPUT_ROOT/token-equivalence/mtp.log" \
             --telemetry-root "$CI_OUTPUT_ROOT/throughput" \
             --prompt "Hello" \
+            --chat \
             --max-new-tokens 8 \
             --output "$CI_OUTPUT_ROOT/reproducibility.json"
 

@@ -94,18 +94,8 @@ fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen38::config::Tex
         256,
     )
     .max(24_576);
-    let engine = DecodeEngine::new(
-        weights,
-        ordinal,
-        16_480,
-        attn_scratch,
-        256,
-        true,
-        0,
-        false,
-        1,
-    )
-    .expect("DecodeEngine");
+    let engine = DecodeEngine::new(weights, ordinal, 16_480, attn_scratch, 256, true, 0)
+        .expect("DecodeEngine");
     Some((engine, config))
 }
 
@@ -267,7 +257,7 @@ fn rung14_reset_refreshes_mutable_state_with_stable_descriptors() {
     };
 
     let before: Vec<usize> = engine
-        .state_for_batch(0)
+        .state()
         .layers
         .iter()
         .filter_map(|layer| {
@@ -288,7 +278,7 @@ fn rung14_reset_refreshes_mutable_state_with_stable_descriptors() {
     engine.decode_step(9419, 0).expect("initial decode");
     engine.reset().expect("reset model state");
     let after: Vec<usize> = engine
-        .state_for_batch(0)
+        .state()
         .layers
         .iter()
         .filter_map(|layer| {

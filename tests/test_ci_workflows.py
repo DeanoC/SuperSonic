@@ -199,6 +199,7 @@ class WorkflowContractTests(unittest.TestCase):
             "--mtp",
             "--telemetry-root",
             "--prompt \"Hello\"",
+            "--chat",
             "--max-new-tokens 8",
         ):
             self.assertIn(option, text, option)

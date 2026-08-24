@@ -212,11 +212,14 @@ def _artifact(path: Path) -> dict[str, Any]:
     }
 
 
-def _model_directory(path: Path) -> dict[str, Any]:
+def _model_directory(path: Path, *, chat: bool) -> dict[str, Any]:
     if not path.is_dir():
         raise ValueError(f"model directory {_safe_name(path)} is unavailable")
     required = {}
-    for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+    required_names = ["config.json", "tokenizer.json"]
+    if chat:
+        required_names.append("tokenizer_config.json")
+    for name in required_names:
         file_path = path / name
         if not file_path.is_file():
             raise ValueError(f"model sidecar {_safe_name(file_path)} is unavailable")
@@ -309,6 +312,8 @@ def build_record(
         raise ValueError("GPU architecture must be a gfx target")
 
     comparison = _comparison_for_record(ordinary_log, mtp_log)
+    if comparison.get("applicable") is not True or comparison.get("equal") is not True:
+        raise ValueError("ordinary/MTP correctness logs are required and must be equal")
     correctness_hash = (
         comparison.get("ordinary_hash") if comparison.get("equal") is True else None
     )
@@ -327,6 +332,8 @@ def build_record(
     ]
     if measured_tokens and len(set(measured_tokens)) != 1:
         raise ValueError("measured runs disagree on generated token count")
+    if not timings["measured"] or not measured_tokens or timings["median_ms_per_tok"] is None:
+        raise ValueError("at least one measured telemetry run is required")
     token_count = measured_tokens[0] if measured_tokens else comparison.get("ordinary_token_count")
 
     hip_version = _hip_version(hip_version_file)
@@ -352,7 +359,7 @@ def build_record(
             "logical_device": "0",
         },
         "artifact": _artifact(artifact),
-        "model_directory": _model_directory(model_dir),
+        "model_directory": _model_directory(model_dir, chat=chat),
         "workload": {
             "prompt": prompt,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
@@ -422,21 +429,31 @@ def validate_record(record: dict[str, Any]) -> None:
     ):
         raise ValueError("reproducibility record has incomplete artifact identity")
     workload = record["workload"]
-    if not isinstance(workload, dict) or not isinstance(workload.get("prompt"), str):
+    if (
+        not isinstance(workload, dict)
+        or not isinstance(workload.get("prompt"), str)
+        or not isinstance(workload.get("token_count"), int)
+        or workload["token_count"] < 1
+    ):
         raise ValueError("reproducibility record has incomplete workload identity")
     comparison = record["correctness"].get("ordinary_vs_mtp")
     if not isinstance(comparison, dict):
         raise ValueError("reproducibility record has no ordinary/MTP result")
-    if comparison.get("applicable") is True and not isinstance(comparison.get("equal"), bool):
-        raise ValueError("applicable ordinary/MTP result must have a boolean equality")
+    if comparison.get("applicable") is not True or comparison.get("equal") is not True:
+        raise ValueError("ordinary/MTP correctness equality is required")
+    for key in ("ordinary_hash", "mtp_hash"):
+        if not isinstance(comparison.get(key), str) or not HASH_RE.fullmatch(comparison[key]):
+            raise ValueError("ordinary/MTP correctness hashes are required")
     correctness_hash = record["correctness"].get("correctness_hash")
-    if correctness_hash is not None and not HASH_RE.fullmatch(str(correctness_hash)):
+    if not isinstance(correctness_hash, str) or not HASH_RE.fullmatch(correctness_hash):
         raise ValueError("reproducibility record has an invalid correctness hash")
     timings = record["timings"]
     if not isinstance(timings, dict) or not isinstance(timings.get("warmup"), list) or not isinstance(
         timings.get("measured"), list
     ):
         raise ValueError("reproducibility record has incomplete timing data")
+    if timings.get("measured_runs", 0) < 1 or timings.get("median_ms_per_tok") is None:
+        raise ValueError("measured telemetry is required")
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:

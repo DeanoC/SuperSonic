@@ -13,7 +13,6 @@ HAL_BUILD = ROOT / "crates" / "gpu-hal" / "build.rs"
 HAL_BACKEND = ROOT / "crates" / "gpu-hal" / "src" / "backend.rs"
 HAL_LIB = ROOT / "crates" / "gpu-hal" / "src" / "lib.rs"
 HAL_OPS = ROOT / "crates" / "gpu-hal" / "src" / "ops.rs"
-HAL_VMM = ROOT / "crates" / "gpu-hal" / "src" / "vmm.rs"
 CORE_LIB = ROOT / "crates" / "core" / "src" / "lib.rs"
 CORE_BACKEND = ROOT / "crates" / "core" / "src" / "backend.rs"
 KERNEL_FFI_SRC = ROOT / "crates" / "kernel-ffi" / "src"
@@ -222,7 +221,6 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
         backend = HAL_BACKEND.read_text(encoding="utf-8")
         lib = HAL_LIB.read_text(encoding="utf-8")
         ops = HAL_OPS.read_text(encoding="utf-8")
-        vmm = HAL_VMM.read_text(encoding="utf-8")
         self.assertRegex(backend, r"pub enum Backend\s*\{\s*Hip,\s*\}")
         self.assertNotIn("compiled_backends", backend)
         self.assertIn("Backend::Hip\n}", backend)
@@ -232,12 +230,11 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
         self.assertNotIn("mod metal_sys", lib)
         self.assertNotIn("use crate::cuda_sys", ops)
         self.assertNotIn("use crate::metal_sys", ops)
-        self.assertNotIn("use crate::cuda_sys", vmm)
+        self.assertFalse((ROOT / "crates" / "gpu-hal" / "src" / "vmm.rs").exists())
 
     def test_hip_surfaces_have_no_disabled_non_hip_branches(self):
         for path in (
             HAL_OPS,
-            HAL_VMM,
             KERNEL_FFI_SRC / "qwen38.rs",
         ):
             source = path.read_text(encoding="utf-8")

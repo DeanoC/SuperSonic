@@ -6,28 +6,22 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
 use gpu_hal::{GpuBuffer, ScalarType};
 
 use qwen38::config::TextConfig;
 use qwen38::desc_builder::{
-    build_batch_seq_descs, build_fp8_scale_descs, build_int4_scale_descs, build_kv_fp8_descs,
-    build_layer_descs,
+    build_batch_seq_descs, build_fp8_scale_descs, build_int4_scale_descs, build_layer_descs,
 };
 use qwen38::rotary::RotaryTables;
 use qwen38::scratch::PersistentDecodeScratch;
-use qwen38::state::{
-    kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, LinearStateSnapshot,
-    ModelState, ModelStateDiskSnapshot,
-};
+use qwen38::state::{LinearStateSnapshot, ModelState, ModelStateDiskSnapshot};
 use qwen38::weights::Qwen38Weights;
 use serde::{Deserialize, Serialize};
 
 use crate::mtp::{
-    mtp_decode_step, mtp_forward, prefill_append_verify_cached, restore_linear_prefix,
-    restore_linear_state, MtpPrefillAppendCache, MtpVerifyCache, MtpVerifyScratch,
+    mtp_forward, prefill_append_verify_cached, restore_linear_prefix, restore_linear_state,
+    MtpPrefillAppendCache, MtpVerifyCache, MtpVerifyScratch,
 };
-use crate::oracle::OracleOutput;
 use crate::prefill_engine;
 
 /// Decode a byte slice of little-endian `f32` values into a host `Vec<f32>`.
@@ -437,32 +431,6 @@ fn maybe_attn_rms_norm_rows(
     Ok(())
 }
 
-fn fp8_e4m3_to_f32_host(byte: u8) -> f32 {
-    let sign = (byte >> 7) & 1;
-    let exp = (byte >> 3) & 0xF;
-    let mantissa = byte & 0x7;
-    if byte == 0x7F || byte == 0xFF {
-        return 0.0;
-    }
-    let val = if exp == 0 {
-        mantissa as f32 / 8.0 * 1.52587890625e-2
-    } else {
-        (1.0 + mantissa as f32 / 8.0) * 2f32.powi(exp as i32 - 7)
-    };
-    if sign != 0 {
-        -val
-    } else {
-        val
-    }
-}
-
-fn f32_to_bf16_bytes_host(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
-    values
-        .into_iter()
-        .flat_map(|v| half::bf16::from_f32(v).to_le_bytes())
-        .collect()
-}
-
 fn is_qwen38_4b_shape(config: &TextConfig) -> bool {
     config.hidden_size == 2560
         && config.intermediate_size == 9216
@@ -481,8 +449,6 @@ pub struct MtpSpecRound {
 pub struct DecodeEngine {
     weights: Qwen38Weights,
     state: ModelState,
-    /// Extra model states for batch items 1..batch_size-1.
-    extra_states: Vec<ModelState>,
     scratch: PersistentDecodeScratch,
     rotary: RotaryTables,
     hidden_io: GpuBuffer,
@@ -505,12 +471,8 @@ pub struct DecodeEngine {
     int4_scale_device: Option<GpuBuffer>,
     /// Prefill chunk size (0 = no chunking).
     prefill_chunk_size: usize,
-    /// Use FP8 E4M3 KV cache with dynamic per-head scaling.
-    kv_fp8: bool,
     /// Optional total decode context reservation for preallocated KV storage.
     decode_context_limit: Option<usize>,
-    /// Batch size (1 = single-sequence, default).
-    batch_size: usize,
     /// Cached workspace for the Qwen3.8 MTP fused verifier.
     /// The fused verify path runs the persistent 4B megakernel with
     /// `batch_size = B` while the live engine is constructed with
@@ -683,405 +645,6 @@ impl DecodeEngine {
         self.scratch.workspace.as_ptr() as usize
     }
 
-    fn load_kv_shadow_for_state_static(
-        config: &TextConfig,
-        ordinal: usize,
-        state: &mut ModelState,
-    ) -> Result<()> {
-        let num_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
-        let elem_bytes = ScalarType::BF16.size_in_bytes();
-
-        for layer_idx in 0..state.layers.len() {
-            if !config.is_full_attention(layer_idx) {
-                continue;
-            }
-            let should_populate = {
-                let ls = &state.layers[layer_idx];
-                ls.kv_shadow_k.is_some()
-                    && ls.kv_shadow_v.is_some()
-                    && ls.kv_shadow_start == ls.kv_filled
-            };
-            if !should_populate {
-                continue;
-            }
-
-            let (prefix_k_host, prefix_v_host, prefix_len) =
-                Self::assemble_full_attention_prefix_cache_bf16_host_static(
-                    config, state, layer_idx,
-                )?;
-            if prefix_len == 0 {
-                state.layers[layer_idx].kv_shadow_start = 0;
-                continue;
-            }
-
-            let ls = &mut state.layers[layer_idx];
-            let shadow_k = ls
-                .kv_shadow_k
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing K shadow"))?;
-            let shadow_v = ls
-                .kv_shadow_v
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V shadow"))?;
-            let cap = shadow_k.shape()[2];
-            let cap_stride = cap * head_dim * elem_bytes;
-            let contig_stride = prefix_len * head_dim * elem_bytes;
-
-            // One-shot scratch: written once via H2D, DMA'd into shadow_k/v
-            // exactly once, then dropped at end of this iteration. No
-            // re-read, so GPU L2 is irrelevant — Scratch lets gfx1150 skip
-            // the H2D driver call (host-mapped pointer = host data target).
-            let tmp_k = GpuBuffer::from_host_bytes_with_kind(
-                ordinal,
-                ScalarType::BF16,
-                &[num_kv_heads, prefix_len, head_dim],
-                &prefix_k_host,
-                gpu_hal::BufferKind::Scratch,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow K H2D: {e}"))?;
-            let tmp_v = GpuBuffer::from_host_bytes_with_kind(
-                ordinal,
-                ScalarType::BF16,
-                &[num_kv_heads, prefix_len, head_dim],
-                &prefix_v_host,
-                gpu_hal::BufferKind::Scratch,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow V H2D: {e}"))?;
-
-            for h in 0..num_kv_heads {
-                gpu_hal::copy_d2d(
-                    ordinal,
-                    shadow_k.offset_ptr(h * cap_stride) as *mut c_void,
-                    tmp_k.offset_ptr(h * contig_stride),
-                    contig_stride,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow K copy h={h}: {e}"))?;
-                gpu_hal::copy_d2d(
-                    ordinal,
-                    shadow_v.offset_ptr(h * cap_stride) as *mut c_void,
-                    tmp_v.offset_ptr(h * contig_stride),
-                    contig_stride,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow V copy h={h}: {e}"))?;
-            }
-            ls.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
-                .map(|window| prefix_len.saturating_sub(window))
-                .unwrap_or(0);
-        }
-
-        Ok(())
-    }
-
-    fn assemble_full_attention_prefix_cache_bf16_host_static(
-        config: &TextConfig,
-        state: &ModelState,
-        layer_idx: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>, usize)> {
-        let ls = state
-            .layers
-            .get(layer_idx)
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} out of range"))?;
-        let prefix_len = ls.kv_filled;
-        let num_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
-        let elem_bytes = ScalarType::BF16.size_in_bytes();
-        let mut out_k = vec![0u8; num_kv_heads * prefix_len * head_dim * elem_bytes];
-        let mut out_v = vec![0u8; num_kv_heads * prefix_len * head_dim * elem_bytes];
-        if prefix_len == 0 {
-            return Ok((out_k, out_v, prefix_len));
-        }
-
-        let cap = ls.kv_capacity();
-
-        if let (Some(scale_k), Some(scale_v)) = (ls.kv_scale_k.as_ref(), ls.kv_scale_v.as_ref()) {
-            let cache_k = ls
-                .kv_cache_k
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing FP8 K cache"))?;
-            let cache_v = ls
-                .kv_cache_v
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing FP8 V cache"))?;
-            let k_bytes = cache_k
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} fp8 K cache D2H: {e}"))?;
-            let v_bytes = cache_v
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} fp8 V cache D2H: {e}"))?;
-            let k_scales = decode_f32_le(
-                &scale_k
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} fp8 K scale D2H: {e}"))?,
-            );
-            let v_scales = decode_f32_le(
-                &scale_v
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} fp8 V scale D2H: {e}"))?,
-            );
-
-            let mut deq_k = Vec::with_capacity(num_kv_heads * prefix_len * head_dim);
-            let mut deq_v = Vec::with_capacity(num_kv_heads * prefix_len * head_dim);
-            for h in 0..num_kv_heads {
-                for t in 0..prefix_len {
-                    let scale_k_val = k_scales[h * cap + t];
-                    let scale_v_val = v_scales[h * cap + t];
-                    let base = (h * cap + t) * head_dim;
-                    for d in 0..head_dim {
-                        deq_k.push(fp8_e4m3_to_f32_host(k_bytes[base + d]) * scale_k_val);
-                        deq_v.push(fp8_e4m3_to_f32_host(v_bytes[base + d]) * scale_v_val);
-                    }
-                }
-            }
-            out_k = f32_to_bf16_bytes_host(deq_k);
-            out_v = f32_to_bf16_bytes_host(deq_v);
-        } else if ls.has_virtual_kv_cache() {
-            let packed_kv = ls
-                .virtual_kv_cache_k
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing virtual K cache"))?;
-            let k_bytes = packed_kv
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} virtual BF16 K cache D2H: {e}"))?;
-            let v_bytes = if let Some(v_cache) = ls.virtual_kv_cache_v.as_ref() {
-                v_cache.to_host_bytes().map_err(|e| {
-                    anyhow::anyhow!("layer {layer_idx} virtual BF16 V cache D2H: {e}")
-                })?
-            } else {
-                k_bytes.clone()
-            };
-            let v_base = if ls.virtual_kv_cache_v.is_some() {
-                0
-            } else {
-                k_bytes.len() / 2
-            };
-            let src_head_stride = cap * head_dim * elem_bytes;
-            let dst_head_stride = prefix_len * head_dim * elem_bytes;
-            let copy_bytes = prefix_len * head_dim * elem_bytes;
-            for h in 0..num_kv_heads {
-                let src = h * src_head_stride;
-                let dst = h * dst_head_stride;
-                out_k[dst..dst + copy_bytes].copy_from_slice(&k_bytes[src..src + copy_bytes]);
-                out_v[dst..dst + copy_bytes]
-                    .copy_from_slice(&v_bytes[v_base + src..v_base + src + copy_bytes]);
-            }
-        } else {
-            let cache_k = ls
-                .kv_cache_k
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing BF16 K cache"))?;
-            let cache_v = ls
-                .kv_cache_v
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing BF16 V cache"))?;
-            let k_bytes = cache_k
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} BF16 K cache D2H: {e}"))?;
-            let v_bytes = cache_v
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} BF16 V cache D2H: {e}"))?;
-            let src_head_stride = cap * head_dim * elem_bytes;
-            let dst_head_stride = prefix_len * head_dim * elem_bytes;
-            let copy_bytes = prefix_len * head_dim * elem_bytes;
-            for h in 0..num_kv_heads {
-                let src = h * src_head_stride;
-                let dst = h * dst_head_stride;
-                out_k[dst..dst + copy_bytes].copy_from_slice(&k_bytes[src..src + copy_bytes]);
-                out_v[dst..dst + copy_bytes].copy_from_slice(&v_bytes[src..src + copy_bytes]);
-            }
-        }
-
-        Ok((out_k, out_v, prefix_len))
-    }
-
-    fn assemble_full_attention_prefix_cache_bf16_host_for_state(
-        &self,
-        state: &ModelState,
-        layer_idx: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>, usize)> {
-        Self::assemble_full_attention_prefix_cache_bf16_host_static(
-            &self.weights.config,
-            state,
-            layer_idx,
-        )
-    }
-
-    pub fn full_attention_prefix_cache_bf16_host(
-        &self,
-        layer_idx: usize,
-        batch_index: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>, usize)> {
-        let state = self.state_for_batch(batch_index);
-        self.assemble_full_attention_prefix_cache_bf16_host_for_state(state, layer_idx)
-    }
-
-    pub fn full_attention_prefix_cache_snapshots_bf16_host(
-        &self,
-    ) -> Result<Vec<(usize, Vec<u8>, Vec<u8>, usize)>> {
-        let mut snapshots = Vec::new();
-        for idx in 0..self.weights.config.num_hidden_layers {
-            if self.weights.config.is_full_attention(idx) {
-                let (k, v, len) = self.full_attention_prefix_cache_bf16_host(idx, 0)?;
-                snapshots.push((idx, k, v, len));
-            }
-        }
-        Ok(snapshots)
-    }
-
-    pub fn full_attention_cache_step_bytes(
-        &self,
-        layer_idx: usize,
-        batch_index: usize,
-        seq_pos: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let config = self.weights.config.clone();
-        let ls = self
-            .state_for_batch(batch_index)
-            .layers
-            .get(layer_idx)
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} out of range"))?;
-        let cache_k = ls
-            .kv_cache_k
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing K cache"))?;
-        let cache_v = ls
-            .kv_cache_v
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V cache"))?;
-        let num_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
-        let elem_bytes = ScalarType::BF16.size_in_bytes();
-        let step_k = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {layer_idx} trace step_k alloc: {e}"))?;
-        let step_v = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {layer_idx} trace step_v alloc: {e}"))?;
-
-        let cap = cache_k.shape()[2];
-        let cap_stride = cap * head_dim * elem_bytes;
-        let src_stride = head_dim * elem_bytes;
-        let dst_stride = head_dim * elem_bytes;
-        let src_offset = seq_pos * head_dim * elem_bytes;
-        for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
-                self.ordinal,
-                step_k.offset_ptr(h * dst_stride) as *mut c_void,
-                cache_k.offset_ptr(h * cap_stride + src_offset),
-                src_stride,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {layer_idx} trace step_k copy h={h}: {e}"))?;
-            gpu_hal::copy_d2d(
-                self.ordinal,
-                step_v.offset_ptr(h * dst_stride) as *mut c_void,
-                cache_v.offset_ptr(h * cap_stride + src_offset),
-                src_stride,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {layer_idx} trace step_v copy h={h}: {e}"))?;
-        }
-
-        Ok((
-            step_k
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} trace step_k D2H: {e}"))?,
-            step_v
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} trace step_v D2H: {e}"))?,
-        ))
-    }
-
-    fn apply_oracle_hidden(&mut self, oracle: &OracleOutput) -> Result<()> {
-        let b64 = base64::engine::general_purpose::STANDARD;
-
-        let hidden_b64 = oracle
-            .prefill_hidden
-            .as_ref()
-            .context("oracle output missing prefill_hidden (use --emit-state)")?;
-        let hidden_bytes = b64
-            .decode(hidden_b64)
-            .context("decode prefill_hidden base64")?;
-        let hidden_shape = oracle
-            .prefill_hidden_shape
-            .as_ref()
-            .context("missing prefill_hidden_shape")?;
-        // Oracle's tensor_to_b64 may return the full underlying storage (all tokens)
-        // instead of just the last token. Take only the last token's worth of bytes.
-        let expected_bytes: usize =
-            hidden_shape.iter().product::<usize>() * ScalarType::BF16.size_in_bytes();
-        let actual_hidden = if hidden_bytes.len() > expected_bytes {
-            &hidden_bytes[hidden_bytes.len() - expected_bytes..]
-        } else {
-            &hidden_bytes
-        };
-        self.hidden_io =
-            GpuBuffer::from_host_bytes(self.ordinal, ScalarType::BF16, hidden_shape, actual_hidden)
-                .map_err(|e| anyhow::anyhow!("load prefill hidden: {e}"))?;
-        Ok(())
-    }
-
-    fn apply_oracle_full_attention_state(&mut self, oracle: &OracleOutput) -> Result<()> {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let kv_caches = oracle
-            .kv_caches
-            .as_ref()
-            .context("oracle output missing kv_caches")?;
-        for kv in kv_caches {
-            let k_bytes = b64.decode(&kv.k).context("decode KV k base64")?;
-            let v_bytes = b64.decode(&kv.v).context("decode KV v base64")?;
-            let ls = &mut self.state.layers[kv.layer];
-            ls.kv_cache_k = Some(
-                GpuBuffer::from_host_bytes(self.ordinal, ScalarType::BF16, &kv.k_shape, &k_bytes)
-                    .map_err(|e| anyhow::anyhow!("load KV k layer {}: {e}", kv.layer))?,
-            );
-            ls.kv_cache_v = Some(
-                GpuBuffer::from_host_bytes(self.ordinal, ScalarType::BF16, &kv.v_shape, &v_bytes)
-                    .map_err(|e| anyhow::anyhow!("load KV v layer {}: {e}", kv.layer))?,
-            );
-            ls.kv_filled = kv.k_shape[2];
-        }
-        Ok(())
-    }
-
-    fn apply_oracle_linear_attention_state(&mut self, oracle: &OracleOutput) -> Result<()> {
-        self.apply_oracle_conv_state(oracle)?;
-        self.apply_oracle_recurrent_state(oracle)?;
-        Ok(())
-    }
-
-    fn apply_oracle_conv_state(&mut self, oracle: &OracleOutput) -> Result<()> {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let conv_states = oracle
-            .conv_states
-            .as_ref()
-            .context("oracle output missing conv_states")?;
-        for cs in conv_states {
-            let bytes = b64.decode(&cs.data).context("decode conv_state base64")?;
-            let ls = &mut self.state.layers[cs.layer];
-            ls.conv_state = Some(
-                GpuBuffer::from_host_bytes(self.ordinal, ScalarType::BF16, &cs.shape, &bytes)
-                    .map_err(|e| anyhow::anyhow!("load conv_state layer {}: {e}", cs.layer))?,
-            );
-        }
-        Ok(())
-    }
-
-    fn apply_oracle_recurrent_state(&mut self, oracle: &OracleOutput) -> Result<()> {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let rec_states = oracle
-            .recurrent_states
-            .as_ref()
-            .context("oracle output missing recurrent_states")?;
-        for rs in rec_states {
-            let bytes = b64
-                .decode(&rs.data)
-                .context("decode recurrent_state base64")?;
-            let ls = &mut self.state.layers[rs.layer];
-            ls.recurrent_state = Some(
-                GpuBuffer::from_host_bytes(self.ordinal, ScalarType::F32, &rs.shape, &bytes)
-                    .map_err(|e| anyhow::anyhow!("load recurrent_state layer {}: {e}", rs.layer))?,
-            );
-        }
-        Ok(())
-    }
-
     pub fn new(
         weights: Qwen38Weights,
         ordinal: usize,
@@ -1090,8 +653,6 @@ impl DecodeEngine {
         kv_chunk_size: usize,
         use_4b_kernel: bool,
         prefill_chunk_size: usize,
-        kv_fp8: bool,
-        batch_size: usize,
     ) -> Result<Self> {
         let config = &weights.config;
         let rotary =
@@ -1105,8 +666,6 @@ impl DecodeEngine {
             kv_chunk_size,
             use_4b_kernel,
             prefill_chunk_size,
-            kv_fp8,
-            batch_size,
         )
     }
 
@@ -1119,21 +678,10 @@ impl DecodeEngine {
         kv_chunk_size: usize,
         use_4b_kernel: bool,
         prefill_chunk_size: usize,
-        kv_fp8: bool,
-        batch_size: usize,
     ) -> Result<Self> {
         let config = &weights.config;
         let state = ModelState::new(config, ordinal)
             .map_err(|e| anyhow::anyhow!("model state init: {e}"))?;
-
-        // Create extra model states for batch items 1..batch_size
-        let mut extra_states = Vec::new();
-        for b in 1..batch_size {
-            extra_states.push(
-                ModelState::new(config, ordinal)
-                    .map_err(|e| anyhow::anyhow!("model state init (batch {b}): {e}"))?,
-            );
-        }
 
         let scratch = PersistentDecodeScratch::new(
             ordinal,
@@ -1142,33 +690,16 @@ impl DecodeEngine {
             config.num_hidden_layers,
             proj_buf_floats,
             attn_scratch_floats,
-            batch_size,
         )
         .map_err(|e| anyhow::anyhow!("scratch init: {e}"))?;
-        let hidden_io = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[batch_size, 1, config.hidden_size],
-        )
-        .map_err(|e| anyhow::anyhow!("hidden_io: {e}"))?;
-        let normed_buf = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[batch_size, 1, config.hidden_size],
-        )
-        .map_err(|e| anyhow::anyhow!("normed_buf: {e}"))?;
-        let logits_buf = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[batch_size, 1, config.vocab_size],
-        )
-        .map_err(|e| anyhow::anyhow!("logits_buf: {e}"))?;
-        let logits_f32_buf = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::F32,
-            &[batch_size, 1, config.vocab_size],
-        )
-        .map_err(|e| anyhow::anyhow!("logits_f32_buf: {e}"))?;
+        let hidden_io = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, config.hidden_size])
+            .map_err(|e| anyhow::anyhow!("hidden_io: {e}"))?;
+        let normed_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, config.hidden_size])
+            .map_err(|e| anyhow::anyhow!("normed_buf: {e}"))?;
+        let logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, config.vocab_size])
+            .map_err(|e| anyhow::anyhow!("logits_buf: {e}"))?;
+        let logits_f32_buf = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, config.vocab_size])
+            .map_err(|e| anyhow::anyhow!("logits_f32_buf: {e}"))?;
         let argmax_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("argmax_buf: {e}"))?;
         let lm_head_block_best_vals = GpuBuffer::zeros(ordinal, ScalarType::F32, &[512])
@@ -1217,7 +748,6 @@ impl DecodeEngine {
         Ok(Self {
             weights,
             state,
-            extra_states,
             scratch,
             rotary,
             hidden_io,
@@ -1236,9 +766,7 @@ impl DecodeEngine {
             fp8_scale_device,
             int4_scale_device,
             prefill_chunk_size,
-            kv_fp8,
             decode_context_limit: None,
-            batch_size,
             mtp_verify_cache: None,
             mtp_prefill_append_cache: None,
             mtp_verify_scratch: None,
@@ -1765,91 +1293,11 @@ impl DecodeEngine {
     }
 
     pub fn set_decode_context_limit(&mut self, context_tokens: usize) {
-        let context_tokens = context_tokens.max(1);
-        self.decode_context_limit = Some(context_tokens);
-        self.maybe_enable_virtual_bf16_kv(context_tokens);
-    }
-
-    pub fn kv_fp8_enabled(&self) -> bool {
-        self.kv_fp8
-    }
-
-    pub fn virtual_kv_memory_stats(&self) -> qwen38::state::VirtualKvMemoryStats {
-        self.state.virtual_kv_memory_stats()
-    }
-
-    pub fn virtual_kv_memory_stats_by_layer(
-        &self,
-    ) -> Vec<(usize, qwen38::state::VirtualKvMemoryStats)> {
-        self.state.virtual_kv_memory_stats_by_layer()
-    }
-
-    pub fn evict_virtual_kv_to_host(&mut self) -> Result<()> {
-        if std::env::var_os("SUPERSONIC_VMM_KV_RESTORE_TO_VMM").is_some() {
-            self.state
-                .evict_virtual_kv_to_host(&self.weights.config)
-                .map_err(|e| anyhow::anyhow!("evict virtual KV to host: {e}"))
-        } else {
-            let snapshots = self.full_attention_prefix_cache_snapshots_bf16_host()?;
-            self.state
-                .evict_virtual_kv_to_host_from_snapshots(&self.weights.config, snapshots)
-                .map_err(|e| anyhow::anyhow!("evict virtual KV to host: {e}"))
-        }
-    }
-
-    pub fn restore_virtual_kv_from_host(&mut self) -> Result<()> {
-        self.state
-            .restore_virtual_kv_from_host()
-            .map_err(|e| anyhow::anyhow!("restore virtual KV from host: {e}"))
-    }
-
-    pub fn restore_virtual_kv_from_host_to_vmm(&mut self) -> Result<()> {
-        self.state
-            .restore_virtual_kv_from_host_to_vmm()
-            .map_err(|e| anyhow::anyhow!("restore virtual KV from host to VMM: {e}"))
-    }
-
-    fn maybe_enable_virtual_bf16_kv(&mut self, context_tokens: usize) {
-        let env = std::env::var("SUPERSONIC_VMM_KV").ok();
-        if env.as_deref() == Some("0") {
-            return;
-        }
-        if self.kv_fp8 || self.batch_size != 1 {
-            return;
-        }
-        let backend = self.hidden_io.backend();
-        if self.use_4b_kernel {
-            if env.as_deref() == Some("1") {
-                eprintln!(
-                    "[vmm] requested by SUPERSONIC_VMM_KV=1 but backend={backend} device={} is using the 4B/component decode path, which does not support virtual KV yet; using dense KV allocator",
-                    self.ordinal
-                );
-            }
-            return;
-        }
-        if backend != gpu_hal::Backend::Hip && env.as_deref() != Some("1") {
-            return;
-        }
-        let supported = gpu_hal::vmm_is_supported(backend, self.ordinal);
-        if !supported {
-            if env.as_deref() == Some("1") {
-                eprintln!(
-                    "[vmm] requested by SUPERSONIC_VMM_KV=1 but backend={backend} device={} does not support VMM; using dense KV allocator",
-                    self.ordinal
-                );
-            }
-            return;
-        }
-        self.state
-            .enable_virtual_bf16_kv(&self.weights.config, context_tokens);
-        eprintln!(
-            "[vmm] Qwen3.8 BF16 dense KV uses reserved virtual memory for {} tokens",
-            context_tokens
-        );
+        self.decode_context_limit = Some(context_tokens.max(1));
     }
 
     /// Verify the engine's attn_scratch budget covers the current largest
-    /// `kv_max_t` across all full-attention layers (of every batch item).
+    /// `kv_max_t` across all full-attention layers.
     /// The 4B persistent decode kernel writes `saved_q+gate+pre_gate+scores`
     /// into attn_scratch; `saved_scores` is indexed `[qh * kv_max_b + t]`.
     fn check_attn_scratch_budget(&self) -> Result<()> {
@@ -1861,10 +1309,8 @@ impl DecodeEngine {
         let hd = config.head_dim;
         let base = 3 * nh * hd;
         let mut max_kv = 0usize;
-        for st in std::iter::once(&self.state).chain(self.extra_states.iter()) {
-            for ls in &st.layers {
-                max_kv = max_kv.max(ls.kv_capacity());
-            }
+        for ls in &self.state.layers {
+            max_kv = max_kv.max(ls.kv_capacity());
         }
         let required = base + nh * max_kv;
         if required > self.attn_scratch_floats {
@@ -1880,42 +1326,12 @@ impl DecodeEngine {
         Ok(())
     }
 
-    pub fn set_kv_fp8_for_trace(&mut self, enabled: bool) {
-        self.kv_fp8 = enabled;
-    }
-
     pub fn rotary(&self) -> &RotaryTables {
         &self.rotary
     }
 
-    pub fn state_for_batch(&self, batch_index: usize) -> &ModelState {
-        if batch_index == 0 {
-            &self.state
-        } else {
-            &self.extra_states[batch_index - 1]
-        }
-    }
-
-    pub fn load_prefill_state(&mut self, oracle: &OracleOutput) -> Result<()> {
-        self.apply_oracle_hidden(oracle)?;
-        self.apply_oracle_full_attention_state(oracle)?;
-        self.apply_oracle_linear_attention_state(oracle)?;
-
-        // Convert BF16 KV caches to FP8 if requested
-        if self.kv_fp8 {
-            prefill_engine::convert_kv_caches_to_fp8(
-                &mut self.state,
-                &self.weights.config,
-                self.ordinal,
-            )?;
-        }
-
-        // Reset sync counters for fresh kernel launch sequence
-        self.scratch
-            .reset_sync()
-            .map_err(|e| anyhow::anyhow!("reset sync: {e}"))?;
-
-        Ok(())
+    pub fn state(&self) -> &ModelState {
+        &self.state
     }
 
     /// Reset per-session state so the engine is ready for a fresh prompt.
@@ -1925,10 +1341,6 @@ impl DecodeEngine {
     pub fn reset(&mut self) -> Result<()> {
         self.state = ModelState::new(&self.weights.config, self.ordinal)
             .map_err(|e| anyhow::anyhow!("reset model state: {e}"))?;
-        for es in &mut self.extra_states {
-            *es = ModelState::new(&self.weights.config, self.ordinal)
-                .map_err(|e| anyhow::anyhow!("reset extra state: {e}"))?;
-        }
         self.scratch
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("reset sync: {e}"))?;
@@ -1990,7 +1402,6 @@ impl DecodeEngine {
             self.ordinal,
             self.kv_chunk_size,
             self.prefill_chunk_size,
-            self.kv_fp8,
             self.use_4b_kernel,
             false,
             None,
@@ -2016,7 +1427,6 @@ impl DecodeEngine {
             self.ordinal,
             self.kv_chunk_size,
             self.prefill_chunk_size,
-            self.kv_fp8,
             self.use_4b_kernel,
             false,
             None,
@@ -2027,25 +1437,16 @@ impl DecodeEngine {
         Ok(result)
     }
 
-    /// Rebuild sequence-0 state from scratch by replaying native GPU prefill
-    /// over the provided token history. Optionally replicates that state across
-    /// extra batch slots for lockstep batch decoding.
-    pub fn rebuild_prefill_state(
-        &mut self,
-        token_ids: &[u32],
-        replicate_batch: bool,
-    ) -> Result<Vec<f32>> {
+    /// Rebuild the single-sequence state from scratch by replaying native GPU
+    /// prefill over the provided token history.
+    pub fn rebuild_prefill_state(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
         self.state = ModelState::new(&self.weights.config, self.ordinal)
             .map_err(|e| anyhow::anyhow!("rebuild model state init: {e}"))?;
-        let logits = self.prefill_native(token_ids)?;
-        if replicate_batch && self.batch_size > 1 {
-            self.replicate_state_to_batch()?;
-        }
-        Ok(logits)
+        self.prefill_native(token_ids)
     }
 
     pub fn rebuild_prefill_state_greedy_token(&mut self, token_ids: &[u32]) -> Result<u32> {
-        let logits = self.rebuild_prefill_state(token_ids, false)?;
+        let logits = self.rebuild_prefill_state(token_ids)?;
         Ok(Self::greedy_sample(&logits))
     }
 
@@ -2061,7 +1462,6 @@ impl DecodeEngine {
             self.ordinal,
             self.kv_chunk_size,
             self.prefill_chunk_size,
-            self.kv_fp8,
             self.use_4b_kernel,
             true,
             None,
@@ -2104,29 +1504,13 @@ impl DecodeEngine {
         for (idx, layer) in self.state.layers.iter_mut().enumerate() {
             if config.is_full_attention(idx) {
                 layer
-                    .ensure_kv_capacity(
-                        seqlen_offset,
-                        self.ordinal,
-                        config,
-                        self.kv_chunk_size,
-                        self.kv_fp8,
-                    )
+                    .ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size)
                     .map_err(|e| anyhow::anyhow!("ensure KV capacity layer {idx}: {e}"))?;
             }
         }
         self.check_attn_scratch_budget()?;
-        if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
-            Self::load_kv_shadow_for_state_static(
-                &self.weights.config,
-                self.ordinal,
-                &mut self.state,
-            )?;
-        }
         let descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
         self.scratch.upload_descs(&descs)?;
-        if let Some(descs) = build_kv_fp8_descs(&self.state, self.kv_fp8) {
-            self.scratch.upload_kv_fp8_descs(&descs)?;
-        }
         gpu_hal::memset_zeros(
             self.ordinal,
             self.scratch.workspace.as_mut_ptr(),
@@ -2220,65 +1604,7 @@ impl DecodeEngine {
         Ok((logits, out.timings))
     }
 
-    fn gqh_component_decode_enabled(&self) -> bool {
-        !self.weights.gqh_headers.is_empty()
-            && std::env::var_os("SUPERSONIC_QWEN38_GQH_COMPONENT_DECODE").is_some()
-    }
-
-    /// Dedicated GQH/ggml-K matvecs plus the slim prefill attention/linear/MLP
-    /// cores. The fat persistent 4B kernel cannot occupy well with GQH walkers
-    /// inlined; this path matches the 66 ms standalone proj budget plus cores.
-    fn decode_step_gqh_component(
-        &mut self,
-        token_id: u32,
-        seqlen_offset: usize,
-    ) -> Result<(Vec<f32>, DecodeStageTimings)> {
-        let mut scratch = match self.mtp_verify_scratch.take() {
-            Some(scratch) => scratch,
-            None => MtpVerifyScratch::new(&self.weights.config, self.ordinal)?,
-        };
-        maybe_dump_gqh_decode_state(
-            &self.state,
-            &self.weights.config,
-            Some(&self.hidden_io),
-            "before",
-            token_id,
-            seqlen_offset,
-            "component",
-        );
-        let start = Instant::now();
-        let result = mtp_decode_step(
-            &self.weights,
-            &mut self.state,
-            &self.rotary,
-            &mut scratch,
-            token_id,
-            seqlen_offset,
-            self.ordinal,
-            self.kv_chunk_size,
-        );
-        let copy = scratch.copy_last_residual_to(self.ordinal, &mut self.hidden_io);
-        self.mtp_verify_scratch = Some(scratch);
-        copy?;
-        let logits = result?;
-        maybe_dump_gqh_decode_state(
-            &self.state,
-            &self.weights.config,
-            Some(&self.hidden_io),
-            "after",
-            token_id,
-            seqlen_offset,
-            "component",
-        );
-        let mut timings = DecodeStageTimings::default();
-        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
-        Ok((logits, timings))
-    }
-
     pub fn decode_step(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
-        if self.gqh_component_decode_enabled() {
-            return Ok(self.decode_step_gqh_component(token_id, seqlen_offset)?.0);
-        }
         if self.use_4b_kernel {
             return Ok(self
                 .decode_step_4b_single_kernel_with_timings(token_id, seqlen_offset)?
@@ -2337,9 +1663,8 @@ impl DecodeEngine {
             self.proj_buf_floats,
             self.attn_scratch_floats,
             self.fp8_scale_device.as_ref(),
-            self.scratch.kv_fp8_desc_device.as_ref(),
             1,
-            self.scratch.batch_seq_desc_device.as_ref(),
+            None,
             self.int4_scale_device.as_ref(),
             false,
             false,
@@ -2406,13 +1731,8 @@ impl DecodeEngine {
             self.use_4b_kernel,
             "decode_step_4b_single_kernel_with_timings requires 4B kernel"
         );
-        anyhow::ensure!(
-            self.batch_size == 1,
-            "decode_step_4b_single_kernel_with_timings requires batch_size == 1"
-        );
-
         let (mut batch_logits, mut timings) =
-            self.decode_step_batch_impl(&[token_id], seqlen_offset, true, false)?;
+            self.decode_step_single_kernel_impl(token_id, seqlen_offset, true)?;
         let logits = batch_logits
             .pop()
             .ok_or_else(|| anyhow::anyhow!("single-sequence 4B kernel timings missing logits"))?;
@@ -2452,9 +1772,6 @@ impl DecodeEngine {
         greedy_only: bool,
         greedy_compare_tokens: Option<&[u32]>,
     ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
-        if self.kv_fp8 {
-            anyhow::bail!("verify_block_prefill_append does not support kv_fp8");
-        }
         if tokens.is_empty() {
             anyhow::bail!("verify_block_prefill_append: tokens must be non-empty");
         }
@@ -2465,13 +1782,7 @@ impl DecodeEngine {
             for (idx, layer_state) in self.state.layers.iter_mut().enumerate() {
                 if config.is_full_attention(idx) {
                     layer_state
-                        .ensure_kv_capacity(
-                            max_pos,
-                            self.ordinal,
-                            config,
-                            self.kv_chunk_size,
-                            false,
-                        )
+                        .ensure_kv_capacity(max_pos, self.ordinal, config, self.kv_chunk_size)
                         .map_err(|e| {
                             anyhow::anyhow!("prefill append ensure KV layer {idx}: {e}")
                         })?;
@@ -2516,10 +1827,7 @@ impl DecodeEngine {
     /// prior positions within the same launch.
     ///
     /// Requirements:
-    /// * `use_4b_kernel = true` and `batch_size = 1` (engine construction
-    ///   is not mutated; a verify-local B-sized cache is used instead).
-    /// * `kv_fp8 = false` — fused verify uses BF16 KV like
-    ///   `verify_block_prefill`.
+    /// * `use_4b_kernel = true` (a verify-local B-slot cache is used).
     /// * `tokens.len()` must be in `1..=MAX_BATCH_SIZE` (kernel limit).
     ///
     /// Semantics match `verify_block_prefill`: full-attention K/V is
@@ -2559,12 +1867,6 @@ impl DecodeEngine {
     ) -> Result<(Vec<Vec<f32>>, Vec<u32>)> {
         if !self.use_4b_kernel {
             anyhow::bail!("verify_block_fused_decode requires use_4b_kernel");
-        }
-        if self.batch_size != 1 {
-            anyhow::bail!("verify_block_fused_decode requires engine batch_size=1");
-        }
-        if self.kv_fp8 {
-            anyhow::bail!("verify_block_fused_decode does not support kv_fp8");
         }
         if tokens.is_empty() {
             anyhow::bail!("verify_block_fused_decode: tokens must be non-empty");
@@ -2621,14 +1923,8 @@ impl DecodeEngine {
             let config = &self.weights.config;
             for (i, ls) in self.state.layers.iter_mut().enumerate() {
                 if config.is_full_attention(i) {
-                    ls.ensure_kv_capacity(
-                        max_pos,
-                        self.ordinal,
-                        config,
-                        self.kv_chunk_size,
-                        self.kv_fp8,
-                    )
-                    .map_err(|e| anyhow::anyhow!("fused verify ensure KV layer {i}: {e}"))?;
+                    ls.ensure_kv_capacity(max_pos, self.ordinal, config, self.kv_chunk_size)
+                        .map_err(|e| anyhow::anyhow!("fused verify ensure KV layer {i}: {e}"))?;
                 }
             }
         }
@@ -2666,10 +1962,9 @@ impl DecodeEngine {
         // offset for RoPE + KV append + causal read.
         let state_refs: Vec<&ModelState> = (0..b).map(|_| &self.state).collect();
         let seqlen_offsets: Vec<usize> = (0..b).map(|bi| pos_offset + bi).collect();
-        let batch_descs =
-            build_batch_seq_descs(&state_refs, &seqlen_offsets, /* kv_fp8 */ false).ok_or_else(
-                || anyhow::anyhow!("fused verify: build_batch_seq_descs returned None for B={b}"),
-            )?;
+        let batch_descs = build_batch_seq_descs(&state_refs, &seqlen_offsets).ok_or_else(|| {
+            anyhow::anyhow!("fused verify: build_batch_seq_descs returned None for B={b}")
+        })?;
         let desc_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 batch_descs.as_ptr() as *const u8,
@@ -2733,7 +2028,6 @@ impl DecodeEngine {
             self.proj_buf_floats,
             self.attn_scratch_floats,
             self.fp8_scale_device.as_ref(),
-            None, // kv_fp8_descs: fused verify disallows kv_fp8
             b,
             Some(&cache.batch_desc_device),
             self.int4_scale_device.as_ref(),
@@ -2879,138 +2173,39 @@ impl DecodeEngine {
             .collect())
     }
 
-    /// Copy prefill state from sequence 0 to all extra batch sequences.
-    /// Call after load_prefill_state() or prefill_native() to initialize batch items.
-    pub fn replicate_state_to_batch(&mut self) -> Result<()> {
-        for b in 0..self.extra_states.len() {
-            self.extra_states[b] = self
-                .state
-                .clone_gpu()
-                .map_err(|e| anyhow::anyhow!("clone state to batch {}: {e}", b + 1))?;
-        }
-        Ok(())
-    }
-
-    /// Run one batched decode step. Returns per-sequence logits.
-    /// `token_ids`: one token per batch item.
-    /// `seqlen_offset`: shared sequence position (all sequences advance in lockstep).
-    pub fn decode_step_batch(
+    fn decode_step_single_kernel_impl(
         &mut self,
-        token_ids: &[u32],
-        seqlen_offset: usize,
-    ) -> Result<Vec<Vec<f32>>> {
-        let (all_logits, _) =
-            self.decode_step_batch_impl(token_ids, seqlen_offset, false, false)?;
-        Ok(all_logits)
-    }
-
-    /// Run one batched decode step and return per-sequence logits plus native
-    /// stage timings for the persistent batch path.
-    pub fn decode_step_batch_with_timings(
-        &mut self,
-        token_ids: &[u32],
-        seqlen_offset: usize,
-    ) -> Result<(Vec<Vec<f32>>, DecodeStageTimings)> {
-        self.decode_step_batch_impl(token_ids, seqlen_offset, true, false)
-    }
-
-    fn build_optional_batch_seq_descs_for_decode(
-        states: &[&ModelState],
-        seqlen_offsets: &[usize],
-        kv_fp8: bool,
-    ) -> Result<Option<Vec<kernel_ffi::BatchSeqDesc>>> {
-        if states.len() <= 1 {
-            return Ok(None);
-        }
-        let descs = build_batch_seq_descs(states, seqlen_offsets, kv_fp8).ok_or_else(|| {
-            anyhow::anyhow!("build batch sequence descriptors for B={}", states.len())
-        })?;
-        Ok(Some(descs))
-    }
-
-    fn decode_step_batch_impl(
-        &mut self,
-        token_ids: &[u32],
+        token_id: u32,
         seqlen_offset: usize,
         enable_timing_slots: bool,
-        greedy_argmax: bool,
     ) -> Result<(Vec<Vec<f32>>, DecodeStageTimings)> {
-        anyhow::ensure!(
-            token_ids.len() == self.batch_size,
-            "batch token count must match engine batch size"
-        );
-        anyhow::ensure!(self.use_4b_kernel, "batched decode requires 4B kernel");
+        anyhow::ensure!(self.use_4b_kernel, "single decode requires 4B kernel");
         let config = &self.weights.config;
-        let b = self.batch_size;
         let mut timings = DecodeStageTimings::default();
         let row_bytes = config.hidden_size * ScalarType::BF16.size_in_bytes();
+        gpu_hal::copy_d2d(
+            self.ordinal,
+            self.hidden_io.as_ptr() as *mut c_void,
+            self.weights
+                .embed_tokens()
+                .offset_ptr(token_id as usize * row_bytes),
+            row_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("embedding lookup: {e}"))?;
 
-        for (bi, &token_id) in token_ids.iter().enumerate() {
-            gpu_hal::copy_d2d(
-                self.ordinal,
-                unsafe { (self.hidden_io.as_ptr() as *mut u8).add(bi * row_bytes) as *mut c_void },
-                self.weights
-                    .embed_tokens()
-                    .offset_ptr(token_id as usize * row_bytes),
-                row_bytes,
-            )
-            .map_err(|e| anyhow::anyhow!("embedding lookup batch {bi}: {e}"))?;
-        }
-
-        for bi in 0..b {
-            let state = if bi == 0 {
-                &mut self.state
-            } else {
-                &mut self.extra_states[bi - 1]
-            };
-            for (layer_idx, layer) in state.layers.iter_mut().enumerate() {
-                if config.is_full_attention(layer_idx) {
-                    layer
-                        .ensure_kv_capacity(
-                            seqlen_offset,
-                            self.ordinal,
-                            config,
-                            self.kv_chunk_size,
-                            self.kv_fp8,
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("ensure KV batch {bi} layer {layer_idx}: {e}")
-                        })?;
-                }
+        for (layer_idx, layer) in self.state.layers.iter_mut().enumerate() {
+            if config.is_full_attention(layer_idx) {
+                layer
+                    .ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size)
+                    .map_err(|e| anyhow::anyhow!("ensure KV layer {layer_idx}: {e}"))?;
             }
         }
         self.check_attn_scratch_budget()?;
-        if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
-            Self::load_kv_shadow_for_state_static(
-                &self.weights.config,
-                self.ordinal,
-                &mut self.state,
-            )?;
-            for state in &mut self.extra_states {
-                Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, state)?;
-            }
-        }
 
         let descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
         self.scratch
             .upload_descs(&descs)
             .map_err(|e| anyhow::anyhow!("upload decode descriptors: {e}"))?;
-        let state_refs: Vec<&ModelState> = std::iter::once(&self.state)
-            .chain(self.extra_states.iter())
-            .collect();
-        let offsets = vec![seqlen_offset; b];
-        let batch_descs =
-            Self::build_optional_batch_seq_descs_for_decode(&state_refs, &offsets, self.kv_fp8)?;
-        if let Some(ref batch_descs) = batch_descs {
-            self.scratch
-                .upload_batch_seq_descs(batch_descs)
-                .map_err(|e| anyhow::anyhow!("upload batch sequence descriptors: {e}"))?;
-        }
-        if let Some(kv_descs) = build_kv_fp8_descs(&self.state, self.kv_fp8) {
-            self.scratch
-                .upload_kv_fp8_descs(&kv_descs)
-                .map_err(|e| anyhow::anyhow!("upload KV descriptors: {e}"))?;
-        }
         gpu_hal::memset_zeros(
             self.ordinal,
             self.scratch.workspace.as_mut_ptr(),
@@ -3039,11 +2234,8 @@ impl DecodeEngine {
             self.proj_buf_floats,
             self.attn_scratch_floats,
             self.fp8_scale_device.as_ref(),
-            self.scratch.kv_fp8_desc_device.as_ref(),
-            b,
-            batch_descs
-                .as_ref()
-                .and_then(|_| self.scratch.batch_seq_desc_device.as_ref()),
+            1,
+            None,
             self.int4_scale_device.as_ref(),
             enable_timing_slots,
             false,
@@ -3052,16 +2244,9 @@ impl DecodeEngine {
         timings.persistent_ms = persistent_start.elapsed().as_secs_f64() * 1000.0;
 
         let filled = seqlen_offset + 1;
-        for bi in 0..b {
-            let state = if bi == 0 {
-                &mut self.state
-            } else {
-                &mut self.extra_states[bi - 1]
-            };
-            for (layer_idx, layer) in state.layers.iter_mut().enumerate() {
-                if config.is_full_attention(layer_idx) {
-                    layer.set_kv_filled(filled);
-                }
+        for (layer_idx, layer) in self.state.layers.iter_mut().enumerate() {
+            if config.is_full_attention(layer_idx) {
+                layer.set_kv_filled(filled);
             }
         }
 
@@ -3069,7 +2254,7 @@ impl DecodeEngine {
         rms_norm_rows_model(
             config,
             self.ordinal,
-            b,
+            1,
             config.hidden_size,
             &self.hidden_io,
             &self.weights.norm_weight,
@@ -3078,58 +2263,10 @@ impl DecodeEngine {
         )?;
         timings.rms_norm_ms = norm_start.elapsed().as_secs_f64() * 1000.0;
 
-        if greedy_argmax && b == 1 {
-            let lm_start = Instant::now();
-            if lm_head_lowbit(
-                self.ordinal,
-                1,
-                config.vocab_size,
-                config.hidden_size,
-                &self.normed_buf,
-                &self.weights,
-                &mut self.logits_f32_buf,
-                "greedy lm_head",
-            )? {
-            } else {
-                kernel_ffi::matmul_rhs_transposed_4b(
-                    self.ordinal,
-                    ScalarType::F32,
-                    1,
-                    1,
-                    config.vocab_size,
-                    config.hidden_size,
-                    &self.normed_buf,
-                    self.weights.lm_head(),
-                    &mut self.logits_f32_buf,
-                )
-                .map_err(|e| anyhow::anyhow!("greedy lm_head: {e}"))?;
-            }
-            timings.lm_head_ms = lm_start.elapsed().as_secs_f64() * 1000.0;
-            let argmax_start = Instant::now();
-            kernel_ffi::prefill_ffi::argmax_f32_as_bf16_rows(
-                self.ordinal,
-                1,
-                config.vocab_size,
-                &self.logits_f32_buf,
-                &mut self.argmax_buf,
-            )
-            .map_err(|e| anyhow::anyhow!("greedy argmax: {e}"))?;
-            let bytes = self.argmax_buf.to_host_bytes()?;
-            timings.logits_d2h_ms = argmax_start.elapsed().as_secs_f64() * 1000.0;
-            let token = u32::from_le_bytes(
-                bytes
-                    .get(..4)
-                    .ok_or_else(|| anyhow::anyhow!("greedy argmax returned truncated token"))?
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("greedy argmax token conversion"))?,
-            );
-            return Ok((vec![vec![f32::from_bits(token)]], timings));
-        }
-
         let lm_start = Instant::now();
-        if lm_head_lowbit(
+        if !lm_head_lowbit(
             self.ordinal,
-            b,
+            1,
             config.vocab_size,
             config.hidden_size,
             &self.normed_buf,
@@ -3137,12 +2274,11 @@ impl DecodeEngine {
             &mut self.logits_buf,
             "lm_head",
         )? {
-        } else {
             kernel_ffi::matmul_rhs_transposed_4b(
                 self.ordinal,
                 ScalarType::BF16,
                 1,
-                b,
+                1,
                 config.vocab_size,
                 config.hidden_size,
                 &self.normed_buf,
@@ -3154,18 +2290,16 @@ impl DecodeEngine {
         timings.lm_head_ms = lm_start.elapsed().as_secs_f64() * 1000.0;
 
         let d2h_start = Instant::now();
-        let logits_bytes = self.logits_buf.to_host_bytes()?;
+        let logits_bytes = self
+            .logits_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("logits D2H: {e}"))?;
         timings.logits_d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
-        let stride = config.vocab_size * ScalarType::BF16.size_in_bytes();
-        let all_logits = (0..b)
-            .map(|bi| {
-                logits_bytes[bi * stride..(bi + 1) * stride]
-                    .chunks_exact(2)
-                    .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                    .collect()
-            })
+        let logits = logits_bytes
+            .chunks_exact(2)
+            .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
             .collect();
-        Ok((all_logits, timings))
+        Ok((vec![logits], timings))
     }
 }
 
@@ -3174,21 +2308,7 @@ mod mtp_accept_tests {
     use super::{DecodeEngine, ModelState};
 
     #[test]
-    fn single_sequence_decode_does_not_require_batch_descriptors() {
-        let state = ModelState {
-            layers: Vec::new(),
-            mtp: None,
-        };
-        let states = [&state];
-
-        let descs = DecodeEngine::build_optional_batch_seq_descs_for_decode(&states, &[0], false)
-            .expect("single-sequence descriptor selection");
-
-        assert!(descs.is_none());
-    }
-
-    #[test]
-    fn multi_sequence_decode_keeps_batch_descriptors() {
+    fn mtp_verify_keeps_internal_b_slot_descriptors() {
         let first = ModelState {
             layers: Vec::new(),
             mtp: None,
@@ -3199,10 +2319,8 @@ mod mtp_accept_tests {
         };
         let states = [&first, &second];
 
-        let descs =
-            DecodeEngine::build_optional_batch_seq_descs_for_decode(&states, &[0, 0], false)
-                .expect("multi-sequence descriptor selection")
-                .expect("B>1 must retain batch descriptors");
+        let descs = qwen38::desc_builder::build_batch_seq_descs(&states, &[0, 0])
+            .expect("B>1 must retain internal MTP descriptors");
 
         assert!(descs.is_empty());
     }
