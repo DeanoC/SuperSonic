@@ -73,6 +73,7 @@ class RequestedTelemetry:
 class ObservedTelemetry:
     gpu_clock_mhz: int | None
     memory_clock_mhz: int | None
+    power_cap_watts: int | None
     power_watts: float | None
     temperature_celsius: float | None
     gpu_utilization_percent: float | None
@@ -85,6 +86,7 @@ class TelemetrySample:
     offset_seconds: float
     gpu_clock_mhz: int | None
     memory_clock_mhz: int | None
+    power_cap_watts: int | None
     power_watts: float | None
     temperature_celsius: float | None
     gpu_utilization_percent: float | None
@@ -110,6 +112,7 @@ class EnvironmentSnapshot:
     cache_state: str
     cache_evidence: dict[str, object]
     process_reuse: bool
+    verification_errors: tuple[str, ...]
     evidence_notes: tuple[str, ...]
 
 
@@ -149,6 +152,7 @@ def collect_snapshot(
                 offset_seconds=offset,
                 gpu_clock_mhz=observed.gpu_clock_mhz,
                 memory_clock_mhz=observed.memory_clock_mhz,
+                power_cap_watts=observed.power_cap_watts,
                 power_watts=observed.power_watts,
                 temperature_celsius=observed.temperature_celsius,
                 gpu_utilization_percent=observed.gpu_utilization_percent,
@@ -165,6 +169,27 @@ def collect_snapshot(
         performance_level=_policy_value(clock_policy, "performance_level"),
     )
     cpu_governor = _read_cpu_governor(cpu_governor_reader, notes)
+    verification_errors = verify_clock_policy(
+        before,
+        [
+            ObservedTelemetry(
+                gpu_clock_mhz=sample.gpu_clock_mhz,
+                memory_clock_mhz=sample.memory_clock_mhz,
+                power_cap_watts=sample.power_cap_watts,
+                power_watts=sample.power_watts,
+                temperature_celsius=sample.temperature_celsius,
+                gpu_utilization_percent=sample.gpu_utilization_percent,
+                memory_utilization_percent=sample.memory_utilization_percent,
+                performance_level=sample.performance_level,
+            )
+            for sample in sample_values
+        ],
+        after,
+        clock_policy,
+    )
+    for error in verification_errors:
+        if error not in notes:
+            notes.append(error)
     return EnvironmentSnapshot(
         clock_policy=str(_policy_value(clock_policy, "name") or ""),
         requested=requested,
@@ -174,7 +199,7 @@ def collect_snapshot(
         observed_after=after,
         observed_after_at=after_at,
         telemetry_samples=tuple(sample_values),
-        headline_eligible=str(_policy_value(clock_policy, "name") or "") != "uncontrolled-clocks",
+        headline_eligible=_headline_eligible(clock_policy, verification_errors),
         physical_gpu=str(physical_gpu),
         logical_gpu=str(env.get("SUPERSONIC_DEVICE", "0")),
         cpu_governor=cpu_governor,
@@ -182,6 +207,7 @@ def collect_snapshot(
         cache_state=cache_state,
         cache_evidence=resolved_cache_evidence,
         process_reuse=bool(resolved_cache_evidence.get("process_reuse", False)),
+        verification_errors=verification_errors,
         evidence_notes=tuple(notes),
     )
 
@@ -254,10 +280,17 @@ def _default_cache_evidence(cache_state: str) -> dict[str, object]:
     return {"prefix_cache": _PREFIX_CACHE_STATE[cache_state], "process_reuse": False}
 
 
+def _headline_eligible(policy, verification_errors: tuple[str, ...]) -> bool:
+    if _policy_value(policy, "name") != "locked":
+        return False
+    return not verification_errors
+
+
 def _clock_violations(samples: tuple[ObservedTelemetry, ...], policy) -> list[str]:
     errors: list[str] = []
     requested_gpu = _policy_value(policy, "gpu_clock_mhz")
     requested_memory = _policy_value(policy, "memory_clock_mhz")
+    requested_power_cap = _policy_value(policy, "power_cap_watts")
     requested_level = _policy_value(policy, "performance_level")
     requested_temperature_limit = _policy_value(policy, "temperature_limit_celsius")
     gpu_tolerance = int(_policy_value(policy, "clock_tolerance_mhz") or 0)
@@ -278,6 +311,14 @@ def _clock_violations(samples: tuple[ObservedTelemetry, ...], policy) -> list[st
                 errors.append(
                     f"memory clock drift at sample {index}: observed {sample.memory_clock_mhz} MHz, "
                     f"expected {requested_memory}±{memory_tolerance}"
+                )
+        if requested_power_cap is not None:
+            if sample.power_cap_watts is None:
+                errors.append(f"missing power cap verification at sample {index}")
+            elif sample.power_cap_watts != requested_power_cap:
+                errors.append(
+                    f"power cap mismatch at sample {index}: observed {sample.power_cap_watts} W, "
+                    f"expected {requested_power_cap} W"
                 )
         if requested_level is not None:
             if sample.performance_level is None:
@@ -316,6 +357,7 @@ def _parse_showallinfo(output: str, notes: list[str]) -> ObservedTelemetry:
     return ObservedTelemetry(
         gpu_clock_mhz=_extract_int(_GPU_CLOCK_RE, output, "GPU clock", notes),
         memory_clock_mhz=_extract_int(_MEMORY_CLOCK_RE, output, "memory clock", notes),
+        power_cap_watts=_extract_intish(_POWER_CAP_RE, output, "power cap", notes),
         power_watts=_extract_float(_POWER_RE, output, "power draw", notes),
         temperature_celsius=_extract_float(_TEMPERATURE_RE, output, "temperature", notes),
         gpu_utilization_percent=_extract_float(_GPU_USE_RE, output, "GPU use (%)", notes),
@@ -347,6 +389,16 @@ def _extract_float(
 ) -> float | None:
     value = _extract_str(pattern, output, label, notes)
     return float(value) if value is not None else None
+
+
+def _extract_intish(
+    pattern: re.Pattern[str],
+    output: str,
+    label: str,
+    notes: list[str],
+) -> int | None:
+    value = _extract_str(pattern, output, label, notes)
+    return int(float(value)) if value is not None else None
 
 
 def _extract_str(

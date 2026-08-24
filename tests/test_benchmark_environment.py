@@ -57,6 +57,7 @@ class EnvironmentPolicyTests(unittest.TestCase):
         self.before = self.environment.ObservedTelemetry(
             gpu_clock_mhz=2400,
             memory_clock_mhz=1249,
+            power_cap_watts=295,
             power_watts=245.0,
             temperature_celsius=67.0,
             gpu_utilization_percent=91.0,
@@ -74,8 +75,9 @@ class EnvironmentPolicyTests(unittest.TestCase):
         cache_evidence: dict[str, object] | None = None,
         environment_map: dict[str, str] | None = None,
         cpu_governor_reader=None,
+        fixture_text: str | None = None,
     ):
-        fixture = (FIXTURES / "rocm-smi-showallinfo.txt").read_text(encoding="utf-8")
+        fixture = fixture_text or (FIXTURES / "rocm-smi-showallinfo.txt").read_text(encoding="utf-8")
         runner = _ProbeRunner([fixture, fixture, fixture])
         snapshot = self.environment.collect_snapshot(
             physical_gpu="1",
@@ -120,6 +122,20 @@ class EnvironmentPolicyTests(unittest.TestCase):
         errors = self.environment.verify_clock_policy(self.before, [observed], self.after, self.policy)
         self.assertIn("performance level", " ".join(errors).lower())
 
+    def test_locked_power_cap_match_passes(self):
+        errors = self.environment.verify_clock_policy(self.before, [self.before], self.after, self.policy)
+        self.assertNotIn("power cap", " ".join(errors).lower())
+
+    def test_locked_power_cap_missing_fails(self):
+        observed = replace(self.before, power_cap_watts=None)
+        errors = self.environment.verify_clock_policy(self.before, [observed], self.after, self.policy)
+        self.assertIn("power cap", " ".join(errors).lower())
+
+    def test_locked_power_cap_mismatch_fails(self):
+        observed = replace(self.before, power_cap_watts=280)
+        errors = self.environment.verify_clock_policy(self.before, [observed], self.after, self.policy)
+        self.assertIn("power cap", " ".join(errors).lower())
+
     def test_unverified_flush_claim_fails(self):
         with self.assertRaisesRegex(ValueError, "verified"):
             self.environment.validate_cache_evidence(
@@ -159,9 +175,12 @@ class EnvironmentPolicyTests(unittest.TestCase):
         self.assertEqual(snapshot.requested.memory_clock_mhz, 1249)
         self.assertEqual(snapshot.requested.power_cap_watts, 295)
         self.assertEqual(snapshot.requested.performance_level, "manual")
+        self.assertEqual(snapshot.observed_before.power_cap_watts, 295)
         self.assertEqual(snapshot.observed_before.temperature_celsius, 67.0)
         self.assertEqual(snapshot.observed_before.performance_level, "manual")
+        self.assertEqual(snapshot.observed_after.power_cap_watts, 295)
         self.assertEqual(snapshot.observed_after.power_watts, 245.0)
+        self.assertEqual(snapshot.telemetry_samples[0].power_cap_watts, 295)
         self.assertEqual(snapshot.telemetry_samples[0].offset_seconds, 2.5)
         self.assertEqual(snapshot.cpu_governor, "performance")
         self.assertEqual(snapshot.physical_gpu, "1")
@@ -216,6 +235,16 @@ class EnvironmentPolicyTests(unittest.TestCase):
         )
         self.assertIsNone(snapshot.cpu_governor)
         self.assertIn("cpu governor", " ".join(snapshot.evidence_notes).lower())
+
+    def test_locked_snapshot_with_unsupported_probe_fields_is_not_headline_eligible(self):
+        unsupported_fixture = (
+            (FIXTURES / "rocm-smi-showallinfo.txt")
+            .read_text(encoding="utf-8")
+            .replace("GPU[1]          : Max Graphics Package Power (W): 295.0\n", "")
+        )
+        snapshot, _ = self.snapshot(fixture_text=unsupported_fixture)
+        self.assertFalse(snapshot.headline_eligible)
+        self.assertIn("power cap", " ".join(snapshot.evidence_notes).lower())
 
 
 if __name__ == "__main__":
