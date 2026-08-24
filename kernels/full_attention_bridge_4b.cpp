@@ -9017,6 +9017,21 @@ int persistent_decode_post_enqueue_status(
     return 0;
 }
 
+int persistent_decode_prepare_only_status(hipError_t sync_err, int device_ordinal) {
+    if (sync_err != hipSuccess) {
+        std::fprintf(
+            stderr,
+            "[decode] persistent prepare-only synchronize failure status=%d ordinal=%d\n",
+            static_cast<int>(sync_err),
+            device_ordinal);
+        supersonic_gpu_integrity_fail_stop(
+            "persistent decode prepare-only synchronize",
+            static_cast<int>(sync_err),
+            device_ordinal);
+    }
+    return 0;
+}
+
 #ifdef SUPERSONIC_FAILURE_INJECTION
 extern "C" void supersonic_qwen35_4b_test_trigger_persistent_decode_failure(
     int launch_status, int sync_status) {
@@ -9024,6 +9039,12 @@ extern "C" void supersonic_qwen35_4b_test_trigger_persistent_decode_failure(
         static_cast<hipError_t>(launch_status),
         static_cast<hipError_t>(sync_status),
         0);
+}
+
+extern "C" void supersonic_qwen35_4b_test_trigger_prepare_only_failure(
+    int sync_status) {
+    (void)persistent_decode_prepare_only_status(
+        static_cast<hipError_t>(sync_status), 0);
 }
 #endif
 
@@ -10738,12 +10759,13 @@ int persistent_decode_device(
             if (g_hip_gqh_prepare_only) {
                 g_hip_gqh_prepare_only = false;
                 (void)hipGetLastError();
-                (void)hipDeviceSynchronize();
+                const int prepare_status = persistent_decode_prepare_only_status(
+                    hipDeviceSynchronize(), device_ordinal);
                 std::fprintf(
                     stderr,
                     "[decode] GQH tight convert prepared%s\n",
                     launch_err == hipSuccess ? " + HIP graph" : " (eager decode)");
-                return 0;
+                return prepare_status;
             }
             if (launch_err == hipSuccess && cache.exec != nullptr) {
                 launch_err = hipGraphLaunch(cache.exec, cache.stream);
@@ -10757,11 +10779,12 @@ int persistent_decode_device(
         } else {
             if (g_hip_gqh_prepare_only) {
                 g_hip_gqh_prepare_only = false;
-                (void)hipDeviceSynchronize();
+                const int prepare_status = persistent_decode_prepare_only_status(
+                    hipDeviceSynchronize(), device_ordinal);
                 std::fprintf(
                     stderr,
                     "[decode] GQH tight convert prepared (eager decode)\n");
-                return 0;
+                return prepare_status;
             }
             launch_err = record_layers(0);
         }

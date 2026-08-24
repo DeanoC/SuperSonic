@@ -756,6 +756,7 @@ mod tests {
             launch_status: c_int,
             sync_status: c_int,
         );
+        fn supersonic_qwen35_4b_test_trigger_prepare_only_failure(sync_status: c_int);
     }
 
     fn vector_dir() -> PathBuf {
@@ -941,6 +942,50 @@ mod tests {
             .env("SUPERSONIC_GPU_FAILURE_CHILD", "1")
             .status()
             .expect("spawn 4B persistent synchronize child");
+        assert_eq!(status.signal(), Some(6));
+    }
+
+    #[cfg(supersonic_failure_injection)]
+    #[test]
+    fn fatal_4b_prepare_only_graph_sync_failure_aborts_in_child() {
+        if std::env::var_os("SUPERSONIC_GPU_FAILURE_CHILD").is_some() {
+            unsafe {
+                supersonic_qwen35_4b_test_trigger_prepare_only_failure(909);
+            }
+            panic!("injected 4B prepare-only graph synchronize failure returned");
+        }
+
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "gqh::tests::fatal_4b_prepare_only_graph_sync_failure_aborts_in_child",
+                "--nocapture",
+            ])
+            .env("SUPERSONIC_GPU_FAILURE_CHILD", "1")
+            .status()
+            .expect("spawn 4B prepare-only graph child");
+        assert_eq!(status.signal(), Some(6));
+    }
+
+    #[cfg(supersonic_failure_injection)]
+    #[test]
+    fn fatal_4b_prepare_only_eager_sync_failure_aborts_in_child() {
+        if std::env::var_os("SUPERSONIC_GPU_FAILURE_CHILD").is_some() {
+            unsafe {
+                supersonic_qwen35_4b_test_trigger_prepare_only_failure(910);
+            }
+            panic!("injected 4B prepare-only eager synchronize failure returned");
+        }
+
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "gqh::tests::fatal_4b_prepare_only_eager_sync_failure_aborts_in_child",
+                "--nocapture",
+            ])
+            .env("SUPERSONIC_GPU_FAILURE_CHILD", "1")
+            .status()
+            .expect("spawn 4B prepare-only eager child");
         assert_eq!(status.signal(), Some(6));
     }
 

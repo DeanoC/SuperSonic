@@ -35,6 +35,16 @@ class Qwen38BridgeIntegrityTests(unittest.TestCase):
         self.assertNotIn("quantize_kv_to_fp8_kernel", body)
         self.assertNotIn("hipLaunchKernelGGL", body)
 
+    def test_prepare_only_sync_failures_use_integrity_policy(self):
+        start = self.source.index("int persistent_decode_device(")
+        end = self.source.index("// Restore conv+rec", start)
+        body = self.source[start:end]
+
+        self.assertEqual(
+            body.count("persistent_decode_prepare_only_status(\n                    hipDeviceSynchronize()"),
+            2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
