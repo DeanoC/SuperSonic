@@ -8,7 +8,6 @@ from .model import QualityCase, canonical_json, parse_strict_json
 
 
 MTP_CATEGORY = "ordinary-vs-mtp-token-equality"
-MTP_CASE_ID = MTP_CATEGORY
 MAX_VALUE_PREVIEW = 160
 
 
@@ -50,7 +49,7 @@ def score_case(case: QualityCase, output: ParsedOutput) -> QualityResult:
             actual = parse_strict_json(output.generated_text, context="structured_json output")
         except ValueError as exc:
             return _result(case, actual=output.generated_text, passed=False, failure=str(exc))
-        passed = canonical_json(actual) == canonical_json(case.expected)
+        passed = actual == case.expected
         failure = None if passed else "structured_json output did not exactly match expected JSON value"
         return _result(case, actual=actual, passed=passed, failure=failure)
 
@@ -61,21 +60,20 @@ def score_mtp_pair(
     ordinary: ParsedOutput,
     mtp: ParsedOutput,
     *,
-    case_id: str = MTP_CASE_ID,
-    category: str = MTP_CATEGORY,
+    case: QualityCase | None = None,
+    case_id: str | None = None,
+    category: str | None = None,
 ) -> QualityResult:
-    case = QualityCase(
-        id=case_id,
+    mtp_case = _resolve_mtp_case(
+        case=case,
+        case_id=case_id,
         category=category,
-        prompt="",
-        max_new_tokens=max(ordinary.generated_tokens, mtp.generated_tokens, 1),
-        scorer="exact_tokens",
-        expected=list(ordinary.token_ids) if ordinary.token_ids is not None else None,
-        decoding_policy="greedy",
+        ordinary=ordinary,
+        mtp=mtp,
     )
     if ordinary.token_ids is None or mtp.token_ids is None:
         return _result(
-            case,
+            mtp_case,
             actual=list(mtp.token_ids) if mtp.token_ids is not None else None,
             passed=False,
             failure="ordinary/MTP token ids unavailable for exact comparison",
@@ -83,7 +81,7 @@ def score_mtp_pair(
     actual = list(mtp.token_ids)
     passed = tuple(ordinary.token_ids) == tuple(mtp.token_ids)
     failure = None if passed else "ordinary/MTP token ids did not exactly match"
-    return _result(case, actual=actual, passed=passed, failure=failure)
+    return _result(mtp_case, actual=actual, passed=passed, failure=failure)
 
 
 def summarize_quality(
@@ -198,3 +196,30 @@ def _result_dict(result: QualityResult) -> dict[str, object]:
         "expected_value": result.expected_value,
         "actual_value": result.actual_value,
     }
+
+
+def _resolve_mtp_case(
+    *,
+    case: QualityCase | None,
+    case_id: str | None,
+    category: str | None,
+    ordinary: ParsedOutput,
+    mtp: ParsedOutput,
+) -> QualityCase:
+    if case is not None:
+        if case_id is not None or category is not None:
+            raise ValueError("score_mtp_pair accepts either case or explicit case_id/category, not both")
+        return case
+
+    if case_id is None or category is None:
+        raise ValueError("score_mtp_pair requires a manifest QualityCase or explicit case_id/category")
+
+    return QualityCase(
+        id=case_id,
+        category=category,
+        prompt="",
+        max_new_tokens=max(ordinary.generated_tokens, mtp.generated_tokens, 1),
+        scorer="exact_tokens",
+        expected=list(ordinary.token_ids) if ordinary.token_ids is not None else None,
+        decoding_policy="greedy",
+    )

@@ -96,6 +96,16 @@ class BenchmarkQualityTests(unittest.TestCase):
 
         self.assertTrue(result.passed)
 
+    def test_structured_json_uses_parsed_value_equality_for_numeric_json(self):
+        quality = load_quality_module()
+
+        result = quality.score_case(
+            self.case({"answer": 42}, scorer="structured_json"),
+            self.output('{"answer": 42.0}'),
+        )
+
+        self.assertTrue(result.passed)
+
     def test_structured_json_rejects_duplicate_keys(self):
         quality = load_quality_module()
 
@@ -121,7 +131,12 @@ class BenchmarkQualityTests(unittest.TestCase):
     def test_mtp_requires_identical_tokens(self):
         quality = load_quality_module()
 
-        result = quality.score_mtp_pair(self.output("same", token_ids=(1, 2)), self.output("same", token_ids=(1, 3)))
+        result = quality.score_mtp_pair(
+            self.output("same", token_ids=(1, 2)),
+            self.output("same", token_ids=(1, 3)),
+            case_id="mtp-case-1",
+            category="ordinary-vs-mtp-token-equality",
+        )
 
         self.assertFalse(result.passed)
         self.assertIn("token", result.failure.lower())
@@ -129,11 +144,70 @@ class BenchmarkQualityTests(unittest.TestCase):
     def test_mtp_fails_clearly_when_tokens_are_unavailable(self):
         quality = load_quality_module()
 
-        result = quality.score_mtp_pair(self.output("ordinary", token_ids=None), self.output("mtp", token_ids=(1, 2)))
+        result = quality.score_mtp_pair(
+            self.output("ordinary", token_ids=None),
+            self.output("mtp", token_ids=(1, 2)),
+            case_id="mtp-case-2",
+            category="ordinary-vs-mtp-token-equality",
+        )
 
         self.assertFalse(result.passed)
         self.assertIn("token", result.failure.lower())
         self.assertIn("unavailable", result.failure.lower())
+
+    def test_mtp_pair_requires_manifest_case_or_explicit_identity(self):
+        quality = load_quality_module()
+
+        with self.assertRaisesRegex(ValueError, "requires a manifest QualityCase or explicit case_id/category"):
+            quality.score_mtp_pair(self.output("ordinary", token_ids=(1, 2)), self.output("mtp", token_ids=(1, 2)))
+
+    def test_mtp_pair_requires_unique_manifest_case_identity_for_summary(self):
+        manifest = importlib.import_module("tools.benchmark.manifest")
+        quality = load_quality_module()
+
+        mtp_cases = tuple(
+            case for case in manifest.load_quality("v1") if case.category == "ordinary-vs-mtp-token-equality"
+        )
+        self.assertEqual(len(mtp_cases), 2)
+
+        results = tuple(
+            quality.score_mtp_pair(
+                self.output("ordinary", token_ids=tuple(case.expected)),
+                self.output("mtp", token_ids=tuple(case.expected)),
+                case=case,
+            )
+            for case in mtp_cases
+        )
+        summary = quality.summarize_quality(results, required_cases=mtp_cases)
+
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["passed"], 2)
+        self.assertEqual(summary["missing_case_ids"], [])
+        self.assertEqual(
+            [entry["id"] for entry in summary["cases"]],
+            [case.id for case in mtp_cases],
+        )
+
+    def test_duplicate_quality_result_ids_fail_closed(self):
+        quality = load_quality_module()
+
+        with self.assertRaisesRegex(ValueError, "duplicate quality result id"):
+            quality.summarize_quality(
+                (
+                    quality.score_mtp_pair(
+                        self.output("ordinary", token_ids=(1, 2, 3)),
+                        self.output("mtp", token_ids=(1, 2, 3)),
+                        case_id="duplicate",
+                        category="ordinary-vs-mtp-token-equality",
+                    ),
+                    quality.score_mtp_pair(
+                        self.output("ordinary", token_ids=(4, 5, 6)),
+                        self.output("mtp", token_ids=(4, 5, 6)),
+                        case_id="duplicate",
+                        category="ordinary-vs-mtp-token-equality",
+                    ),
+                )
+            )
 
     def test_summarize_quality_reports_every_category_and_preserves_evidence(self):
         manifest = importlib.import_module("tools.benchmark.manifest")
