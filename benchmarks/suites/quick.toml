@@ -1,6 +1,7 @@
 version = 1
 name = "quick"
 budget_seconds = 600
+minimum_duration_seconds = 0
 quality_version = "v2"
 quality_case_ids = [
   "instruction-following-1",

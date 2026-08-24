@@ -108,14 +108,67 @@ class EnvironmentPolicyTests(unittest.TestCase):
         snapshot, _ = self.snapshot("uncontrolled-clocks")
         self.assertFalse(snapshot.headline_eligible)
 
-    def test_locked_clock_drift_fails(self):
+    def test_loaded_clock_drift_requires_three_consecutive_out_of_band_samples(self):
+        self.assertEqual(
+            self.environment.verify_clock_policy(self.before, [self.drifted], self.after, self.policy),
+            (),
+        )
+        self.assertEqual(
+            self.environment.verify_clock_policy(
+                self.before,
+                [self.drifted, self.drifted],
+                self.after,
+                self.policy,
+            ),
+            (),
+        )
         errors = self.environment.verify_clock_policy(
             self.before,
-            [self.drifted],
+            [self.drifted, self.drifted, self.drifted],
             self.after,
             self.policy,
         )
-        self.assertIn("clock drift", " ".join(errors).lower())
+        self.assertIn("sustained clock drift", " ".join(errors).lower())
+
+        reset_errors = self.environment.verify_clock_policy(
+            self.before,
+            [self.drifted, self.drifted, self.before, self.drifted, self.drifted],
+            self.after,
+            self.policy,
+        )
+        self.assertEqual(reset_errors, ())
+
+    def test_snapshot_verifies_each_live_observation_once(self):
+        drift_samples = tuple(
+            self.environment.TelemetrySample(
+                offset_seconds=float(index),
+                gpu_clock_mhz=self.drifted.gpu_clock_mhz,
+                memory_clock_mhz=self.drifted.memory_clock_mhz,
+                power_cap_watts=self.drifted.power_cap_watts,
+                power_watts=self.drifted.power_watts,
+                temperature_celsius=self.drifted.temperature_celsius,
+                gpu_utilization_percent=self.drifted.gpu_utilization_percent,
+                memory_utilization_percent=self.drifted.memory_utilization_percent,
+                performance_level=self.drifted.performance_level,
+            )
+            for index in (1, 2)
+        )
+
+        snapshot = self.environment.snapshot_from_observations(
+            physical_gpu="1",
+            logical_gpu="0",
+            clock_policy=self.policy,
+            cache_state="warm-resident",
+            observed_before=self.before,
+            observed_before_at="2026-08-24T12:00:00Z",
+            telemetry_samples=drift_samples,
+            observed_after=self.after,
+            observed_after_at="2026-08-24T12:00:02Z",
+            cpu_governor_reader=lambda: "performance\n",
+        )
+
+        self.assertTrue(snapshot.headline_eligible)
+        self.assertEqual(snapshot.telemetry_samples, drift_samples)
 
     def test_locked_gpu_clock_uses_loaded_samples_and_nominal_tolerance(self):
         policy = SimpleNamespace(**{**self.policy.__dict__, "gpu_clock_mhz": 2350, "clock_tolerance_mhz": 100})

@@ -9,15 +9,19 @@ No measured throughput number is published in this repository yet.
 
 The suite manifests own the measurement budgets:
 
-- `quick` is exactly 600 seconds (10 minutes). It is the development and GPU
+- `quick` has a 600-second hard budget (10 minutes). It is the development and GPU
   smoke candidate, with the representative quality and performance cases.
-- `full` is exactly 21,600 seconds (six hours). It is manually triggered after
-  quick review or for an overnight run, and includes the complete quality
-  corpus, both cache series, MTP cases, and the configured peer engine.
+- `full` runs for about six hours: it has a 20,700-second minimum inside a
+  21,600-second hard budget. It is
+  manually triggered after quick review or for an overnight run, and includes
+  the complete quality corpus, both cache series, MTP cases, and the configured
+  peer engine. After warmups, the seeded case/engine order runs as
+  balanced rounds until the minimum is reached; the reserved 900 seconds bound the final
+  round and manifest finalization.
 
 The GitHub Actions job caps include checkout, host probes, artifact preflight,
 and the release build in addition to the harness. The quick workflow cap is
-30 minutes and the full workflow cap is 390 minutes. The harness budgets and
+30 minutes and the full workflow cap is 450 minutes. The harness budgets and
 the workflow caps are different limits; neither changes the other. A full run
 is `workflow_dispatch` only and is not part of push or pull-request CI.
 
@@ -193,8 +197,9 @@ RUST_TEST_THREADS=1 timeout --foreground 21660s \
   --output target/benchmarks/candidate
 ```
 
-The `21660s` wrapper leaves time for cleanup around the exact 21,600-second
-suite budget. The manual full workflow validates its candidate for diagnosis
+The `21660s` wrapper bounds cleanup around the 20,700-second minimum and
+21,600-second hard budget. Each full performance subprocess has a 60-second
+fail-closed timeout. The manual full workflow validates its candidate for diagnosis
 and uploads it even if the harness is incomplete. An incomplete, failed, or
 quality-failed bundle is diagnostic only and cannot be promoted.
 
@@ -213,9 +218,10 @@ execution boundary until adapter transitions are verified. Do not add them to a
 candidate or describe a prefix-cache transition as measured before that gate
 exists.
 
-`locked` means the host operator prepared the requested clock and power state
-and the harness verified the nominal GPU clock against loaded samples within
-the recorded tolerance, plus memory clock, power cap, and performance level
+`locked` means the host operator prepared the requested clock and power state.
+The harness retains every observation and reports GPU clock drift when
+three consecutive loaded samples are outside the recorded tolerance. It also verifies
+memory clock, power cap, and performance level strictly
 before, during, and after each measured case. Idle edge samples are retained
 but are not compared to the nominal GPU clock because RDNA power gating lowers
 the instantaneous sclk while idle. `uncontrolled-clocks` records retain observed telemetry for
@@ -227,8 +233,8 @@ Every candidate record retains the commit and dirty state, engine/version,
 ROCm/HIP versions, static physical GPU provenance, logical mapping, artifact
 identity and digest, prompt/workload, cache/process state, clock evidence,
 correctness and ordinary-versus-MTP equality, and raw measured samples in
-measurement order. The validator validates raw sample values, exact sample
-count, and bundle completeness. The renderer deterministically derives sample
+measurement order. The validator validates raw sample values, the suite-required
+or balanced-round sample count, and bundle completeness. The renderer deterministically derives sample
 count, median, minimum, maximum, and median absolute deviation (MAD) from
 those validated raw samples; no stored summary replaces the raw source.
 

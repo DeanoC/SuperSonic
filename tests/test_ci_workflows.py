@@ -112,14 +112,17 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("amd-smi-provenance.json", text)
         self.assertIn("--clock-policy locked", text)
         self.assertIn("--gpu-clock-tolerance-mhz", text)
+        self.assertIn("suite.minimum_duration_seconds != 20700", text)
+        self.assertIn("suite.budget_seconds != 21600", text)
+        self.assertIn("case.timeout_seconds != 60", text)
         self.assertIn("RUST_TEST_THREADS: \"1\"", text)
         self.assertIn("qwen38_gqh_gguf_crawl", text)
         self.assertIn("qwen38_gqh_decode_rung11", text)
         self.assertIn("--include-ignored --test-threads=1 --nocapture", text)
-        self.assertLess(text.index("qwen38_gqh_decode_rung11"), text.index("Run exact six-hour full harness"))
+        self.assertLess(text.index("qwen38_gqh_decode_rung11"), text.index("Run six-hour balanced full harness"))
         post_correctness_idle = text.split(
             "- name: Reverify GPU idle after correctness", 1
-        )[1].split("- name: Run exact six-hour full harness", 1)[0]
+        )[1].split("- name: Run six-hour balanced full harness", 1)[0]
         self.assertIn("max_wait_seconds=900", post_correctness_idle)
         self.assertIn("required_idle_samples=3", post_correctness_idle)
         self.assertIn("while :; do", post_correctness_idle)

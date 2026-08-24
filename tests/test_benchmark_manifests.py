@@ -58,6 +58,8 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(full.decoding_policy, "greedy")
         self.assertEqual(quick.budget_seconds, 600)
         self.assertEqual(full.budget_seconds, 21600)
+        self.assertEqual(quick.minimum_duration_seconds, 0)
+        self.assertEqual(full.minimum_duration_seconds, 20700)
         self.assertLess(set(quick.quality_case_ids), set(full.quality_case_ids))
         self.assertEqual(set(full.quality_case_ids), {case.id for case in quality_cases})
         self.assertEqual(tuple(quick.engines), ("supersonic",))
@@ -99,6 +101,7 @@ class BenchmarkManifestTests(unittest.TestCase):
                 )
             if case.mode == "mtp":
                 self.assertEqual(case.engines, ("supersonic",))
+            self.assertEqual(case.timeout_seconds, 60)
 
         quick = manifest.load_suite("quick")
         self.assertTrue(all(case.warmups == 1 for case in quick.performance_cases))
@@ -117,6 +120,7 @@ class BenchmarkManifestTests(unittest.TestCase):
 version = 1
 name = "bad"
 budget_seconds = 600
+minimum_duration_seconds = 0
 quality_version = "v1"
 quality_case_ids = ["instruction-following-1"]
 engines = ["supersonic", "llama-cpp"]
@@ -139,6 +143,41 @@ engines = ["llama-cpp"]
             )
 
             with self.assertRaisesRegex(ValueError, "llama-cpp|supports|unsupported"):
+                manifest.load_suite_path(bad_manifest)
+
+    def test_minimum_duration_cannot_exceed_hard_budget(self):
+        manifest = load_manifest_module()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bad_manifest = Path(temporary) / "bad-duration.toml"
+            bad_manifest.write_text(
+                """
+version = 1
+name = "bad-duration"
+budget_seconds = 600
+minimum_duration_seconds = 601
+quality_version = "v1"
+quality_case_ids = ["instruction-following-1"]
+engines = ["supersonic"]
+decoding_policy = "greedy"
+
+[[performance_cases]]
+id = "case"
+prompt = "hello"
+max_new_tokens = 8
+warmups = 0
+repetitions = 1
+mode = "ordinary"
+cache_state = "cold-load"
+timeout_seconds = 30
+decoding_policy = "greedy"
+engines = ["supersonic"]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "minimum_duration_seconds.*budget_seconds"):
                 manifest.load_suite_path(bad_manifest)
 
     def test_quality_corpus_has_required_categories_and_unique_ids(self):
@@ -336,6 +375,7 @@ engines = ["llama-cpp"]
 version = 1
 name = "bad"
 budget_seconds = 600
+minimum_duration_seconds = 0
 quality_version = "v1"
 quality_case_ids = ["instruction-following-1"]
 engines = ["supersonic"]
@@ -370,6 +410,7 @@ engines = ["supersonic"]
             "version",
             "name",
             "budget_seconds",
+            "minimum_duration_seconds",
             "quality_version",
             "quality_case_ids",
             "engines",

@@ -48,6 +48,18 @@ class ActiveDocsTests(unittest.TestCase):
         for term in ("comparability", "artifact", "cache state", "clock", "sample count"):
             self.assertIn(term, text)
 
+    def test_full_duration_rounds_and_sustained_clock_policy_are_documented(self):
+        benchmark_text = (ROOT / "docs" / "benchmarks.md").read_text(encoding="utf-8")
+        performance_text = (ROOT / "docs" / "performance.md").read_text(encoding="utf-8")
+        testing_text = (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")
+
+        for text in (benchmark_text, performance_text, testing_text):
+            self.assertIn("20,700-second minimum", text)
+            self.assertIn("21,600-second hard budget", text)
+        self.assertIn("balanced rounds", benchmark_text)
+        self.assertIn("three consecutive loaded", benchmark_text)
+        self.assertIn("three consecutive loaded", performance_text)
+
     def test_benchmark_recipes_match_versioned_cli_and_local_prerequisites(self):
         text = (ROOT / "docs" / "benchmarks.md").read_text(encoding="utf-8")
         self.assertIn("HIP_ARCH=gfx1201 cargo build --release --workspace", text)
@@ -709,6 +721,7 @@ printf 'cargo|%s|GQH=%s|MODEL=%s|8192=%s|REQ=%s\\n' "$*" \
         retained_plans = {
             "2026-08-23-qwen38-rocm-product-slimming.md",
             "2026-08-24-reproducible-benchmark-pages.md",
+            "2026-08-24-six-hour-balanced-full-benchmark.md",
         }
         for path in superpowers_root.glob("plans/*.md"):
             self.assertIn(path.name, retained_plans, path.as_posix())

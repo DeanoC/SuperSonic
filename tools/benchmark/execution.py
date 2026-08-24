@@ -125,6 +125,8 @@ class BundleStatus:
     records: tuple[Path, ...] = ()
     quality_failed: bool = False
     performance_report_only: bool = True
+    elapsed_seconds: float = 0.0
+    completed_rounds: int = 0
 
 
 # ``BenchmarkConfig`` is a descriptive alias for callers that do not want to
@@ -312,7 +314,8 @@ def run_suite(
     if not callable(runner) and callable(getattr(runner, "run", None)):
         runner = runner.run
     run_manifest = preflight(config)
-    deadline = clock() + run_manifest.suite.budget_seconds
+    started = clock()
+    deadline = started + run_manifest.suite.budget_seconds
     errors: list[str] = []
     records: list[Path] = []
     interrupted = False
@@ -345,59 +348,81 @@ def run_suite(
 
     scheduled = ordered_cases(run_manifest)
     expected_count = len(scheduled)
-    for case, engine in scheduled:
-        if interrupted:
-            break
-        now = clock()
-        if now >= deadline:
-            _append_error(errors, "budget_exhausted")
-            break
-        case_deadline = min(deadline, now + float(case.timeout_seconds))
-        # _execute_case recomputes the positive remainder immediately before
-        # every warmup/repetition subprocess.  Passing only the case cap here
-        # avoids spending a stale timeout between scheduling and invocation.
-        timeout = float(case.timeout_seconds)
-        try:
-            result = _execute_case(
-                run_manifest,
-                case,
-                engine,
-                timeout=timeout,
-                suite_deadline=deadline,
-                case_deadline=case_deadline,
-                clock=clock,
-                command_runner=runner,
-                quality_summary=quality_summaries.get(engine.name, _quality_placeholder_summary(run_manifest.quality_cases)),
-            )
-        except KeyboardInterrupt:
-            _append_error(errors, "interrupted")
-            interrupted = True
-            break
-        except _CaseError as exc:
-            _append_error(errors, exc.code)
-            if exc.code == "budget_exhausted":
+    completed_rounds = 0
+    if run_manifest.suite.minimum_duration_seconds > 0 and not interrupted:
+        duration_records, duration_errors, duration_interrupted, completed_rounds = _run_duration_cases(
+            run_manifest,
+            scheduled,
+            deadline=deadline,
+            minimum_deadline=started + run_manifest.suite.minimum_duration_seconds,
+            clock=clock,
+            command_runner=runner,
+            quality_summaries=quality_summaries,
+        )
+        records.extend(duration_records)
+        errors.extend(error for error in duration_errors if error not in errors)
+        interrupted = duration_interrupted
+    else:
+        for case, engine in scheduled:
+            if interrupted:
                 break
-            continue
-        except ValueError as exc:
-            # Validation is part of promotion.  A bad candidate is retained
-            # only in its raw logs and represented as a structured execution
-            # error; it must never escape as a partially promoted record.
-            _append_error(errors, "invalid_record")
-            _write_case_error(run_manifest.bundle, case, engine, str(exc))
-            continue
-        except (TypeError, RuntimeError) as exc:
-            _append_error(errors, "process_failed")
-            _write_case_error(run_manifest.bundle, case, engine, str(exc))
-            continue
-        if result is not None:
-            records.append(result)
-        # Do not schedule another case once the active case has exhausted the
-        # suite budget.  The check is deliberately monotonic and not wall time.
-        if clock() >= deadline:
-            _append_error(errors, "budget_exhausted")
-            break
+            now = clock()
+            if now >= deadline:
+                _append_error(errors, "budget_exhausted")
+                break
+            case_deadline = min(deadline, now + float(case.timeout_seconds))
+            # _execute_case recomputes the positive remainder immediately before
+            # every warmup/repetition subprocess.  Passing only the case cap here
+            # avoids spending a stale timeout between scheduling and invocation.
+            timeout = float(case.timeout_seconds)
+            try:
+                result = _execute_case(
+                    run_manifest,
+                    case,
+                    engine,
+                    timeout=timeout,
+                    suite_deadline=deadline,
+                    case_deadline=case_deadline,
+                    clock=clock,
+                    command_runner=runner,
+                    quality_summary=quality_summaries.get(
+                        engine.name, _quality_placeholder_summary(run_manifest.quality_cases)
+                    ),
+                )
+            except KeyboardInterrupt:
+                _append_error(errors, "interrupted")
+                interrupted = True
+                break
+            except _CaseError as exc:
+                _append_error(errors, exc.code)
+                if exc.code == "budget_exhausted":
+                    break
+                continue
+            except ValueError as exc:
+                # Validation is part of promotion.  A bad candidate is retained
+                # only in its raw logs and represented as a structured execution
+                # error; it must never escape as a partially promoted record.
+                _append_error(errors, "invalid_record")
+                _write_case_error(run_manifest.bundle, case, engine, str(exc))
+                continue
+            except (TypeError, RuntimeError) as exc:
+                _append_error(errors, "process_failed")
+                _write_case_error(run_manifest.bundle, case, engine, str(exc))
+                continue
+            if isinstance(result, Path):
+                records.append(result)
+            # Do not schedule another case once the active case has exhausted the
+            # suite budget.  The check is deliberately monotonic and not wall time.
+            if clock() >= deadline:
+                _append_error(errors, "budget_exhausted")
+                break
 
-    completed = len(records) == expected_count and not interrupted and not any(
+    elapsed_seconds = max(0.0, float(clock()) - float(started))
+    duration_complete = (
+        run_manifest.suite.minimum_duration_seconds == 0
+        or elapsed_seconds >= run_manifest.suite.minimum_duration_seconds
+    )
+    completed = len(records) == expected_count and duration_complete and not interrupted and not any(
         error in {"budget_exhausted", "case_timeout", "process_failed", "invalid_output", "interrupted"}
         for error in errors
     )
@@ -419,9 +444,130 @@ def run_suite(
         records=tuple(records),
         quality_failed=quality_failed,
         performance_report_only=True,
+        elapsed_seconds=elapsed_seconds,
+        completed_rounds=completed_rounds,
     )
     _update_bundle_manifest(run_manifest, status)
     return status
+
+
+def _run_duration_cases(
+    run_manifest: RunManifest,
+    scheduled: Sequence[tuple[PerformanceCase, EngineManifest]],
+    *,
+    deadline: float,
+    minimum_deadline: float,
+    clock: Callable[[], float],
+    command_runner: Callable[..., object],
+    quality_summaries: Mapping[str, Mapping[str, object]],
+) -> tuple[list[Path], list[str], bool, int]:
+    """Run one measured invocation per entry in complete seeded rounds."""
+
+    accumulated: dict[tuple[str, str], dict[str, object]] = {}
+    promoted: list[Path] = []
+    errors: list[str] = []
+    interrupted = False
+    completed_rounds = 0
+    required_rounds = max(case.repetitions for case, _ in scheduled)
+
+    while completed_rounds < required_rounds or clock() < minimum_deadline:
+        round_records: list[tuple[PerformanceCase, EngineManifest, dict[str, object]]] = []
+        round_failed = False
+        for case, engine in scheduled:
+            if clock() >= deadline:
+                _append_error(errors, "budget_exhausted")
+                round_failed = True
+                break
+            round_case = replace(
+                case,
+                warmups=case.warmups if completed_rounds == 0 else 0,
+                repetitions=1,
+            )
+            try:
+                record = _execute_case(
+                    run_manifest,
+                    round_case,
+                    engine,
+                    timeout=float(case.timeout_seconds),
+                    suite_deadline=deadline,
+                    case_deadline=deadline,
+                    clock=clock,
+                    command_runner=command_runner,
+                    quality_summary=quality_summaries.get(
+                        engine.name, _quality_placeholder_summary(run_manifest.quality_cases)
+                    ),
+                    promote=False,
+                    run_label_offset=completed_rounds,
+                )
+                if not isinstance(record, dict):
+                    raise RuntimeError("duration case did not return an in-memory record")
+                round_records.append((case, engine, record))
+            except KeyboardInterrupt:
+                _append_error(errors, "interrupted")
+                interrupted = True
+                round_failed = True
+                break
+            except _CaseError as exc:
+                _append_error(errors, exc.code)
+                round_failed = True
+                break
+            except ValueError as exc:
+                _append_error(errors, "invalid_record")
+                _write_case_error(run_manifest.bundle, case, engine, str(exc))
+                round_failed = True
+                break
+            except (TypeError, RuntimeError) as exc:
+                _append_error(errors, "process_failed")
+                _write_case_error(run_manifest.bundle, case, engine, str(exc))
+                round_failed = True
+                break
+        if round_failed or len(round_records) != len(scheduled):
+            break
+
+        for case, engine, record in round_records:
+            key = (case.id, engine.name)
+            accumulated[key] = _merge_duration_record(accumulated.get(key), record, case)
+        completed_rounds += 1
+
+    if completed_rounds >= required_rounds:
+        for case, engine in scheduled:
+            target = run_manifest.bundle / "records" / _record_filename(case, engine)
+            _atomic_promote_record(accumulated[(case.id, engine.name)], target)
+            promoted.append(target)
+
+    return promoted, errors, interrupted, completed_rounds
+
+
+def _merge_duration_record(
+    existing: Mapping[str, object] | None,
+    current: Mapping[str, object],
+    case: PerformanceCase,
+) -> dict[str, object]:
+    merged = json.loads(canonical_json(dict(current)))
+    merged["workload"]["warmups"] = case.warmups
+    if existing is None:
+        return merged
+
+    previous = json.loads(canonical_json(dict(existing)))
+    previous["samples"].extend(merged["samples"])
+    previous_env = previous["environment"]
+    current_env = merged["environment"]
+    previous_samples = previous_env["telemetry_samples"]
+    current_samples = current_env["telemetry_samples"]
+    offset = float(previous_samples[-1]["offset_seconds"]) if previous_samples else 0.0
+    for sample in current_samples:
+        sample["offset_seconds"] = offset + float(sample["offset_seconds"])
+        previous_samples.append(sample)
+    previous_env["observed_after"] = current_env["observed_after"]
+    previous_env["observed_after_at"] = current_env["observed_after_at"]
+    for note in current_env["evidence_notes"]:
+        if note not in previous_env["evidence_notes"]:
+            previous_env["evidence_notes"].append(note)
+    previous_env["verification_errors"] = []
+    derived_errors = validation.headline_verification_errors(previous)
+    previous_env["verification_errors"] = list(derived_errors)
+    previous_env["headline_eligible"] = previous_env["clock_policy"] == "locked" and not derived_errors
+    return previous
 
 
 def run_process(
@@ -588,7 +734,9 @@ def _execute_case(
     clock: Callable[[], float],
     command_runner: Callable[..., object],
     quality_summary: Mapping[str, object],
-) -> Path | None:
+    promote: bool = True,
+    run_label_offset: int = 0,
+) -> Path | dict[str, object] | None:
     inputs = adapters.AdapterInputs(
         model_dir=Path(run_manifest.config.model_dir),
         artifact=Path(run_manifest.config.artifact),
@@ -623,7 +771,11 @@ def _execute_case(
     invocation_count = case.warmups + case.repetitions
     for index in range(invocation_count):
         measured = index >= case.warmups
-        label = f"run-{index - case.warmups + 1}" if measured else f"warmup-{index + 1}"
+        label = (
+            f"run-{run_label_offset + index - case.warmups + 1}"
+            if measured
+            else f"warmup-{index + 1}"
+        )
         active_timeout = timeout
         if suite_deadline is not None and case_deadline is not None:
             active_timeout = _remaining_timeout(
@@ -697,6 +849,8 @@ def _execute_case(
         quality_summary=quality_summary,
         environment_snapshot=case_snapshot,
     )
+    if not promote:
+        return record
     filename = _record_filename(case, engine)
     target = run_manifest.bundle / "records" / filename
     _atomic_promote_record(record, target)
@@ -1233,6 +1387,7 @@ def _persist_bundle_manifest(
             "version": run_manifest.suite.version,
             "quality_version": run_manifest.suite.quality_version,
             "budget_seconds": run_manifest.suite.budget_seconds,
+            "minimum_duration_seconds": run_manifest.suite.minimum_duration_seconds,
         },
         "seed": config.seed,
         "budgets": {
@@ -1295,6 +1450,8 @@ def _update_bundle_manifest(run_manifest: RunManifest, status: BundleStatus) -> 
         "records": [record.name for record in status.records],
         "quality_failed": status.quality_failed,
         "performance_report_only": status.performance_report_only,
+        "elapsed_seconds": status.elapsed_seconds,
+        "completed_rounds": status.completed_rounds,
     }
     # Do not return a status until this atomic write/fsync/replace has
     # completed.  A finalization failure must remain visible to the caller.

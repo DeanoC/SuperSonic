@@ -72,6 +72,7 @@ def validate_bundle(path: str | Path, require_complete: bool) -> tuple[Path, ...
         for result_path, record in records:
             _validate_publishable(record, result_path)
         _validate_complete_bundle(records)
+        _validate_duration_bundles(Path(path), records)
     return paths
 
 
@@ -366,7 +367,12 @@ def _validate_record_consistency(record: dict[str, object]) -> None:
     if workload["cache_state"] != case.cache_state:
         raise ValueError("workload cache_state does not match suite manifest")
     sample_count = len(record["samples"])
-    if sample_count != case.repetitions:
+    if suite.minimum_duration_seconds > 0:
+        if sample_count < case.repetitions:
+            raise ValueError(
+                f"sample count must be at least {case.repetitions} for duration suite {case.id}, got {sample_count}"
+            )
+    elif sample_count != case.repetitions:
         raise ValueError(f"sample count must be exactly {case.repetitions} for {case.id}, got {sample_count}")
 
     if env["cache_state"] != workload["cache_state"]:
@@ -459,6 +465,68 @@ def _validate_complete_bundle(records: list[tuple[Path, dict[str, object]]]) -> 
         missing = sorted(expected - actual)
         if missing:
             raise ValueError(f"incomplete benchmark bundle for suite {suite_name}: missing {missing}")
+
+
+def _validate_duration_bundles(
+    root: Path,
+    records: list[tuple[Path, dict[str, object]]],
+) -> None:
+    duration_groups: dict[tuple[str, str], list[tuple[Path, dict[str, object]]]] = {}
+    for path, record in records:
+        run = _required_mapping(record, "run")
+        suite_name = str(run["suite"])
+        suite = load_suite(suite_name)
+        if suite.minimum_duration_seconds > 0:
+            duration_groups.setdefault((suite_name, str(run["run_id"])), []).append((path, record))
+    if not duration_groups:
+        return
+    if root.is_file():
+        raise ValueError("duration suite publication requires its portable bundle manifest")
+
+    manifests: dict[str, Mapping[str, object]] = {}
+    for manifest_path in sorted(root.rglob("manifest.json")):
+        payload = _load_json(manifest_path)
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"benchmark bundle manifest is not an object: {manifest_path}")
+        run_id = str(payload.get("run_id", ""))
+        if not run_id:
+            raise ValueError(f"benchmark bundle manifest lacks run_id: {manifest_path}")
+        if run_id in manifests:
+            raise ValueError(f"duplicate benchmark bundle manifest for run_id {run_id!r}")
+        manifests[run_id] = payload
+
+    for (suite_name, run_id), group in duration_groups.items():
+        suite = load_suite(suite_name)
+        payload = manifests.get(run_id)
+        if payload is None:
+            raise ValueError(f"duration suite {suite_name} requires a portable bundle manifest")
+        suite_evidence = _required_mapping(payload, "suite")
+        if suite_evidence.get("name") != suite_name:
+            raise ValueError("duration bundle manifest suite name does not match records")
+        if suite_evidence.get("budget_seconds") != suite.budget_seconds:
+            raise ValueError("duration bundle manifest budget_seconds does not match suite")
+        if suite_evidence.get("minimum_duration_seconds") != suite.minimum_duration_seconds:
+            raise ValueError("duration bundle manifest minimum duration does not match suite")
+
+        status = _required_mapping(payload, "status")
+        if status.get("state") != "complete":
+            raise ValueError("duration bundle manifest must have complete status")
+        elapsed = status.get("elapsed_seconds")
+        if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(float(elapsed)):
+            raise ValueError("duration bundle elapsed_seconds must be finite")
+        if float(elapsed) < suite.minimum_duration_seconds:
+            raise ValueError("duration bundle elapsed_seconds is below the minimum duration")
+        rounds = status.get("completed_rounds")
+        if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
+            raise ValueError("duration bundle completed_rounds must be a positive integer")
+        sample_counts = {len(record["samples"]) for _, record in group}
+        if sample_counts != {rounds}:
+            raise ValueError("duration bundle records do not contain balanced completed rounds")
+        stored_records = status.get("records")
+        if not isinstance(stored_records, list) or any(not isinstance(name, str) for name in stored_records):
+            raise ValueError("duration bundle manifest records must be an array of filenames")
+        if set(stored_records) != {path.name for path, _ in group}:
+            raise ValueError("duration bundle manifest record set does not match balanced records")
 
 
 def _validate_headline_consistency(record: Mapping[str, object]) -> None:

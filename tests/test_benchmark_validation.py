@@ -1,9 +1,11 @@
 import copy
+from dataclasses import replace
 import importlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,6 +81,47 @@ class BenchmarkValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incomplete"):
             self.validation.validate_bundle(self.bundle, require_complete=True)
 
+    def test_duration_bundle_requires_sufficient_elapsed_and_balanced_round_evidence(self):
+        quick = self.validation.load_suite("quick")
+        suite = replace(
+            quick,
+            name="duration-test",
+            minimum_duration_seconds=5,
+            performance_cases=(quick.performance_cases[0],),
+        )
+        record = copy.deepcopy(self.valid_record)
+        record["run"]["suite"] = "duration-test"
+        (self.bundle / "one-result.json").write_text(json.dumps(record), encoding="utf-8")
+        manifest = {
+            "run_id": record["run"]["run_id"],
+            "suite": {
+                "name": "duration-test",
+                "budget_seconds": 600,
+                "minimum_duration_seconds": 5,
+            },
+            "status": {
+                "state": "complete",
+                "records": ["one-result.json"],
+                "elapsed_seconds": 4.9,
+                "completed_rounds": 3,
+            },
+        }
+        (self.bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        with mock.patch.object(self.validation, "load_suite", return_value=suite):
+            with self.assertRaisesRegex(ValueError, "minimum duration|elapsed"):
+                self.validation.validate_bundle(self.bundle, require_complete=True)
+
+            manifest["status"]["elapsed_seconds"] = 5.0
+            manifest["status"]["completed_rounds"] = 2
+            (self.bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "balanced|round"):
+                self.validation.validate_bundle(self.bundle, require_complete=True)
+
+            manifest["status"]["completed_rounds"] = 3
+            (self.bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            self.validation.validate_bundle(self.bundle, require_complete=True)
+
     def test_schema_is_recursive_closed_and_strict_about_json_types(self):
         record = copy.deepcopy(self.valid_record)
         record["engine"]["unexpected"] = "field"
@@ -136,7 +179,9 @@ class BenchmarkValidationTests(unittest.TestCase):
         self.assert_record_invalid(record, "headline|locked|uncontrolled")
 
         record = copy.deepcopy(self.valid_record)
-        record["environment"]["observed_before"]["gpu_clock_mhz"] = 2300
+        drift_sample = copy.deepcopy(record["environment"]["telemetry_samples"][0])
+        drift_sample["gpu_clock_mhz"] = 2300
+        record["environment"]["telemetry_samples"] = [copy.deepcopy(drift_sample) for _ in range(3)]
         record["environment"]["headline_eligible"] = True
         record["environment"]["verification_errors"] = []
         self.assert_record_invalid(record, "headline|clock drift")

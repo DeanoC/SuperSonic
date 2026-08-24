@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import sys
 import tempfile
@@ -110,6 +111,14 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.peer_binary.chmod(0o755)
 
     def config(self, *, suite="quick", include_peer=False, run_quality=False, output=None):
+        if suite == "full":
+            # Most unit tests exercise full-suite case/peer behavior, not the
+            # real 20,700-second duration loop. Keep those tests bounded; the
+            # dedicated duration test below drives that scheduler explicitly.
+            suite = replace(
+                self.execution.manifest.load_suite("full"),
+                minimum_duration_seconds=0,
+            )
         return self.execution.RunConfig(
             suite=suite,
             model_dir=self.model_dir,
@@ -348,6 +357,77 @@ class BenchmarkExecutionTests(unittest.TestCase):
         third = self.execution.ordered_cases(self.execution.preflight(self.config(suite="full", include_peer=True)), seed=11)
         self.assertEqual([(c.id, e.name) for c, e in first], [(c.id, e.name) for c, e in second])
         self.assertNotEqual([(c.id, e.name) for c, e in first], [(c.id, e.name) for c, e in third])
+
+    def test_duration_suite_runs_complete_balanced_rounds_and_records_elapsed_evidence(self):
+        from dataclasses import replace
+
+        suite = self.execution.manifest.load_suite("quick")
+        first = replace(
+            suite.performance_cases[0],
+            id="duration-first",
+            prompt="first",
+            warmups=1,
+            repetitions=1,
+            timeout_seconds=10,
+        )
+        second = replace(
+            suite.performance_cases[0],
+            id="duration-second",
+            prompt="second",
+            warmups=0,
+            repetitions=1,
+            timeout_seconds=10,
+        )
+        suite = replace(
+            suite,
+            name="duration-test",
+            budget_seconds=20,
+            minimum_duration_seconds=5,
+            performance_cases=(first, second),
+        )
+
+        class AdvancingClock:
+            def __init__(self):
+                self.value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        clock = AdvancingClock()
+
+        class AdvancingRunner(FakeRunner):
+            def __call__(self, argv, timeout=None, **kwargs):
+                result = super().__call__(argv, timeout=timeout, **kwargs)
+                clock.value += 1.0
+                return result
+
+        # Validation normally resolves a checked-in suite by name. This test
+        # supplies an in-memory suite solely to keep the fake duration short.
+        runner = AdvancingRunner()
+        with mock.patch.object(self.execution.validation, "load_suite", return_value=suite):
+            status = self.execution.run_suite(
+                self.execution.replace_config(self.config(run_quality=False), suite=suite),
+                clock,
+                runner,
+            )
+
+        records = [json.loads(path.read_text(encoding="utf-8")) for path in status.records]
+        self.assertEqual(status.completed_rounds, 2)
+        self.assertGreaterEqual(status.elapsed_seconds, 5.0)
+        self.assertEqual([len(record["samples"]) for record in records], [2, 2])
+        self.assertEqual(
+            runner.started_case_ids,
+            [
+                "first",
+                "first",
+                "second",
+                "first",
+                "second",
+            ],
+        )
+        manifest = json.loads((status.bundle / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"]["completed_rounds"], 2)
+        self.assertGreaterEqual(manifest["status"]["elapsed_seconds"], 5.0)
 
     def test_mtp_quality_integration_rejects_non_manifest_token_cases(self):
         quality_cases = self.execution.manifest.load_quality("v1")
