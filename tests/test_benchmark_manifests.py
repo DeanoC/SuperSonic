@@ -149,6 +149,20 @@ engines = ["llama-cpp"]
             self.assertGreater(case.max_new_tokens, 0)
             self.assertIn(case.scorer, {"exact_text", "exact_tokens", "structured_json"})
 
+    def test_json_loader_rejects_duplicate_keys_and_non_finite_numbers(self):
+        manifest = load_manifest_module()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            duplicate_path = Path(temporary) / "duplicate.json"
+            duplicate_path.write_text('{"name":"first","name":"second"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                manifest._load_json(duplicate_path)
+
+            non_finite_path = Path(temporary) / "non-finite.json"
+            non_finite_path.write_text('{"value":1e309}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                manifest._load_json(non_finite_path)
+
     def test_engine_manifests_resolve_pins_and_exact_keys(self):
         manifest = load_manifest_module()
 

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter
-import json
 from pathlib import Path
 import tomllib
 
-from .model import EngineManifest, PerformanceCase, QualityCase, SuiteManifest, canonical_json
+from .model import EngineManifest, PerformanceCase, QualityCase, SuiteManifest, canonical_json, parse_strict_json
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -295,7 +294,7 @@ def _load_toml(path: Path) -> dict[str, object]:
 def _load_json(path: Path) -> dict[str, object]:
     if not path.is_file():
         raise ValueError(f"missing manifest file: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = parse_strict_json(path.read_text(encoding="utf-8"), context=f"manifest {path}")
     if not isinstance(data, dict):
         raise ValueError(f"manifest {path} must contain a top-level object")
     return data
