@@ -26,8 +26,8 @@ FORBIDDEN_PATTERNS = (
     re.compile(r"--backend\b", re.IGNORECASE),
     re.compile(r"\bSUPERSONIC_BACKENDS?\b", re.IGNORECASE),
     re.compile(r"(?:\b(?:cuda|metal)\b|\b(?:cuda|metal)[_-][a-z0-9_]+)", re.IGNORECASE),
-    re.compile(r"\b(?:gemma|phi|llama)(?:\s*[0-9]|[_-][a-z0-9])", re.IGNORECASE),
-    re.compile(r"\b(?:gemma|phi|llama)\b", re.IGNORECASE),
+    re.compile(r"\b(?:gemma|phi|llama)(?!-(?:cli|cpp)\b)(?:\s*[0-9]|[_-][a-z0-9])", re.IGNORECASE),
+    re.compile(r"\b(?:gemma|phi|llama)(?!-(?:cli|cpp)\b)\b", re.IGNORECASE),
     re.compile(r"qwen[-_ ]*3[.]?[56](?![0-9])", re.IGNORECASE),
     re.compile(r"\bDFlash\b|\bSpecPrefill\b|\bCertified[-_ ]?KV\b", re.IGNORECASE),
     re.compile(r"\bKV[-_ ]?FP8\b|\bFP8\b|\bVMM\b|\bMoE\b", re.IGNORECASE),
@@ -42,14 +42,23 @@ FORBIDDEN_PATTERNS = (
 FLM_RE = re.compile(r"\bFLM\b|--flm(?:-file)?\b|\bflm[_-]file\b", re.IGNORECASE)
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)\s]+)")
 INTERNAL_FLM_HEADING_RE = re.compile(r"^##\s+Internal FLM foundation\s*$", re.IGNORECASE)
-TOK_PER_SECOND_RE = re.compile(r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*tok/s\b", re.IGNORECASE)
+TOK_PER_SECOND_RE = re.compile(
+    r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*(?:tok(?:ens?)?\s*/\s*s|t(?:ok(?:ens?)?)?\s+per\s+second)\b",
+    re.IGNORECASE,
+)
 PERFORMANCE_METRIC_RE = re.compile(
-    r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*(?:tok/s|tokens?/s|ms(?:_per_tok|/token))\b",
+    r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*(?:"
+    r"t(?:ok(?:ens?)?)?\s*(?:/|per)\s*(?:second|sec|s)|"
+    r"tps|"
+    r"milliseconds?\s*(?:per|/)\s*tokens?|"
+    r"ms\s*(?:_per_tok|/\s*(?:tok(?:en)?s?)|per\s+tokens?)"
+    r")\b",
     re.IGNORECASE,
 )
 SPEEDUP_RE = re.compile(
-    r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*[x×]\s*(?:speedup|faster)\b"
-    r"|\bspeedup\s*[:=]\s*(?:\d+(?:\.\d+)?)\s*[x×]?\b",
+    r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*[x×]\s*(?:speed[- ]?up|faster)\b"
+    r"|\bspeed[- ]?up\s*(?:is\s*)?[:=]?\s*(?:\d+(?:\.\d+)?)\s*[x×]\b"
+    r"|(?<![\w.])(?:\d+(?:\.\d+)?)\s*(?:%|percent(?:age)?)\s+faster\b",
     re.IGNORECASE,
 )
 CLAIM_RE = re.compile(

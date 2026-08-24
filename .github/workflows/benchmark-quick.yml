@@ -220,6 +220,8 @@ jobs:
             --artifact "$SUPERSONIC_GQH_GGUF" \
             --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
             --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
+            --rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt" \
+            --hip-version-file "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt" \
             --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
             --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
             --device "$SUPERSONIC_DEVICE" \

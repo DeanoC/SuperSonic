@@ -158,19 +158,19 @@ class BenchmarkCompareTests(unittest.TestCase):
             "workload.stop_policy": ("workload", "stop_policy", "honor-eos"),
             "workload.warmups": ("workload", "warmups", 2),
             "workload.measurement_boundary": ("workload", "measurement_boundary", "end-to-end"),
-            "environment.power_cap_watts": ("environment", "requested", {"power_cap_watts": 280}),
+            "environment.requested.power_cap_watts": ("environment", "requested", {"power_cap_watts": 280}),
         }
 
         for reason, mutation in mutations.items():
             with self.subTest(reason=reason):
                 right = copy.deepcopy(self.locked_warm)
-                if len(mutation) == 3:
+                if reason == "environment.requested.power_cap_watts":
+                    right["environment"]["requested"]["power_cap_watts"] = 280
+                elif len(mutation) == 3:
                     section, key, value = mutation
                     right[section][key] = value
                 else:
                     raise AssertionError("unexpected mutation fixture")
-                if reason == "environment.power_cap_watts":
-                    right["environment"]["requested"]["power_cap_watts"] = 280
                 result = self.compare.compare_records(self.locked_warm, right)
                 self.assertFalse(result.comparable)
                 self.assertIsNone(result.speedup)
@@ -195,6 +195,34 @@ class BenchmarkCompareTests(unittest.TestCase):
                     target = target[key]
                 target[path[-1]] = value
                 self.assertNotEqual(base_key, self.compare.series_key(record))
+
+    def test_requested_clock_power_level_cache_process_and_boundary_mismatches_forbid_speedup(self):
+        mutations = (
+            (("environment", "rocm_version"), "ROCm 7.0.0", "rocm_version"),
+            (("environment", "hip_version"), "HIP 7.0.0", "hip_version"),
+            (("environment", "requested", "gpu_clock_mhz"), 2500, "gpu_clock_mhz"),
+            (("environment", "requested", "memory_clock_mhz"), 1300, "memory_clock_mhz"),
+            (("environment", "requested", "power_cap_watts"), 280, "power_cap_watts"),
+            (("environment", "requested", "performance_level"), "auto", "performance_level"),
+            (("workload", "cache_state"), "cold-load", "cache_state"),
+            (("environment", "process_reuse"), True, "process_reuse"),
+            (("workload", "measurement_boundary"), "end-to-end", "measurement_boundary"),
+        )
+        for path, value, reason in mutations:
+            with self.subTest(path=path):
+                right = copy.deepcopy(self.locked_warm)
+                target = right
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                result = self.compare.compare_records(self.locked_warm, right)
+                self.assertFalse(result.comparable)
+                self.assertIsNone(result.speedup)
+                self.assertIn(reason, result.reasons)
+                self.assertNotEqual(
+                    self.compare.series_key(self.locked_warm),
+                    self.compare.series_key(right),
+                )
 
 
 if __name__ == "__main__":

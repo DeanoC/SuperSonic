@@ -52,6 +52,28 @@ values from its validated output. The physical ordinal is retained for SMI
 evidence; masking it makes the selected device logical `0` to the process.
 Do not assume physical GPU zero or use `eval` on selector output.
 
+Capture the bounded toolchain identities after selecting the physical device;
+the CLI consumes these files and stores only normalized values in records:
+
+```bash
+timeout --foreground 30s hipcc --version \
+  | tee "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt"
+timeout --foreground 30s rocm-smi -d "$SUPERSONIC_R9700_GPU_ID" \
+  --showdriverversion | tee "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt"
+```
+
+## Release-build prerequisite
+
+Before either local quick or full run, build the canonical release workspace
+with the same HIP target used by the selected device:
+
+```bash
+HIP_ARCH=gfx1201 cargo build --release --workspace
+```
+
+The harness invokes that release binary; it does not compile a different
+development profile implicitly.
+
 ## Quick candidate
 
 The following is the implemented CLI shape used by the quick workflow. All
@@ -68,6 +90,8 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --artifact "$SUPERSONIC_GQH_GGUF" \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
   --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
+  --rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt" \
+  --hip-version-file "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt" \
   --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
   --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
   --device "$SUPERSONIC_DEVICE" \
@@ -96,8 +120,20 @@ python3 tools/supersonic-bench.py validate --publishable "$bundle"
 ## Full candidate
 
 The full workflow is the same CLI with the full suite and its separate pinned
-peer artifact. The workflow supplies the actual peer path and binary pin; a
-local invocation must provide the corresponding `--peer-artifact` path.
+peer artifact. Before a local full run, `llama-cli` must be on `PATH`, must
+match the first non-comment line in `tools/external/llama-cpp-version.txt`,
+and the peer artifact must be readable:
+
+```bash
+export SUPERSONIC_LLAMA_CPP_ARTIFACT=/path/to/pinned-peer-artifact.gguf
+command -v llama-cli
+test -r "$SUPERSONIC_LLAMA_CPP_ARTIFACT"
+pinned_peer_version="$(grep -v '^#' tools/external/llama-cpp-version.txt | grep -v '^$' | head -n 1)"
+test "$(llama-cli --version)" = "$pinned_peer_version"
+```
+
+The workflow supplies the actual peer path and binary pin; a local invocation
+must provide the corresponding `--peer-artifact` path.
 
 ```bash
 set -euo pipefail
@@ -110,6 +146,8 @@ RUST_TEST_THREADS=1 timeout --foreground 21660s \
   --peer-artifact /path/to/pinned-peer-artifact.gguf \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
   --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
+  --rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt" \
+  --hip-version-file "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt" \
   --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
   --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
   --device "$SUPERSONIC_DEVICE" \
@@ -154,8 +192,10 @@ diagnosis but are excluded from headline performance and peer speedup claims.
 Every candidate record retains the commit and dirty state, engine/version,
 ROCm/HIP versions, static physical GPU provenance, logical mapping, artifact
 identity and digest, prompt/workload, cache/process state, clock evidence,
-correctness and ordinary-versus-MTP equality, raw measured samples, sample
-count, median, minimum, maximum, and median absolute deviation (MAD).
+correctness and ordinary-versus-MTP equality, and raw measured samples in
+measurement order. The validator and renderer deterministically derive sample
+count, median, minimum, maximum, and median absolute deviation (MAD) from
+those raw samples; no stored summary replaces the raw source.
 
 The reviewer runs validation and, for a peer comparison, the implemented
 comparator. A mismatch remains visible with reasons but produces no speedup:

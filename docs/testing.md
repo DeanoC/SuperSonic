@@ -65,6 +65,8 @@ optional or planned flag:
 
 ```bash
 set -euo pipefail
+HIP_ARCH=gfx1201 cargo build --release --workspace
+run_id="quick-manual-$(date +%s)"
 RUST_TEST_THREADS=1 timeout --foreground 660s \
   python3 tools/supersonic-bench.py run \
   --suite quick \
@@ -72,6 +74,8 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --artifact "$SUPERSONIC_GQH_GGUF" \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
   --gpu-static-json target/benchmarks/manual/amd-smi-provenance.json \
+  --rocm-version-file target/benchmarks/manual/rocm-driver-version.txt \
+  --hip-version-file target/benchmarks/manual/hipcc-version.txt \
   --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
   --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
   --device "$SUPERSONIC_DEVICE" \
@@ -82,9 +86,10 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
   --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
   --seed 1 \
+  --run-id "$run_id" \
   --output target/benchmarks/candidate
 python3 tools/supersonic-bench.py validate --publishable \
-  target/benchmarks/candidate/<run-id>
+  "target/benchmarks/candidate/$run_id"
 ```
 
 The quick harness budget is exactly 600 seconds (10 minutes), while its
@@ -100,7 +105,7 @@ The harness records `cold-load` and `warm-resident` separately and keeps
 their adapter transitions are verified. `uncontrolled-clocks` results may be
 retained for diagnosis but are excluded from headline and peer speedup claims.
 The candidate directory is diagnostic until a reviewer checks raw samples,
-median/MAD, correctness, cache/clock evidence, artifact digests, and
+the validator/renderer-derived median/MAD/count, correctness, cache/clock evidence, artifact digests, and
 comparability, then promotes only portable records in a code-reviewed change.
 
 ## Failure policy

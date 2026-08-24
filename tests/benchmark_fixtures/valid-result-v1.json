@@ -55,6 +55,8 @@
     "measurement_boundary": "decode"
   },
   "environment": {
+    "rocm_version": "ROCm 6.4.2",
+    "hip_version": "HIP 6.4.2",
     "clock_policy": "locked",
     "requested": {
       "gpu_clock_mhz": 2400,

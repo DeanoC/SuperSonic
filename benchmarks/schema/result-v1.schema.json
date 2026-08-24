@@ -80,7 +80,8 @@
           "type": "string"
         },
         "version": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^(?!unknown$)[A-Za-z0-9][A-Za-z0-9 ._:+()-]{0,127}$"
         },
         "adapter_version": {
           "type": "integer",
@@ -278,6 +279,8 @@
       "type": "object",
       "required": [
         "clock_policy",
+        "rocm_version",
+        "hip_version",
         "requested",
         "requested_at",
         "observed_before",
@@ -297,6 +300,14 @@
         "evidence_notes"
       ],
       "properties": {
+        "rocm_version": {
+          "type": "string",
+          "pattern": "^(?!unknown$)ROCm [A-Za-z0-9][A-Za-z0-9 ._:+()-]{0,122}$"
+        },
+        "hip_version": {
+          "type": "string",
+          "pattern": "^(?!unknown$)HIP [A-Za-z0-9][A-Za-z0-9 ._:+()-]{0,123}$"
+        },
         "clock_policy": {
           "type": "string",
           "enum": [

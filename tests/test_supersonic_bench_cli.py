@@ -67,6 +67,10 @@ class BenchmarkCliTests(unittest.TestCase):
                 "0",
                 "--gpu-static-json",
                 "/tmp/amd-smi-static.json",
+                "--rocm-version-file",
+                "/tmp/rocm-version.txt",
+                "--hip-version-file",
+                "/tmp/hip-version.txt",
                 "--gpu-arch",
                 "gfx1201",
                 "--clock-policy",
@@ -82,6 +86,8 @@ class BenchmarkCliTests(unittest.TestCase):
         self.assertEqual(args.gpu_clock_mhz, 2600)
         self.assertEqual(args.memory_clock_mhz, 1800)
         self.assertEqual(args.power_cap_watts, 300)
+        self.assertEqual(args.rocm_version_file, Path("/tmp/rocm-version.txt"))
+        self.assertEqual(args.hip_version_file, Path("/tmp/hip-version.txt"))
 
     def test_gpu_identity_cannot_be_forged_through_public_cli(self):
         cli = load_cli_module()

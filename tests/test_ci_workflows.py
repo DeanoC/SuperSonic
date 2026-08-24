@@ -204,6 +204,15 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn('[[ "$SUPERSONIC_GPU_LOGICAL" =~ ^[0-9]+$ ]]', text)
             self.assertNotIn('[[ "$SUPERSONIC_GPU_LOGICAL" == "$SUPERSONIC_DEVICE" ]]', text)
 
+    def test_benchmark_workflows_pass_captured_toolchain_version_files(self):
+        for name in ("benchmark-quick.yml", "benchmark-full.yml"):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text(encoding="utf-8")
+                self.assertIn('--rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt"', text)
+                self.assertIn('--hip-version-file "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt"', text)
+                self.assertIn("run_id=", text)
+                self.assertIn('--run-id "$run_id"', text)
+
     def test_cpu_ci_validates_benchmark_fixtures_without_gpu(self):
         workflow = WORKFLOWS / "ci.yml"
         text = workflow.read_text(encoding="utf-8")

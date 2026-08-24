@@ -48,6 +48,20 @@ class ActiveDocsTests(unittest.TestCase):
         for term in ("comparability", "artifact", "cache state", "clock", "sample count"):
             self.assertIn(term, text)
 
+    def test_benchmark_recipes_match_versioned_cli_and_local_prerequisites(self):
+        text = (ROOT / "docs" / "benchmarks.md").read_text(encoding="utf-8")
+        self.assertIn("HIP_ARCH=gfx1201 cargo build --release --workspace", text)
+        self.assertIn("--rocm-version-file", text)
+        self.assertIn("--hip-version-file", text)
+        self.assertIn('run_id="quick-manual-', text)
+        self.assertIn('run_id="full-manual-', text)
+        self.assertIn("command -v llama-cli", text)
+        self.assertIn('test -r "$SUPERSONIC_LLAMA_CPP_ARTIFACT"', text)
+        self.assertIn("validator and renderer deterministically derive", text)
+        testing = (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")
+        self.assertIn('run_id="quick-manual-', testing)
+        self.assertIn('--run-id "$run_id"', testing)
+
     def test_repository_active_docs_have_no_removed_product_contract(self):
         checker = load_checker()
         self.assertEqual([], checker.find_violations(ROOT))
@@ -524,6 +538,34 @@ class ActiveDocsTests(unittest.TestCase):
                 "A prose explanation can mention a 2.0x multiplier without making a speed claim.\n",
             ),
         )
+
+    def test_common_numeric_performance_phrasings_require_complete_evidence(self):
+        checker = load_checker()
+        for phrase in (
+            "37 tokens per second",
+            "1.2 milliseconds per token",
+            "speedup is 2.0x",
+            "50% faster",
+            "1 token per second",
+            "1 millisecond per token",
+            "37 tok/s",
+            "1.2 ms/token",
+            "speed-up is 2.0x",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(checker.find_performance_violations(Path("README.md"), phrase))
+
+    def test_numeric_claim_bypass_and_non_performance_multiplier_are_safe(self):
+        checker = load_checker()
+        self.assertEqual(
+            [],
+            checker.find_performance_violations(
+                Path("README.md"), "The 2.0x multiplier is a scale factor."
+            ),
+        )
+        for phrase in ("37 tokens\u00a0per\u00a0second", "speedup is\u00a02.0x", "50 percent faster"):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(checker.find_performance_violations(Path("README.md"), phrase))
 
     def test_testing_artifact_block_defines_and_propagates_strict_environment(self):
         document = (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")

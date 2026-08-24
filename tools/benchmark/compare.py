@@ -8,6 +8,8 @@ from . import validation
 
 
 COMPARABILITY_FIELDS = (
+    "environment.rocm_version",
+    "environment.hip_version",
     "hardware.identity",
     "hardware.identity_kind",
     "hardware.architecture",
@@ -28,8 +30,17 @@ COMPARABILITY_FIELDS = (
     "workload.warmups",
     "workload.measurement_boundary",
     "environment.clock_policy",
-    "environment.power_cap_watts",
+    "environment.requested.gpu_clock_mhz",
+    "environment.requested.memory_clock_mhz",
+    "environment.requested.power_cap_watts",
+    "environment.requested.performance_level",
+    "environment.process_reuse",
 )
+
+# Engine identity distinguishes the two sides of a peer comparison and keeps
+# independent engine series apart, but it is not a shared-input requirement:
+# the comparator is specifically used to compare different engines.
+SERIES_IDENTITY_FIELDS = ("engine.name", "engine.version", *COMPARABILITY_FIELDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +79,7 @@ def summarize_samples(values: list[float] | tuple[float, ...]) -> SampleSummary:
 
 
 def series_key(record: dict[str, object]) -> tuple[str, ...]:
-    return tuple(f"{field}={_field_value(record, field)}" for field in COMPARABILITY_FIELDS)
+    return tuple(f"{field}={_field_value(record, field)}" for field in SERIES_IDENTITY_FIELDS)
 
 
 def compare_records(left: dict[str, object], right: dict[str, object]) -> Comparison:
@@ -124,8 +135,6 @@ def _median(values: tuple[float, ...]) -> float:
 
 
 def _field_value(record: dict[str, object], field: str) -> object:
-    if field == "environment.power_cap_watts":
-        return record["environment"]["requested"]["power_cap_watts"]
     value: Any = record
     for part in field.split("."):
         value = value[part]
@@ -137,7 +146,7 @@ def _reason_name(field: str) -> str:
         return "clock_policy"
     if field == "workload.cache_state":
         return "cache_state"
-    if field == "environment.power_cap_watts":
+    if field == "environment.requested.power_cap_watts":
         return "power_cap_watts"
     if field == "artifact.sha256":
         return "sha256"

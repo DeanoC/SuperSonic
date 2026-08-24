@@ -525,6 +525,8 @@ def _evidence_block(record: Mapping[str, object], *, href_prefix: str = "") -> s
         ("engine", _value(record, "engine.name")),
         ("engine version", _value(record, "engine.version")),
         ("adapter version", _value(record, "engine.adapter_version")),
+        ("ROCm version", environment.get("rocm_version")),
+        ("HIP version", environment.get("hip_version")),
         ("GPU market name", identity_fields.get("market_name")),
         ("GPU identity", hardware.get("identity")),
         ("GPU identity source SHA-256", hardware.get("identity_source_sha256")),

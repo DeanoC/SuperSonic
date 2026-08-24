@@ -93,6 +93,10 @@ class BenchmarkExecutionTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.rocm_version_file = self.root / "rocm-version.txt"
+        self.rocm_version_file.write_text("ROCm 6.4.2\n", encoding="utf-8")
+        self.hip_version_file = self.root / "hip-version.txt"
+        self.hip_version_file.write_text("HIP 6.4.2\n", encoding="utf-8")
         self.binary = self.root / "supersonic"
         self.binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.binary.chmod(0o755)
@@ -112,6 +116,8 @@ class BenchmarkExecutionTests(unittest.TestCase):
             physical_gpu="0",
             gpu_arch="gfx1201",
             gpu_static_json=self.static_json,
+            rocm_version_file=self.rocm_version_file,
+            hip_version_file=self.hip_version_file,
             logical_gpu="0",
             output_dir=Path(output or self.root / "candidate"),
             engine_binaries={
@@ -129,7 +135,15 @@ class BenchmarkExecutionTests(unittest.TestCase):
             self.execution.preflight(config)
 
     def test_preflight_requires_explicit_model_artifact_and_gpu(self):
-        for field in ("model_dir", "artifact", "physical_gpu", "gpu_arch", "gpu_static_json"):
+        for field in (
+            "model_dir",
+            "artifact",
+            "physical_gpu",
+            "gpu_arch",
+            "gpu_static_json",
+            "rocm_version_file",
+            "hip_version_file",
+        ):
             config = self.config()
             config = self.execution.replace_config(config, **{field: None})
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field.replace("_", ".*")):
@@ -197,6 +211,26 @@ class BenchmarkExecutionTests(unittest.TestCase):
         record = json.loads(records[0].read_text(encoding="utf-8"))
         self.assertFalse(record["environment"]["process_reuse"])
         self.assertEqual(record["environment"]["cache_evidence"]["process_state"], "fresh-process")
+        self.assertEqual(record["environment"]["rocm_version"], "ROCm 6.4.2")
+        self.assertEqual(record["environment"]["hip_version"], "HIP 6.4.2")
+        self.assertTrue(record["engine"]["version"].startswith("source-"))
+        self.assertNotIn(str(self.rocm_version_file), json.dumps(record))
+        self.assertNotIn(str(self.hip_version_file), json.dumps(record))
+
+    def test_version_file_parser_rejects_empty_unknown_and_oversized_captures(self):
+        parser = self.execution._read_version_file
+        empty = self.root / "empty-version.txt"
+        empty.write_text("\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "empty"):
+            parser(empty, "HIP")
+        unknown = self.root / "unknown-version.txt"
+        unknown.write_text("HIP unknown\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "parseable|unknown"):
+            parser(unknown, "HIP")
+        oversized = self.root / "oversized-version.txt"
+        oversized.write_text("HIP 6.4.2\n" + ("x" * 4096), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "4096"):
+            parser(oversized, "HIP")
 
     def test_performance_failures_are_report_only_but_quality_failures_block(self):
         config = self.config(run_quality=False)
@@ -237,6 +271,8 @@ class BenchmarkExecutionTests(unittest.TestCase):
         records = [json.loads(path.read_text(encoding="utf-8")) for path in status.records]
         supersonic = next(record for record in records if record["engine"]["name"] == "supersonic")
         peer = next(record for record in records if record["engine"]["name"] == "llama-cpp")
+        self.assertEqual(peer["engine"]["version"], "version: 9430 (d48a56eff)")
+        self.assertNotEqual(peer["engine"]["version"].lower(), "unknown")
         self.assertEqual(peer["artifact"]["sha256"], self.execution._digest_file(self.peer_artifact))
         self.assertNotEqual(supersonic["artifact"]["sha256"], peer["artifact"]["sha256"])
         self.assertNotEqual(supersonic["artifact"]["semantic_id"], peer["artifact"]["semantic_id"])

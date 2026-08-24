@@ -44,6 +44,29 @@ class BenchmarkValidationTests(unittest.TestCase):
     def test_valid_fixture_passes(self):
         self.validation.validate_record(self.valid_record)
 
+    def test_structured_toolchain_versions_are_required_and_safe(self):
+        self.assertRegex(self.valid_record["environment"]["rocm_version"], r"^ROCm ")
+        self.assertRegex(self.valid_record["environment"]["hip_version"], r"^HIP ")
+        self.assertNotEqual(self.valid_record["engine"]["version"].lower(), "unknown")
+
+        for key in ("rocm_version", "hip_version"):
+            record = copy.deepcopy(self.valid_record)
+            record["environment"][key] = "unknown"
+            self.assert_record_invalid(record, "version|unknown")
+
+            record = copy.deepcopy(self.valid_record)
+            record["environment"][key] = record["environment"][key] + " unknown"
+            self.assert_record_invalid(record, "version|unknown")
+
+        record = copy.deepcopy(self.valid_record)
+        record["engine"]["version"] = "unknown"
+        self.assert_record_invalid(record, "engine.*version|unknown")
+
+    def test_version_fields_never_contain_source_paths(self):
+        serialized = json.dumps(self.valid_record)
+        self.assertNotIn("version-file", serialized)
+        self.assertNotRegex(serialized, r"(?:^|[\" ])/(?:home|tmp|workspace)/")
+
     def test_path_and_non_finite_sample_fail(self):
         record = copy.deepcopy(self.valid_record)
         record["run"]["command"] = ["/home/private/supersonic"]

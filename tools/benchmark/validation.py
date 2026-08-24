@@ -48,6 +48,8 @@ _SECRET_VALUE_PATTERNS = (
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)")
 _PCI_BDF = re.compile(r"^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$", re.IGNORECASE)
 _GPU_UUID = re.compile(r"^[a-z0-9][a-z0-9_.:-]{7,}$", re.IGNORECASE)
+_SAFE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:+()-]{0,127}$")
+_UNKNOWN_VERSION = re.compile(r"\bunknown\b", re.IGNORECASE)
 
 
 def validate_record(record: object) -> None:
@@ -305,6 +307,9 @@ def _validate_record_consistency(record: dict[str, object]) -> None:
     hardware = record["hardware"]
     if not isinstance(run, dict) or not isinstance(engine_info, dict) or not isinstance(workload, dict):
         raise ValueError("record sections must be objects")
+    _validate_version_identity(engine_info.get("version"), "engine.version")
+    _validate_version_identity(env.get("rocm_version"), "environment.rocm_version", prefix="ROCm ")
+    _validate_version_identity(env.get("hip_version"), "environment.hip_version", prefix="HIP ")
     identity = str(hardware.get("identity", "")) if isinstance(hardware, Mapping) else ""
     if not identity.strip() or identity.lower() in {"unknown", "unknown-gpu", "n/a", "na"}:
         raise ValueError("hardware identity must be a verified physical identity")
@@ -403,6 +408,18 @@ def _validate_quality_summary(quality: dict[str, object], required_case_ids: tup
             bucket["failed"] += 1
     if quality["categories"] != category_counts:
         raise ValueError("quality category counts do not match cases")
+
+
+def _validate_version_identity(value: object, path: str, *, prefix: str | None = None) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{path} must be a non-empty version identity")
+    value = value.strip()
+    if len(value) > 128 or _SAFE_VERSION.fullmatch(value) is None:
+        raise ValueError(f"{path} is outside safe version bounds")
+    if _UNKNOWN_VERSION.search(value):
+        raise ValueError(f"{path} must not be unknown")
+    if prefix is not None and not value.startswith(prefix):
+        raise ValueError(f"{path} must use the structured {prefix.strip()} prefix")
 
 
 def _validate_publishable(record: dict[str, object], path: Path) -> None:

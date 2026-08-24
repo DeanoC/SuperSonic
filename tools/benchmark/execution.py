@@ -37,6 +37,9 @@ FULL_BUDGET_SECONDS = EXPECTED_BUDGETS["full"]
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 SUPPORTED_GPU_ARCHES = frozenset(("gfx1100", "gfx1201"))
 MTP_CATEGORY = quality.MTP_CATEGORY
+VERSION_FILE_MAX_BYTES = 4096
+VERSION_VALUE_MAX_LENGTH = 128
+_VERSION_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:+()-]{0,127}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +57,10 @@ class RunConfig:
     physical_gpu: str | None
     gpu_arch: str | None
     gpu_static_json: Path | None = None
+    rocm_version_file: Path | None = None
+    hip_version_file: Path | None = None
+    rocm_version: str | None = None
+    hip_version: str | None = None
     logical_gpu: str | None = None
     output_dir: Path = Path("target/benchmarks/candidate")
     peer_artifact: Path | None = None
@@ -180,6 +187,14 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         raise ValueError("context_size must be positive")
     logical_gpu = _required_text(resolved.logical_gpu or str(resolved.device), "logical_gpu")
     static_json = _required_path(resolved.gpu_static_json, "gpu_static_json", directory=False, nonempty=True)
+    rocm_version_file = _required_path(
+        resolved.rocm_version_file, "rocm_version_file", directory=False, nonempty=True
+    )
+    hip_version_file = _required_path(
+        resolved.hip_version_file, "hip_version_file", directory=False, nonempty=True
+    )
+    rocm_version = _read_version_file(rocm_version_file, "ROCm")
+    hip_version = _read_version_file(hip_version_file, "HIP")
     static_gpu = gpu.resolve_static_gpu(
         static_json,
         physical_gpu=physical_gpu,
@@ -230,6 +245,10 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         physical_gpu=physical_gpu,
         gpu_arch=gpu_arch,
         gpu_static_json=static_json,
+        rocm_version_file=rocm_version_file,
+        hip_version_file=hip_version_file,
+        rocm_version=rocm_version,
+        hip_version=hip_version,
         logical_gpu=static_gpu.logical_gpu,
     )
     if resolved_config.environment_snapshot is None and (
@@ -852,7 +871,7 @@ def _build_record(
         },
         "engine": {
             "name": engine.name,
-            "version": engine.pinned_version or config.engine_versions.get(engine.name) or "unknown",
+            "version": _engine_version(run_manifest, engine),
             "adapter_version": adapters.ADAPTER_VERSION,
         },
         "hardware": {
@@ -892,6 +911,7 @@ def _build_record(
 
 
 def _environment_record(config: RunConfig, case: PerformanceCase) -> dict[str, object]:
+    rocm_version, hip_version = _configured_versions(config)
     provided = config.environment_snapshot
     if callable(provided):
         provided = provided()
@@ -918,6 +938,8 @@ def _environment_record(config: RunConfig, case: PerformanceCase) -> dict[str, o
             else {"prefix_cache": case.cache_state.removeprefix("prefix-cache-"), "process_reuse": False}
         )
         return {
+            "rocm_version": rocm_version,
+            "hip_version": hip_version,
             "clock_policy": policy,
             "requested": {
                 "gpu_clock_mhz": _optional_policy_int(requested.get("gpu_clock_mhz")),
@@ -946,6 +968,8 @@ def _environment_record(config: RunConfig, case: PerformanceCase) -> dict[str, o
     if not isinstance(value, dict):
         raise ValueError("environment_snapshot must be an object")
     value["cache_state"] = case.cache_state
+    value["rocm_version"] = rocm_version
+    value["hip_version"] = hip_version
     value["cache_evidence"] = _cache_evidence(case.cache_state, value.get("cache_evidence"))
     # Environment snapshots supplied by callers are evidence, not a license to
     # claim process reuse between one-shot invocations.  Reject a positive
@@ -1086,7 +1110,7 @@ def _persist_bundle_manifest(
             {
                 "name": engine.name,
                 "binary": Path(engine.binary).name,
-                "version": engine.pinned_version,
+                "version": _engine_version(run_manifest, engine),
                 "adapter_version": adapters.ADAPTER_VERSION,
             }
             for engine in run_manifest.engines
@@ -1259,6 +1283,10 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
                 "gpu_arch",
                 "architecture",
                 "gpu_static_json",
+                "rocm_version_file",
+                "hip_version_file",
+                "rocm_version",
+                "hip_version",
                 "logical_gpu",
                 "output_dir",
                 "output",
@@ -1313,6 +1341,10 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
         "seed": None,
         "run_quality": True,
         "gpu_static_json": None,
+        "rocm_version_file": None,
+        "hip_version_file": None,
+        "rocm_version": None,
+        "hip_version": None,
         "logical_gpu": None,
         "artifact_semantic_id": None,
         "artifact_quantization": None,
@@ -1346,6 +1378,99 @@ def _required_path(
     if nonempty and path.stat().st_size <= 0:
         raise ValueError(f"{label} unavailable: empty file")
     return path.resolve()
+
+
+def _read_version_file(path: Path, label: str) -> str:
+    """Parse one bounded, human-captured toolchain version into a safe value.
+
+    The raw capture remains a candidate diagnostic, but portable records carry
+    only a normalized version identity.  Keeping the parser here (rather than
+    serializing the path or whole command output) makes the record independent
+    of the host filesystem.
+    """
+
+    resolved = _required_path(path, f"{label.lower()}_version_file", directory=False, nonempty=True)
+    raw = resolved.read_bytes()
+    if len(raw) > VERSION_FILE_MAX_BYTES:
+        raise ValueError(
+            f"{label.lower()}_version_file exceeds {VERSION_FILE_MAX_BYTES} bytes"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} version file must be UTF-8 text") from exc
+    if not text.strip():
+        raise ValueError(f"{label} version file is empty")
+    if any(char in text for char in "\x00\r"):
+        raise ValueError(f"{label} version file contains unsafe control characters")
+    if re.search(r"\bunknown\b", text, re.IGNORECASE):
+        raise ValueError(f"{label} version file must not contain unknown")
+
+    # hipcc and rocm-smi use different labels and often emit a short banner.
+    # Extract the first version token, then normalize its product prefix so
+    # consumers compare structured identities rather than arbitrary banners.
+    if label.upper() == "HIP":
+        pattern = re.compile(
+            r"(?:HIP(?:CC)?|hipcc)\s*(?:version\s*)?[:=]?\s*"
+            r"([0-9][A-Za-z0-9._+-]*)",
+            re.IGNORECASE,
+        )
+    else:
+        pattern = re.compile(
+            r"(?:ROCm|Driver)\s*(?:version\s*)?[:=]?\s*"
+            r"([0-9][A-Za-z0-9._+-]*)",
+            re.IGNORECASE,
+        )
+    match = pattern.search(text)
+    if match is None:
+        # Keep a strict fallback for already-normalized captures such as
+        # ``ROCm 6.4.2`` and ``HIP 6.4.2``.
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        match = re.search(r"(?:version\s*[:=]?\s*)?([0-9][A-Za-z0-9._+-]*)", first)
+        if match is None:
+            raise ValueError(f"{label} version file has no parseable version")
+        version = match.group(1)
+    else:
+        version = match.group(1)
+    normalized = f"{label} {version}"
+    if len(normalized) > VERSION_VALUE_MAX_LENGTH or _VERSION_VALUE_RE.fullmatch(normalized) is None:
+        raise ValueError(f"{label} version is empty or exceeds safe bounds")
+    return normalized
+
+
+def _configured_versions(config: RunConfig) -> tuple[str, str]:
+    rocm = config.rocm_version
+    hip = config.hip_version
+    if rocm is None and config.rocm_version_file is not None:
+        rocm = _read_version_file(Path(config.rocm_version_file), "ROCm")
+    if hip is None and config.hip_version_file is not None:
+        hip = _read_version_file(Path(config.hip_version_file), "HIP")
+    if not rocm or not hip:
+        raise ValueError("ROCm and HIP version identities are required")
+    for label, value in (("ROCm", rocm), ("HIP", hip)):
+        if not isinstance(value, str) or _VERSION_VALUE_RE.fullmatch(value) is None:
+            raise ValueError(f"{label} version identity is unsafe")
+        if not value.startswith(f"{label} "):
+            raise ValueError(f"{label} version identity must use the structured prefix")
+        if re.search(r"\bunknown\b", value, re.IGNORECASE):
+            raise ValueError(f"{label} version identity must not be unknown")
+    return rocm, hip
+
+
+def _engine_version(run_manifest: RunManifest, engine: EngineManifest) -> str:
+    # The source commit is the deterministic SuperSonic build identity.  The
+    # dirty bit is independently recorded in run.dirty and must not turn a
+    # portable version into a host path or a generic "unknown" value.
+    if engine.name == "supersonic":
+        value = f"source-{run_manifest.commit}"
+    else:
+        value = engine.pinned_version or run_manifest.config.engine_versions.get(engine.name)
+    if not isinstance(value, str) or not value.strip() or value.strip().lower() == "unknown":
+        raise ValueError(f"{engine.name} requires a non-unknown version identity")
+    value = value.strip()
+    if len(value) > VERSION_VALUE_MAX_LENGTH or _VERSION_VALUE_RE.fullmatch(value) is None:
+        raise ValueError(f"{engine.name} version identity is unsafe")
+    return value
 
 
 def _validate_model_files(model_dir: Path, *, chat: bool) -> None:

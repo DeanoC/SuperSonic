@@ -37,6 +37,18 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="captured authoritative AMD SMI static JSON used for GPU provenance",
     )
+    run.add_argument(
+        "--rocm-version-file",
+        type=Path,
+        required=True,
+        help="captured bounded ROCm/driver version text used for portable identity",
+    )
+    run.add_argument(
+        "--hip-version-file",
+        type=Path,
+        required=True,
+        help="captured bounded HIP compiler version text used for portable identity",
+    )
     run.add_argument("--logical-gpu")
     run.add_argument("--gpu-arch", default=None)
     run.add_argument("--device", type=int, default=0)
@@ -128,6 +140,8 @@ def _run(args: argparse.Namespace) -> int:
         physical_gpu=args.physical_gpu,
         gpu_arch=gpu_arch,
         gpu_static_json=args.gpu_static_json,
+        rocm_version_file=args.rocm_version_file,
+        hip_version_file=args.hip_version_file,
         logical_gpu=args.logical_gpu or os.environ.get("SUPERSONIC_DEVICE", str(args.device)),
         output_dir=args.output,
         device=args.device,

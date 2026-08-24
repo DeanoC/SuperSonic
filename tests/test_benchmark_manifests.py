@@ -242,6 +242,8 @@ engines = ["llama-cpp"]
             set(schema["properties"]["environment"]["required"]),
             {
                 "clock_policy",
+                "rocm_version",
+                "hip_version",
                 "requested",
                 "requested_at",
                 "observed_before",
