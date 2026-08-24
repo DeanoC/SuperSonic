@@ -115,3 +115,9 @@ Performance numbers are published only when the exact commit, GPU target,
 artifact, workload, measurement method, and correctness result are recorded.
 Until that evidence is attached, this page intentionally makes no standalone
 throughput claim.
+
+The reproducible benchmark procedure in [Benchmarks](docs/benchmarks.md)
+defines the exact 10-minute quick and six-hour manual full harnesses, their
+30/390-minute workflow caps, candidate review, and promotion into Pages. A
+zero-baseline Pages checkout intentionally skips deployment until the first
+reviewed result records are committed.

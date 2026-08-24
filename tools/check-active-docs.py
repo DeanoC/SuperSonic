@@ -43,6 +43,19 @@ FLM_RE = re.compile(r"\bFLM\b|--flm(?:-file)?\b|\bflm[_-]file\b", re.IGNORECASE)
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)\s]+)")
 INTERNAL_FLM_HEADING_RE = re.compile(r"^##\s+Internal FLM foundation\s*$", re.IGNORECASE)
 TOK_PER_SECOND_RE = re.compile(r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*tok/s\b", re.IGNORECASE)
+PERFORMANCE_METRIC_RE = re.compile(
+    r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*(?:tok/s|tokens?/s|ms(?:_per_tok|/token))\b",
+    re.IGNORECASE,
+)
+SPEEDUP_RE = re.compile(
+    r"(?<![\w.])(?:\d+(?:\.\d+)?)\s*[x×]\s*(?:speedup|faster)\b"
+    r"|\bspeedup\s*[:=]\s*(?:\d+(?:\.\d+)?)\s*[x×]?\b",
+    re.IGNORECASE,
+)
+CLAIM_RE = re.compile(
+    rf"(?:{PERFORMANCE_METRIC_RE.pattern})|(?:{SPEEDUP_RE.pattern})",
+    re.IGNORECASE,
+)
 COMMIT_EVIDENCE_RE = re.compile(
     r"\b(?:commit|revision)(?:\s+hash)?\s*[:=]?\s*`?([0-9a-f]{7,64})\b",
     re.IGNORECASE,
@@ -77,6 +90,58 @@ MEASUREMENT_EVIDENCE_RE = re.compile(
     r"|\bmeasurement\s*[:=]\s*(?!documented\b|elsewhere\b)[^,\n.;]+"
     r"|\bmedian\s+(?:decode|prefill)?\s*(?:measurement|latency|ms_per_tok)"
     r"\s*[:=]?\s*\d+)",
+    re.IGNORECASE,
+)
+ENGINE_EVIDENCE_RE = re.compile(r"\bengine\s*[:=]\s*[^\s,;]+", re.IGNORECASE)
+VERSION_EVIDENCE_RE = re.compile(
+    r"\b(?:engine[-_ ]?)?version\s*[:=]\s*[^\s,;]+", re.IGNORECASE
+)
+ENGINE_VERSION_EVIDENCE_RE = re.compile(
+    r"\bengine\s*/\s*version\s*[:=]\s*[^\n,;]+", re.IGNORECASE
+)
+CLOCK_EVIDENCE_RE = re.compile(
+    r"(?:\b(?:clock|clocks)(?:[-_ ]policy|[-_ ]verification|[-_ ]verified)?\s*[:=]\s*"
+    r"(?:locked|verified|pass|yes|true)\b|\b(?:verified[-_ ]?clock|clock[-_ ]?verified)\s*[:=]\s*"
+    r"(?:locked|verified|pass|yes|true)\b|\bclocks?\s+(?:are\s+)?verified\b)",
+    re.IGNORECASE,
+)
+CACHE_STATE_EVIDENCE_RE = re.compile(
+    r"\b(?:cache(?:[-_ ]state)?|cache_state)\s*[:=]\s*"
+    r"(?:cold-load|warm-resident|prefix-cache-(?:empty|populated|reset))\b",
+    re.IGNORECASE,
+)
+PROCESS_STATE_EVIDENCE_RE = re.compile(
+    r"\b(?:process(?:[-_ ]state)?|process_reuse)\s*[:=]\s*"
+    r"(?:fresh-process|false|true)\b",
+    re.IGNORECASE,
+)
+STATISTIC_EVIDENCE_RE = re.compile(
+    r"\b(?:statistic|summary\s+statistic|metric)\s*[:=]\s*"
+    r"(?:median|mean|minimum|maximum|mad|p\d+(?:\.\d+)?)\b"
+    r"|\bmedian\b",
+    re.IGNORECASE,
+)
+SAMPLE_COUNT_EVIDENCE_RE = re.compile(
+    r"\b(?:sample(?:s)?\s*(?:count|number)|samples?|sample_count|"
+    r"measured[-_ ]runs?(?:[-_ ]count)?|n)\s*[:=]\s*\d+\b",
+    re.IGNORECASE,
+)
+CORRECTNESS_EVIDENCE_RE = re.compile(
+    r"(?:\b(?:correctness|quality|token(?:[-_ ]sequence)?[-_ ]?equality|"
+    r"mtp(?:[-_ /]+)?equality)\s*[:=]\s*"
+    r"(?:pass(?:ed)?|ok|true|yes|verified|equal(?:ity)?|match(?:ed)?)\b"
+    r"|\b(?:correctness|quality)\s+(?:pass(?:ed)?|verified|matches?)\b)",
+    re.IGNORECASE,
+)
+DIRECT_RUN_EVIDENCE_RE = re.compile(
+    r"(?:\b(?:direct[-_ ]run|run\s+(?:id|record|manifest|evidence|command)|"
+    r"run[-_]?(?:id|record|manifest|evidence|command)|command)\s*[:=]\s*"
+    r"(?:`[^`]+`|[^\s,;]+)|\bbenchmarks/results/[^\s)]+\.json\b|"
+    r"\btarget/benchmarks/[^\s)]+)",
+    re.IGNORECASE,
+)
+DIRECT_RUN_PLACEHOLDER_RE = re.compile(
+    r"(?:<[^>]+>|\$\{?[A-Z_][A-Z0-9_]*\}?|\b(?:documented|elsewhere|unknown|tbd|placeholder)\b)",
     re.IGNORECASE,
 )
 
@@ -159,7 +224,14 @@ def _heading_level(line: str) -> int | None:
 
 
 def find_performance_violations(path: Path, text: str) -> list[str]:
-    """Require colocated evidence for every numeric ``tok/s`` claim."""
+    """Require colocated evidence for numeric performance and peer claims.
+
+    Ordinary prose is intentionally outside this check.  A paragraph is
+    inspected only when it contains a numeric metric (for example ``tok/s``)
+    or an explicit numeric speedup/faster claim.  Each claim receives its own
+    evidence slice so one run record cannot accidentally qualify a second
+    number in the same paragraph.
+    """
 
     violations: list[str] = []
     def artifact_evidence(value: str) -> bool:
@@ -181,7 +253,13 @@ def find_performance_violations(path: Path, text: str) -> list[str]:
         end = claims[claim_index + 1].start() if claim_index + 1 < len(claims) else len(paragraph)
         return paragraph[start:end]
 
-    for match in TOK_PER_SECOND_RE.finditer(text):
+    def has_direct_run_evidence(value: str) -> bool:
+        for candidate in DIRECT_RUN_EVIDENCE_RE.finditer(value):
+            if not DIRECT_RUN_PLACEHOLDER_RE.search(candidate.group(0)):
+                return True
+        return False
+
+    for match in CLAIM_RE.finditer(text):
         separator = text.rfind("\n\n", 0, match.start())
         paragraph_start = 0 if separator < 0 else separator + 2
         paragraph_end = text.find("\n\n", match.end())
@@ -189,7 +267,7 @@ def find_performance_violations(path: Path, text: str) -> list[str]:
             paragraph_end = len(text)
         paragraph = text[paragraph_start:paragraph_end]
         relative_start = match.start() - paragraph_start
-        claims = list(TOK_PER_SECOND_RE.finditer(paragraph))
+        claims = list(CLAIM_RE.finditer(paragraph))
         claim_index = next(
             index for index, claim in enumerate(claims) if claim.start() == relative_start
         )
@@ -203,8 +281,26 @@ def find_performance_violations(path: Path, text: str) -> list[str]:
             missing.append("gfx1100/gfx1201 target")
         if not WORKLOAD_EVIDENCE_RE.search(evidence):
             missing.append("workload context")
-        if not MEASUREMENT_EVIDENCE_RE.search(evidence):
+        if not (MEASUREMENT_EVIDENCE_RE.search(evidence) or STATISTIC_EVIDENCE_RE.search(evidence)):
             missing.append("measurement context")
+        if not (
+            ENGINE_VERSION_EVIDENCE_RE.search(evidence)
+            or (ENGINE_EVIDENCE_RE.search(evidence) and VERSION_EVIDENCE_RE.search(evidence))
+        ):
+            missing.append("engine/version evidence")
+        if not CLOCK_EVIDENCE_RE.search(evidence):
+            missing.append("verified clock policy")
+        if not (
+            CACHE_STATE_EVIDENCE_RE.search(evidence)
+            and PROCESS_STATE_EVIDENCE_RE.search(evidence)
+        ):
+            missing.append("cache/process state")
+        if not STATISTIC_EVIDENCE_RE.search(evidence) or not SAMPLE_COUNT_EVIDENCE_RE.search(evidence):
+            missing.append("statistic and sample count")
+        if not CORRECTNESS_EVIDENCE_RE.search(evidence):
+            missing.append("correctness result")
+        if not has_direct_run_evidence(evidence):
+            missing.append("direct run evidence")
         if missing:
             line_number = text.count("\n", 0, match.start()) + 1
             violations.append(

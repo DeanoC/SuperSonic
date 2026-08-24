@@ -56,12 +56,66 @@ decode, chat-template generation, and the ordinary-versus-MTP token sequence.
 Keep `--include-ignored` and `--test-threads=1`: the canonical artifact is
 large and these cases are deliberately serialized.
 
+## Benchmark acceptance
+
+The artifact gate is a prerequisite for the reproducible benchmark candidate.
+After it passes, use the exact commands in [benchmarks](benchmarks.md). The
+implemented CLI requires the captured static GPU provenance JSON; it is not an
+optional or planned flag:
+
+```bash
+set -euo pipefail
+RUST_TEST_THREADS=1 timeout --foreground 660s \
+  python3 tools/supersonic-bench.py run \
+  --suite quick \
+  --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
+  --artifact "$SUPERSONIC_GQH_GGUF" \
+  --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
+  --gpu-static-json target/benchmarks/manual/amd-smi-provenance.json \
+  --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
+  --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
+  --device "$SUPERSONIC_DEVICE" \
+  --chat \
+  --clock-policy locked \
+  --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+  --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
+  --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
+  --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
+  --seed 1 \
+  --output target/benchmarks/candidate
+python3 tools/supersonic-bench.py validate --publishable \
+  target/benchmarks/candidate/<run-id>
+```
+
+The quick harness budget is exactly 600 seconds (10 minutes), while its
+workflow job cap is 30 minutes. The explicitly manual full workflow uses the
+same evidence contract with `--suite full` and `--peer-artifact`; its exact
+budget is 21,600 seconds (six hours) and its workflow cap is 390 minutes.
+These caps include checkout, static provenance, idle checks, artifact
+preflight, and the release build. A full run is never silently substituted for
+the quick gate.
+
+The harness records `cold-load` and `warm-resident` separately and keeps
+`process_reuse=false` for both. Prefix-cache cases remain unsupported until
+their adapter transitions are verified. `uncontrolled-clocks` results may be
+retained for diagnosis but are excluded from headline and peer speedup claims.
+The candidate directory is diagnostic until a reviewer checks raw samples,
+median/MAD, correctness, cache/clock evidence, artifact digests, and
+comparability, then promotes only portable records in a code-reviewed change.
+
 ## Failure policy
 
 Unsupported model values, missing sidecars, incompatible GQH headers, missing
 GPU artifacts, ambiguous device discovery, and token mismatches are failures.
 Only an unconfigured local artifact-dependent test may report a documented
 local skip; the configured workflow must fail closed.
+
+The benchmark harness distinguishes `complete`, `failed`, and `incomplete`.
+Budget exhaustion, interruption, timeout, missing samples, quality mismatch,
+or an evidence violation preserves completed diagnostics but makes the bundle
+ineligible for `validate --publishable`. A partial quick or full run is never
+published as a complete aggregate. Performance telemetry is report-only; a
+deterministic quality failure blocks immediately.
 
 ### GPU integrity fail-stop policy
 

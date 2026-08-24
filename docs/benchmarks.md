@@ -1,57 +1,193 @@
 # Benchmarks
 
-Benchmark runs measure the supported Qwen3.8-27B GQH path; they do not expand
-the support matrix. Report maximum measured performance only with enough
-evidence for another contributor to reproduce the same workload and correctness
-gate.
+The benchmark harness measures the supported Qwen3.8-27B GQH path without
+expanding the runner contract. A result is a reviewable candidate first; it
+becomes a public number only after validation, correctness, and evidence review.
+No measured throughput number is published in this repository yet.
 
-## Record before measuring
+## Tiers and time budgets
 
-Save the exact commit, ROCm version, target architecture, physical device
-selection, model-directory path, GGUF filename, prompt, context size, and
-generated-token count. Keep the structured stage-timing output and the
-ordinary-versus-MTP token comparison with the run.
+The suite manifests own the measurement budgets:
 
-For `gfx1201`, use the validated physical-device selection in the
-[README](../README.md). The selection exports `SUPERSONIC_R9700_GPU_ID` and
-`HIP_VISIBLE_DEVICES`; the process still uses logical `--device 0`. Never
-replace discovery with an assumed physical ordinal.
+- `quick` is exactly 600 seconds (10 minutes). It is the development and GPU
+  smoke candidate, with the representative quality and performance cases.
+- `full` is exactly 21,600 seconds (six hours). It is manually triggered after
+  quick review or for an overnight run, and includes the complete quality
+  corpus, both cache series, MTP cases, and the configured peer engine.
 
-## Reproducible command
+The GitHub Actions job caps include checkout, host probes, artifact preflight,
+and the release build in addition to the harness. The quick workflow cap is
+30 minutes and the full workflow cap is 390 minutes. The harness budgets and
+the workflow caps are different limits; neither changes the other. A full run
+is `workflow_dispatch` only and is not part of push or pull-request CI.
 
-Build for the target, then run warmups followed by repeated measurements:
+## Read-only host preparation
+
+The host operator may prepare clocks, power, and performance level outside the
+repository. The harness does not apply privileged clock, power, or operating-
+system cache changes. It reads the configured state and fails closed when a
+locked request cannot be verified.
+
+Capture the static AMD SMI evidence used for physical-device provenance before
+running the CLI:
 
 ```bash
-HIP_ARCH=gfx1201 cargo build --release --workspace
-
-HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
-  ./target/release/supersonic \
-  --model qwen3.8-27b \
-  --model-dir /data/models/Qwen3.8-27B \
-  --gguf-file /home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf \
-  --prompt "Hello" \
-  --max-new-tokens 128 \
-  --emit-generated-json \
-  --emit-stage-timings \
-  --device 0
+set -euo pipefail
+export BENCHMARK_OUTPUT_ROOT=target/benchmarks/manual
+mkdir -p "$BENCHMARK_OUTPUT_ROOT"
+timeout --foreground 30s amd-smi static --asic --bus --json \
+  > "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic-bus.json"
+timeout --foreground 30s amd-smi list -e --json \
+  > "$BENCHMARK_OUTPUT_ROOT/amd-smi-enumeration.json"
+python3 tools/merge-amd-smi-provenance.py \
+  --asic-bus "$BENCHMARK_OUTPUT_ROOT/amd-smi-static-asic-bus.json" \
+  --enumeration "$BENCHMARK_OUTPUT_ROOT/amd-smi-enumeration.json" \
+  --output "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json"
 ```
 
-Run the correctness gate in [testing](testing.md) first. For each measured
-run, record warmup count, measured-run count, prefill time, median decode
-`ms_per_tok`, derived `tok/s`, and the generated-token equality result. A
-telemetry failure does not replace or weaken the correctness result.
+Use the selector in the [README](../README.md) with that merged record. Export
+the selected `SUPERSONIC_R9700_GPU_ID`, `SUPERSONIC_R9700_GPU_ARCH`,
+`SUPERSONIC_GPU_LOGICAL`, `HIP_VISIBLE_DEVICES`, and `SUPERSONIC_DEVICE`
+values from its validated output. The physical ordinal is retained for SMI
+evidence; masking it makes the selected device logical `0` to the process.
+Do not assume physical GPU zero or use `eval` on selector output.
 
-The committed `gfx1201` workflow writes the same evidence as
-`target/ci/qwen38-gfx1201/reproducibility.json`. It records the commit,
-ROCm/HIP versions, physical-to-logical GPU mapping, artifact basename and
-SHA-256 digest, prompt and token count, correctness hash, ordinary-versus-MTP
-equality, and each warmup/measured prefill and decode timing. Absolute
-artifact and model-directory paths are intentionally omitted from this
-portable record.
+## Quick candidate
 
-## Comparing runs
+The following is the implemented CLI shape used by the quick workflow. All
+paths and clock values are explicit inputs; the static JSON is required by the
+CLI and is the authoritative provenance source.
 
-Compare runs only when the artifact, prompt, generation length, build target,
-and device selection match. Keep `gfx1100` and `gfx1201` results in separate
-series. If the workload or artifact changes, start a new dated series rather
-than combining numbers.
+```bash
+set -euo pipefail
+run_id="quick-manual-$(date +%s)"
+RUST_TEST_THREADS=1 timeout --foreground 660s \
+  python3 tools/supersonic-bench.py run \
+  --suite quick \
+  --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
+  --artifact "$SUPERSONIC_GQH_GGUF" \
+  --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
+  --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
+  --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
+  --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
+  --device "$SUPERSONIC_DEVICE" \
+  --chat \
+  --clock-policy locked \
+  --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+  --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
+  --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
+  --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
+  --seed 1 \
+  --run-id "$run_id" \
+  --output target/benchmarks/candidate
+```
+
+The `660s` wrapper leaves time for process cleanup around the exact 600-second
+suite budget. The workflow stores the candidate under
+`target/benchmarks/quick/candidate/<run-id>` and uploads that directory, logs,
+and host diagnostics even when a later step fails. Validate the exact bundle,
+not a hand-selected JSON file:
+
+```bash
+bundle=target/benchmarks/candidate/<run-id>
+python3 tools/supersonic-bench.py validate --publishable "$bundle"
+```
+
+## Full candidate
+
+The full workflow is the same CLI with the full suite and its separate pinned
+peer artifact. The workflow supplies the actual peer path and binary pin; a
+local invocation must provide the corresponding `--peer-artifact` path.
+
+```bash
+set -euo pipefail
+run_id="full-manual-$(date +%s)"
+RUST_TEST_THREADS=1 timeout --foreground 21660s \
+  python3 tools/supersonic-bench.py run \
+  --suite full \
+  --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
+  --artifact "$SUPERSONIC_GQH_GGUF" \
+  --peer-artifact /path/to/pinned-peer-artifact.gguf \
+  --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
+  --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
+  --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
+  --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
+  --device "$SUPERSONIC_DEVICE" \
+  --chat \
+  --clock-policy locked \
+  --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+  --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
+  --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
+  --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
+  --seed 1 \
+  --run-id "$run_id" \
+  --output target/benchmarks/candidate
+```
+
+The `21660s` wrapper leaves time for cleanup around the exact 21,600-second
+suite budget. The manual full workflow validates its candidate for diagnosis
+and uploads it even if the harness is incomplete. An incomplete, failed, or
+quality-failed bundle is diagnostic only and cannot be promoted.
+
+## Cache and clock terminology
+
+Cache state is part of the series identity. `cold-load` uses a fresh process
+and records model-load/startup separately; `warm-resident` declares warmups
+before measured samples. Both states record `process_reuse=false`; that field
+must not be inferred from a warmup or changed to claim process reuse. A
+filesystem cache flush is never claimed unless its mechanism and verification
+are attached to the evidence.
+
+The schema also names `prefix-cache-empty`, `prefix-cache-populated`, and
+`prefix-cache-reset`. Those cases are explicitly unsupported by the current
+execution boundary until adapter transitions are verified. Do not add them to a
+candidate or describe a prefix-cache transition as measured before that gate
+exists.
+
+`locked` means the host operator prepared the requested clock and power state
+and the harness verified static GPU telemetry before, during, and after the
+measurement. `uncontrolled-clocks` records retain observed telemetry for
+diagnosis but are excluded from headline performance and peer speedup claims.
+
+## Evidence and review
+
+Every candidate record retains the commit and dirty state, engine/version,
+ROCm/HIP versions, static physical GPU provenance, logical mapping, artifact
+identity and digest, prompt/workload, cache/process state, clock evidence,
+correctness and ordinary-versus-MTP equality, raw measured samples, sample
+count, median, minimum, maximum, and median absolute deviation (MAD).
+
+The reviewer runs validation and, for a peer comparison, the implemented
+comparator. A mismatch remains visible with reasons but produces no speedup:
+
+```bash
+python3 tools/supersonic-bench.py validate --publishable <candidate-bundle>
+python3 tools/supersonic-bench.py compare <record-a> <record-b> \
+  --output target/benchmarks/candidate/comparison.json
+```
+
+Peer artifacts are usually noncomparable by digest under the comparison
+ruling. A peer result may remain useful context, but unlike artifact digests,
+tokenizer/template identity, cache state, clocks, workload, or timing boundary
+must never become a headline ratio.
+
+## Promotion and Pages bootstrap
+
+Promotion is a code-reviewed change. After the candidate passes
+`validate --publishable` and its quality/evidence review, copy only the
+portable manifest and result records into `benchmarks/results/`. Do not copy
+raw logs, SMI dumps, absolute model/artifact paths, or a candidate-local
+comparison file. Then validate the committed source:
+
+```bash
+python3 tools/supersonic-bench.py validate --publishable benchmarks/results
+python3 tools/supersonic-bench.py render benchmarks/results target/benchmarks/site
+```
+
+The Pages workflow is configured for the GitHub Actions source in repository
+Settings → Pages. It validates records before rendering and deploys only from
+the default branch after that validation. A zero-baseline checkout is expected:
+when `benchmarks/results/` contains no JSON records, Pages reports that no
+committed baseline exists and skips validation, rendering, upload, and deploy.
+The first reviewed baseline commit on the default branch bootstraps the site;
+there is no placeholder or synthetic performance number.

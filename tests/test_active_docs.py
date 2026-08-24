@@ -29,6 +29,25 @@ def load_checker():
 
 
 class ActiveDocsTests(unittest.TestCase):
+    def test_benchmark_docs_define_tiers_clocks_and_cache(self):
+        text = (ROOT / "docs" / "benchmarks.md").read_text(encoding="utf-8").lower()
+        for term in (
+            "quick",
+            "10 minutes",
+            "full",
+            "six hours",
+            "locked",
+            "uncontrolled-clocks",
+            "cold-load",
+            "warm-resident",
+        ):
+            self.assertIn(term, text)
+
+    def test_peer_claims_require_comparability_evidence(self):
+        text = (ROOT / "docs" / "performance.md").read_text(encoding="utf-8").lower()
+        for term in ("comparability", "artifact", "cache state", "clock", "sample count"):
+            self.assertIn(term, text)
+
     def test_repository_active_docs_have_no_removed_product_contract(self):
         checker = load_checker()
         self.assertEqual([], checker.find_violations(ROOT))
@@ -422,8 +441,11 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertTrue(weak_violations)
 
         strong = (
-            "commit: abcdef1, artifact: /tmp/qwen38.gqh.gguf, target: gfx1201, "
-            "prompt=Hello, warmup=1, median decode measurement: 37.2 tok/s.\n"
+            "engine: supersonic, version: 1.0, commit: abcdef1, "
+            "artifact: /tmp/qwen38.gqh.gguf, target: gfx1201, prompt=Hello, "
+            "clock policy: locked, cache state: warm-resident, process_reuse=false, "
+            "warmup=1, statistic: median, sample count: 3, correctness: pass, "
+            "direct run: benchmarks/results/run.json, decode measurement: 37.2 tok/s.\n"
         )
         self.assertEqual([], checker.find_performance_violations(Path("README.md"), strong))
 
@@ -450,13 +472,57 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertTrue(checker.find_performance_violations(Path("README.md"), shared_evidence))
 
         structured_records = (
-            "commit: abcdef1, artifact: /tmp/qwen38-a.gqh.gguf, target: gfx1201, "
-            "prompt=Hello, warmup=1, median decode measurement: 37.2 tok/s; "
-            "commit: abcdef2, artifact: /tmp/qwen38-b.gqh.gguf, target: gfx1100, "
-            "prompt=World, warmup=2, median decode measurement: 38.4 tok/s.\n"
+            "engine: supersonic, version: 1.0, commit: abcdef1, "
+            "artifact: /tmp/qwen38-a.gqh.gguf, target: gfx1201, prompt=Hello, "
+            "clock policy: locked, cache state: warm-resident, process_reuse=false, "
+            "warmup=1, statistic: median, sample count: 3, correctness: pass, "
+            "direct run: benchmarks/results/a.json, decode measurement: 37.2 tok/s; "
+            "engine: peer, version: 2.0, commit: abcdef2, "
+            "artifact: /tmp/qwen38-b.gqh.gguf, target: gfx1100, prompt=World, "
+            "clock policy: locked, cache state: warm-resident, process_reuse=false, "
+            "warmup=2, statistic: median, sample count: 3, correctness: pass, "
+            "direct run: benchmarks/results/b.json, decode measurement: 38.4 tok/s.\n"
         )
         self.assertEqual(
             [], checker.find_performance_violations(Path("README.md"), structured_records)
+        )
+
+    def test_numeric_claim_requires_peer_evidence_and_speedup_is_qualified(self):
+        checker = load_checker()
+        current_contract = (
+            "commit: abcdef1, artifact: /tmp/qwen38.gqh.gguf, target: gfx1201, "
+            "prompt=Hello, warmup=1, median decode measurement: 37.2 tok/s.\n"
+        )
+        violations = checker.find_performance_violations(Path("README.md"), current_contract)
+        self.assertTrue(violations)
+        self.assertTrue(any("engine" in violation for violation in violations))
+        self.assertTrue(any("clock" in violation for violation in violations))
+        self.assertTrue(any("cache" in violation for violation in violations))
+        self.assertTrue(any("sample" in violation for violation in violations))
+        self.assertTrue(any("correctness" in violation for violation in violations))
+        self.assertTrue(any("direct run" in violation for violation in violations))
+
+        self.assertTrue(
+            checker.find_performance_violations(
+                Path("README.md"),
+                "The 2.0x speedup claim has no run record or comparability evidence.\n",
+            )
+        )
+        structured_evidence = (
+            "engine=supersonic, version=1.0, commit=abcdef1, artifact=qwen38.gqh.gguf, "
+            "gpu=gfx1201, workload=quick-short, clock=locked, "
+            "cache_state=warm-resident, process_reuse=false, statistic=median, "
+            "sample_count=3, correctness=pass, direct_run=run-1, 37.2 tok/s.\n"
+        )
+        self.assertEqual(
+            [], checker.find_performance_violations(Path("README.md"), structured_evidence)
+        )
+        self.assertEqual(
+            [],
+            checker.find_performance_violations(
+                Path("README.md"),
+                "A prose explanation can mention a 2.0x multiplier without making a speed claim.\n",
+            ),
         )
 
     def test_testing_artifact_block_defines_and_propagates_strict_environment(self):
