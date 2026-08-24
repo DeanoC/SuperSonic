@@ -583,12 +583,12 @@ printf 'cargo|%s|GQH=%s|MODEL=%s|8192=%s|REQ=%s\\n' "$*" \
             self.assertFalse((ROOT / directory).exists(), directory)
 
         superpowers_root = ROOT / "docs" / "superpowers"
+        retained_specs = {
+            "2026-08-23-qwen38-rocm-product-slimming-design.md",
+            "2026-08-24-reproducible-benchmark-pages-design.md",
+        }
         for path in superpowers_root.glob("specs/*.md"):
-            self.assertEqual(
-                path.name,
-                "2026-08-23-qwen38-rocm-product-slimming-design.md",
-                path.as_posix(),
-            )
+            self.assertIn(path.name, retained_specs, path.as_posix())
         for path in superpowers_root.glob("plans/*.md"):
             self.assertEqual(
                 path.name,
