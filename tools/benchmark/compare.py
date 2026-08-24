@@ -31,6 +31,7 @@ COMPARABILITY_FIELDS = (
     "workload.measurement_boundary",
     "environment.clock_policy",
     "environment.requested.gpu_clock_mhz",
+    "environment.requested.clock_tolerance_mhz",
     "environment.requested.memory_clock_mhz",
     "environment.requested.power_cap_watts",
     "environment.requested.performance_level",

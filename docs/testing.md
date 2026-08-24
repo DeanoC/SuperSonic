@@ -86,6 +86,7 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --chat \
   --clock-policy locked \
   --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+  --gpu-clock-tolerance-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ" \
   --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
   --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
   --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \

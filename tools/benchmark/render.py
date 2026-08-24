@@ -550,6 +550,7 @@ def _evidence_block(record: Mapping[str, object], *, href_prefix: str = "") -> s
         ("quality failures", quality.get("failed")),
         ("clock policy", environment.get("clock_policy")),
         ("requested GPU clock MHz", requested.get("gpu_clock_mhz")),
+        ("accepted GPU clock tolerance MHz", requested.get("clock_tolerance_mhz")),
         ("requested memory clock MHz", requested.get("memory_clock_mhz")),
         ("requested power cap watts", requested.get("power_cap_watts")),
         ("requested performance level", requested.get("performance_level")),

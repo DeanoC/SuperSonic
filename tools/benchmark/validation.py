@@ -93,6 +93,7 @@ def headline_verification_errors(record: Mapping[str, object]) -> tuple[str, ...
         policy = {
             "name": env.get("clock_policy"),
             "gpu_clock_mhz": requested.get("gpu_clock_mhz"),
+            "clock_tolerance_mhz": requested.get("clock_tolerance_mhz"),
             "memory_clock_mhz": requested.get("memory_clock_mhz"),
             "power_cap_watts": requested.get("power_cap_watts"),
             "performance_level": requested.get("performance_level"),

@@ -117,6 +117,60 @@ class EnvironmentPolicyTests(unittest.TestCase):
         )
         self.assertIn("clock drift", " ".join(errors).lower())
 
+    def test_locked_gpu_clock_uses_loaded_samples_and_nominal_tolerance(self):
+        policy = SimpleNamespace(**{**self.policy.__dict__, "gpu_clock_mhz": 2350, "clock_tolerance_mhz": 100})
+        idle_before = replace(self.before, gpu_clock_mhz=412, gpu_utilization_percent=0.0)
+        loaded = replace(self.before, gpu_clock_mhz=2302, gpu_utilization_percent=99.0)
+        idle_after = replace(self.after, gpu_clock_mhz=34, gpu_utilization_percent=0.0)
+
+        errors = self.environment.verify_clock_policy(idle_before, [loaded], idle_after, policy)
+
+        self.assertEqual(errors, ())
+
+    def test_locked_gpu_clock_requires_a_loaded_sample(self):
+        policy = SimpleNamespace(**{**self.policy.__dict__, "gpu_clock_mhz": 2350, "clock_tolerance_mhz": 100})
+        idle_before = replace(self.before, gpu_clock_mhz=412, gpu_utilization_percent=0.0)
+        idle_sample = replace(self.before, gpu_clock_mhz=500, gpu_utilization_percent=5.0)
+        idle_after = replace(self.after, gpu_clock_mhz=34, gpu_utilization_percent=0.0)
+
+        errors = self.environment.verify_clock_policy(idle_before, [idle_sample], idle_after, policy)
+
+        self.assertIn("loaded GPU clock", " ".join(errors))
+
+    def test_snapshot_from_live_observations_preserves_loaded_telemetry(self):
+        policy = SimpleNamespace(**{**self.policy.__dict__, "gpu_clock_mhz": 2350, "clock_tolerance_mhz": 100})
+        idle_before = replace(self.before, gpu_clock_mhz=412, gpu_utilization_percent=0.0)
+        loaded = self.environment.TelemetrySample(
+            offset_seconds=1.25,
+            gpu_clock_mhz=2302,
+            memory_clock_mhz=1249,
+            power_cap_watts=295,
+            power_watts=245.0,
+            temperature_celsius=67.0,
+            gpu_utilization_percent=99.0,
+            memory_utilization_percent=88.0,
+            performance_level="manual",
+        )
+        idle_after = replace(self.after, gpu_clock_mhz=34, gpu_utilization_percent=0.0)
+
+        snapshot = self.environment.snapshot_from_observations(
+            physical_gpu="1",
+            logical_gpu="0",
+            clock_policy=policy,
+            cache_state="warm-resident",
+            observed_before=idle_before,
+            observed_before_at="2026-08-24T12:00:00Z",
+            telemetry_samples=(loaded,),
+            observed_after=idle_after,
+            observed_after_at="2026-08-24T12:00:02Z",
+            environment_map={"HIP_ARCH": "gfx1201", "HIP_VISIBLE_DEVICES": "1"},
+            cpu_governor_reader=lambda: "performance\n",
+        )
+
+        self.assertTrue(snapshot.headline_eligible)
+        self.assertEqual(snapshot.telemetry_samples, (loaded,))
+        self.assertEqual(snapshot.requested.clock_tolerance_mhz, 100)
+
     def test_locked_performance_level_mismatch_fails(self):
         observed = replace(self.before, performance_level="auto")
         errors = self.environment.verify_clock_policy(self.before, [observed], self.after, self.policy)
@@ -172,6 +226,7 @@ class EnvironmentPolicyTests(unittest.TestCase):
 
         self.assertTrue(snapshot.headline_eligible)
         self.assertEqual(snapshot.requested.gpu_clock_mhz, 2400)
+        self.assertEqual(snapshot.requested.clock_tolerance_mhz, 20)
         self.assertEqual(snapshot.requested.memory_clock_mhz, 1249)
         self.assertEqual(snapshot.requested.power_cap_watts, 295)
         self.assertEqual(snapshot.requested.performance_level, "manual")

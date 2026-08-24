@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -133,6 +134,52 @@ class BenchmarkExecutionTests(unittest.TestCase):
         config = self.execution.replace_config(config, peer_artifact=self.root / "missing-peer.gguf")
         with self.assertRaisesRegex(ValueError, "llama-cpp.*unavailable|peer.*unavailable"):
             self.execution.preflight(config)
+
+    def test_real_process_monitor_captures_telemetry_while_child_is_running(self):
+        fixture = (FIXTURES / "rocm-smi-showallinfo.txt").read_text(encoding="utf-8")
+
+        result, samples, notes = self.execution._run_process_with_telemetry(
+            (sys.executable, "-c", "import time; time.sleep(0.12)"),
+            timeout=1.0,
+            physical_gpu="0",
+            probe_runner=lambda _argv: fixture,
+            sample_interval_seconds=0.02,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertGreaterEqual(len(samples), 2)
+        self.assertTrue(all(sample.gpu_utilization_percent == 91.0 for sample in samples))
+        self.assertEqual(notes, ())
+
+    def test_locked_real_run_records_live_process_telemetry(self):
+        self.binary.write_text(
+            "#!/bin/sh\n"
+            "sleep 0.3\n"
+            "printf '[generated_json] \"ok\"\\n'\n"
+            "printf '[tokens] 1\\n'\n"
+            "printf '[result] prompt_tokens=2 generated_tokens=1 decode_ms=1.0 ms_per_tok=1.0\\n'\n",
+            encoding="utf-8",
+        )
+        self.binary.chmod(0o755)
+        fixture = (FIXTURES / "rocm-smi-showallinfo.txt").read_text(encoding="utf-8")
+        config = self.execution.replace_config(
+            self.config(suite="quick", run_quality=False),
+            clock_policy={
+                "name": "locked",
+                "gpu_clock_mhz": 2400,
+                "clock_tolerance_mhz": 20,
+                "memory_clock_mhz": 1249,
+                "power_cap_watts": 295,
+                "performance_level": "manual",
+            },
+            environment_command_runner=lambda _argv: fixture,
+        )
+
+        status = self.execution.run_suite(config)
+
+        record = json.loads(status.records[0].read_text(encoding="utf-8"))
+        self.assertGreaterEqual(len(record["environment"]["telemetry_samples"]), 4)
+        self.assertTrue(record["environment"]["headline_eligible"])
 
     def test_preflight_requires_explicit_model_artifact_and_gpu(self):
         for field in (

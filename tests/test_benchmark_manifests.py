@@ -271,6 +271,7 @@ engines = ["llama-cpp"]
             set(schema["properties"]["environment"]["properties"]["requested"]["required"]),
             {
                 "gpu_clock_mhz",
+                "clock_tolerance_mhz",
                 "memory_clock_mhz",
                 "power_cap_watts",
                 "performance_level",

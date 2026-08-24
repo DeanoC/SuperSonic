@@ -65,11 +65,13 @@ _VRAM_USE_RE = re.compile(
     re.IGNORECASE,
 )
 _PERFORMANCE_LEVEL_RE = re.compile(r"Performance\s+Level\s*:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
+_LOADED_GPU_UTILIZATION_PERCENT = 90.0
 
 
 @dataclass(frozen=True, slots=True)
 class RequestedTelemetry:
     gpu_clock_mhz: int | None
+    clock_tolerance_mhz: int | None
     memory_clock_mhz: int | None
     power_cap_watts: int | None
     performance_level: str | None
@@ -170,6 +172,7 @@ def collect_snapshot(
     after_at = _timestamp(timestamp())
     requested = RequestedTelemetry(
         gpu_clock_mhz=_policy_value(clock_policy, "gpu_clock_mhz"),
+        clock_tolerance_mhz=_policy_value(clock_policy, "clock_tolerance_mhz"),
         memory_clock_mhz=_policy_value(clock_policy, "memory_clock_mhz"),
         power_cap_watts=_policy_value(clock_policy, "power_cap_watts"),
         performance_level=_policy_value(clock_policy, "performance_level"),
@@ -209,6 +212,72 @@ def collect_snapshot(
         physical_gpu=str(physical_gpu),
         logical_gpu=str(env.get("SUPERSONIC_DEVICE", "0")),
         cpu_governor=cpu_governor,
+        allowlisted_environment={key: env[key] for key in ALLOWLISTED_ENVIRONMENT if key in env},
+        cache_state=cache_state,
+        cache_evidence=resolved_cache_evidence,
+        process_reuse=bool(resolved_cache_evidence.get("process_reuse", False)),
+        verification_errors=verification_errors,
+        evidence_notes=tuple(notes),
+    )
+
+
+def snapshot_from_observations(
+    *,
+    physical_gpu: str,
+    logical_gpu: str,
+    clock_policy,
+    cache_state: str,
+    observed_before: ObservedTelemetry,
+    observed_before_at: str,
+    telemetry_samples: tuple[TelemetrySample, ...],
+    observed_after: ObservedTelemetry,
+    observed_after_at: str,
+    environment_map: Mapping[str, str] | None = None,
+    cache_evidence: Mapping[str, object] | None = None,
+    cpu_governor_reader: Callable[[], str] | None = None,
+    evidence_notes: tuple[str, ...] = (),
+) -> EnvironmentSnapshot:
+    resolved_cache_evidence = dict(cache_evidence or _default_cache_evidence(cache_state))
+    validate_cache_evidence(cache_state, resolved_cache_evidence)
+    requested = RequestedTelemetry(
+        gpu_clock_mhz=_policy_value(clock_policy, "gpu_clock_mhz"),
+        clock_tolerance_mhz=_policy_value(clock_policy, "clock_tolerance_mhz"),
+        memory_clock_mhz=_policy_value(clock_policy, "memory_clock_mhz"),
+        power_cap_watts=_policy_value(clock_policy, "power_cap_watts"),
+        performance_level=_policy_value(clock_policy, "performance_level"),
+    )
+    observed = tuple(
+        ObservedTelemetry(
+            gpu_clock_mhz=sample.gpu_clock_mhz,
+            memory_clock_mhz=sample.memory_clock_mhz,
+            power_cap_watts=sample.power_cap_watts,
+            power_watts=sample.power_watts,
+            temperature_celsius=sample.temperature_celsius,
+            gpu_utilization_percent=sample.gpu_utilization_percent,
+            memory_utilization_percent=sample.memory_utilization_percent,
+            performance_level=sample.performance_level,
+        )
+        for sample in telemetry_samples
+    )
+    verification_errors = verify_clock_policy(observed_before, list(observed), observed_after, clock_policy)
+    notes = list(evidence_notes)
+    for error in verification_errors:
+        if error not in notes:
+            notes.append(error)
+    env = dict(environment_map or {})
+    return EnvironmentSnapshot(
+        clock_policy=str(_policy_value(clock_policy, "name") or ""),
+        requested=requested,
+        requested_at=observed_before_at,
+        observed_before=observed_before,
+        observed_before_at=observed_before_at,
+        observed_after=observed_after,
+        observed_after_at=observed_after_at,
+        telemetry_samples=telemetry_samples,
+        headline_eligible=_headline_eligible(clock_policy, verification_errors),
+        physical_gpu=str(physical_gpu),
+        logical_gpu=str(logical_gpu),
+        cpu_governor=_read_cpu_governor(cpu_governor_reader, notes),
         allowlisted_environment={key: env[key] for key in ALLOWLISTED_ENVIRONMENT if key in env},
         cache_state=cache_state,
         cache_evidence=resolved_cache_evidence,
@@ -278,6 +347,10 @@ def _build_probe_command(physical_gpu: str) -> tuple[str, ...]:
     return (*_SHOWALLINFO_COMMAND_PREFIX, "-d", str(physical_gpu), "--showallinfo")
 
 
+def build_probe_command(physical_gpu: str) -> tuple[str, ...]:
+    return _build_probe_command(physical_gpu)
+
+
 def _default_cache_evidence(cache_state: str) -> dict[str, object]:
     if cache_state not in _CACHE_STATES:
         raise ValueError(f"unknown cache_state: {cache_state!r}")
@@ -301,8 +374,14 @@ def _clock_violations(samples: tuple[ObservedTelemetry, ...], policy) -> list[st
     requested_temperature_limit = _policy_value(policy, "temperature_limit_celsius")
     gpu_tolerance = int(_policy_value(policy, "clock_tolerance_mhz") or 0)
     memory_tolerance = int(_policy_value(policy, "memory_clock_tolerance_mhz") or gpu_tolerance)
+    loaded_gpu_samples = 0
     for index, sample in enumerate(samples):
-        if requested_gpu is not None:
+        gpu_is_loaded = (
+            sample.gpu_utilization_percent is not None
+            and sample.gpu_utilization_percent >= _LOADED_GPU_UTILIZATION_PERCENT
+        )
+        if requested_gpu is not None and gpu_is_loaded:
+            loaded_gpu_samples += 1
             if sample.gpu_clock_mhz is None:
                 errors.append(f"missing GPU clock verification at sample {index}")
             elif abs(sample.gpu_clock_mhz - requested_gpu) > gpu_tolerance:
@@ -340,6 +419,8 @@ def _clock_violations(samples: tuple[ObservedTelemetry, ...], policy) -> list[st
                     f"temperature exceeded limit at sample {index}: observed "
                     f"{sample.temperature_celsius}, limit {requested_temperature_limit}"
                 )
+    if requested_gpu is not None and loaded_gpu_samples == 0:
+        errors.append("missing loaded GPU clock verification sample")
     return errors
 
 
@@ -375,6 +456,12 @@ def _parse_showallinfo(output: str, notes: list[str]) -> ObservedTelemetry:
         ),
         performance_level=_extract_str(_PERFORMANCE_LEVEL_RE, output, "performance level", notes),
     )
+
+
+def parse_showallinfo(output: str, notes: list[str] | None = None) -> ObservedTelemetry:
+    """Parse one bounded ROCm SMI telemetry probe for live monitoring."""
+
+    return _parse_showallinfo(output, notes if notes is not None else [])
 
 
 def _extract_int(

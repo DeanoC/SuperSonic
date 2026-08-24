@@ -85,6 +85,8 @@ class BenchmarkCliTests(unittest.TestCase):
                 "locked",
                 "--gpu-clock-mhz",
                 "2600",
+                "--gpu-clock-tolerance-mhz",
+                "100",
                 "--memory-clock-mhz",
                 "1800",
                 "--power-cap-watts",
@@ -92,6 +94,7 @@ class BenchmarkCliTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.gpu_clock_mhz, 2600)
+        self.assertEqual(args.gpu_clock_tolerance_mhz, 100)
         self.assertEqual(args.memory_clock_mhz, 1800)
         self.assertEqual(args.power_cap_watts, 300)
         self.assertEqual(args.rocm_version_file, Path("/tmp/rocm-version.txt"))

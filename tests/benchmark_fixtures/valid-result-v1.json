@@ -60,6 +60,7 @@
     "clock_policy": "locked",
     "requested": {
       "gpu_clock_mhz": 2400,
+      "clock_tolerance_mhz": 20,
       "memory_clock_mhz": 1249,
       "power_cap_watts": 295,
       "performance_level": "manual"

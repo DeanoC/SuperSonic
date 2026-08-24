@@ -60,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--chat", action="store_true")
     run.add_argument("--clock-policy", choices=("locked", "uncontrolled-clocks"), default="uncontrolled-clocks")
     run.add_argument("--gpu-clock-mhz", type=int)
+    run.add_argument("--gpu-clock-tolerance-mhz", type=int)
     run.add_argument("--memory-clock-mhz", type=int)
     run.add_argument("--power-cap-watts", type=int)
     run.add_argument("--performance-level")
@@ -132,6 +133,7 @@ def _run(args: argparse.Namespace) -> int:
         clock_policy = {
             "name": "locked",
             "gpu_clock_mhz": args.gpu_clock_mhz,
+            "clock_tolerance_mhz": args.gpu_clock_tolerance_mhz,
             "memory_clock_mhz": args.memory_clock_mhz,
             "power_cap_watts": args.power_cap_watts,
             "performance_level": args.performance_level,

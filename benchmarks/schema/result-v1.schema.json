@@ -319,12 +319,20 @@
           "type": "object",
           "required": [
             "gpu_clock_mhz",
+            "clock_tolerance_mhz",
             "memory_clock_mhz",
             "power_cap_watts",
             "performance_level"
           ],
           "properties": {
             "gpu_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "clock_tolerance_mhz": {
               "type": [
                 "integer",
                 "null"

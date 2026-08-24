@@ -102,6 +102,7 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --chat \
   --clock-policy locked \
   --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+  --gpu-clock-tolerance-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ" \
   --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
   --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
   --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
@@ -181,6 +182,7 @@ RUST_TEST_THREADS=1 timeout --foreground 21660s \
   --chat \
   --clock-policy locked \
   --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+  --gpu-clock-tolerance-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ" \
   --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
   --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
   --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
@@ -210,8 +212,11 @@ candidate or describe a prefix-cache transition as measured before that gate
 exists.
 
 `locked` means the host operator prepared the requested clock and power state
-and the harness verified static GPU telemetry before, during, and after the
-measurement. `uncontrolled-clocks` records retain observed telemetry for
+and the harness verified the nominal GPU clock against loaded samples within
+the recorded tolerance, plus memory clock, power cap, and performance level
+before, during, and after each measured case. Idle edge samples are retained
+but are not compared to the nominal GPU clock because RDNA power gating lowers
+the instantaneous sclk while idle. `uncontrolled-clocks` records retain observed telemetry for
 diagnosis but are excluded from headline performance and peer speedup claims.
 
 ## Evidence and review

@@ -41,6 +41,7 @@ jobs:
       SUPERSONIC_GQH_GGUF_SHA256: ${{ secrets.SUPERSONIC_GQH_GGUF_SHA256 || vars.SUPERSONIC_GQH_GGUF_SHA256 }}
       SUPERSONIC_QWEN38_MODEL_DIR: ${{ secrets.SUPERSONIC_QWEN38_MODEL_DIR || vars.SUPERSONIC_QWEN38_MODEL_DIR || '/data/models/Qwen3.8-27B' }}
       SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ }}
+      SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ }}
       SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ }}
       SUPERSONIC_BENCHMARK_POWER_CAP_WATTS: ${{ vars.SUPERSONIC_BENCHMARK_POWER_CAP_WATTS }}
       SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL: ${{ vars.SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL }}
@@ -152,12 +153,15 @@ jobs:
         run: |
           set -euo pipefail
           : "${SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ:?GPU clock must be configured by the host operator}"
+          : "${SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ:?GPU clock tolerance must be configured by the host operator}"
           : "${SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ:?memory clock must be configured by the host operator}"
           : "${SUPERSONIC_BENCHMARK_POWER_CAP_WATTS:?power cap must be configured by the host operator}"
           : "${SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL:?performance level must be configured by the host operator}"
           physical_gpu="${SUPERSONIC_R9700_GPU_ID:?device selection did not export a physical GPU}"
           timeout --foreground 30s rocm-smi -d "$physical_gpu" --showallinfo \
             | tee "$BENCHMARK_OUTPUT_ROOT/rocm-smi-clock-before.txt"
+          timeout --foreground 30s rocm-smi -d "$physical_gpu" --showclkfrq \
+            | tee "$BENCHMARK_OUTPUT_ROOT/rocm-smi-clock-levels-before.txt"
           python3 - "$BENCHMARK_OUTPUT_ROOT/rocm-smi-clock-before.txt" <<'PY'
           import os
           import re
@@ -166,7 +170,6 @@ jobs:
 
           text = Path(sys.argv[1]).read_text(encoding="utf-8")
           checks = {
-              "SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ": r"(?:GPU|sclk)\s+Clock\s+Level\s*:\s*(?:[A-Za-z0-9_-]+\s*:\s*)?\(?([0-9]+)\s*MHz",
               "SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ": r"(?:Memory|mclk)\s+Clock\s+Level\s*:\s*(?:[A-Za-z0-9_-]+\s*:\s*)?\(?([0-9]+)\s*MHz",
               "SUPERSONIC_BENCHMARK_POWER_CAP_WATTS": r"(?:Max|Power\s+Cap)\s+Graphics\s+Package\s+Power\s+\(W\)\s*:\s*([0-9]+(?:\.[0-9]+)?)",
           }
@@ -234,6 +237,7 @@ jobs:
             --chat \
             --clock-policy locked \
             --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+            --gpu-clock-tolerance-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ" \
             --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
             --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
             --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \

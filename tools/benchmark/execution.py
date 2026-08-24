@@ -85,7 +85,6 @@ class RunConfig:
     chat_template_sha256: str | None = None
     strict_environment: bool = False
     environment_command_runner: Callable[[tuple[str, ...]], str] | None = None
-    environment_sample_count: int = 0
     cpu_governor_reader: Callable[[], str] | None = None
 
 
@@ -207,8 +206,6 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         logical_gpu=logical_gpu,
     )
     clock_policy_name = _clock_policy_name(resolved.clock_policy)
-    if resolved.environment_sample_count < 0:
-        raise ValueError("environment_sample_count must be non-negative")
     if clock_policy_name == "locked":
         _validate_locked_policy(resolved.clock_policy)
     if resolved.environment_snapshot is not None:
@@ -256,10 +253,6 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         hip_version=hip_version,
         logical_gpu=static_gpu.logical_gpu,
     )
-    if resolved_config.environment_snapshot is None and (
-        clock_policy_name == "locked" or resolved_config.environment_command_runner is not None
-    ):
-        resolved_config = replace(resolved_config, environment_snapshot=_collect_environment_snapshot(resolved_config, suite))
     result = RunManifest(
         suite=suite,
         config=resolved_config,
@@ -473,6 +466,92 @@ def run_process(
     )
 
 
+def _run_process_with_telemetry(
+    argv: Sequence[str],
+    *,
+    timeout: float,
+    physical_gpu: str,
+    probe_runner: Callable[[tuple[str, ...]], str] | None = None,
+    sample_interval_seconds: float = 0.25,
+    cwd: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[ProcessResult, tuple[environment.TelemetrySample, ...], tuple[str, ...]]:
+    vector = tuple(str(item) for item in argv)
+    if not math.isfinite(float(timeout)) or float(timeout) <= 0.0:
+        raise ValueError("process timeout must be positive")
+    if not math.isfinite(float(sample_interval_seconds)) or float(sample_interval_seconds) <= 0.0:
+        raise ValueError("telemetry sample interval must be positive")
+    active_probe_runner = probe_runner or _default_environment_probe_runner
+    command = environment.build_probe_command(str(physical_gpu))
+    started = time.monotonic()
+    deadline = started + float(timeout)
+    samples: list[environment.TelemetrySample] = []
+    notes: list[str] = []
+    process = subprocess.Popen(
+        vector,
+        shell=False,
+        cwd=str(cwd) if cwd is not None else None,
+        env=dict(env) if env is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                process.kill()
+                stdout, stderr = process.communicate()
+                return (
+                    ProcessResult(
+                        argv=vector,
+                        returncode=124,
+                        stdout=_text(stdout),
+                        stderr=_text(stderr),
+                        duration_seconds=time.monotonic() - started,
+                        timed_out=True,
+                    ),
+                    tuple(samples),
+                    tuple(notes),
+                )
+            try:
+                stdout, stderr = process.communicate(timeout=min(float(sample_interval_seconds), remaining))
+                return (
+                    ProcessResult(
+                        argv=vector,
+                        returncode=int(process.returncode),
+                        stdout=_text(stdout),
+                        stderr=_text(stderr),
+                        duration_seconds=time.monotonic() - started,
+                    ),
+                    tuple(samples),
+                    tuple(notes),
+                )
+            except subprocess.TimeoutExpired:
+                try:
+                    observed = environment.parse_showallinfo(active_probe_runner(command), notes)
+                    samples.append(
+                        environment.TelemetrySample(
+                            offset_seconds=time.monotonic() - started,
+                            gpu_clock_mhz=observed.gpu_clock_mhz,
+                            memory_clock_mhz=observed.memory_clock_mhz,
+                            power_cap_watts=observed.power_cap_watts,
+                            power_watts=observed.power_watts,
+                            temperature_celsius=observed.temperature_celsius,
+                            gpu_utilization_percent=observed.gpu_utilization_percent,
+                            memory_utilization_percent=observed.memory_utilization_percent,
+                            performance_level=observed.performance_level,
+                        )
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    notes.append(f"live telemetry probe failed: {exc}")
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
+        raise
+
+
 class _CaseError(RuntimeError):
     def __init__(self, code: str, message: str | None = None) -> None:
         self.code = code
@@ -527,6 +606,20 @@ def _execute_case(
         raise _CaseError("invalid_configuration", str(exc)) from exc
 
     parsed_samples: list[adapters.ParsedOutput] = []
+    live_telemetry = (
+        _clock_policy_name(run_manifest.config.clock_policy) == "locked"
+        and run_manifest.config.environment_snapshot is None
+        and command_runner is run_process
+    )
+    telemetry_before: environment.ObservedTelemetry | None = None
+    telemetry_before_at: str | None = None
+    telemetry_samples: list[environment.TelemetrySample] = []
+    telemetry_notes: list[str] = []
+    telemetry_elapsed = 0.0
+    probe_runner = run_manifest.config.environment_command_runner or _default_environment_probe_runner
+    if live_telemetry:
+        telemetry_before_at = _utc_timestamp()
+        telemetry_before = _probe_environment(run_manifest.config, probe_runner, telemetry_notes)
     invocation_count = case.warmups + case.repetitions
     for index in range(invocation_count):
         measured = index >= case.warmups
@@ -539,13 +632,28 @@ def _execute_case(
                 case_deadline=case_deadline,
                 cap=float(case.timeout_seconds),
             )
-        result = _invoke_process(
-            command_runner,
-            argv,
-            timeout=active_timeout,
-            case_id=case.id,
-            engine_name=engine.name,
-        )
+        if live_telemetry:
+            result, invocation_telemetry, invocation_notes = _run_process_with_telemetry(
+                argv,
+                timeout=active_timeout,
+                physical_gpu=str(run_manifest.config.physical_gpu),
+                probe_runner=probe_runner,
+                env=_process_environment(run_manifest.config),
+            )
+            telemetry_samples.extend(
+                replace(sample, offset_seconds=telemetry_elapsed + sample.offset_seconds)
+                for sample in invocation_telemetry
+            )
+            telemetry_elapsed += result.duration_seconds
+            telemetry_notes.extend(invocation_notes)
+        else:
+            result = _invoke_process(
+                command_runner,
+                argv,
+                timeout=active_timeout,
+                case_id=case.id,
+                engine_name=engine.name,
+            )
         _write_streams(run_manifest.bundle, case, engine, label, result.stdout, result.stderr)
         if result.interrupted:
             raise KeyboardInterrupt
@@ -562,6 +670,24 @@ def _execute_case(
     if len(parsed_samples) != case.repetitions:
         raise _CaseError("invalid_output", f"{case.id} did not produce all measured samples")
 
+    case_snapshot: environment.EnvironmentSnapshot | Mapping[str, object] | None = None
+    if live_telemetry:
+        telemetry_after = _probe_environment(run_manifest.config, probe_runner, telemetry_notes)
+        case_snapshot = environment.snapshot_from_observations(
+            physical_gpu=str(run_manifest.config.physical_gpu),
+            logical_gpu=str(run_manifest.config.logical_gpu or run_manifest.config.device),
+            clock_policy=run_manifest.config.clock_policy,
+            cache_state=case.cache_state,
+            observed_before=telemetry_before,
+            observed_before_at=str(telemetry_before_at),
+            telemetry_samples=tuple(telemetry_samples),
+            observed_after=telemetry_after,
+            observed_after_at=_utc_timestamp(),
+            environment_map=run_manifest.config.environment or os.environ,
+            cache_evidence={"process_state": "fresh-process", "process_reuse": False},
+            cpu_governor_reader=run_manifest.config.cpu_governor_reader,
+            evidence_notes=tuple(telemetry_notes),
+        )
     record = _build_record(
         run_manifest,
         case,
@@ -569,6 +695,7 @@ def _execute_case(
         argv=argv,
         samples=parsed_samples,
         quality_summary=quality_summary,
+        environment_snapshot=case_snapshot,
     )
     filename = _record_filename(case, engine)
     target = run_manifest.bundle / "records" / filename
@@ -865,9 +992,10 @@ def _build_record(
     argv: Sequence[str],
     samples: Sequence[adapters.ParsedOutput],
     quality_summary: Mapping[str, object],
+    environment_snapshot: environment.EnvironmentSnapshot | Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     config = run_manifest.config
-    snapshot = _environment_record(config, case)
+    snapshot = _environment_record(config, case, environment_snapshot=environment_snapshot)
     artifact_info = _artifact_identity(config, engine)
     return {
         "run": {
@@ -922,9 +1050,14 @@ def _build_record(
     }
 
 
-def _environment_record(config: RunConfig, case: PerformanceCase) -> dict[str, object]:
+def _environment_record(
+    config: RunConfig,
+    case: PerformanceCase,
+    *,
+    environment_snapshot: environment.EnvironmentSnapshot | Mapping[str, object] | None = None,
+) -> dict[str, object]:
     rocm_version, hip_version = _configured_versions(config)
-    provided = config.environment_snapshot
+    provided = environment_snapshot if environment_snapshot is not None else config.environment_snapshot
     if callable(provided):
         provided = provided()
     if provided is None:
@@ -955,6 +1088,7 @@ def _environment_record(config: RunConfig, case: PerformanceCase) -> dict[str, o
             "clock_policy": policy,
             "requested": {
                 "gpu_clock_mhz": _optional_policy_int(requested.get("gpu_clock_mhz")),
+                "clock_tolerance_mhz": _optional_policy_int(requested.get("clock_tolerance_mhz")),
                 "memory_clock_mhz": _optional_policy_int(requested.get("memory_clock_mhz")),
                 "power_cap_watts": _optional_policy_int(requested.get("power_cap_watts")),
                 "performance_level": _optional_policy_text(requested.get("performance_level")),
@@ -1322,7 +1456,6 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
                 "chat_template_sha256",
                 "strict_environment",
                 "environment_command_runner",
-                "environment_sample_count",
                 "cpu_governor_reader",
             )
             if hasattr(config, name)
@@ -1364,7 +1497,6 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
         "chat_template_sha256": None,
         "strict_environment": False,
         "environment_command_runner": None,
-        "environment_sample_count": 0,
         "cpu_governor_reader": None,
     }
     for key, value in defaults.items():
@@ -1543,7 +1675,13 @@ def _validate_snapshot_policy_values(snapshot: object, policy: object) -> None:
     if not isinstance(requested, Mapping):
         raise ValueError("locked environment_snapshot is missing requested telemetry")
     configured = _policy_mapping(policy)
-    for key in ("gpu_clock_mhz", "memory_clock_mhz", "power_cap_watts", "performance_level"):
+    for key in (
+        "gpu_clock_mhz",
+        "clock_tolerance_mhz",
+        "memory_clock_mhz",
+        "power_cap_watts",
+        "performance_level",
+    ):
         if configured.get(key) is not None and requested.get(key) != configured.get(key):
             raise ValueError(f"environment_snapshot requested {key} does not match clock policy")
 
@@ -1565,30 +1703,29 @@ def _default_environment_probe_runner(argv: tuple[str, ...]) -> str:
     return output
 
 
-def _collect_environment_snapshot(config: RunConfig, suite: SuiteManifest) -> environment.EnvironmentSnapshot:
-    cache_state = suite.performance_cases[0].cache_state if suite.performance_cases else "warm-resident"
-    configured_runner = config.environment_command_runner or _default_environment_probe_runner
+def _process_environment(config: RunConfig) -> dict[str, str]:
+    result = dict(os.environ)
+    if config.environment is not None:
+        result.update({str(key): str(value) for key, value in config.environment.items()})
+    return result
 
-    def runner(command: tuple[str, ...]) -> str:
-        raw = configured_runner(command)
-        if isinstance(raw, ProcessResult):
-            if raw.returncode != 0:
-                raise ValueError(f"environment probe failed with exit code {raw.returncode}")
-            return raw.stdout + raw.stderr
-        return _text(raw)
 
-    return environment.collect_snapshot(
-        physical_gpu=str(config.physical_gpu),
-        clock_policy=config.clock_policy,
-        cache_state=cache_state,
-        command_runner=runner,
-        cache_evidence={"process_state": "fresh-process", "process_reuse": False},
-        environment_map=config.environment or os.environ,
-        cpu_governor_reader=config.cpu_governor_reader,
-        sample_count=max(1, int(config.environment_sample_count))
-        if _clock_policy_name(config.clock_policy) == "locked"
-        else int(config.environment_sample_count),
-    )
+def _probe_environment(
+    config: RunConfig,
+    runner: Callable[[tuple[str, ...]], str],
+    notes: list[str],
+) -> environment.ObservedTelemetry:
+    command = environment.build_probe_command(str(config.physical_gpu))
+    raw = runner(command)
+    if isinstance(raw, ProcessResult):
+        if raw.returncode != 0:
+            raise ValueError(f"environment probe failed with exit code {raw.returncode}")
+        text = raw.stdout + raw.stderr
+    else:
+        text = _text(raw)
+    if not text.strip():
+        raise ValueError("environment probe returned empty evidence")
+    return environment.parse_showallinfo(text, notes)
 
 
 def _required_text(value: object, label: str) -> str:
