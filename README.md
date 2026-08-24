@@ -9,8 +9,9 @@ The supported contract is one Qwen3.8-27B sequence at a time with deterministic
 greedy generation, optional Qwen3.8 NextN/MTP generation, and the
 `gfx1100` and `gfx1201` ROCm targets. The model directory and the weight
 artifact are separate inputs: `--model-dir` supplies `config.json`, tokenizer
-data, and the chat template; `--gguf-file` supplies the matching custom GQH
-GGUF weights.
+data, and, only when `--chat` is used, the chat template from
+`tokenizer_config.json`; `--gguf-file` supplies the matching custom GQH GGUF
+weights.
 
 ## Quick start
 
@@ -78,11 +79,11 @@ HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
   --device 0
 ```
 
-The model directory must contain `config.json`, `tokenizer.json`, and the
-chat template in `tokenizer_config.json`. The GGUF must be the matching
-project-specific GQH artifact; generic GGUF files are not part of this
-contract. See the [artifact contract](docs/artifact-format.md) before running
-a correctness gate.
+The model directory must contain `config.json` and `tokenizer.json`. Only a
+`--chat` run additionally requires the chat template in
+`tokenizer_config.json`. The GGUF must be the matching project-specific GQH
+artifact; generic GGUF files are not part of this contract. See the [artifact
+contract](docs/artifact-format.md) before running a correctness gate.
 
 Any unlisted model, architecture, artifact format, or non-greedy generation
 combination fails explicitly. A configured GPU or artifact that cannot be

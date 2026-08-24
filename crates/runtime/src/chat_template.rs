@@ -1,10 +1,9 @@
 //! Load and render the chat template shipped with the model.
 //!
-//! Both Qwen3.8 and Gemma 4 bundle a Jinja chat template in
-//! `tokenizer_config.json`. The template expects variables like `messages`
-//! and `add_generation_prompt`, and commonly references `bos_token` /
-//! `eos_token`. We parse it once at startup with `minijinja` and render per
-//! request.
+//! Qwen3.8 bundles a Jinja chat template in `tokenizer_config.json`. The
+//! template expects variables like `messages` and `add_generation_prompt`,
+//! and commonly references `bos_token` / `eos_token`. We parse it once at
+//! startup with `minijinja` and render per request.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -68,7 +67,7 @@ impl ChatTemplate {
 
     /// Load `{model_dir}/tokenizer_config.json` and compile its
     /// `chat_template` field. Returns `Ok(None)` if the file or field is
-    /// missing — the server can still serve `/v1/completions` in that case.
+    /// missing — the direct non-chat prompt path can proceed in that case.
     pub fn try_load(model_dir: &Path) -> Result<Option<Arc<Self>>> {
         let path = model_dir.join("tokenizer_config.json");
         if !path.exists() {
@@ -170,7 +169,7 @@ fn extract_token(cfg: &JsonValue, key: &str) -> Option<String> {
     }
 }
 
-/// Deserialization shape for incoming chat messages on the HTTP API.
+/// Deserialization shape for chat messages supplied by callers.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IncomingChatMessage {
     pub role: String,

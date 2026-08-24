@@ -13,14 +13,16 @@ the compile target; the supported values are `gfx1100` and `gfx1201`.
 
 The public input pair is:
 
-- `--model-dir <directory>` containing `config.json`, `tokenizer.json`, and
-  `tokenizer_config.json` with the Qwen3.8 chat template;
+- `--model-dir <directory>` containing `config.json` and `tokenizer.json`;
+  `tokenizer_config.json` with the Qwen3.8 chat template is needed only when
+  `--chat` is used;
 - `--gguf-file <file>` containing the matching project-specific GQH GGUF
   weights.
 
-The startup validator reads this pair before GPU allocation. Missing files,
-invalid Qwen3.8 geometry, a missing GQH header, or an incompatible tensor
-layout is an error with the path and required role in the message.
+The startup validator reads the required files before GPU allocation, including
+chat-template metadata when `--chat` is set. Missing files, invalid Qwen3.8
+geometry, a missing GQH header, or an incompatible tensor layout is an error
+with the path and required role in the message.
 
 ## Build
 

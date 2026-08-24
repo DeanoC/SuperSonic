@@ -41,6 +41,14 @@ run, record warmup count, measured-run count, prefill time, median decode
 `ms_per_tok`, derived `tok/s`, and the generated-token equality result. A
 telemetry failure does not replace or weaken the correctness result.
 
+The committed `gfx1201` workflow writes the same evidence as
+`target/ci/qwen38-gfx1201/reproducibility.json`. It records the commit,
+ROCm/HIP versions, physical-to-logical GPU mapping, artifact basename and
+SHA-256 digest, prompt and token count, correctness hash, ordinary-versus-MTP
+equality, and each warmup/measured prefill and decode timing. Absolute
+artifact and model-directory paths are intentionally omitted from this
+portable record.
+
 ## Comparing runs
 
 Compare runs only when the artifact, prompt, generation length, build target,

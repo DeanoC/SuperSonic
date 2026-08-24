@@ -382,6 +382,17 @@ class ActiveDocsTests(unittest.TestCase):
         self.assertIn("tokenizer", readme.lower())
         self.assertIn("chat template", readme.lower())
 
+    def test_tokenizer_config_and_chat_template_wording_matches_chat_only_code_path(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8").lower()
+        build = (ROOT / "docs" / "build-and-run.md").read_text(encoding="utf-8").lower()
+        chat_template = (ROOT / "crates" / "runtime" / "src" / "chat_template.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("only when `--chat` is used", readme)
+        self.assertRegex(build, r"when\s+`--chat` is used")
+        self.assertNotIn("gemma", chat_template.lower())
+        self.assertNotIn("server", chat_template.lower())
+
     def test_performance_number_is_omitted_or_fully_qualified(self):
         public_text = "\n".join(
             (ROOT / relative).read_text(encoding="utf-8")

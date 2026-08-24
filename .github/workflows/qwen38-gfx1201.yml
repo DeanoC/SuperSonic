@@ -83,6 +83,17 @@ jobs:
             --showproductname --showuse --showmemuse --showtemp \
             | tee "$CI_OUTPUT_ROOT/rocm-smi-initial.txt"
 
+      - name: Capture ROCm and HIP toolchain identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v hipcc
+          timeout --foreground 30s hipcc --version \
+            | tee "$CI_OUTPUT_ROOT/hipcc-version.txt"
+          timeout --foreground 30s rocm-smi -d "$SUPERSONIC_R9700_GPU_ID" \
+            --showdriverversion \
+            | tee "$CI_OUTPUT_ROOT/rocm-driver-version.txt"
+
       - name: Wait for GPU idle
         shell: bash
         run: |
@@ -190,30 +201,10 @@ jobs:
             > "$CI_OUTPUT_ROOT/token-equivalence/ordinary.log" 2>&1
           ./target/release/supersonic "${common_args[@]}" --speculative-decode \
             > "$CI_OUTPUT_ROOT/token-equivalence/mtp.log" 2>&1
-          python3 - "$CI_OUTPUT_ROOT/token-equivalence/ordinary.log" \
-            "$CI_OUTPUT_ROOT/token-equivalence/mtp.log" \
-            "$CI_OUTPUT_ROOT/token-equivalence/comparison.json" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          def tokens(path: Path) -> list[int]:
-              for line in path.read_text(encoding="utf-8").splitlines():
-                  if line.startswith("[tokens] "):
-                      values = line.removeprefix("[tokens] ").split()
-                      return [int(value) for value in values]
-              raise SystemExit(f"missing structured token line in {path}")
-
-          ordinary = tokens(Path(sys.argv[1]))
-          mtp = tokens(Path(sys.argv[2]))
-          if ordinary != mtp:
-              raise SystemExit(f"ordinary/MTP token mismatch: {ordinary} != {mtp}")
-          Path(sys.argv[3]).write_text(
-              json.dumps({"ordinary": ordinary, "mtp": mtp}, indent=2) + "\n",
-              encoding="utf-8",
-          )
-          print(f"ordinary/MTP token equivalence passed for {len(ordinary)} tokens")
-          PY
+          python3 tools/qwen38-reproducibility.py compare \
+            --ordinary "$CI_OUTPUT_ROOT/token-equivalence/ordinary.log" \
+            --mtp "$CI_OUTPUT_ROOT/token-equivalence/mtp.log" \
+            --output "$CI_OUTPUT_ROOT/token-equivalence/comparison.json"
 
       - name: Throughput telemetry (non-blocking)
         if: always()
@@ -269,6 +260,27 @@ jobs:
           Path(sys.argv[2]).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
           print(json.dumps(summary, sort_keys=True))
           PY
+
+      - name: Write safe reproducibility record
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/qwen38-reproducibility.py record \
+            --commit "$(git rev-parse HEAD)" \
+            --hip-version-file "$CI_OUTPUT_ROOT/hipcc-version.txt" \
+            --rocm-version-file "$CI_OUTPUT_ROOT/rocm-driver-version.txt" \
+            --gpu-json "$CI_OUTPUT_ROOT/amd-smi-static-asic.json" \
+            --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
+            --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
+            --artifact "$SUPERSONIC_GQH_GGUF" \
+            --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
+            --ordinary "$CI_OUTPUT_ROOT/token-equivalence/ordinary.log" \
+            --mtp "$CI_OUTPUT_ROOT/token-equivalence/mtp.log" \
+            --telemetry-root "$CI_OUTPUT_ROOT/throughput" \
+            --prompt "Hello" \
+            --max-new-tokens 8 \
+            --output "$CI_OUTPUT_ROOT/reproducibility.json"
 
       - name: Upload structured R9700 logs and artifacts
         if: always()

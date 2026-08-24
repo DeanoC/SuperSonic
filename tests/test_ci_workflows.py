@@ -182,6 +182,39 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("--speculative-decode", text)
         self.assertIn("--emit-generated-json", text)
         self.assertIn("rocm-smi", text)
+        self.assertIn("hipcc --version", text)
+        self.assertIn("rocm-driver-version.txt", text)
+        self.assertIn("tools/qwen38-reproducibility.py", text)
+        self.assertIn("reproducibility.json", text)
+        for option in (
+            '--commit "$(git rev-parse HEAD)"',
+            "--hip-version-file",
+            "--rocm-version-file",
+            "--gpu-json",
+            "--physical-gpu",
+            "--gpu-arch",
+            "--artifact",
+            "--model-dir",
+            "--ordinary",
+            "--mtp",
+            "--telemetry-root",
+            "--prompt \"Hello\"",
+            "--max-new-tokens 8",
+        ):
+            self.assertIn(option, text, option)
+        record_tool = (ROOT / "tools" / "qwen38-reproducibility.py").read_text(encoding="utf-8")
+        for field in (
+            '"commit"',
+            '"toolchain"',
+            '"physical_gpu"',
+            '"artifact"',
+            '"workload"',
+            '"correctness"',
+            '"ordinary_vs_mtp"',
+            '"warmup_runs"',
+            '"measured_runs"',
+        ):
+            self.assertIn(field, record_tool)
         self.assertRegex(text, re.compile(r"(?i)gpu.*idle"))
         self.assertIn("continue-on-error: true", text)
         self.assertIn("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", text)

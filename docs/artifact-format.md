@@ -10,7 +10,8 @@ weights; the model directory supplies the rest of the startup contract.
 
 - `config.json` with the fixed Qwen3.8-27B geometry;
 - `tokenizer.json` with tokenizer data;
-- `tokenizer_config.json` containing the chat template when `--chat` is used.
+- `tokenizer_config.json` containing the chat template only when `--chat` is
+  used.
 
 `--gguf-file` must point to the matching GQH artifact. The canonical workflow
 may also configure a separate 8192-context GQH file for its extended crawl;
