@@ -237,9 +237,22 @@ engines = ["llama-cpp"]
             {
                 "clock_policy",
                 "requested",
+                "requested_at",
                 "observed_before",
+                "observed_before_at",
                 "observed_after",
+                "observed_after_at",
                 "telemetry_samples",
+                "headline_eligible",
+                "physical_gpu",
+                "logical_gpu",
+                "cpu_governor",
+                "allowlisted_environment",
+                "cache_state",
+                "cache_evidence",
+                "process_reuse",
+                "verification_errors",
+                "evidence_notes",
             },
         )
         self.assertEqual(
@@ -254,6 +267,7 @@ engines = ["llama-cpp"]
         observed_required = {
             "gpu_clock_mhz",
             "memory_clock_mhz",
+            "power_cap_watts",
             "power_watts",
             "temperature_celsius",
             "gpu_utilization_percent",
@@ -272,6 +286,7 @@ engines = ["llama-cpp"]
             "offset_seconds",
             "gpu_clock_mhz",
             "memory_clock_mhz",
+            "power_cap_watts",
             "power_watts",
             "temperature_celsius",
             "gpu_utilization_percent",
