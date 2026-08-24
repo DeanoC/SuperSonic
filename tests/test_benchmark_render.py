@@ -55,6 +55,104 @@ class BenchmarkRenderTests(unittest.TestCase):
 
             self.assertEqual(self._snapshot(first), self._snapshot(second))
 
+    def test_pages_use_document_relative_links_for_project_subpath_deployment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._write_results(root)
+            output = root / "site"
+            self.render.render_site(results, output)
+
+            pages = {
+                "root": (output / "index.html").read_text(encoding="utf-8"),
+                "methodology": (output / "methodology.html").read_text(encoding="utf-8"),
+                "run": next((output / "runs").glob("*.html")).read_text(encoding="utf-8"),
+                "trend": next((output / "trends" / "architecture").glob("*.html")).read_text(
+                    encoding="utf-8"
+                ),
+                "comparison": self.render.render_comparison(self.record, self.record),
+            }
+
+            self.assertIn('href="assets/benchmarks.css"', pages["root"])
+            self.assertIn('href="assets/benchmarks.css"', pages["methodology"])
+            self.assertIn('href="../assets/benchmarks.css"', pages["run"])
+            self.assertIn('href="../../assets/benchmarks.css"', pages["trend"])
+            self.assertIn('href="assets/benchmarks.css"', pages["comparison"])
+            for page in pages.values():
+                self.assertNotIn('href="/', page)
+                self.assertNotIn('src="/', page)
+
+    def test_empty_results_fail_before_output_cleanup_or_writes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = root / "results"
+            (results / "README.md").parent.mkdir(parents=True)
+            (results / "README.md").write_text("records are absent", encoding="utf-8")
+            output = root / "site"
+            output.mkdir()
+            sentinel = output / "sentinel.txt"
+            sentinel.write_text("keep", encoding="utf-8")
+            before = self._snapshot(output)
+
+            with self.assertRaisesRegex(ValueError, "publishable.*record"):
+                self.render.render_site(results, output)
+
+            self.assertEqual(before, self._snapshot(output))
+            fresh_output = root / "fresh-site"
+            with self.assertRaisesRegex(ValueError, "publishable.*record"):
+                self.render.render_site(results, fresh_output)
+            self.assertFalse(fresh_output.exists())
+
+    def test_peer_only_input_does_not_claim_latest_supersonic(self):
+        peer = copy.deepcopy(self.record)
+        peer["engine"]["name"] = "llama-cpp"
+        peer["run"]["run_id"] = "peer-only"
+        page = self.render._render_landing([peer], {self.render._run_page_id(peer): "runs/peer.html"})
+
+        self.assertIn("No qualified SuperSonic result", page)
+        self.assertNotIn("Latest qualified SuperSonic result", page)
+        self.assertIn("peer-only", page)
+
+    def test_broad_output_roots_are_rejected_before_input_or_marker_access(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = root / "results"
+            results.mkdir()
+            malformed = results / "record.json"
+            malformed.write_text("{not-json", encoding="utf-8")
+
+            broad_temp_marker = root / self.render.MARKER_NAME
+            broad_temp_sentinel = root / "keep.txt"
+            broad_temp_marker.write_text("do not authorize broad cleanup", encoding="utf-8")
+            broad_temp_sentinel.write_text("keep", encoding="utf-8")
+            broad_temp_before = self._snapshot(root)
+
+            broad_roots = (
+                Path("/"),
+                Path("/tmp"),
+                Path.cwd(),
+                ROOT,
+                ROOT / "benchmarks" / "results",
+                root,
+            )
+            for output in broad_roots:
+                with self.subTest(output=output):
+                    with self.assertRaisesRegex(ValueError, "output root"):
+                        self.render.render_site(results, output)
+            self.assertEqual(broad_temp_before, self._snapshot(root))
+            with self.assertRaisesRegex(ValueError, "output root"):
+                self.render.render_site(results, Path(tempfile.gettempdir()))
+
+    def test_safe_dedicated_temp_output_leaf_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._write_results(root)
+            output = root / "dedicated-site"
+
+            paths = self.render.render_site(results, output)
+
+            self.assertTrue(paths)
+            self.assertTrue((output / "index.html").exists())
+
     def test_noncomparable_peer_has_reasons_and_no_speedup(self):
         peer = copy.deepcopy(self.record)
         peer["run"]["run_id"] = "peer-run"

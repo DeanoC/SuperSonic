@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import tempfile
 
 from . import compare, manifest, validation
 
@@ -57,18 +58,20 @@ _REASON_FIELDS = {
 }
 
 
-def page(title: str, body: str) -> str:
+def page(title: str, body: str, *, href_prefix: str = "") -> str:
     """Wrap a body in the fixed site document shell.
 
     The title is escaped here as a final guard even though callers generally
-    pass stable text.  The stylesheet path is absolute within the Pages site,
-    so no page needs JavaScript or an external network dependency.
+    pass stable text.  The stylesheet path is document-relative at the page's
+    depth, so the site works under a project subpath and from local files.
+    No page needs JavaScript or an external network dependency.
     """
 
+    stylesheet = f"{href_prefix}assets/benchmarks.css"
     return (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         f"<title>{_escape(title)}</title><link rel=\"stylesheet\" "
-        "href=\"/assets/benchmarks.css\"></head>"
+        f"href=\"{_escape(stylesheet)}\"></head>"
         f"<body>{body}</body></html>\n"
     )
 
@@ -87,6 +90,8 @@ def render_site(results_root: str | Path, output_root: str | Path) -> tuple[Path
     output_path = Path(output_root)
     _check_separate_roots(results_path, output_path)
     records = _load_publishable_records(results_path)
+    if not records:
+        raise ValueError("no validated publishable benchmark record found")
     owned = _prepare_output(output_path)
 
     paths: list[Path] = []
@@ -112,7 +117,7 @@ def render_site(results_root: str | Path, output_root: str | Path) -> tuple[Path
         emit(f"runs/{run_id}.html", _render_run_page(record, href_prefix="../"))
 
     trend_entries = _trend_entries(records)
-    emit("trends/index.html", _render_trend_index(trend_entries))
+    emit("trends/index.html", _render_trend_index(trend_entries, href_prefix="../"))
     for dimension, values in trend_entries:
         for value, dimension_records in values:
             value_id = _value_page_id(dimension, value)
@@ -138,7 +143,7 @@ def render_site(results_root: str | Path, output_root: str | Path) -> tuple[Path
             _render_comparison_page(left, right, result, run_links, href_prefix="../"),
         )
     comparison_rows.sort(key=lambda item: item[0])
-    emit("comparisons/index.html", _render_comparison_index(comparison_rows))
+    emit("comparisons/index.html", _render_comparison_index(comparison_rows, href_prefix="../"))
 
     stylesheet = _stylesheet()
     emit("assets/benchmarks.css", stylesheet)
@@ -252,6 +257,49 @@ def _as_record(value: Mapping[str, object] | object) -> dict[str, object]:
 def _check_separate_roots(results_path: Path, output_path: Path) -> None:
     result_resolved = results_path.resolve()
     output_resolved = output_path.resolve()
+    if output_path.is_symlink():
+        raise ValueError(f"output root must not be a symlink: {output_path}")
+    forbidden_roots = {
+        Path("/").resolve(),
+        Path.cwd().resolve(),
+        Path.home().resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+        manifest.ROOT.resolve(),
+    }
+    if output_resolved in forbidden_roots:
+        raise ValueError(f"output root is not a dedicated output leaf: {output_path}")
+    repo_root = manifest.ROOT.resolve()
+    try:
+        if repo_root.is_relative_to(output_resolved):
+            raise ValueError(f"output root is a repository ancestor, not a dedicated output leaf: {output_path}")
+    except AttributeError:  # pragma: no cover - Python 3.8 compatibility
+        repo_text = str(repo_root) + "/"
+        output_text = str(output_resolved) + "/"
+        if repo_text.startswith(output_text):
+            raise ValueError(f"output root is a repository ancestor, not a dedicated output leaf: {output_path}")
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if output_resolved.parent == temp_root and output_resolved.name.startswith("tmp"):
+        raise ValueError(f"output root is a temporary root, not a dedicated output leaf: {output_path}")
+    if output_resolved.name.lower() in {
+        "tmp",
+        "home",
+        "var",
+        "usr",
+        "opt",
+        "etc",
+        "bin",
+        "lib",
+        "sbin",
+        "benchmarks",
+        "results",
+        "target",
+        "workspaces",
+        "worktrees",
+        "workspace",
+        "repo",
+        "repos",
+    }:
+        raise ValueError(f"output root is not a dedicated output leaf: {output_path}")
     if result_resolved == output_resolved:
         raise ValueError("output root must be separate from benchmark results")
     try:
@@ -428,16 +476,10 @@ def _kv_rows(rows: Iterable[tuple[str, object]]) -> str:
 
 
 def _navigation(href_prefix: str) -> str:
-    if href_prefix:
-        home = f"{href_prefix}index.html"
-        methodology = f"{href_prefix}methodology.html"
-        trends = f"{href_prefix}trends/index.html"
-        comparisons = f"{href_prefix}comparisons/index.html"
-    else:
-        home = "/"
-        methodology = "/methodology.html"
-        trends = "/trends/index.html"
-        comparisons = "/comparisons/index.html"
+    home = f"{href_prefix}index.html"
+    methodology = f"{href_prefix}methodology.html"
+    trends = f"{href_prefix}trends/index.html"
+    comparisons = f"{href_prefix}comparisons/index.html"
     return (
         '<nav aria-label="Primary">'
         f'<a href="{_escape(home)}">Benchmark home</a>'
@@ -706,11 +748,11 @@ def _render_run_page(record: Mapping[str, object], *, href_prefix: str) -> str:
         + f"<pre><code>{_escape(shlex.join(str(item) for item in command) if isinstance(command, Sequence) and not isinstance(command, (str, bytes)) else command)}</code></pre>"
         + "</section></main>"
     )
-    return page(f"Benchmark run: {run_id}", body)
+    return page(f"Benchmark run: {run_id}", body, href_prefix=href_prefix)
 
 
 def _render_landing(records: Sequence[Mapping[str, object]], run_links: Mapping[str, str]) -> str:
-    qualified = [record for record in records if _value(record, "engine.name") == "supersonic"] or list(records)
+    qualified = [record for record in records if _value(record, "engine.name") == "supersonic"]
     latest = max(qualified, key=_record_sort_key) if qualified else None
     rows: list[str] = []
     for record in sorted(records, key=_record_sort_key, reverse=True):
@@ -718,7 +760,12 @@ def _render_landing(records: Sequence[Mapping[str, object]], run_links: Mapping[
         stats = _sample_summary(record)
         href = run_links.get(run_id, f"runs/{run_id}.html")
         rows.append(_trend_row(record, stats, href))
-    latest_html = "<p>No publishable benchmark records are available.</p>"
+    latest_html = "<section class=\"headline\"><h2>No qualified SuperSonic result</h2>"
+    latest_html += (
+        "<p>No qualified SuperSonic record is available; published peer records remain visible below as context.</p></section>"
+        if records
+        else "<p>No publishable benchmark records are available.</p></section>"
+    )
     if latest is not None:
         run_id = _run_page_id(latest)
         href = run_links.get(run_id, f"runs/{run_id}.html")
@@ -805,24 +852,28 @@ def _trend_entries(records: Sequence[Mapping[str, object]]) -> tuple[tuple[str, 
     return tuple(output)
 
 
-def _render_trend_index(entries: Sequence[tuple[str, Sequence[tuple[str, Sequence[Mapping[str, object]]]]]]) -> str:
+def _render_trend_index(
+    entries: Sequence[tuple[str, Sequence[tuple[str, Sequence[Mapping[str, object]]]]]],
+    *,
+    href_prefix: str,
+) -> str:
     sections: list[str] = []
     for dimension, values in entries:
         links = "".join(
-            f"<li><a href=\"trends/{_escape(dimension)}/{_escape(_value_page_id(dimension, value))}.html\">"
+            f"<li><a href=\"{_escape(dimension)}/{_escape(_value_page_id(dimension, value))}.html\">"
             f"{_escape(value)}</a> ({_escape(_fmt(len(records)))})</li>"
             for value, records in values
         )
         sections.append(f"<section><h2>{_escape(_dimension_label(dimension))}</h2><ul>{links}</ul></section>")
     body = (
-        _navigation("")
+        _navigation(href_prefix)
         + '<main class="container"><h1>Benchmark trends</h1>'
         + '<p>Trend pages are separated by architecture, artifact, workload, generation mode, and cache state. '
         + 'Each metric links to the complete run evidence.</p>'
         + "".join(sections)
         + "</main>"
     )
-    return page("Benchmark trends", body)
+    return page("Benchmark trends", body, href_prefix=href_prefix)
 
 
 def _render_trend_page(
@@ -847,7 +898,7 @@ def _render_trend_page(
         + _trend_headers()
         + f"</tr></thead><tbody>{''.join(rows)}</tbody></table></main>"
     )
-    return page(f"Trend: {_dimension_label(dimension)} = {value}", body)
+    return page(f"Trend: {_dimension_label(dimension)} = {value}", body, href_prefix=href_prefix)
 
 
 def _dimension_label(dimension: str) -> str:
@@ -951,6 +1002,7 @@ def _render_comparison_page(
     return page(
         f"Peer comparison: {_value(left, 'engine.name')} vs {_value(right, 'engine.name')}",
         body,
+        href_prefix=href_prefix,
     )
 
 
@@ -986,19 +1038,21 @@ def _comparison_field_evidence(left: Mapping[str, object], right: Mapping[str, o
 
 def _render_comparison_index(
     rows: Sequence[tuple[str, Mapping[str, object], Mapping[str, object], compare.Comparison]],
+    *,
+    href_prefix: str,
 ) -> str:
     table_rows: list[str] = []
     for comparison_id, left, right, result in rows:
         status = "comparable" if result.comparable else "not comparable"
         reasons = ", ".join(result.reasons) if result.reasons else "—"
-        href = f"comparisons/{comparison_id}.html"
+        href = f"{comparison_id}.html"
         table_rows.append(
             f"<tr><th><a href=\"{_escape(href)}\">{_escape(_value(left, 'engine.name'))} vs "
             f"{_escape(_value(right, 'engine.name'))}</a></th><td>{_escape(status)}</td>"
             f"<td>{_escape(reasons)}</td><td>{_escape(_value(left, 'workload.case_id'))}</td></tr>"
         )
     body = (
-        _navigation("")
+        _navigation(href_prefix)
         + '<main class="container"><h1>Peer comparisons</h1>'
         + '<p>Comparability and reasons come directly from <code>compare_records</code>. '
         + 'Unlike artifacts, clocks, cache states, workloads, or hardware are never presented as a relative result.</p>'
@@ -1006,7 +1060,7 @@ def _render_comparison_index(
         + '<th>Pair</th><th>Status</th><th>Validator reasons</th><th>Workload</th></tr></thead>'
         + f"<tbody>{''.join(table_rows)}</tbody></table></main>"
     )
-    return page("Peer comparisons", body)
+    return page("Peer comparisons", body, href_prefix=href_prefix)
 
 
 def _render_methodology() -> str:
@@ -1037,7 +1091,7 @@ def _render_methodology() -> str:
         + '<li>Every numeric metric links to run evidence containing commit, GPU, artifact, workload, correctness, clock, and cache identity.</li>'
         + '</ul></section></main>'
     )
-    return page("Benchmark methodology", body)
+    return page("Benchmark methodology", body, href_prefix="")
 
 
 def _stylesheet() -> str:
