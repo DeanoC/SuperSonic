@@ -921,6 +921,55 @@ hipError_t decode_join_side(int ordinal, hipStream_t main, hipStream_t side) {
     return hipSuccess;
 }
 
+// A side-stream GEMV may be deliberately left running while the main stream
+// prepares recurrent state. Once it is recorded in this guard, every control
+// flow edge out of the layer joins it. This is deliberately fail-stop on a
+// join-resource error: returning to Rust with z still in flight would let the
+// owning workspace be freed while the side stream still reads it.
+struct DecodeSideJoinGuard {
+    int ordinal;
+    hipStream_t main;
+    hipStream_t pending = nullptr;
+
+    DecodeSideJoinGuard(int ordinal_, hipStream_t main_)
+        : ordinal(ordinal_), main(main_) {}
+
+    void defer(hipStream_t side) {
+        pending = side;
+    }
+
+    bool active() const {
+        return pending != nullptr;
+    }
+
+    hipError_t join() {
+        if (pending == nullptr) {
+            return hipSuccess;
+        }
+        const hipStream_t side = pending;
+        pending = nullptr;
+        const hipError_t err = decode_join_side(ordinal, main, side);
+        if (err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "decode side join guard", static_cast<int>(err), ordinal);
+        }
+        return hipSuccess;
+    }
+
+    ~DecodeSideJoinGuard() {
+        if (pending == nullptr) {
+            return;
+        }
+        const hipStream_t side = pending;
+        pending = nullptr;
+        const hipError_t err = decode_join_side(ordinal, main, side);
+        if (err != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "decode side join guard", static_cast<int>(err), ordinal);
+        }
+    }
+};
+
 hipError_t launch_gqh_gemv(
     int ordinal,
     const GqhProjHdr& h,
@@ -2160,11 +2209,13 @@ hipError_t ensure_ggml_k_gemv_scratch(int ordinal, int in_dim, int out_dim) {
         if (g_ggml_x_bf) {
             hipError_t err = hipDeviceSynchronize();
             if (err != hipSuccess) {
-                return finish(err);
+                supersonic_gpu_integrity_fail_stop(
+                    "GGML-K input scratch synchronize", static_cast<int>(err), ordinal);
             }
             err = hipFree(g_ggml_x_bf);
             if (err != hipSuccess) {
-                return finish(err);
+                supersonic_gpu_integrity_fail_stop(
+                    "GGML-K input scratch free", static_cast<int>(err), ordinal);
             }
             g_ggml_x_bf = nullptr;
             g_ggml_cap_in = 0;
@@ -2181,11 +2232,13 @@ hipError_t ensure_ggml_k_gemv_scratch(int ordinal, int in_dim, int out_dim) {
         if (g_ggml_y_bf) {
             hipError_t err = hipDeviceSynchronize();
             if (err != hipSuccess) {
-                return finish(err);
+                supersonic_gpu_integrity_fail_stop(
+                    "GGML-K output scratch synchronize", static_cast<int>(err), ordinal);
             }
             err = hipFree(g_ggml_y_bf);
             if (err != hipSuccess) {
-                return finish(err);
+                supersonic_gpu_integrity_fail_stop(
+                    "GGML-K output scratch free", static_cast<int>(err), ordinal);
             }
             g_ggml_y_bf = nullptr;
             g_ggml_cap_out = 0;
@@ -9669,7 +9722,7 @@ int persistent_decode_device(
                     }
                     in_flags |= 32;
                 }
-                hipStream_t z_pending = nullptr;
+                DecodeSideJoinGuard z_pending(device_ordinal, stream);
                 if (use_gqh_gemv) {
                     const GqhMixerLayer& mx_rms = mlp_hdrs.mix[layer];
                     int rms_flags = 2;
@@ -9789,7 +9842,7 @@ int persistent_decode_device(
                         // Join z after rec-prep: rec-prep only reads qkv, so
                         // it can overlap the z GEMV. Rec fused still needs z.
                         if (z_stream != stream) {
-                            z_pending = z_stream;
+                            z_pending.defer(z_stream);
                         }
                         if (err == hipSuccess && mx.b.qtype != 8) {
                             err = launch_mixer_proj(
@@ -9820,12 +9873,11 @@ int persistent_decode_device(
                         return err;
                     }
                     if (layer == dump_lin) {
-                        if (z_pending != nullptr) {
-                            err = decode_join_side(device_ordinal, stream, z_pending);
+                        if (z_pending.active()) {
+                            err = z_pending.join();
                             if (err != hipSuccess) {
                                 return err;
                             }
-                            z_pending = nullptr;
                         }
                         if (stream) {
                             (void)hipStreamSynchronize(stream);
@@ -9953,24 +10005,22 @@ int persistent_decode_device(
                             conv_snaps,
                             snap_stride);
                     }
-                    if (z_pending != nullptr) {
-                        err = decode_join_side(device_ordinal, stream, z_pending);
+                    if (z_pending.active()) {
+                        err = z_pending.join();
                         if (err != hipSuccess) {
                             return err;
                         }
-                        z_pending = nullptr;
                     }
                     if (dec_prof) {
                         sync_now();
                         ms_prep += now_ms() - t_p0;
                     }
                 } else {
-                    if (z_pending != nullptr) {
-                        err = decode_join_side(device_ordinal, stream, z_pending);
+                    if (z_pending.active()) {
+                        err = z_pending.join();
                         if (err != hipSuccess) {
                             return err;
                         }
-                        z_pending = nullptr;
                     }
                     if ((mid_flags & 256) != 0) {
                         err = launch_decode_full_prep(
@@ -10906,27 +10956,35 @@ extern "C" int supersonic_qwen35_4b_hip_persistent_decode(
     size_t batch_size,
     const void* batch_descs,
     const void* int4_scales) {
-    switch (dtype) {
-    case 2:
-        return persistent_decode_device<hip_bfloat16>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(num_layers),
-            static_cast<int>(hidden_dim),
-            static_cast<int>(intermediate_size),
-            static_cast<int>(seqlen_offset),
-            layers, hidden_io, workspace, counters,
-            barrier_counter, barrier_flag, timing_slots,
-            cos_table, sin_table, static_cast<int>(rotary_dim),
-            static_cast<int>(proj_buf_floats),
-            static_cast<int>(attn_scratch_floats),
-            enable_attention_trace,
-            fp8_scales,
-            kv_fp8_descs,
-            static_cast<int>(batch_size),
-            batch_descs,
-            int4_scales);
-    default:
-        return 256;
+    try {
+        switch (dtype) {
+        case 2:
+            return persistent_decode_device<hip_bfloat16>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(num_layers),
+                static_cast<int>(hidden_dim),
+                static_cast<int>(intermediate_size),
+                static_cast<int>(seqlen_offset),
+                layers, hidden_io, workspace, counters,
+                barrier_counter, barrier_flag, timing_slots,
+                cos_table, sin_table, static_cast<int>(rotary_dim),
+                static_cast<int>(proj_buf_floats),
+                static_cast<int>(attn_scratch_floats),
+                enable_attention_trace,
+                fp8_scales,
+                kv_fp8_descs,
+                static_cast<int>(batch_size),
+                batch_descs,
+                int4_scales);
+        default:
+            return 256;
+        }
+    } catch (...) {
+        // The decode body may have enqueued work before a trace/debug vector
+        // grows. No C++ exception may cross this ABI; fail-stop before Rust
+        // can unwind model-owned buffers.
+        supersonic_gpu_integrity_fail_stop(
+            "persistent decode host allocation", -1, static_cast<int>(device_ordinal));
     }
 }
 

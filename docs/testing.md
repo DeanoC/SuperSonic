@@ -76,10 +76,11 @@ allocation, and other failures before that ownership/async boundary remain
 ordinary returned errors.
 
 The deterministic developer-only death test compiles the injection seam out of
-normal builds and verifies the tracked-wire unregister boundary:
+normal builds (only the exact value `SUPERSONIC_GPU_FAILURE_TESTS=1` enables it;
+unset or `=0` leaves it out) and verifies the tracked-wire unregister boundary:
 
 ```bash
 SUPERSONIC_GPU_FAILURE_TESTS=1 HIP_ARCH=gfx1201 \
   cargo test -p kernel-ffi --lib \
-  'gqh::tests::fatal_cleanup_aborts_in_child' -- --exact --nocapture
+  'gqh::tests::fatal_' -- --nocapture
 ```

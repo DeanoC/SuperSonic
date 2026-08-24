@@ -738,6 +738,7 @@ mod tests {
     unsafe extern "C" {
         fn supersonic_gqh_test_track_wire(device_ordinal: c_int, wire: *const c_void);
         fn supersonic_gqh_test_inject_unregister_sync_failure(status: c_int);
+        fn supersonic_gqh_test_trigger_post_enqueue_failure(status: c_int);
     }
 
     fn vector_dir() -> PathBuf {
@@ -857,6 +858,28 @@ mod tests {
             .status()
             .expect("spawn fatal cleanup child");
         // POSIX SIGABRT is signal 6; keep the death test dependency-free.
+        assert_eq!(status.signal(), Some(6));
+    }
+
+    #[cfg(supersonic_failure_injection)]
+    #[test]
+    fn fatal_post_enqueue_aborts_in_child() {
+        if std::env::var_os("SUPERSONIC_GPU_FAILURE_CHILD").is_some() {
+            unsafe {
+                supersonic_gqh_test_trigger_post_enqueue_failure(811);
+            }
+            panic!("injected post-enqueue failure returned");
+        }
+
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "gqh::tests::fatal_post_enqueue_aborts_in_child",
+                "--nocapture",
+            ])
+            .env("SUPERSONIC_GPU_FAILURE_CHILD", "1")
+            .status()
+            .expect("spawn post-enqueue child");
         assert_eq!(status.signal(), Some(6));
     }
 

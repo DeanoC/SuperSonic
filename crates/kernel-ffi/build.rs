@@ -195,7 +195,7 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path, bridges: &[KernelBridge]) {
 
     println!("cargo:rerun-if-env-changed=GQH_ALLOW_FMA");
     let allow_gqh_fma = env::var_os("GQH_ALLOW_FMA").is_some_and(|value| value != "0");
-    let failure_injection = env::var_os("SUPERSONIC_GPU_FAILURE_TESTS").is_some();
+    let failure_injection = env::var("SUPERSONIC_GPU_FAILURE_TESTS").ok().as_deref() == Some("1");
     let mut objects = Vec::with_capacity(bridges.len());
     for bridge in bridges {
         let object = out_dir.join(&bridge.obj_name);
@@ -267,7 +267,7 @@ fn main() {
     );
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     compile_hip(&kernel_dir, &out_dir, &bridges);
-    if env::var_os("SUPERSONIC_GPU_FAILURE_TESTS").is_some() {
+    if env::var("SUPERSONIC_GPU_FAILURE_TESTS").ok().as_deref() == Some("1") {
         println!("cargo:rustc-cfg=supersonic_failure_injection");
     }
 }

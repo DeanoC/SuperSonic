@@ -8,11 +8,13 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 #include <mutex>
+#include <signal.h>
 #include <stdint.h>
 #include <string.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 bool g_gqh_allow_tight = false;
@@ -46,6 +48,7 @@ int gqh_gemv_flush();
 
 #ifdef SUPERSONIC_FAILURE_INJECTION
 int g_test_unregister_sync_failure = 0;
+int g_test_post_enqueue_failure = 0;
 #endif
 }  // namespace
 
@@ -61,14 +64,47 @@ extern "C" [[noreturn]] void supersonic_gpu_integrity_fail_stop(
     const char* operation,
     int status,
     int device_ordinal) {
-    std::fprintf(
-        stderr,
-        "[gpu-integrity] fatal operation=%s status=%d ordinal=%d\n",
-        operation == nullptr ? "unknown" : operation,
-        status,
-        device_ordinal);
-    std::fflush(stderr);
-    std::abort();
+    // This handler runs precisely when process-global GPU state may be
+    // inconsistent. Do not acquire a lock or call a stdio/allocator path
+    // here: either can deadlock or allocate while unwinding the failed path.
+    char message[256];
+    size_t length = 0;
+    auto append = [&](const char* text) {
+        if (text == nullptr) {
+            text = "unknown";
+        }
+        while (*text != '\0' && length + 1 < sizeof(message)) {
+            message[length++] = *text++;
+        }
+    };
+    auto append_int = [&](int value) {
+        long long signed_value = value;
+        if (signed_value < 0) {
+            append("-");
+            signed_value = -(signed_value + 1);
+            signed_value += 1;
+        }
+        char digits[32];
+        size_t count = 0;
+        do {
+            digits[count++] = static_cast<char>('0' + (signed_value % 10));
+            signed_value /= 10;
+        } while (signed_value != 0 && count < sizeof(digits));
+        while (count != 0 && length + 1 < sizeof(message)) {
+            message[length++] = digits[--count];
+        }
+    };
+    append("[gpu-integrity] fatal operation=");
+    append(operation);
+    append(" status=");
+    append_int(status);
+    append(" ordinal=");
+    append_int(device_ordinal);
+    append("\n");
+    (void)::write(2, message, length);
+    (void)::raise(SIGABRT);
+    (void)::kill(::getpid(), SIGABRT);
+    ::_exit(128 + SIGABRT);
 }
 
 namespace {
@@ -87,7 +123,13 @@ struct GqhBridgeLockGuard {
 extern "C" void supersonic_gqh_test_track_wire(int device_ordinal, const void* wire) {
     GqhBridgeLockGuard guard;
     if (wire != nullptr) {
-        g_gqh_tight.insert({device_ordinal, wire});
+        try {
+            g_gqh_tight.insert({device_ordinal, wire});
+        } catch (...) {
+            // The hook is used before any GPU work in the death-test child;
+            // do not let a host allocation exception cross the C ABI.
+            return;
+        }
     }
 }
 
@@ -95,6 +137,8 @@ extern "C" void supersonic_gqh_test_inject_unregister_sync_failure(int status) {
     GqhBridgeLockGuard guard;
     g_test_unregister_sync_failure = status;
 }
+
+extern "C" void supersonic_gqh_test_trigger_post_enqueue_failure(int status);
 #endif
 
 }  // namespace
@@ -125,17 +169,33 @@ int backend_failure(int project_status, hipError_t native_status) {
         (static_cast<uint32_t>(native_status) & 0xffffu));
 }
 
-int launch_result(int launch_project_status, int sync_project_status) {
+int launch_result(int device_ordinal, const char* operation) {
+#ifdef SUPERSONIC_FAILURE_INJECTION
+    if (g_test_post_enqueue_failure != 0) {
+        const int injected_status = g_test_post_enqueue_failure;
+        g_test_post_enqueue_failure = 0;
+        supersonic_gpu_integrity_fail_stop(operation, injected_status, device_ordinal);
+    }
+#endif
     const hipError_t launch_status = hipGetLastError();
     if (launch_status != hipSuccess) {
-        return backend_failure(launch_project_status, launch_status);
+        supersonic_gpu_integrity_fail_stop(
+            operation, static_cast<int>(launch_status), device_ordinal);
     }
     const hipError_t sync_status = maybe_sync();
     if (sync_status != hipSuccess) {
-        return backend_failure(sync_project_status, sync_status);
+        supersonic_gpu_integrity_fail_stop(
+            operation, static_cast<int>(sync_status), device_ordinal);
     }
     return 0;
 }
+
+#ifdef SUPERSONIC_FAILURE_INJECTION
+extern "C" void supersonic_gqh_test_trigger_post_enqueue_failure(int status) {
+    g_test_post_enqueue_failure = status;
+    (void)launch_result(0, "GQH test post-enqueue");
+}
+#endif
 
 struct ScopedHipDevice {
     int previous = -1;
@@ -333,7 +393,13 @@ void gqh_ensure_tight(
             nsb,
             out_dim);
     }
-    g_gqh_tight.insert({device_ordinal, wire});
+    (void)launch_result(device_ordinal, "GQH tight conversion");
+    try {
+        g_gqh_tight.insert({device_ordinal, wire});
+    } catch (...) {
+        supersonic_gpu_integrity_fail_stop(
+            "GQH tight metadata publish", -1, device_ordinal);
+    }
 }
 
 void gqh_ensure_padded(
@@ -395,8 +461,14 @@ void gqh_ensure_padded(
             nsb,
             out_dim);
     }
-    g_gqh_padded[{device_ordinal, wire}] = dst;
-    g_gqh_tight.insert({device_ordinal, wire});
+    (void)launch_result(device_ordinal, "GQH padded conversion");
+    try {
+        g_gqh_padded[{device_ordinal, wire}] = dst;
+        g_gqh_tight.insert({device_ordinal, wire});
+    } catch (...) {
+        supersonic_gpu_integrity_fail_stop(
+            "GQH padded metadata publish", -1, device_ordinal);
+    }
     static bool dumped_pad = false;
     if (!dumped_pad) {
         dumped_pad = true;
@@ -931,6 +1003,9 @@ extern "C" int supersonic_gqh_hip_decode(
         return 405;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(411, scoped.status);
+    }
     const int nsb = cols / GQH_SUPERBLOCK;
     const int64_t nsb_total = static_cast<int64_t>(rows) * nsb;
     auto* packed = static_cast<const uint8_t*>(wire);
@@ -1046,7 +1121,7 @@ extern "C" int supersonic_gqh_hip_decode(
                 return 401;
         }
     }
-    return launch_result(411, 412);
+    return launch_result(device_ordinal, "GQH decode launch");
 }
 
 extern "C" int supersonic_gqh_hip_matvec(
@@ -1081,6 +1156,9 @@ extern "C" int supersonic_gqh_hip_matvec(
         return 404;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
     const dim3 blocks(
         static_cast<unsigned int>(gqh_row_blocks(in_dim, out_dim)),
         static_cast<unsigned int>(ncols),
@@ -1129,7 +1207,7 @@ extern "C" int supersonic_gqh_hip_matvec(
         default:
             return 401;
     }
-    return launch_result(421, 422);
+    return launch_result(device_ordinal, "GQH matvec launch");
 }
 
 namespace {
@@ -1166,6 +1244,9 @@ int gqh_gemv_launch_single(
         return 404;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
     const dim3 blocks(
         static_cast<unsigned int>(gqh_row_blocks(in_dim, out_dim)),
         static_cast<unsigned int>(ncols),
@@ -1215,7 +1296,7 @@ int gqh_gemv_launch_single(
         default:
             return 401;
     }
-    return launch_result(421, 422);
+    return launch_result(device_ordinal, "GQH GEMV launch");
 }
 
 // --- mixed-rung MLP gate/up fusion ---------------------------------------
@@ -1381,7 +1462,14 @@ int gqh_gemv_launch_pair(const GqhGemvArgs& a, const GqhGemvArgs& b) {
     // run has to say which arms actually fused.
     static std::unordered_set<int64_t> dumped_split;
     const int64_t sig = ((int64_t)a.out_dim << 2) | (a3 ? 2 : 0) | (b3 ? 1 : 0);
-    if (dumped_split.insert(sig).second) {
+    bool first_split_signature = false;
+    try {
+        first_split_signature = dumped_split.insert(sig).second;
+    } catch (...) {
+        supersonic_gpu_integrity_fail_stop(
+            "GQH pair diagnostics allocation", -1, a.device_ordinal);
+    }
+    if (first_split_signature) {
         std::fprintf(
             stderr,
             "[gqh-gemv] split-pair fused a=%s b=%s in=%d out=%d warps=%d\n",
@@ -1413,7 +1501,7 @@ int gqh_gemv_launch_pair(const GqhGemvArgs& a, const GqhGemvArgs& b) {
     // Keep launch/error inspection on the owning device. The scope must not
     // end before hipGetLastError()/maybe_sync: those calls inspect the launch
     // state of the current device.
-    return launch_result(421, 422);
+    return launch_result(a.device_ordinal, "GQH pair GEMV launch");
 }
 
 int gqh_gemv_flush() {
@@ -1440,22 +1528,30 @@ extern "C" int supersonic_gqh_hip_unregister_wires(
     }
 
     std::vector<GqhWireKey> keys;
-    keys.reserve(count);
     std::unordered_set<GqhWireKey, GqhWireKeyHash> unique;
-    unique.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-        if (wires[i] == nullptr) {
-            continue;
+    try {
+        keys.reserve(count);
+        unique.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            if (wires[i] == nullptr) {
+                continue;
+            }
+            const GqhWireKey key{device_ordinal, wires[i]};
+            if (unique.insert(key).second) {
+                keys.push_back(key);
+            }
         }
-        const GqhWireKey key{device_ordinal, wires[i]};
-        if (unique.insert(key).second) {
-            keys.push_back(key);
-        }
+    } catch (...) {
+        // No bridge state has been touched yet, so an allocator failure can
+        // safely be reported to the Rust caller without exposing an exception
+        // across the extern-C ABI.
+        return static_cast<int>(hipErrorOutOfMemory);
     }
     if (keys.empty()) {
         return 0;
     }
 
+    try {
     bool needs_sync = false;
     for (const GqhWireKey& key : keys) {
         needs_sync = needs_sync || g_gqh_tight.find(key) != g_gqh_tight.end() ||
@@ -1557,6 +1653,13 @@ extern "C" int supersonic_gqh_hip_unregister_wires(
             return static_cast<int>(remove_err);
         }
     }
+    } catch (...) {
+        // Once the key set is built, any exception means bridge bookkeeping or
+        // retained GPU state may already have been touched. Continuing would
+        // risk freeing an allocation still referenced by the bridge.
+        supersonic_gpu_integrity_fail_stop(
+            "GQH unregister bookkeeping exception", -1, device_ordinal);
+    }
     return 0;
 }
 
@@ -1606,7 +1709,12 @@ extern "C" int supersonic_gqh_hip_matvec_stream(
         }
     }
     if (g_gemv_prev_valid && gqh_gemv_pairable(g_gemv_prev, cur)) {
-        g_gemv_fusable.insert({g_gemv_prev.device_ordinal, g_gemv_prev.wire});
+        try {
+            g_gemv_fusable.insert({g_gemv_prev.device_ordinal, g_gemv_prev.wire});
+        } catch (...) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH fusable metadata allocation", -1, device_ordinal);
+        }
     }
     if (gqh_gemv_fusable(cur) &&
         g_gemv_fusable.find({cur.device_ordinal, cur.wire}) != g_gemv_fusable.end()) {
@@ -1653,6 +1761,9 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
         return 404;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
     const dim3 blocks(
         static_cast<unsigned int>(gqh_row_blocks(in_dim, out_dim)),
         static_cast<unsigned int>(ncols),
@@ -1687,7 +1798,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_acc(
         default:
             return 401;
     }
-    return launch_result(421, 422);
+    return launch_result(device_ordinal, "GQH accumulated matvec launch");
 }
 
 extern "C" int supersonic_gqh_hip_matvec_stream_pair(
@@ -1747,6 +1858,9 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
         y_col_stride = out_dim;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
     const dim3 blocks(
         static_cast<unsigned int>(gqh_row_blocks(in_dim, row_max)),
         static_cast<unsigned int>(ncols),
@@ -1835,7 +1949,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
                 g, sthreads, 0, hs, pa, pb, xv, ya, in_dim, out_dim,
                 scale_a, scale_b, ga, gb, x_col_stride, y_col_stride, ncols);
         }
-        return launch_result(421, 422);
+        return launch_result(device_ordinal, "GQH GQH4 pair launch");
     }
     gqh_ensure_tight(
         device_ordinal, const_cast<uint8_t*>(pa), in_dim, out_dim, rung_a, hs);
@@ -2103,7 +2217,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
                 rung_b == GQH_RUNG_GQH3,
                 nsb20 ? 20 : 0,
                 kC);
-            return launch_result(421, 422);
+            return launch_result(device_ordinal, "GQH skinny pair launch");
         }
         if (rung_a == GQH_RUNG_GQH3 && rung_b == GQH_RUNG_GQH3) {
             if (dual) {
@@ -2154,7 +2268,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
                     out_dim, out_b_eff, scale_a, scale_b, mag_a, mag_b, fuse_swiglu, ileave);
             }
         }
-        return launch_result(421, 422);
+        return launch_result(device_ordinal, "GQH tight pair launch");
     }
     if (rung_a == GQH_RUNG_GQH3 && rung_b == GQH_RUNG_GQH3) {
         hipLaunchKernelGGL(
@@ -2237,7 +2351,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_pair(
             mag_b,
             fuse_swiglu);
     }
-    return launch_result(421, 422);
+    return launch_result(device_ordinal, "GQH pair launch");
 }
 
 extern "C" int supersonic_gqh_hip_matvec_stream_ab(
@@ -2280,6 +2394,9 @@ extern "C" int supersonic_gqh_hip_matvec_stream_ab(
         return 404;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
     hipStream_t hs = static_cast<hipStream_t>(stream);
     auto* pa = static_cast<const uint8_t*>(wire_a);
     auto* pb = static_cast<const uint8_t*>(wire_b);
@@ -2330,7 +2447,7 @@ extern "C" int supersonic_gqh_hip_matvec_stream_ab(
             tblocks, tthreads, 0, hs, pa, pb, xv, ya, yb, in_dim, out_a, out_b,
             scale_a, scale_b, mag_a, mag_b, ileave);
     }
-    return launch_result(421, 422);
+    return launch_result(device_ordinal, "GQH AB launch");
 }
 
 extern "C" int supersonic_gqh_hip_mix_matvec_stream(
@@ -2358,6 +2475,9 @@ extern "C" int supersonic_gqh_hip_mix_matvec_stream(
         return 401;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
     // llama.cpp mix matvec: 2 warps/block. 16 warps (GQH_MATVEC_WARPS)
     // oversubscribes gfx1100 and was measured slower there.
     constexpr int kMixWarps = 2;
@@ -2397,7 +2517,7 @@ extern "C" int supersonic_gqh_hip_mix_matvec_stream(
             blocks, threads, 0, hs, packed, xv, yv, in_dim, out_dim, mode,
             lut0, lut1, lut2, lut3, (int64_t)in_dim, (int64_t)out_dim);
     }
-    return launch_result(421, 422);
+    return launch_result(device_ordinal, "GQH mix launch");
 }
 
 extern "C" int supersonic_gqh_hip_ensure_tight(
@@ -2412,6 +2532,9 @@ extern "C" int supersonic_gqh_hip_ensure_tight(
         return 405;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
     gqh_ensure_tight(
         device_ordinal, static_cast<uint8_t*>(wire), in_dim, out_dim, rung, 0);
     return 0;
@@ -2429,6 +2552,9 @@ extern "C" int supersonic_gqh_hip_ensure_padded(
         return 405;
     }
     ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
     gqh_ensure_padded(
         device_ordinal, static_cast<uint8_t*>(wire), in_dim, out_dim, rung, 0);
     return 0;
