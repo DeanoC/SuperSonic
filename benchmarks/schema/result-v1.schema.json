@@ -93,6 +93,9 @@
       "type": "object",
       "required": [
         "identity",
+        "identity_kind",
+        "identity_source_sha256",
+        "identity_fields",
         "architecture",
         "physical_gpu",
         "logical_gpu",
@@ -101,6 +104,53 @@
       "properties": {
         "identity": {
           "type": "string"
+        },
+        "identity_kind": {
+          "type": "string",
+          "enum": [
+            "pci_bdf",
+            "uuid"
+          ]
+        },
+        "identity_source_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "identity_fields": {
+          "type": "object",
+          "required": [
+            "gpu",
+            "gfx_arch",
+            "logical_gpu",
+            "identity",
+            "identity_kind"
+          ],
+          "properties": {
+            "gpu": {
+              "type": "string"
+            },
+            "gfx_arch": {
+              "type": "string",
+              "pattern": "^gfx[0-9]+$"
+            },
+            "logical_gpu": {
+              "type": "string"
+            },
+            "identity": {
+              "type": "string"
+            },
+            "identity_kind": {
+              "type": "string",
+              "enum": [
+                "pci_bdf",
+                "uuid"
+              ]
+            },
+            "market_name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
         },
         "architecture": {
           "type": "string",

@@ -20,7 +20,9 @@ AMD_SMI_STATIC_ASIC_FIXTURE = {
                 "market_name": "AMD Radeon RX 7900 XTX",
                 "device_id": "0x744c",
                 "target_graphics_version": "gfx1100",
+                "pci_bdf": "0000:03:00.0",
             },
+            "logical_gpu": 1,
         },
         {
             "gpu": 1,
@@ -28,7 +30,9 @@ AMD_SMI_STATIC_ASIC_FIXTURE = {
                 "market_name": "AMD Radeon AI PRO R9700",
                 "device_id": "0x7551",
                 "target_graphics_version": "gfx1201",
+                "pci_bdf": "0000:65:00.0",
             },
+            "logical_gpu": 0,
         },
     ]
 }
@@ -56,6 +60,25 @@ class R9700SelectionTests(unittest.TestCase):
             [(0, "gfx1100"), (1, "gfx1201")],
         )
         self.assertEqual(self.selector.select_device(self.devices).physical_index, 1)
+        selected = self.selector.select_device(self.devices)
+        self.assertEqual(selected.stable_identity, "0000:65:00.0")
+        self.assertEqual(selected.logical_gpu, "0")
+
+    def test_static_record_without_stable_identity_fails_closed(self):
+        payload = {
+            "gpu_data": [
+                {
+                    "gpu": 1,
+                    "logical_gpu": 0,
+                    "asic": {
+                        "market_name": "AMD Radeon AI PRO R9700",
+                        "target_graphics_version": "gfx1201",
+                    },
+                }
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "identity|BDF|UUID"):
+            self.selector.parse_devices(json.dumps(payload))
 
     def test_list_schema_without_architecture_is_not_treated_as_static_schema(self):
         with self.assertRaises(ValueError):
@@ -72,6 +95,8 @@ class R9700SelectionTests(unittest.TestCase):
                         "market_name": "AMD Radeon AI PRO R9700",
                         "device_id": "0x7551",
                         "target_graphics_version": "gfx1201",
+                        "pci_bdf": "0000:65:00.0",
+                        "logical_gpu": 0,
                         "subsystem": {
                             "gpu": 99,
                             "target_graphics_version": "gfx1201",
@@ -92,7 +117,9 @@ class R9700SelectionTests(unittest.TestCase):
             "asic": {
                 "market_name": "AMD Radeon AI PRO R9700",
                 "target_graphics_version": "gfx1201",
+                "pci_bdf": "0000:65:00.0",
             },
+            "logical_gpu": 0,
         }
         devices = self.selector.parse_devices(json.dumps(payload))
         self.assertEqual(
@@ -108,6 +135,7 @@ class R9700SelectionTests(unittest.TestCase):
         environment = self.selector.render_environment(selected)
         self.assertEqual(environment["HIP_VISIBLE_DEVICES"], "1")
         self.assertEqual(environment["SUPERSONIC_DEVICE"], "0")
+        self.assertEqual(environment["SUPERSONIC_GPU_IDENTITY"], "0000:65:00.0")
 
     def test_explicit_override_is_allowed_only_after_gfx_validation(self):
         selected = self.selector.select_device(self.devices, override="1")

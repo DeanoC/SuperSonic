@@ -20,7 +20,17 @@
     "adapter_version": 1
   },
   "hardware": {
-    "identity": "AMD Radeon RX 9070 XT",
+    "identity": "0000:65:00.0",
+    "identity_kind": "pci_bdf",
+    "identity_source_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+    "identity_fields": {
+      "gpu": "1",
+      "gfx_arch": "gfx1201",
+      "logical_gpu": "0",
+      "identity": "0000:65:00.0",
+      "identity_kind": "pci_bdf",
+      "market_name": "AMD Radeon AI PRO R9700"
+    },
     "architecture": "gfx1201",
     "physical_gpu": "1",
     "clock_policy": "locked",

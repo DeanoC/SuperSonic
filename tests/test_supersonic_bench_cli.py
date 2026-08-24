@@ -57,8 +57,8 @@ class BenchmarkCliTests(unittest.TestCase):
                 "/artifact",
                 "--physical-gpu",
                 "0",
-                "--gpu-identity",
-                "R9700",
+                "--gpu-static-json",
+                "/tmp/amd-smi-static.json",
                 "--gpu-arch",
                 "gfx1201",
                 "--clock-policy",
@@ -74,6 +74,26 @@ class BenchmarkCliTests(unittest.TestCase):
         self.assertEqual(args.gpu_clock_mhz, 2600)
         self.assertEqual(args.memory_clock_mhz, 1800)
         self.assertEqual(args.power_cap_watts, 300)
+
+    def test_gpu_identity_cannot_be_forged_through_public_cli(self):
+        cli = load_cli_module()
+        parser = cli.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "run",
+                    "--suite",
+                    "quick",
+                    "--model-dir",
+                    "/model",
+                    "--artifact",
+                    "/artifact",
+                    "--physical-gpu",
+                    "0",
+                    "--gpu-identity",
+                    "forged",
+                ]
+            )
 
 
 if __name__ == "__main__":

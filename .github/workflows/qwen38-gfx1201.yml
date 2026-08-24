@@ -66,7 +66,7 @@ jobs:
           printf '%s\n' "$selection" | tee "$CI_OUTPUT_ROOT/device-selection.log"
           while IFS='=' read -r name value; do
             case "$name" in
-              SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE)
+              SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|SUPERSONIC_GPU_IDENTITY|SUPERSONIC_GPU_IDENTITY_KIND|SUPERSONIC_GPU_LOGICAL|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE)
                 printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
                 export "$name=$value"
                 ;;
@@ -79,6 +79,9 @@ jobs:
           physical_gpu="$SUPERSONIC_R9700_GPU_ID"
           [[ "$HIP_VISIBLE_DEVICES" == "$physical_gpu" ]]
           [[ "$SUPERSONIC_DEVICE" == "0" ]]
+          [[ -n "$SUPERSONIC_GPU_IDENTITY" ]]
+          [[ "$SUPERSONIC_GPU_IDENTITY_KIND" == "pci_bdf" || "$SUPERSONIC_GPU_IDENTITY_KIND" == "uuid" ]]
+          [[ "$SUPERSONIC_GPU_LOGICAL" == "$SUPERSONIC_DEVICE" ]]
           timeout --foreground 30s rocm-smi -d "$physical_gpu" \
             --showproductname --showuse --showmemuse --showtemp \
             | tee "$CI_OUTPUT_ROOT/rocm-smi-initial.txt"

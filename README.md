@@ -38,7 +38,7 @@ while IFS='=' read -r name value; do
     exit 1
   }
   case "$name" in
-    SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE) ;;
+    SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|SUPERSONIC_GPU_IDENTITY|SUPERSONIC_GPU_IDENTITY_KIND|SUPERSONIC_GPU_LOGICAL|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE) ;;
     *)
       echo "invalid R9700 selector output: unexpected key $name" >&2
       exit 1
@@ -51,15 +51,21 @@ while IFS='=' read -r name value; do
   selected["$name"]="$value"
 done <<< "$selection"
 
-[[ "${#selected[@]}" -eq 4 ]]
+[[ "${#selected[@]}" -eq 7 ]]
 [[ "${selected[SUPERSONIC_R9700_GPU_ID]}" =~ ^[0-9]+$ ]]
 [[ "${selected[SUPERSONIC_R9700_GPU_ARCH]}" == "gfx1201" ]]
 [[ "${selected[HIP_VISIBLE_DEVICES]}" == "${selected[SUPERSONIC_R9700_GPU_ID]}" ]]
 [[ "${selected[SUPERSONIC_DEVICE]}" == "0" ]]
+[[ -n "${selected[SUPERSONIC_GPU_IDENTITY]}" ]]
+[[ "${selected[SUPERSONIC_GPU_IDENTITY_KIND]}" == "pci_bdf" || "${selected[SUPERSONIC_GPU_IDENTITY_KIND]}" == "uuid" ]]
+[[ "${selected[SUPERSONIC_GPU_LOGICAL]}" == "${selected[SUPERSONIC_DEVICE]}" ]]
 export SUPERSONIC_R9700_GPU_ID="${selected[SUPERSONIC_R9700_GPU_ID]}"
 export SUPERSONIC_R9700_GPU_ARCH="${selected[SUPERSONIC_R9700_GPU_ARCH]}"
 export HIP_VISIBLE_DEVICES="${selected[HIP_VISIBLE_DEVICES]}"
 export SUPERSONIC_DEVICE="${selected[SUPERSONIC_DEVICE]}"
+export SUPERSONIC_GPU_IDENTITY="${selected[SUPERSONIC_GPU_IDENTITY]}"
+export SUPERSONIC_GPU_IDENTITY_KIND="${selected[SUPERSONIC_GPU_IDENTITY_KIND]}"
+export SUPERSONIC_GPU_LOGICAL="${selected[SUPERSONIC_GPU_LOGICAL]}"
 ```
 
 Build for the selected ROCm target, then run the one direct GQH path:

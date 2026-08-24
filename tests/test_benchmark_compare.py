@@ -103,6 +103,16 @@ class BenchmarkCompareTests(unittest.TestCase):
         self.assertIsNone(result.speedup)
         self.assertIn("physical_gpu", result.reasons)
 
+    def test_different_physical_bdf_records_never_compute_speedup(self):
+        left = copy.deepcopy(self.locked_warm)
+        right = copy.deepcopy(self.locked_warm)
+        right["hardware"]["identity"] = "0000:66:00.0"
+        right["hardware"]["identity_fields"]["identity"] = "0000:66:00.0"
+        result = self.compare.compare_records(left, right)
+        self.assertFalse(result.comparable)
+        self.assertIsNone(result.speedup)
+        self.assertIn("identity", result.reasons)
+
     def test_drifted_locked_record_never_computes_speedup(self):
         drifted = copy.deepcopy(self.locked_warm)
         drifted["environment"]["observed_after"]["gpu_clock_mhz"] = 2300

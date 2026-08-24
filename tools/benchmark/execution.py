@@ -26,7 +26,7 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
-from . import adapters, environment, manifest, quality, validation
+from . import adapters, environment, gpu, manifest, quality, validation
 from .model import EngineManifest, PerformanceCase, QualityCase, SuiteManifest, canonical_json
 
 
@@ -53,9 +53,7 @@ class RunConfig:
     artifact: Path | None
     physical_gpu: str | None
     gpu_arch: str | None
-    gpu_identity: str | None = None
-    gpu_identity_verified: bool = False
-    gpu_identity_evidence: Mapping[str, object] | str | None = None
+    gpu_static_json: Path | None = None
     logical_gpu: str | None = None
     output_dir: Path = Path("target/benchmarks/candidate")
     peer_artifact: Path | None = None
@@ -89,6 +87,7 @@ class RunManifest:
     config: RunConfig
     engines: tuple[EngineManifest, ...]
     quality_cases: tuple[QualityCase, ...]
+    gpu: gpu.StaticGpuProvenance
     run_id: str
     bundle: Path
     commit: str
@@ -179,13 +178,14 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         raise ValueError("device must be non-negative")
     if resolved.context_size is not None and resolved.context_size <= 0:
         raise ValueError("context_size must be positive")
-    gpu_identity = _required_text(resolved.gpu_identity, "gpu_identity")
-    if gpu_identity.lower() in {"unknown", "unknown-gpu", "n/a", "na"}:
-        raise ValueError("gpu_identity must be a verified physical identity")
-    if not bool(resolved.gpu_identity_verified) and not resolved.gpu_identity_evidence:
-        raise ValueError("gpu_identity must include verified physical identity evidence")
-    _validate_gpu_identity_evidence(resolved.gpu_identity_evidence, gpu_identity, physical_gpu, gpu_arch)
     logical_gpu = _required_text(resolved.logical_gpu or str(resolved.device), "logical_gpu")
+    static_json = _required_path(resolved.gpu_static_json, "gpu_static_json", directory=False, nonempty=True)
+    static_gpu = gpu.resolve_static_gpu(
+        static_json,
+        physical_gpu=physical_gpu,
+        gpu_arch=gpu_arch,
+        logical_gpu=logical_gpu,
+    )
     clock_policy_name = _clock_policy_name(resolved.clock_policy)
     if resolved.environment_sample_count < 0:
         raise ValueError("environment_sample_count must be non-negative")
@@ -229,8 +229,8 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         artifact=artifact,
         physical_gpu=physical_gpu,
         gpu_arch=gpu_arch,
-        gpu_identity=gpu_identity,
-        logical_gpu=logical_gpu,
+        gpu_static_json=static_json,
+        logical_gpu=static_gpu.logical_gpu,
     )
     if resolved_config.environment_snapshot is None and (
         clock_policy_name == "locked" or resolved_config.environment_command_runner is not None
@@ -241,6 +241,7 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         config=resolved_config,
         engines=engines,
         quality_cases=quality_cases,
+        gpu=static_gpu,
         run_id=run_id,
         bundle=bundle,
         commit=commit,
@@ -855,10 +856,13 @@ def _build_record(
             "adapter_version": adapters.ADAPTER_VERSION,
         },
         "hardware": {
-            "identity": str(config.gpu_identity),
-            "architecture": str(config.gpu_arch),
-            "physical_gpu": str(config.physical_gpu),
-            "logical_gpu": str(config.logical_gpu),
+            "identity": run_manifest.gpu.identity,
+            "identity_kind": run_manifest.gpu.identity_kind,
+            "identity_source_sha256": run_manifest.gpu.source_sha256,
+            "identity_fields": dict(run_manifest.gpu.selected_fields),
+            "architecture": run_manifest.gpu.architecture,
+            "physical_gpu": run_manifest.gpu.physical_gpu,
+            "logical_gpu": run_manifest.gpu.logical_gpu,
             "clock_policy": snapshot["clock_policy"],
         },
         "artifact": artifact_info,
@@ -1068,12 +1072,13 @@ def _persist_bundle_manifest(
         "commit": run_manifest.commit,
         "dirty": run_manifest.dirty,
         "gpu": {
-            "identity": config.gpu_identity,
-            "architecture": config.gpu_arch,
-            "physical_gpu": config.physical_gpu,
-            "logical_gpu": config.logical_gpu,
-            "verified": bool(config.gpu_identity_verified or config.gpu_identity_evidence),
-            "evidence": _safe_evidence(config.gpu_identity_evidence),
+            "identity": run_manifest.gpu.identity,
+            "identity_kind": run_manifest.gpu.identity_kind,
+            "identity_source_sha256": run_manifest.gpu.source_sha256,
+            "identity_fields": dict(run_manifest.gpu.selected_fields),
+            "architecture": run_manifest.gpu.architecture,
+            "physical_gpu": run_manifest.gpu.physical_gpu,
+            "logical_gpu": run_manifest.gpu.logical_gpu,
         },
         "model": {"files": model_files},
         "artifacts": artifact_entries,
@@ -1105,24 +1110,25 @@ def _persist_bundle_manifest(
 
 def _update_bundle_manifest(run_manifest: RunManifest, status: BundleStatus) -> None:
     path = run_manifest.bundle / "manifest.json"
-    if not path.is_file():
-        return
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            return
-        payload["status"] = {
-            "state": status.state,
-            "errors": list(status.errors),
-            "records": [record.name for record in status.records],
-            "quality_failed": status.quality_failed,
-            "performance_report_only": status.performance_report_only,
-        }
-        _atomic_json_write(payload, path)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        # A result status is still returned to the caller; the raw bundle is
-        # retained for diagnosis if a filesystem update itself fails.
-        return
+        path.stat()
+    except FileNotFoundError:
+        raise OSError(f"benchmark bundle manifest is missing: {path}")
+    # Let read/decode failures retain their original exception and message.
+    # They are finalization failures, not optional diagnostics.
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"benchmark bundle manifest is not an object: {path}")
+    payload["status"] = {
+        "state": status.state,
+        "errors": list(status.errors),
+        "records": [record.name for record in status.records],
+        "quality_failed": status.quality_failed,
+        "performance_report_only": status.performance_report_only,
+    }
+    # Do not return a status until this atomic write/fsync/replace has
+    # completed.  A finalization failure must remain visible to the caller.
+    _atomic_json_write(payload, path)
 
 
 def _record_filename(case: PerformanceCase, engine: EngineManifest) -> str:
@@ -1252,9 +1258,7 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
                 "physical_gpu",
                 "gpu_arch",
                 "architecture",
-                "gpu_identity",
-                "gpu_identity_verified",
-                "gpu_identity_evidence",
+                "gpu_static_json",
                 "logical_gpu",
                 "output_dir",
                 "output",
@@ -1308,9 +1312,7 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
         "run_id": None,
         "seed": None,
         "run_quality": True,
-        "gpu_identity": None,
-        "gpu_identity_verified": False,
-        "gpu_identity_evidence": None,
+        "gpu_static_json": None,
         "logical_gpu": None,
         "artifact_semantic_id": None,
         "artifact_quantization": None,
@@ -1385,26 +1387,6 @@ def _validate_locked_policy(policy: object) -> None:
         value = requested[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             raise ValueError(f"locked clock policy {key} must be positive")
-
-
-def _validate_gpu_identity_evidence(
-    evidence: Mapping[str, object] | str | None,
-    identity: str,
-    physical_gpu: str,
-    gpu_arch: str,
-) -> None:
-    if not isinstance(evidence, Mapping):
-        return
-    for key, expected in (
-        ("physical_gpu", physical_gpu),
-        ("physical_index", physical_gpu),
-        ("architecture", gpu_arch),
-        ("gfx_arch", gpu_arch),
-        ("identity", identity),
-        ("market_name", identity),
-    ):
-        if key in evidence and str(evidence[key]) != str(expected):
-            raise ValueError(f"gpu identity evidence {key} does not match configured identity")
 
 
 def _snapshot_policy_name(snapshot: object) -> str:
@@ -1685,16 +1667,6 @@ def _safe_environment(values: Mapping[str, object]) -> dict[str, str]:
     return result
 
 
-def _safe_evidence(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {str(key): _safe_evidence(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_safe_evidence(item) for item in value]
-    if isinstance(value, str) and (value.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", value)):
-        return Path(value).name or "path"
-    return value
-
-
 def _clock_policy_name(policy: object) -> str:
     name = policy.get("name") if isinstance(policy, Mapping) else getattr(policy, "name", policy)
     text = str(name)
@@ -1744,10 +1716,7 @@ def _append_error(errors: list[str], value: str) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:

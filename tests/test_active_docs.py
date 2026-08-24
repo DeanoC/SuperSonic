@@ -136,7 +136,9 @@ class ActiveDocsTests(unittest.TestCase):
                         "market_name": "AMD Radeon RX 7900 XTX",
                         "device_id": "0x744c",
                         "target_graphics_version": "gfx1100",
+                        "pci_bdf": "0000:03:00.0",
                     },
+                    "logical_gpu": 1,
                 },
                 {
                     "gpu": 1,
@@ -144,7 +146,9 @@ class ActiveDocsTests(unittest.TestCase):
                         "market_name": "AMD Radeon AI PRO R9700",
                         "device_id": "0x7551",
                         "target_graphics_version": "gfx1201",
+                        "pci_bdf": "0000:65:00.0",
                     },
+                    "logical_gpu": 0,
                 },
             ]
         }

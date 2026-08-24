@@ -46,6 +46,8 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\b(?:ghp|github_pat|hf)_[a-z0-9_]{8,}", re.IGNORECASE),
 )
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)")
+_PCI_BDF = re.compile(r"^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$", re.IGNORECASE)
+_GPU_UUID = re.compile(r"^[a-z0-9][a-z0-9_.:-]{7,}$", re.IGNORECASE)
 
 
 def validate_record(record: object) -> None:
@@ -306,10 +308,34 @@ def _validate_record_consistency(record: dict[str, object]) -> None:
     identity = str(hardware.get("identity", "")) if isinstance(hardware, Mapping) else ""
     if not identity.strip() or identity.lower() in {"unknown", "unknown-gpu", "n/a", "na"}:
         raise ValueError("hardware identity must be a verified physical identity")
+    identity_kind = str(hardware.get("identity_kind", "")) if isinstance(hardware, Mapping) else ""
+    if identity_kind not in {"pci_bdf", "uuid"}:
+        raise ValueError("hardware identity_kind must be pci_bdf or uuid")
+    source_digest = str(hardware.get("identity_source_sha256", "")) if isinstance(hardware, Mapping) else ""
+    if re.fullmatch(r"[0-9a-f]{64}", source_digest) is None:
+        raise ValueError("hardware identity_source_sha256 must be a SHA-256 digest")
     physical = str(hardware.get("physical_gpu", ""))
     logical = str(hardware.get("logical_gpu", ""))
     if not physical.strip() or not physical.isdigit() or not logical.strip():
         raise ValueError("hardware must carry physical and logical GPU mappings")
+    architecture = str(hardware.get("architecture", ""))
+    identity_fields = hardware.get("identity_fields") if isinstance(hardware, Mapping) else None
+    if not isinstance(identity_fields, Mapping):
+        raise ValueError("hardware identity_fields must preserve selected static evidence")
+    expected_fields = {
+        "gpu": physical,
+        "gfx_arch": architecture,
+        "logical_gpu": logical,
+        "identity": identity,
+        "identity_kind": identity_kind,
+    }
+    for key, expected in expected_fields.items():
+        if str(identity_fields.get(key, "")) != expected:
+            raise ValueError(f"hardware identity_fields.{key} does not match hardware")
+    if identity_kind == "pci_bdf" and _PCI_BDF.fullmatch(identity) is None:
+        raise ValueError("hardware PCI identity must be a stable BDF")
+    if identity_kind == "uuid" and _GPU_UUID.fullmatch(identity) is None:
+        raise ValueError("hardware UUID identity must be stable and non-empty")
     suite = load_suite(str(run["suite"]))
     if run["suite_version"] != suite.version:
         raise ValueError("run suite_version does not match suite manifest")

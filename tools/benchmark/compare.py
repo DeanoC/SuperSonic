@@ -9,6 +9,7 @@ from . import validation
 
 COMPARABILITY_FIELDS = (
     "hardware.identity",
+    "hardware.identity_kind",
     "hardware.architecture",
     "hardware.physical_gpu",
     "hardware.logical_gpu",

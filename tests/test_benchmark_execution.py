@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +74,25 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.artifact.write_bytes(b"artifact")
         self.peer_artifact = self.root / "peer.gguf"
         self.peer_artifact.write_bytes(b"peer")
+        self.static_json = self.root / "amd-smi-static.json"
+        self.static_json.write_text(
+            json.dumps(
+                {
+                    "gpu_data": [
+                        {
+                            "gpu": 0,
+                            "logical_gpu": 0,
+                            "asic": {
+                                "market_name": "AMD Radeon AI PRO R9700",
+                                "target_graphics_version": "gfx1201",
+                                "pci_bdf": "0000:65:00.0",
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
         self.binary = self.root / "supersonic"
         self.binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.binary.chmod(0o755)
@@ -91,8 +111,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
             peer_artifact=self.peer_artifact if include_peer else None,
             physical_gpu="0",
             gpu_arch="gfx1201",
-            gpu_identity="AMD Radeon AI PRO R9700",
-            gpu_identity_verified=True,
+            gpu_static_json=self.static_json,
             logical_gpu="0",
             output_dir=Path(output or self.root / "candidate"),
             engine_binaries={
@@ -110,7 +129,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
             self.execution.preflight(config)
 
     def test_preflight_requires_explicit_model_artifact_and_gpu(self):
-        for field in ("model_dir", "artifact", "physical_gpu", "gpu_arch"):
+        for field in ("model_dir", "artifact", "physical_gpu", "gpu_arch", "gpu_static_json"):
             config = self.config()
             config = self.execution.replace_config(config, **{field: None})
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field.replace("_", ".*")):
@@ -334,6 +353,58 @@ class BenchmarkExecutionTests(unittest.TestCase):
         status = self.execution.run_suite(config, FakeClock([0, 1, 2]), InterruptRunner())
         payload = json.loads((status.bundle / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(payload["status"]["state"], "incomplete")
+
+    def test_static_gpu_provenance_derives_identity_and_source_digest(self):
+        status = self.execution.run_suite(
+            self.config(run_quality=False),
+            FakeClock([0] + list(range(1, 100))),
+            FakeRunner(),
+        )
+        record = json.loads(status.records[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["hardware"]["identity"], "0000:65:00.0")
+        self.assertEqual(record["hardware"]["identity_kind"], "pci_bdf")
+        self.assertEqual(
+            record["hardware"]["identity_source_sha256"],
+            self.execution._digest_file(self.static_json),
+        )
+        self.assertEqual(record["hardware"]["identity_fields"]["gpu"], "0")
+        self.assertEqual(record["hardware"]["identity_fields"]["gfx_arch"], "gfx1201")
+
+    def test_static_gpu_mismatched_architecture_fails_preflight(self):
+        payload = json.loads(self.static_json.read_text(encoding="utf-8"))
+        payload["gpu_data"][0]["asic"]["target_graphics_version"] = "gfx1100"
+        self.static_json.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "architecture|gfx"):
+            self.execution.preflight(self.config())
+
+    def test_final_manifest_write_failure_is_not_swallowed(self):
+        config = self.config(run_quality=False)
+        original = self.execution._atomic_json_write
+        calls = 0
+
+        def fail_final(payload, target):
+            nonlocal calls
+            calls += 1
+            if calls >= 2:
+                raise OSError("injected final manifest fsync failure")
+            return original(payload, target)
+
+        with mock.patch.object(self.execution, "_atomic_json_write", side_effect=fail_final):
+            with self.assertRaisesRegex(OSError, "final manifest fsync"):
+                self.execution.run_suite(config, FakeClock([0] + list(range(1, 100))), FakeRunner())
+
+    def test_final_manifest_read_failure_is_not_swallowed(self):
+        config = self.config(run_quality=False)
+        original = Path.read_text
+
+        def fail_manifest(path, *args, **kwargs):
+            if path.name == "manifest.json":
+                raise OSError("injected final manifest read failure")
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", fail_manifest):
+            with self.assertRaisesRegex(OSError, "final manifest read"):
+                self.execution.run_suite(config, FakeClock([0] + list(range(1, 100))), FakeRunner())
 
     def test_environment_snapshot_is_serialized_without_fabricated_telemetry(self):
         snapshot = json.loads((FIXTURES / "valid-result-v1.json").read_text(encoding="utf-8"))["environment"]

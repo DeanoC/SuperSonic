@@ -31,8 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--artifact", type=Path, required=True)
     run.add_argument("--peer-artifact", type=Path)
     run.add_argument("--physical-gpu", required=True)
-    run.add_argument("--gpu-identity", required=True)
-    run.add_argument("--gpu-identity-verified", action="store_true")
+    run.add_argument(
+        "--gpu-static-json",
+        type=Path,
+        required=True,
+        help="captured authoritative AMD SMI static JSON used for GPU provenance",
+    )
     run.add_argument("--logical-gpu")
     run.add_argument("--gpu-arch", default=None)
     run.add_argument("--device", type=int, default=0)
@@ -82,11 +86,6 @@ def _run(args: argparse.Namespace) -> int:
         raise ValueError("gpu_arch is required explicitly or through HIP_ARCH")
     import os
 
-    selector_verified = (
-        os.environ.get("SUPERSONIC_R9700_GPU_ID") == str(args.physical_gpu)
-        and os.environ.get("SUPERSONIC_R9700_GPU_ARCH") == gpu_arch
-    )
-    gpu_identity_verified = bool(args.gpu_identity_verified or selector_verified)
     clock_policy: object = args.clock_policy
     if args.clock_policy == "locked":
         clock_policy = {
@@ -103,17 +102,7 @@ def _run(args: argparse.Namespace) -> int:
         peer_artifact=args.peer_artifact,
         physical_gpu=args.physical_gpu,
         gpu_arch=gpu_arch,
-        gpu_identity=args.gpu_identity,
-        gpu_identity_verified=gpu_identity_verified,
-        gpu_identity_evidence=(
-            {
-                "source": "select-r9700-device",
-                "physical_gpu": str(args.physical_gpu),
-                "architecture": gpu_arch,
-            }
-            if gpu_identity_verified
-            else None
-        ),
+        gpu_static_json=args.gpu_static_json,
         logical_gpu=args.logical_gpu or os.environ.get("SUPERSONIC_DEVICE", str(args.device)),
         output_dir=args.output,
         device=args.device,
