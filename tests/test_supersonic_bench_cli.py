@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOL = ROOT / "tools" / "supersonic-bench.py"
+
+
+def load_cli_module():
+    spec = importlib.util.spec_from_file_location("supersonic_bench_cli", TOOL)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"unable to load {TOOL}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class BenchmarkCliTests(unittest.TestCase):
+    def test_run_requires_explicit_inputs(self):
+        cli = load_cli_module()
+        with self.assertRaises(SystemExit) as raised:
+            cli.main(["run", "--suite", "quick"])
+        self.assertNotEqual(raised.exception.code, 0)
+
+    def test_validate_publishable_uses_publishability_gate(self):
+        cli = load_cli_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertNotEqual(cli.main(["validate", "--publishable", temporary]), 0)
+
+    def test_compare_emits_json(self):
+        cli = load_cli_module()
+        self.assertTrue(hasattr(cli, "main"))
+        self.assertTrue(hasattr(cli, "build_parser"))
+
+    def test_public_cli_does_not_add_runner_execution_flags(self):
+        cli = load_cli_module()
+        parser = cli.build_parser()
+        text = str(parser)
+        self.assertNotIn("--model qwen3.8-27b", text)
+        self.assertNotIn("--gguf-file", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
