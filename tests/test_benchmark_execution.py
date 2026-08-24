@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -195,6 +196,28 @@ class BenchmarkExecutionTests(unittest.TestCase):
             config = self.execution.replace_config(config, **{field: None})
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field.replace("_", ".*")):
                 self.execution.preflight(config)
+
+    def test_chat_template_identity_hashes_the_template_not_its_container_file(self):
+        template = "{% if messages %}{{ messages[0].content }}{% endif %}"
+        config_file = self.model_dir / "tokenizer_config.json"
+        config_file.write_text(
+            json.dumps({"chat_template": template, "unrelated": "container metadata"}),
+            encoding="utf-8",
+        )
+        template_digest = hashlib.sha256(template.encode("utf-8")).hexdigest()
+        container_digest = hashlib.sha256(config_file.read_bytes()).hexdigest()
+        config = self.execution.replace_config(
+            self.config(),
+            chat=True,
+            chat_template_sha256=template_digest,
+        )
+
+        self.execution.preflight(config)
+
+        with self.assertRaisesRegex(ValueError, "chat_template_sha256"):
+            self.execution.preflight(
+                self.execution.replace_config(config, chat_template_sha256=container_digest)
+            )
 
     def test_case_engine_scope_is_honored(self):
         manifest = self.execution.preflight(self.config(suite="full", include_peer=True))

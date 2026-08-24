@@ -27,7 +27,7 @@ from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from . import adapters, environment, gpu, manifest, quality, validation
-from .model import EngineManifest, PerformanceCase, QualityCase, SuiteManifest, canonical_json
+from .model import EngineManifest, PerformanceCase, QualityCase, SuiteManifest, canonical_json, parse_strict_json
 
 
 ROOT = manifest.ROOT
@@ -1630,8 +1630,15 @@ def _validate_model_digests(model_dir: Path, config: RunConfig) -> None:
         template = model_dir / "tokenizer_config.json"
         if not template.is_file():
             raise ValueError("chat_template_sha256 requires tokenizer_config.json")
-        if config.chat_template_sha256 != _digest_file(template):
-            raise ValueError("chat_template_sha256 does not match tokenizer_config.json")
+        payload = parse_strict_json(template.read_text(encoding="utf-8"), context="tokenizer_config.json")
+        if not isinstance(payload, Mapping):
+            raise ValueError("tokenizer_config.json must contain an object")
+        chat_template = payload.get("chat_template")
+        if not isinstance(chat_template, str) or not chat_template:
+            raise ValueError("tokenizer_config.json must contain a non-empty chat_template string")
+        actual_chat_template = hashlib.sha256(chat_template.encode("utf-8")).hexdigest()
+        if config.chat_template_sha256 != actual_chat_template:
+            raise ValueError("chat_template_sha256 does not match tokenizer_config.json chat_template")
 
 
 def _validate_active_cases(suite: SuiteManifest) -> None:
