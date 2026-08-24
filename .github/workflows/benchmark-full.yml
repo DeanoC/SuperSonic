@@ -246,17 +246,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          max_wait_seconds=900
+          interval_seconds=15
+          required_idle_samples=3
+          max_gpu_use_percent=10
+          max_vram_use_percent=20
+          idle_samples=0
+          deadline=$(( $(date +%s) + max_wait_seconds ))
           physical_gpu="${SUPERSONIC_R9700_GPU_ID:?device selection did not export a physical GPU}"
-          for sample in 1 2 3; do
-            probe_file="$BENCHMARK_OUTPUT_ROOT/rocm-smi-post-correctness-${sample}.txt"
-            timeout --foreground 30s rocm-smi -d "$physical_gpu" \
+          while :; do
+            now="$(date +%s)"
+            if (( now >= deadline )); then
+              echo "timed out waiting for GPU ${physical_gpu} idle after correctness" >&2
+              exit 1
+            fi
+            remaining=$((deadline - now))
+            probe_timeout=$(( remaining < 30 ? remaining : 30 ))
+            probe_file="$BENCHMARK_OUTPUT_ROOT/rocm-smi-post-correctness-${now}.txt"
+            timeout --foreground "${probe_timeout}s" rocm-smi -d "$physical_gpu" \
               --showuse --showmemuse --showtemp | tee "$probe_file"
             utilization="$(python3 tools/parse-rocm-smi.py --input "$probe_file")"
             gpu_use="$(awk '{for (i=1; i<=NF; i++) if ($i ~ /^gpu_use_percent=/) {sub(/^[^=]*=/, "", $i); print $i}}' <<< "$utilization")"
             vram_use="$(awk '{for (i=1; i<=NF; i++) if ($i ~ /^vram_use_percent=/) {sub(/^[^=]*=/, "", $i); print $i}}' <<< "$utilization")"
-            awk -v gpu="$gpu_use" -v vram="$vram_use" \
-              'BEGIN { exit !(gpu <= 10 && vram <= 20) }'
-            if (( sample < 3 )); then sleep 15; fi
+            if awk -v gpu="$gpu_use" -v vram="$vram_use" \
+              -v max_gpu="$max_gpu_use_percent" -v max_vram="$max_vram_use_percent" \
+              'BEGIN { exit !(gpu <= max_gpu && vram <= max_vram) }'; then
+              idle_samples=$((idle_samples + 1))
+              echo "GPU post-correctness idle sample ${idle_samples}/${required_idle_samples}: gpu=${gpu_use}% vram=${vram_use}%"
+            else
+              idle_samples=0
+              echo "GPU still settling after correctness: gpu=${gpu_use}% vram=${vram_use}%"
+            fi
+            if (( idle_samples >= required_idle_samples )); then
+              break
+            fi
+            sleep "$(( interval_seconds < remaining ? interval_seconds : remaining ))"
           done
 
       - name: Run exact six-hour full harness
