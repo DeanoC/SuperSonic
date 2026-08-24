@@ -13,7 +13,6 @@ ADAPTER_VERSION = 1
 MODEL_NAME = "qwen3.8-27b"
 DEFAULT_DEVICE = 0
 DEFAULT_SAMPLING_SEED = 42
-LLAMA_CPP_VERSION_RE = re.compile(r"^version:\s+.+$", re.MULTILINE)
 GENERATED_JSON_RE = re.compile(r"^\[generated_json\]\s+(?P<value>.+)$", re.MULTILINE)
 TOKENS_RE = re.compile(r"^\[tokens\]\s+(?P<value>.*)$", re.MULTILINE)
 RESULT_RE = re.compile(
@@ -25,6 +24,24 @@ RESULT_RE = re.compile(
 )
 STAGE_TIMINGS_RE = re.compile(
     r"^\[stage-timings\]\s+steps=(?P<steps>[0-9]+)\b.*?\btotal_native_decode_ms=(?P<total>[-+A-Za-z0-9.]+)\b.*$",
+    re.MULTILINE,
+)
+LLAMA_CPP_TIMING_PREFIX_RE = re.compile(r"^llama_perf_context_print:\s+")
+LLAMA_CPP_PROMPT_EVAL_RE = re.compile(
+    r"^llama_perf_context_print:\s+prompt eval time\s+=\s+(?P<ms>[-+A-Za-z0-9.]+)\s+ms\s+/\s+"
+    r"(?P<count>[0-9]+)\s+tokens\s+\(\s*(?P<per_tok>[-+A-Za-z0-9.]+)\s+ms per token,\s+"
+    r"(?P<tps>[-+A-Za-z0-9.]+)\s+tokens per second\)$",
+    re.MULTILINE,
+)
+LLAMA_CPP_EVAL_RE = re.compile(
+    r"^llama_perf_context_print:\s+eval time\s+=\s+(?P<ms>[-+A-Za-z0-9.]+)\s+ms\s+/\s+"
+    r"(?P<count>[0-9]+)\s+runs\s+\(\s*(?P<per_tok>[-+A-Za-z0-9.]+)\s+ms per token,\s+"
+    r"(?P<tps>[-+A-Za-z0-9.]+)\s+tokens per second\)$",
+    re.MULTILINE,
+)
+LLAMA_CPP_TOTAL_RE = re.compile(
+    r"^llama_perf_context_print:\s+total time\s+=\s+(?P<ms>[-+A-Za-z0-9.]+)\s+ms\s+/\s+"
+    r"(?P<count>[0-9]+)\s+tokens$",
     re.MULTILINE,
 )
 
@@ -44,7 +61,7 @@ class ParsedOutput:
     engine_name: str
     engine_version: str | None
     generated_text: str
-    token_ids: tuple[int, ...]
+    token_ids: tuple[int, ...] | None
     prompt_tokens: int
     generated_tokens: int
     decode_ms: float
@@ -71,8 +88,9 @@ def parse_output(engine_name: str, stdout: str) -> ParsedOutput:
     if engine_name == "supersonic":
         return _parse_common_output(engine_name, stdout, engine_version=None)
     if engine_name == "llama-cpp":
-        version = _extract_exactly_one(LLAMA_CPP_VERSION_RE, stdout, "version line")
-        return _parse_common_output(engine_name, stdout, engine_version=version)
+        from .manifest import load_engine
+
+        return _parse_llama_cpp_output(stdout, engine_version=load_engine(engine_name).pinned_version)
     raise ValueError(f"unsupported engine adapter: {engine_name}")
 
 
@@ -125,6 +143,9 @@ def _build_llama_cpp_command(
         "--n-predict",
         str(case.max_new_tokens),
         "--ignore-eos",
+        "--perf",
+        "--show-timings",
+        "--no-display-prompt",
         "--temp",
         "0",
         "--top-k",
@@ -134,6 +155,10 @@ def _build_llama_cpp_command(
         "--seed",
         str(DEFAULT_SAMPLING_SEED),
     ]
+    if inputs.chat:
+        args.extend(["--conversation", "--single-turn"])
+    else:
+        args.append("--no-conversation")
     if inputs.context_size is not None:
         args.extend(["--ctx-size", str(_require_positive_int(inputs.context_size, "context_size"))])
     return tuple(args)
@@ -189,6 +214,47 @@ def _parse_common_output(
     )
 
 
+def _parse_llama_cpp_output(stdout: str, *, engine_version: str | None) -> ParsedOutput:
+    prompt_match = _extract_match_exactly_one(LLAMA_CPP_PROMPT_EVAL_RE, stdout, "prompt eval time line")
+    eval_match = _extract_match_exactly_one(LLAMA_CPP_EVAL_RE, stdout, "eval time line")
+    total_match = _extract_match_exactly_one(LLAMA_CPP_TOTAL_RE, stdout, "total time line")
+
+    generated_text = _parse_llama_cpp_generated_text(stdout)
+    if not generated_text:
+        raise ValueError("llama-cpp output must contain deterministic generated text")
+
+    prompt_tokens = int(prompt_match.group("count"))
+    prompt_ms = _require_finite_positive(float(prompt_match.group("ms")), "prompt_eval_ms")
+    prompt_ms_per_tok = _require_finite_positive(float(prompt_match.group("per_tok")), "prompt_eval_ms_per_tok")
+    prompt_tps = _require_finite_positive(float(prompt_match.group("tps")), "prompt_eval_tokens_per_second")
+    _require_rate_consistency(prompt_ms, prompt_tokens, prompt_ms_per_tok, prompt_tps, "prompt eval time")
+
+    generated_tokens = int(eval_match.group("count"))
+    decode_ms = _require_finite_positive(float(eval_match.group("ms")), "decode_ms")
+    ms_per_tok = _require_finite_positive(float(eval_match.group("per_tok")), "ms_per_tok")
+    tokens_per_second = _require_finite_positive(float(eval_match.group("tps")), "tokens_per_second")
+    _require_rate_consistency(decode_ms, generated_tokens, ms_per_tok, tokens_per_second, "eval time")
+
+    total_tokens = int(total_match.group("count"))
+    total_ms = _require_finite_positive(float(total_match.group("ms")), "total_ms")
+    if total_tokens != prompt_tokens + generated_tokens:
+        raise ValueError("llama-cpp total time token count is inconsistent with prompt and generated counts")
+    if not math.isclose(total_ms, prompt_ms + decode_ms, rel_tol=0.05, abs_tol=2.0):
+        raise ValueError("llama-cpp total time is inconsistent with prompt and eval time")
+
+    return ParsedOutput(
+        engine_name="llama-cpp",
+        engine_version=engine_version,
+        generated_text=generated_text,
+        token_ids=None,
+        prompt_tokens=prompt_tokens,
+        generated_tokens=generated_tokens,
+        decode_ms=decode_ms,
+        ms_per_tok=ms_per_tok,
+        tokens_per_second=tokens_per_second,
+    )
+
+
 def _parse_generated_text(stdout: str) -> str:
     raw = _extract_exactly_one(GENERATED_JSON_RE, stdout, "[generated_json] line")
     try:
@@ -221,6 +287,11 @@ def _parse_result(stdout: str) -> tuple[int, int, float, float]:
     decode_ms = _require_finite_positive(float(match.group("decode")), "decode_ms")
     ms_per_tok = _require_finite_positive(float(match.group("per_tok")), "ms_per_tok")
     return prompt_tokens, generated_tokens, decode_ms, ms_per_tok
+
+
+def _parse_llama_cpp_generated_text(stdout: str) -> str:
+    lines = [line for line in stdout.splitlines() if not LLAMA_CPP_TIMING_PREFIX_RE.match(line)]
+    return "\n".join(lines)
 
 
 def _extract_exactly_one(pattern: re.Pattern[str], text: str, label: str) -> str:
@@ -265,3 +336,19 @@ def _require_finite_positive(value: float, label: str) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{label} must be finite and positive")
     return value
+
+
+def _require_rate_consistency(
+    elapsed_ms: float,
+    token_count: int,
+    ms_per_tok: float,
+    tokens_per_second: float,
+    label: str,
+) -> None:
+    if token_count <= 0:
+        raise ValueError(f"{label} token count must be positive")
+    if not math.isclose(elapsed_ms, token_count * ms_per_tok, rel_tol=0.05, abs_tol=1.0):
+        raise ValueError(f"{label} is inconsistent with token count and ms_per_tok")
+    derived_tps = (token_count * 1000.0) / elapsed_ms
+    if not math.isclose(tokens_per_second, derived_tps, rel_tol=0.05, abs_tol=1.0):
+        raise ValueError(f"{label} is inconsistent with tokens per second")
