@@ -1,0 +1,38 @@
+version = 1
+name = "quick"
+budget_seconds = 600
+quality_version = "v1"
+quality_case_ids = [
+  "instruction-following-1",
+  "structured-extraction-1",
+  "arithmetic-and-reasoning-1",
+  "code-completion-1",
+  "long-context-retrieval-1",
+  "chat-template-behavior-1",
+  "repeated-run-determinism-1",
+  "ordinary-vs-mtp-token-equality-1",
+]
+engines = ["supersonic"]
+decoding_policy = "greedy"
+
+[[performance_cases]]
+id = "quick-short-warm-ordinary"
+prompt = "Summarize why deterministic benchmarking needs fixed prompts in one sentence."
+max_new_tokens = 32
+warmups = 1
+repetitions = 3
+mode = "ordinary"
+cache_state = "warm-resident"
+timeout_seconds = 45
+decoding_policy = "greedy"
+
+[[performance_cases]]
+id = "quick-long-warm-ordinary"
+prompt = "You are benchmarking a single-sequence greedy Qwen3.8 runner. Explain how fixed prompts, exact artifacts, and repeatable timing windows keep a run comparable across commits without adding unsupported compatibility paths."
+max_new_tokens = 64
+warmups = 1
+repetitions = 3
+mode = "ordinary"
+cache_state = "warm-resident"
+timeout_seconds = 90
+decoding_policy = "greedy"

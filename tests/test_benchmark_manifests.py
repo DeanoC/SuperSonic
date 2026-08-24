@@ -1,0 +1,256 @@
+import importlib
+import json
+from collections import Counter
+from pathlib import Path
+import tempfile
+import tomllib
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BENCHMARKS = ROOT / "benchmarks"
+SCHEMA = BENCHMARKS / "schema" / "result-v1.schema.json"
+APPROVED_CATEGORIES = {
+    "instruction-following",
+    "structured-extraction",
+    "arithmetic-and-reasoning",
+    "code-completion",
+    "long-context-retrieval",
+    "chat-template-behavior",
+    "repeated-run-determinism",
+    "ordinary-vs-mtp-token-equality",
+}
+
+
+def load_manifest_module():
+    try:
+        return importlib.import_module("tools.benchmark.manifest")
+    except ModuleNotFoundError as exc:
+        raise AssertionError("tools.benchmark.manifest is absent") from exc
+
+
+class BenchmarkManifestTests(unittest.TestCase):
+    maxDiff = None
+
+    def test_budgets_and_case_sets(self):
+        manifest = load_manifest_module()
+
+        quick = manifest.load_suite("quick")
+        full = manifest.load_suite("full")
+        quality_cases = manifest.load_quality("v1")
+
+        self.assertEqual(quick.version, 1)
+        self.assertEqual(full.version, 1)
+        self.assertEqual(quick.decoding_policy, "greedy")
+        self.assertEqual(full.decoding_policy, "greedy")
+        self.assertEqual(quick.budget_seconds, 600)
+        self.assertEqual(full.budget_seconds, 21600)
+        self.assertLess(set(quick.quality_case_ids), set(full.quality_case_ids))
+        self.assertEqual(set(full.quality_case_ids), {case.id for case in quality_cases})
+        self.assertEqual(tuple(quick.engines), ("supersonic",))
+        self.assertEqual(tuple(full.engines), ("supersonic", "llama-cpp"))
+
+    def test_suite_cases_are_positive_unique_and_reference_supported_modes(self):
+        manifest = load_manifest_module()
+
+        full = manifest.load_suite("full")
+
+        case_ids = [case.id for case in full.performance_cases]
+        self.assertEqual(len(case_ids), len(set(case_ids)))
+        self.assertTrue(any("short" in case_id for case_id in case_ids))
+        self.assertTrue(any("long" in case_id for case_id in case_ids))
+        self.assertTrue(any("cold" in case_id for case_id in case_ids))
+        self.assertTrue(any("warm" in case_id for case_id in case_ids))
+        self.assertTrue(any("ordinary" in case_id for case_id in case_ids))
+        self.assertTrue(any("mtp" in case_id for case_id in case_ids))
+
+        engines = {engine.name: engine for engine in map(manifest.load_engine, full.engines)}
+        suite_modes = {case.mode for case in full.performance_cases}
+        self.assertEqual(suite_modes, {"ordinary", "mtp"})
+        for case in full.performance_cases:
+            self.assertGreaterEqual(case.warmups, 0)
+            self.assertGreater(case.repetitions, 0)
+            self.assertGreater(case.timeout_seconds, 0)
+            self.assertEqual(case.decoding_policy, "greedy")
+            self.assertIn(case.cache_state, {"cold-load", "warm-resident"})
+            self.assertTrue(
+                any(case.mode in engine.supported_modes for engine in engines.values()),
+                msg=f"no engine supports mode {case.mode}",
+            )
+
+        quick = manifest.load_suite("quick")
+        self.assertTrue(all(case.warmups == 1 for case in quick.performance_cases))
+        self.assertTrue(all(case.repetitions == 3 for case in quick.performance_cases))
+        self.assertTrue(all(case.mode == "ordinary" for case in quick.performance_cases))
+
+    def test_quality_corpus_has_required_categories_and_unique_ids(self):
+        manifest = load_manifest_module()
+
+        quality_cases = manifest.load_quality("v1")
+
+        case_ids = [case.id for case in quality_cases]
+        self.assertEqual(len(case_ids), len(set(case_ids)))
+        category_counts = Counter(case.category for case in quality_cases)
+        self.assertEqual(set(category_counts), APPROVED_CATEGORIES)
+        for category in APPROVED_CATEGORIES:
+            self.assertGreaterEqual(category_counts[category], 2, msg=category)
+        for case in quality_cases:
+            self.assertEqual(case.decoding_policy, "greedy")
+            self.assertGreater(case.max_new_tokens, 0)
+            self.assertIn(case.scorer, {"exact_text", "exact_tokens", "structured_json"})
+
+    def test_engine_manifests_resolve_pins_and_exact_keys(self):
+        manifest = load_manifest_module()
+
+        supersonic = manifest.load_engine("supersonic")
+        llama_cpp = manifest.load_engine("llama-cpp")
+
+        self.assertEqual(supersonic.version, 1)
+        self.assertEqual(llama_cpp.version, 1)
+        self.assertEqual(tuple(supersonic.supported_modes), ("ordinary", "mtp"))
+        self.assertEqual(tuple(llama_cpp.supported_modes), ("ordinary",))
+        self.assertIsNone(supersonic.version_pin_file)
+        self.assertEqual(llama_cpp.version_pin_file, "tools/external/llama-cpp-version.txt")
+        self.assertEqual(llama_cpp.pinned_version, "version: 9430 (d48a56eff)")
+
+        supersonic_raw = tomllib.loads(
+            (BENCHMARKS / "engines" / "supersonic.toml").read_text(encoding="utf-8")
+        )
+        llama_raw = tomllib.loads(
+            (BENCHMARKS / "engines" / "llama-cpp.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            set(supersonic_raw),
+            {"version", "name", "binary", "version_command", "supported_modes"},
+        )
+        self.assertEqual(
+            set(llama_raw),
+            {
+                "version",
+                "name",
+                "binary",
+                "version_command",
+                "version_pin_file",
+                "supported_modes",
+            },
+        )
+
+    def test_result_schema_contract_is_versioned_and_closed(self):
+        text = SCHEMA.read_text(encoding="utf-8")
+        schema = json.loads(text)
+
+        self.assertEqual(schema["type"], "object")
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(
+            set(schema["required"]),
+            {
+                "run",
+                "engine",
+                "hardware",
+                "artifact",
+                "workload",
+                "environment",
+                "samples",
+                "quality",
+                "status",
+                "errors",
+            },
+        )
+        self.assertEqual(set(schema["properties"]), set(schema["required"]))
+        self.assertEqual(schema["properties"]["run"]["properties"]["schema_version"]["const"], 1)
+
+    def test_canonical_json_is_sorted_and_compact(self):
+        manifest = load_manifest_module()
+
+        value = {"b": 1, "a": {"d": 2, "c": [3, {"b": 1, "a": 0}]}}
+
+        self.assertEqual(
+            manifest.canonical_json(value),
+            '{"a":{"c":[3,{"a":0,"b":1}],"d":2},"b":1}',
+        )
+
+    def test_unknown_cache_state_and_key_fail(self):
+        manifest = load_manifest_module()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bad_root = Path(temporary)
+            bad_manifest = bad_root / "bad-suite.toml"
+            bad_manifest.write_text(
+                """
+version = 1
+name = "bad"
+budget_seconds = 600
+quality_version = "v1"
+quality_case_ids = ["instruction-following-1"]
+engines = ["supersonic"]
+decoding_policy = "greedy"
+unknown_key = true
+
+[[performance_cases]]
+id = "bad-case"
+prompt = "hello"
+max_new_tokens = 8
+warmups = 1
+repetitions = 3
+mode = "ordinary"
+cache_state = "unknown"
+timeout_seconds = 30
+decoding_policy = "greedy"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "cache_state|unknown_key|unknown"):
+                manifest.load_suite_path(bad_manifest)
+
+    def test_manifest_files_have_exact_allowed_keys(self):
+        quick = tomllib.loads((BENCHMARKS / "suites" / "quick.toml").read_text(encoding="utf-8"))
+        full = tomllib.loads((BENCHMARKS / "suites" / "full.toml").read_text(encoding="utf-8"))
+        quality = json.loads((BENCHMARKS / "quality" / "v1.json").read_text(encoding="utf-8"))
+
+        expected_suite_keys = {
+            "version",
+            "name",
+            "budget_seconds",
+            "quality_version",
+            "quality_case_ids",
+            "engines",
+            "decoding_policy",
+            "performance_cases",
+        }
+        expected_case_keys = {
+            "id",
+            "prompt",
+            "max_new_tokens",
+            "warmups",
+            "repetitions",
+            "mode",
+            "cache_state",
+            "timeout_seconds",
+            "decoding_policy",
+        }
+
+        for raw_suite in (quick, full):
+            self.assertEqual(set(raw_suite), expected_suite_keys)
+            for case in raw_suite["performance_cases"]:
+                self.assertEqual(set(case), expected_case_keys)
+
+        self.assertEqual(set(quality), {"version", "categories", "cases"})
+        for case in quality["cases"]:
+            self.assertEqual(
+                set(case),
+                {
+                    "id",
+                    "category",
+                    "prompt",
+                    "max_new_tokens",
+                    "scorer",
+                    "expected",
+                    "decoding_policy",
+                },
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

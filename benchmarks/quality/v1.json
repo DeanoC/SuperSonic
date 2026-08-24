@@ -1,0 +1,165 @@
+{
+  "version": "v1",
+  "categories": [
+    "instruction-following",
+    "structured-extraction",
+    "arithmetic-and-reasoning",
+    "code-completion",
+    "long-context-retrieval",
+    "chat-template-behavior",
+    "repeated-run-determinism",
+    "ordinary-vs-mtp-token-equality"
+  ],
+  "cases": [
+    {
+      "id": "instruction-following-1",
+      "category": "instruction-following",
+      "prompt": "Reply with exactly the word ready.",
+      "max_new_tokens": 4,
+      "scorer": "exact_text",
+      "expected": "ready",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "instruction-following-2",
+      "category": "instruction-following",
+      "prompt": "Reply with exactly the phrase benchmark stable.",
+      "max_new_tokens": 6,
+      "scorer": "exact_text",
+      "expected": "benchmark stable",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "structured-extraction-1",
+      "category": "structured-extraction",
+      "prompt": "Return JSON with keys city and gpu for: city=Sofia gpu=gfx1201.",
+      "max_new_tokens": 24,
+      "scorer": "structured_json",
+      "expected": {
+        "city": "Sofia",
+        "gpu": "gfx1201"
+      },
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "structured-extraction-2",
+      "category": "structured-extraction",
+      "prompt": "Return JSON with keys engine and mode for: engine=supersonic mode=ordinary.",
+      "max_new_tokens": 24,
+      "scorer": "structured_json",
+      "expected": {
+        "engine": "supersonic",
+        "mode": "ordinary"
+      },
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "arithmetic-and-reasoning-1",
+      "category": "arithmetic-and-reasoning",
+      "prompt": "What is 19 + 23? Reply with digits only.",
+      "max_new_tokens": 4,
+      "scorer": "exact_text",
+      "expected": "42",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "arithmetic-and-reasoning-2",
+      "category": "arithmetic-and-reasoning",
+      "prompt": "What is 6 * 7? Reply with digits only.",
+      "max_new_tokens": 4,
+      "scorer": "exact_text",
+      "expected": "42",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "code-completion-1",
+      "category": "code-completion",
+      "prompt": "Complete the Python statement: answer =",
+      "max_new_tokens": 8,
+      "scorer": "exact_text",
+      "expected": "42",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "code-completion-2",
+      "category": "code-completion",
+      "prompt": "Complete the Rust return expression: return",
+      "max_new_tokens": 8,
+      "scorer": "exact_text",
+      "expected": " 42;",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "long-context-retrieval-1",
+      "category": "long-context-retrieval",
+      "prompt": "Context: alpha beta gamma delta epsilon zeta eta theta. Which word follows gamma? Reply with one word.",
+      "max_new_tokens": 4,
+      "scorer": "exact_text",
+      "expected": "delta",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "long-context-retrieval-2",
+      "category": "long-context-retrieval",
+      "prompt": "Context: warm cache cold load reproducible evidence strict schema. Which word follows warm? Reply with one word.",
+      "max_new_tokens": 4,
+      "scorer": "exact_text",
+      "expected": "cache",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "chat-template-behavior-1",
+      "category": "chat-template-behavior",
+      "prompt": "System: concise. User: Reply with ok.",
+      "max_new_tokens": 4,
+      "scorer": "exact_text",
+      "expected": "ok",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "chat-template-behavior-2",
+      "category": "chat-template-behavior",
+      "prompt": "System: terse. User: Reply with done.",
+      "max_new_tokens": 4,
+      "scorer": "exact_text",
+      "expected": "done",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "repeated-run-determinism-1",
+      "category": "repeated-run-determinism",
+      "prompt": "Reply with the digits 1234.",
+      "max_new_tokens": 4,
+      "scorer": "exact_text",
+      "expected": "1234",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "repeated-run-determinism-2",
+      "category": "repeated-run-determinism",
+      "prompt": "Reply with the digits 5678.",
+      "max_new_tokens": 4,
+      "scorer": "exact_text",
+      "expected": "5678",
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "ordinary-vs-mtp-token-equality-1",
+      "category": "ordinary-vs-mtp-token-equality",
+      "prompt": "Reply with the token ids for 1 2 3.",
+      "max_new_tokens": 8,
+      "scorer": "exact_tokens",
+      "expected": [1, 2, 3],
+      "decoding_policy": "greedy"
+    },
+    {
+      "id": "ordinary-vs-mtp-token-equality-2",
+      "category": "ordinary-vs-mtp-token-equality",
+      "prompt": "Reply with the token ids for 4 5 6.",
+      "max_new_tokens": 8,
+      "scorer": "exact_tokens",
+      "expected": [4, 5, 6],
+      "decoding_policy": "greedy"
+    }
+  ]
+}
