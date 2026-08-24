@@ -14,6 +14,7 @@ from .execution import (
     run_process,
     run_suite,
 )
+from .render import render_comparison, render_run, render_site
 
 __all__ = [
     "ADAPTER_VERSION",
@@ -42,6 +43,9 @@ __all__ = [
     "preflight",
     "run_process",
     "run_suite",
+    "render_comparison",
+    "render_run",
+    "render_site",
     "score_case",
     "score_mtp_pair",
     "summarize_quality",

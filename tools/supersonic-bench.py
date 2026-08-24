@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.benchmark import compare, validation  # noqa: E402
+from tools.benchmark import compare, render, validation  # noqa: E402
 from tools.benchmark.execution import RunConfig, run_suite  # noqa: E402
 
 
@@ -60,6 +60,29 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("right", type=Path)
     compare_parser.add_argument("--output", type=Path)
 
+    render_parser = subparsers.add_parser("render", help="render publishable benchmark records as static HTML")
+    render_parser.add_argument(
+        "results_root",
+        nargs="?",
+        type=Path,
+        default=Path("benchmarks/results"),
+        help="directory or record file containing publishable results",
+    )
+    render_parser.add_argument(
+        "output_root",
+        nargs="?",
+        type=Path,
+        default=Path("target/benchmarks/site"),
+        help="disposable output directory for generated HTML",
+    )
+    render_parser.add_argument("--results-root", "--results", dest="results_option", type=Path)
+    render_parser.add_argument(
+        "--output-root",
+        "--output",
+        dest="output_option",
+        type=Path,
+    )
+
     return parser
 
 
@@ -73,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
             return _validate(args)
         if args.command == "compare":
             return _compare(args)
+        if args.command == "render":
+            return _render(args)
     except (OSError, ValueError, TypeError) as exc:
         print(f"supersonic-bench: {exc}", file=sys.stderr)
         return 2
@@ -160,6 +185,19 @@ def _compare(args: argparse.Namespace) -> int:
         print(encoded)
     # A non-comparable pair is a valid, useful report with explicit reasons;
     # malformed records are the validation error that should fail the command.
+    return 0
+
+
+def _render(args: argparse.Namespace) -> int:
+    results_root = args.results_option or args.results_root
+    output_root = args.output_option or args.output_root
+    files = render.render_site(results_root, output_root)
+    payload = {
+        "files": [str(path) for path in files],
+        "output_root": str(output_root),
+        "results_root": str(results_root),
+    }
+    print(json.dumps(payload, sort_keys=True))
     return 0
 
 

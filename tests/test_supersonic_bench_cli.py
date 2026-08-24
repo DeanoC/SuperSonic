@@ -36,6 +36,14 @@ class BenchmarkCliTests(unittest.TestCase):
         self.assertTrue(hasattr(cli, "main"))
         self.assertTrue(hasattr(cli, "build_parser"))
 
+    def test_render_accepts_results_and_output_paths(self):
+        cli = load_cli_module()
+        parser = cli.build_parser()
+        args = parser.parse_args(["render", "benchmarks/results", "target/site"])
+        self.assertEqual(args.command, "render")
+        self.assertEqual(args.results_root, Path("benchmarks/results"))
+        self.assertEqual(args.output_root, Path("target/site"))
+
     def test_public_cli_does_not_add_runner_execution_flags(self):
         cli = load_cli_module()
         parser = cli.build_parser()
