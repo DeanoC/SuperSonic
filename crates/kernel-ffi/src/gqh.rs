@@ -1271,12 +1271,11 @@ mod tests {
         let file = model_store::gguf::GgufFile::open(&path).expect("open qwen38 gguf");
         // Historical GGUF wire ID; Qwen3.8 is the sole public model identity.
         assert_eq!(file.kv("general.architecture"), Some("qwen35"));
-        assert_eq!(file.gqh_header_count(), 350);
+        assert_eq!(file.gqh_header_count(), 396);
 
         let cases = [
             ("blk.0.ffn_gate.weight", GqhRung::Gqh3, RUNG_GQH3, 4),
-            ("blk.0.ffn_down.weight", GqhRung::Gqh2H, RUNG_GQH2_H, 4),
-            ("output.weight", GqhRung::Gqh2H, RUNG_GQH2_H, 2),
+            ("blk.0.ffn_down.weight", GqhRung::Gqh3, RUNG_GQH3, 4),
         ];
         for (name, cpu_rung, rung, rows) in cases {
             let tensor = file
@@ -1422,7 +1421,7 @@ mod tests {
             assert_bits_eq(&read_f32(&dst), &cpu, name);
             checked += 1;
         }
-        assert_eq!(checked, 344, "64-layer GQH tensors plus lm_head");
+        assert_eq!(checked, 393, "Q3KXL 64-layer GQH tensors plus lm_head");
     }
 
     #[test]

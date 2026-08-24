@@ -1,0 +1,5 @@
+version = 1
+name = "supersonic"
+binary = "./target/release/supersonic"
+version_command = ["./target/release/supersonic", "--version"]
+supported_modes = ["ordinary", "mtp"]

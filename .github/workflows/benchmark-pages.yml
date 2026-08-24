@@ -1,0 +1,97 @@
+name: Reproducible benchmark Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/benchmark-pages.yml"
+      - "benchmarks/**"
+      - "tools/supersonic-bench.py"
+      - "tools/benchmark/**"
+  pull_request:
+    paths:
+      - ".github/workflows/benchmark-pages.yml"
+      - "benchmarks/**"
+      - "tools/supersonic-bench.py"
+      - "tools/benchmark/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-pages-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-render:
+    name: Validate records; deterministic Pages site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      has_results: ${{ steps.detect-results.outputs.has_results }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - name: Detect committed benchmark baseline
+        id: detect-results
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d benchmarks/results ]] && find benchmarks/results -type f -name '*.json' -print -quit | grep -q .; then
+            echo "has_results=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report missing benchmark baseline
+        if: steps.detect-results.outputs.has_results == 'false'
+        run: echo "No committed benchmark baseline; skipping validation, render, upload, and deploy."
+
+      - name: Verify committed records are publishable
+        if: steps.detect-results.outputs.has_results == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/supersonic-bench.py validate --publishable benchmarks/results
+
+      - name: Render deterministic benchmark site
+        if: steps.detect-results.outputs.has_results == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/supersonic-bench.py render benchmarks/results target/benchmarks/site
+          test -s target/benchmarks/site/index.html
+          test -s target/benchmarks/site/methodology.html
+
+      - name: Upload validated Pages artifact
+        if: steps.detect-results.outputs.has_results == 'true'
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: target/benchmarks/site
+
+  deploy:
+    name: Deploy validated benchmark Pages site
+    needs: validate-and-render
+    if: needs.validate-and-render.outputs.has_results == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+
+      - name: Deploy validated benchmark site
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

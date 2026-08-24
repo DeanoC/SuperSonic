@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: qwen38-gfx1201-${{ github.workflow }}
+  group: benchmark-gfx1201-device-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -58,15 +58,21 @@ jobs:
           set -euo pipefail
           mkdir -p "$CI_OUTPUT_ROOT"
           command -v amd-smi
-          timeout --foreground 30s amd-smi static --asic --json \
-            | tee "$CI_OUTPUT_ROOT/amd-smi-static-asic.json"
+          timeout --foreground 30s amd-smi static --asic --bus --json \
+            | tee "$CI_OUTPUT_ROOT/amd-smi-static-asic-bus.json"
+          timeout --foreground 30s amd-smi list -e --json \
+            | tee "$CI_OUTPUT_ROOT/amd-smi-enumeration.json"
+          python3 tools/merge-amd-smi-provenance.py \
+            --asic-bus "$CI_OUTPUT_ROOT/amd-smi-static-asic-bus.json" \
+            --enumeration "$CI_OUTPUT_ROOT/amd-smi-enumeration.json" \
+            --output "$CI_OUTPUT_ROOT/amd-smi-provenance.json"
           selection="$(python3 tools/select-r9700-device.py \
-            --input "$CI_OUTPUT_ROOT/amd-smi-static-asic.json" \
+            --input "$CI_OUTPUT_ROOT/amd-smi-provenance.json" \
             --override "${SUPERSONIC_R9700_GPU_ID:-}")"
           printf '%s\n' "$selection" | tee "$CI_OUTPUT_ROOT/device-selection.log"
           while IFS='=' read -r name value; do
             case "$name" in
-              SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE)
+              SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|SUPERSONIC_GPU_IDENTITY|SUPERSONIC_GPU_IDENTITY_KIND|SUPERSONIC_GPU_LOGICAL|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE)
                 printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
                 export "$name=$value"
                 ;;
@@ -79,6 +85,11 @@ jobs:
           physical_gpu="$SUPERSONIC_R9700_GPU_ID"
           [[ "$HIP_VISIBLE_DEVICES" == "$physical_gpu" ]]
           [[ "$SUPERSONIC_DEVICE" == "0" ]]
+          [[ -n "$SUPERSONIC_GPU_IDENTITY" ]]
+          [[ "$SUPERSONIC_GPU_IDENTITY_KIND" == "pci_bdf" || "$SUPERSONIC_GPU_IDENTITY_KIND" == "uuid" ]]
+          # AMD SMI's raw HIP ordinal is retained for provenance; HIP_VISIBLE_DEVICES
+          # remaps the selected physical GPU to the runner-visible device 0.
+          [[ "$SUPERSONIC_GPU_LOGICAL" =~ ^[0-9]+$ ]]
           timeout --foreground 30s rocm-smi -d "$physical_gpu" \
             --showproductname --showuse --showmemuse --showtemp \
             | tee "$CI_OUTPUT_ROOT/rocm-smi-initial.txt"
@@ -206,7 +217,11 @@ jobs:
             --mtp "$CI_OUTPUT_ROOT/token-equivalence/mtp.log" \
             --output "$CI_OUTPUT_ROOT/token-equivalence/comparison.json"
 
-      - name: Throughput telemetry (non-blocking)
+      # Retain this legacy diagnostic until benchmark-quick records expose
+      # complete parity with warmup_runs, measured_runs, and ms_per_tok.  It
+      # is deliberately not a publication path and remains separate from the
+      # validated benchmark candidate artifacts.
+      - name: Legacy throughput telemetry (diagnostic only)
         if: always()
         continue-on-error: true
         shell: bash
@@ -271,7 +286,7 @@ jobs:
             --commit "$(git rev-parse HEAD)" \
             --hip-version-file "$CI_OUTPUT_ROOT/hipcc-version.txt" \
             --rocm-version-file "$CI_OUTPUT_ROOT/rocm-driver-version.txt" \
-            --gpu-json "$CI_OUTPUT_ROOT/amd-smi-static-asic.json" \
+            --gpu-json "$CI_OUTPUT_ROOT/amd-smi-provenance.json" \
             --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
             --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" \
             --artifact "$SUPERSONIC_GQH_GGUF" \

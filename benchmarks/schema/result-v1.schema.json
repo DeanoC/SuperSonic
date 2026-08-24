@@ -1,0 +1,1026 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "benchmarks/schema/result-v1.schema.json",
+  "type": "object",
+  "required": [
+    "run",
+    "engine",
+    "hardware",
+    "artifact",
+    "workload",
+    "environment",
+    "samples",
+    "quality",
+    "status",
+    "errors"
+  ],
+  "properties": {
+    "run": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "suite",
+        "suite_version",
+        "quality_version",
+        "case_id",
+        "run_id",
+        "commit",
+        "dirty",
+        "command"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "suite": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "suite_version": {
+          "const": 1
+        },
+        "quality_version": {
+          "type": "string",
+          "pattern": "^v[0-9]+$"
+        },
+        "case_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "run_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "engine": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "adapter_version"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^(?!unknown$)[A-Za-z0-9][A-Za-z0-9 ._:+()-]{0,127}$"
+        },
+        "adapter_version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "hardware": {
+      "type": "object",
+      "required": [
+        "identity",
+        "identity_kind",
+        "identity_source_sha256",
+        "identity_fields",
+        "architecture",
+        "physical_gpu",
+        "logical_gpu",
+        "clock_policy"
+      ],
+      "properties": {
+        "identity": {
+          "type": "string"
+        },
+        "identity_kind": {
+          "type": "string",
+          "enum": [
+            "pci_bdf",
+            "uuid"
+          ]
+        },
+        "identity_source_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "identity_fields": {
+          "type": "object",
+          "required": [
+            "gpu",
+            "gfx_arch",
+            "logical_gpu",
+            "identity",
+            "identity_kind"
+          ],
+          "properties": {
+            "gpu": {
+              "type": "string"
+            },
+            "gfx_arch": {
+              "type": "string",
+              "pattern": "^gfx[0-9]+$"
+            },
+            "logical_gpu": {
+              "type": "string"
+            },
+            "identity": {
+              "type": "string"
+            },
+            "identity_kind": {
+              "type": "string",
+              "enum": [
+                "pci_bdf",
+                "uuid"
+              ]
+            },
+            "market_name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "architecture": {
+          "type": "string",
+          "pattern": "^gfx[0-9]+$"
+        },
+        "physical_gpu": {
+          "type": "string"
+        },
+        "logical_gpu": {
+          "type": "string"
+        },
+        "clock_policy": {
+          "type": "string",
+          "enum": [
+            "locked",
+            "uncontrolled-clocks"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "required": [
+        "semantic_id",
+        "quantization",
+        "sha256",
+        "tokenizer_sha256",
+        "chat_template_sha256"
+      ],
+      "properties": {
+        "semantic_id": {
+          "type": "string"
+        },
+        "quantization": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "tokenizer_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "chat_template_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "workload": {
+      "type": "object",
+      "required": [
+        "case_id",
+        "prompt_sha256",
+        "context_limit",
+        "max_new_tokens",
+        "mode",
+        "stop_policy",
+        "cache_state",
+        "warmups",
+        "measurement_boundary"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "prompt_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "context_limit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_new_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "ordinary",
+            "mtp"
+          ]
+        },
+        "stop_policy": {
+          "type": "string",
+          "const": "ignore-eos"
+        },
+        "cache_state": {
+          "type": "string",
+          "enum": [
+            "cold-load",
+            "warm-resident",
+            "prefix-cache-empty",
+            "prefix-cache-populated",
+            "prefix-cache-reset"
+          ]
+        },
+        "warmups": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "measurement_boundary": {
+          "type": "string",
+          "enum": [
+            "decode",
+            "end-to-end"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "environment": {
+      "type": "object",
+      "required": [
+        "clock_policy",
+        "rocm_version",
+        "hip_version",
+        "requested",
+        "requested_at",
+        "observed_before",
+        "observed_before_at",
+        "observed_after",
+        "observed_after_at",
+        "telemetry_samples",
+        "headline_eligible",
+        "physical_gpu",
+        "logical_gpu",
+        "cpu_governor",
+        "allowlisted_environment",
+        "cache_state",
+        "cache_evidence",
+        "process_reuse",
+        "verification_errors",
+        "evidence_notes"
+      ],
+      "properties": {
+        "rocm_version": {
+          "type": "string",
+          "pattern": "^(?!unknown$)ROCm [A-Za-z0-9][A-Za-z0-9 ._:+()-]{0,122}$"
+        },
+        "hip_version": {
+          "type": "string",
+          "pattern": "^(?!unknown$)HIP [A-Za-z0-9][A-Za-z0-9 ._:+()-]{0,123}$"
+        },
+        "clock_policy": {
+          "type": "string",
+          "enum": [
+            "locked",
+            "uncontrolled-clocks"
+          ]
+        },
+        "requested": {
+          "type": "object",
+          "required": [
+            "gpu_clock_mhz",
+            "clock_tolerance_mhz",
+            "memory_clock_mhz",
+            "power_cap_watts",
+            "performance_level"
+          ],
+          "properties": {
+            "gpu_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "clock_tolerance_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "power_cap_watts": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "performance_level": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "observed_before": {
+          "type": "object",
+          "required": [
+            "gpu_clock_mhz",
+            "memory_clock_mhz",
+            "power_cap_watts",
+            "power_watts",
+            "temperature_celsius",
+            "gpu_utilization_percent",
+            "memory_utilization_percent",
+            "performance_level"
+          ],
+          "properties": {
+            "gpu_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "power_cap_watts": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "power_watts": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "temperature_celsius": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "gpu_utilization_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_utilization_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "performance_level": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "observed_after": {
+          "type": "object",
+          "required": [
+            "gpu_clock_mhz",
+            "memory_clock_mhz",
+            "power_cap_watts",
+            "power_watts",
+            "temperature_celsius",
+            "gpu_utilization_percent",
+            "memory_utilization_percent",
+            "performance_level"
+          ],
+          "properties": {
+            "gpu_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "power_cap_watts": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "power_watts": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "temperature_celsius": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "gpu_utilization_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_utilization_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "performance_level": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "telemetry_samples": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "offset_seconds",
+              "gpu_clock_mhz",
+              "memory_clock_mhz",
+              "power_cap_watts",
+              "power_watts",
+              "temperature_celsius",
+              "gpu_utilization_percent",
+              "memory_utilization_percent",
+              "performance_level"
+            ],
+            "properties": {
+              "offset_seconds": {
+                "type": "number",
+                "minimum": 0
+              },
+            "gpu_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_clock_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+              "power_cap_watts": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+            "power_watts": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "temperature_celsius": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "gpu_utilization_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "memory_utilization_percent": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "performance_level": {
+              "type": [
+                "string",
+                "null"
+              ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "requested_at": {
+          "type": "string"
+        },
+        "observed_before_at": {
+          "type": "string"
+        },
+        "observed_after_at": {
+          "type": "string"
+        },
+        "headline_eligible": {
+          "type": "boolean"
+        },
+        "physical_gpu": {
+          "type": "string"
+        },
+        "logical_gpu": {
+          "type": "string"
+        },
+        "cpu_governor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "allowlisted_environment": {
+          "type": "object",
+          "properties": {
+            "HIP_ARCH": {
+              "type": "string"
+            },
+            "HIP_VISIBLE_DEVICES": {
+              "type": "string"
+            },
+            "ROCM_PATH": {
+              "type": "string"
+            },
+            "HIP_PATH": {
+              "type": "string"
+            },
+            "SUPERSONIC_DEVICE": {
+              "type": "string"
+            },
+            "RUSTFLAGS": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "cache_state": {
+          "type": "string",
+          "enum": [
+            "cold-load",
+            "warm-resident",
+            "prefix-cache-empty",
+            "prefix-cache-populated",
+            "prefix-cache-reset"
+          ]
+        },
+        "cache_evidence": {
+          "type": "object",
+          "properties": {
+            "process_state": {
+              "type": "string"
+            },
+            "process_reuse": {
+              "type": "boolean"
+            },
+            "filesystem_flush": {
+              "type": "string",
+              "enum": [
+                "verified",
+                "unavailable",
+                "not-requested"
+              ]
+            },
+            "prefix_cache": {
+              "type": "string",
+              "enum": [
+                "empty",
+                "populated",
+                "reset"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "process_reuse": {
+          "type": "boolean"
+        },
+        "verification_errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence_notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "samples": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "decode_ms",
+          "tokens_per_second"
+        ],
+        "properties": {
+          "decode_ms": {
+            "type": "number",
+            "minimum": 0
+          },
+          "tokens_per_second": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": [
+        "passed",
+        "failed",
+        "total",
+        "categories",
+        "cases",
+        "missing_case_ids"
+      ],
+      "properties": {
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "categories": {
+          "type": "object",
+          "properties": {
+            "instruction-following": {
+              "type": "object",
+              "required": [
+                "passed",
+                "failed",
+                "total"
+              ],
+              "properties": {
+                "passed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            },
+            "structured-extraction": {
+              "type": "object",
+              "required": [
+                "passed",
+                "failed",
+                "total"
+              ],
+              "properties": {
+                "passed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            },
+            "arithmetic-and-reasoning": {
+              "type": "object",
+              "required": [
+                "passed",
+                "failed",
+                "total"
+              ],
+              "properties": {
+                "passed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            },
+            "code-completion": {
+              "type": "object",
+              "required": [
+                "passed",
+                "failed",
+                "total"
+              ],
+              "properties": {
+                "passed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            },
+            "long-context-retrieval": {
+              "type": "object",
+              "required": [
+                "passed",
+                "failed",
+                "total"
+              ],
+              "properties": {
+                "passed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            },
+            "chat-template-behavior": {
+              "type": "object",
+              "required": [
+                "passed",
+                "failed",
+                "total"
+              ],
+              "properties": {
+                "passed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            },
+            "repeated-run-determinism": {
+              "type": "object",
+              "required": [
+                "passed",
+                "failed",
+                "total"
+              ],
+              "properties": {
+                "passed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            },
+            "ordinary-vs-mtp-token-equality": {
+              "type": "object",
+              "required": [
+                "passed",
+                "failed",
+                "total"
+              ],
+              "properties": {
+                "passed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "category",
+              "scorer",
+              "passed",
+              "failure",
+              "expected_hash",
+              "actual_hash",
+              "expected_value",
+              "actual_value"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string"
+              },
+              "scorer": {
+                "type": "string",
+                "enum": [
+                  "exact_text",
+                  "exact_tokens",
+                  "structured_json"
+                ]
+              },
+              "passed": {
+                "type": "boolean"
+              },
+              "failure": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "expected_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "actual_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "expected_value": {
+                "type": "string"
+              },
+              "actual_value": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "missing_case_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "status": {
+      "type": "object",
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "complete",
+            "incomplete",
+            "failed"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,10 @@
+===================== ROCm System Management Interface =====================
+GPU[1]          : Card series: AMD Radeon AI PRO R9700
+GPU[1]          : Performance Level: manual
+GPU[1]          : GPU Clock Level: 2400Mhz
+GPU[1]          : Memory Clock Level: 1249Mhz
+GPU[1]          : Average Graphics Package Power (W): 245.0
+GPU[1]          : Max Graphics Package Power (W): 295.0
+GPU[1]          : Temperature (Sensor edge) (C): 67.0
+GPU[1]          : GPU use (%): 91
+GPU[1]          : GPU Memory Allocated (VRAM%): 88

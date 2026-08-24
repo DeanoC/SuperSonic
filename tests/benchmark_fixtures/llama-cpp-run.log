@@ -1,0 +1,5 @@
+ world
+llama_perf_context_print:        load time =      40.00 ms /     1 runs   (   40.00 ms per token,    25.00 tokens per second)
+llama_perf_context_print: prompt eval time =      84.00 ms /     7 tokens (   12.00 ms per token,    83.33 tokens per second)
+llama_perf_context_print:        eval time =      12.00 ms /     3 runs   (    4.00 ms per token,   250.00 tokens per second)
+llama_perf_context_print:       total time =      96.00 ms /    10 tokens

@@ -2,6 +2,7 @@ import importlib.util
 import json
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -48,6 +49,201 @@ def load_helper(filename: str, module_name: str):
 
 
 class WorkflowContractTests(unittest.TestCase):
+    def test_quick_benchmark_is_serial_gpu_candidate_job(self):
+        workflow = WORKFLOWS / "benchmark-quick.yml"
+        self.assertTrue(workflow.is_file(), workflow)
+        text = workflow.read_text(encoding="utf-8")
+
+        self.assertIn("workflow_dispatch:", text)
+        self.assertRegex(
+            text,
+            re.compile(r"runs-on:\s*\[self-hosted,\s*linux,\s*rocm,\s*gfx1201\]"),
+        )
+        self.assertIn("timeout-minutes: 30", text)
+        self.assertIn("--suite quick", text)
+        self.assertIn("concurrency:", text)
+        self.assertIn("RUST_TEST_THREADS: \"1\"", text)
+        self.assertIn("amd-smi static --asic --bus --json", text)
+        self.assertIn("amd-smi list -e --json", text)
+        self.assertIn("merge-amd-smi-provenance.py", text)
+        self.assertIn("tools/select-r9700-device.py", text)
+        self.assertIn("HIP_VISIBLE_DEVICES", text)
+        self.assertIn("SUPERSONIC_DEVICE", text)
+        self.assertRegex(text, re.compile(r"(?i)gpu.*idle"))
+        self.assertIn("--clock-policy locked", text)
+        self.assertIn("--gpu-clock-mhz", text)
+        self.assertIn("--gpu-clock-tolerance-mhz", text)
+        self.assertIn("--memory-clock-mhz", text)
+        self.assertIn("--power-cap-watts", text)
+        self.assertIn("--gpu-static-json", text)
+        self.assertIn("SUPERSONIC_GQH_GGUF", text)
+        self.assertIn("SUPERSONIC_QWEN38_MODEL_DIR", text)
+        self.assertIn("if: always()", text)
+        self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", text)
+        self.assertNotIn("actions/upload-artifact@v", text)
+        self.assertNotRegex(text, re.compile(r"\bgit\s+(?:commit|push)\b"))
+        self.assertNotIn("deploy-pages", text)
+        self.assertNotIn("continue-on-error: true", text)
+
+    def test_full_is_manual_serial_and_six_hours(self):
+        workflow = WORKFLOWS / "benchmark-full.yml"
+        self.assertTrue(workflow.is_file(), workflow)
+        text = workflow.read_text(encoding="utf-8")
+
+        self.assertIn("workflow_dispatch:", text)
+        self.assertIn("timeout-minutes: 450", text)
+        self.assertIn("concurrency:", text)
+        self.assertIn("--suite full", text)
+        self.assertNotIn("continue-on-error: true", text)
+        self.assertRegex(
+            text,
+            re.compile(r"runs-on:\s*\[self-hosted,\s*linux,\s*rocm,\s*gfx1201\]"),
+        )
+        self.assertIn("--peer-artifact", text)
+        self.assertIn("tools/external/llama-cpp-version.txt", text)
+        self.assertIn("SUPERSONIC_LLAMA_CPP_SERVER", text)
+        self.assertIn("SUPERSONIC_LLAMA_CPP_ARTIFACT", text)
+        self.assertIn('test "$(basename "$llama_server")" = "llama-server"', text)
+        self.assertIn('export PATH="$(dirname "$SUPERSONIC_LLAMA_CPP_SERVER"):$PATH"', text)
+        self.assertIn('"$llama_server" --version 2>&1 | head -n 1', text)
+        self.assertIn("amd-smi static --asic --bus --json", text)
+        self.assertIn("amd-smi list -e --json", text)
+        self.assertIn("merge-amd-smi-provenance.py", text)
+        self.assertIn("amd-smi-provenance.json", text)
+        self.assertIn("--clock-policy locked", text)
+        self.assertIn("--gpu-clock-tolerance-mhz", text)
+        self.assertIn("RUST_TEST_THREADS: \"1\"", text)
+        self.assertIn("qwen38_gqh_gguf_crawl", text)
+        self.assertIn("qwen38_gqh_decode_rung11", text)
+        self.assertIn("--include-ignored --test-threads=1 --nocapture", text)
+        self.assertLess(text.index("qwen38_gqh_decode_rung11"), text.index("Run exact six-hour full harness"))
+        self.assertIn("if: always()", text)
+        self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", text)
+        self.assertNotRegex(text, re.compile(r"\bgit\s+(?:commit|push)\b"))
+        self.assertNotIn("deploy-pages", text)
+
+    def test_pages_validates_before_deploy(self):
+        workflow = WORKFLOWS / "benchmark-pages.yml"
+        self.assertTrue(workflow.is_file(), workflow)
+        text = workflow.read_text(encoding="utf-8")
+
+        self.assertLess(text.index("validate --publishable"), text.index(" render "))
+        self.assertLess(text.index(" render "), text.index("deploy-pages"))
+        self.assertNotIn("pull_request_target", text)
+        self.assertIn("pull_request:", text)
+        self.assertIn("pages: write", text)
+        self.assertIn("id-token: write", text)
+        self.assertRegex(text, re.compile(r"github\.ref\s*==\s*['\"]refs/heads/main['\"]"))
+        for action in (
+            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+            "actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b",
+            "actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa",
+            "actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e",
+        ):
+            self.assertIn(action, text)
+
+    def test_pages_readme_only_results_skip_baseline_cleanly(self):
+        workflow = WORKFLOWS / "benchmark-pages.yml"
+        text = workflow.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "benchmarks" / "results"
+            results.mkdir(parents=True)
+            (results / "README.md").write_text(
+                "Results are produced by the GPU workflow.\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(tuple(results.rglob("*.json")), ())
+
+        self.assertIn("id: detect-results", text)
+        self.assertIn("has_results", text)
+        self.assertIn("No committed benchmark baseline", text)
+        self.assertIn("steps.detect-results.outputs.has_results", text)
+        self.assertRegex(text, re.compile(r"has_results\s*==\s*['\"]true['\"]"))
+
+    def test_pages_malformed_first_record_remains_blocking(self):
+        workflow = WORKFLOWS / "benchmark-pages.yml"
+        text = workflow.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "benchmarks" / "results"
+            results.mkdir(parents=True)
+            malformed = results / "000-malformed.json"
+            malformed.write_text("{not-json\n", encoding="utf-8")
+            (results / "001-valid.json").write_text(
+                (ROOT / "tests" / "benchmark_fixtures" / "valid-result-v1.json").read_text(
+                    encoding="utf-8"
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                tuple(sorted(results.rglob("*.json"))),
+                (malformed, results / "001-valid.json"),
+            )
+            from tools.benchmark import validation
+
+            with self.assertRaises(ValueError):
+                validation.validate_bundle(results, require_complete=True)
+
+        self.assertIn("find benchmarks/results -type f -name '*.json'", text)
+        self.assertIn("validate --publishable benchmarks/results", text)
+        self.assertNotIn("head -n 1", text)
+
+    def test_gpu_workflows_share_one_serial_per_device_group(self):
+        paths = (
+            WORKFLOWS / "benchmark-quick.yml",
+            WORKFLOWS / "benchmark-full.yml",
+            WORKFLOWS / "qwen38-gfx1201.yml",
+        )
+        groups = []
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            match = re.search(r"^  group:\s*(.+)$", text, re.MULTILINE)
+            self.assertIsNotNone(match, path)
+            groups.append(match.group(1).strip())
+            self.assertRegex(text, re.compile(r"^  cancel-in-progress:\s*false\s*$", re.MULTILINE))
+        self.assertEqual(len(set(groups)), 1)
+        self.assertIn("gfx1201", groups[0])
+
+    def test_gpu_workflows_keep_raw_hip_mapping_separate_from_visible_device(self):
+        for path in (
+            WORKFLOWS / "benchmark-quick.yml",
+            WORKFLOWS / "benchmark-full.yml",
+            WORKFLOWS / "qwen38-gfx1201.yml",
+        ):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('[[ "$SUPERSONIC_GPU_LOGICAL" =~ ^[0-9]+$ ]]', text)
+            self.assertNotIn('[[ "$SUPERSONIC_GPU_LOGICAL" == "$SUPERSONIC_DEVICE" ]]', text)
+
+    def test_benchmark_workflows_pass_captured_toolchain_version_files(self):
+        for name in ("benchmark-quick.yml", "benchmark-full.yml"):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text(encoding="utf-8")
+                self.assertIn('--rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt"', text)
+                self.assertIn('--hip-version-file "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt"', text)
+                self.assertIn("run_id=", text)
+                self.assertIn('--run-id "$run_id"', text)
+
+    def test_benchmark_workflows_fail_closed_on_non_q3kxl_artifact_digests(self):
+        digest = "c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98"
+        for name in ("benchmark-quick.yml", "benchmark-full.yml"):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text(encoding="utf-8")
+                self.assertIn(f'expected_q3kxl_sha256="{digest}"', text)
+                self.assertIn('test "$SUPERSONIC_GQH_GGUF_SHA256" = "$expected_q3kxl_sha256"', text)
+        full = (WORKFLOWS / "benchmark-full.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            'test "$SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256" = "$expected_q3kxl_sha256"',
+            full,
+        )
+
+    def test_cpu_ci_validates_benchmark_fixtures_without_gpu(self):
+        workflow = WORKFLOWS / "ci.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("python3 tools/supersonic-bench.py render tests/benchmark_fixtures", text)
+        self.assertIn("tests.test_benchmark_manifests", text)
+        self.assertIn("tests.test_benchmark_validation", text)
+        self.assertIn("tests.test_amd_smi_provenance", text)
+        self.assertNotIn("self-hosted", text)
+
     def test_r9700_workflow_data_flow_validates_physical_to_logical_mapping(self):
         selector = load_helper("select-r9700-device.py", "workflow_select_r9700")
         devices = selector.parse_devices(
@@ -60,7 +256,9 @@ class WorkflowContractTests(unittest.TestCase):
                                 "market_name": "AMD Radeon RX 7900 XTX",
                                 "device_id": "0x744c",
                                 "target_graphics_version": "gfx1100",
+                                "pci_bdf": "0000:03:00.0",
                             },
+                            "logical_gpu": 1,
                         },
                         {
                             "gpu": 1,
@@ -68,7 +266,9 @@ class WorkflowContractTests(unittest.TestCase):
                                 "market_name": "AMD Radeon AI PRO R9700",
                                 "device_id": "0x7551",
                                 "target_graphics_version": "gfx1201",
+                                "pci_bdf": "0000:65:00.0",
                             },
+                            "logical_gpu": 0,
                         },
                     ]
                 }
@@ -154,7 +354,9 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("HIP_VISIBLE_DEVICES", text)
         self.assertNotIn("|| '0'", text)
         self.assertNotIn(":-0", text)
-        self.assertIn("amd-smi static --asic --json", text)
+        self.assertIn("amd-smi static --asic --bus --json", text)
+        self.assertIn("amd-smi list -e --json", text)
+        self.assertIn("merge-amd-smi-provenance.py", text)
         self.assertIn("tools/select-r9700-device.py", text)
         self.assertIn("tools/parse-rocm-smi.py", text)
         self.assertIn("GITHUB_ENV", text)

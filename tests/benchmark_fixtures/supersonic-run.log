@@ -1,0 +1,5 @@
+Hello world
+[generated_json] " world"
+[tokens] 42 43 44
+[result] prompt_tokens=7 generated_tokens=3 decode_ms=9 ms_per_tok=3
+[stage-timings] steps=3 persistent_ms=4.000 rms_norm_ms=1.000 lm_head_ms=1.000 logits_d2h_ms=0.500 host_sampling_ms=0.250 gpu_argmax_ms=0.250 token_d2h_ms=0.100 total_native_decode_ms=9.000 persistent_full_attn_ms=0.500 persistent_full_attn_proj_ms=0.250 persistent_full_attn_core_ms=0.125 persistent_full_attn_out_ms=0.125 persistent_linear_proj_ms=0.500 persistent_linear_core_ms=0.500 persistent_linear_core_conv_ms=0.250 persistent_linear_core_recurrent_ms=0.125 persistent_linear_core_post_ms=0.125 persistent_linear_out_ms=0.500 persistent_mlp_gate_up_ms=0.500 persistent_mlp_down_ms=0.500

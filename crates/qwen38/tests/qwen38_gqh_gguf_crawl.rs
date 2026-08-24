@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use gpu_hal::{GpuBuffer, ScalarType};
-use kernel_ffi::gqh::{self, RUNG_GQH2_H, RUNG_GQH3};
+use kernel_ffi::gqh::{self, RUNG_GQH2_H, RUNG_GQH3, RUNG_GQH4};
 use model_store::gguf::GgufFile;
 use model_store::gqh::GqhRung;
 use qwen38::desc_builder::build_int4_scale_descs;
@@ -12,7 +12,7 @@ use qwen38::gguf_ingest::{check_mapping, load_text_config};
 use qwen38::weights::{
     infer_lowbit_type, is_gqh_qtype, matmul_gqh, LayerKind, Qwen38Weights, LOWBIT_GGML_Q2_K,
     LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K, LOWBIT_GGML_Q8_0, LOWBIT_GQH2_H,
-    LOWBIT_GQH3,
+    LOWBIT_GQH3, LOWBIT_GQH4,
 };
 
 fn gguf_path() -> Option<PathBuf> {
@@ -96,22 +96,22 @@ fn rung2_hf_config_matches_gguf_geometry() {
 }
 
 #[test]
-fn rung3_q2k_embed_row_is_finite() {
+fn rung3_q3k_embed_row_is_finite() {
     let Some(path) = gguf_path() else {
         return;
     };
     let file = GgufFile::open(&path).expect("open gguf");
     let embed = file.tensor("token_embd.weight").expect("embed");
-    assert_eq!(embed.tensor_type, 10);
+    assert_eq!(embed.tensor_type, 11);
     let cols = embed.dims[0];
     let rows = embed.dims[1];
     let packed = file.tensor_bytes("token_embd.weight").expect("bytes");
-    let row_bytes = model_store::q2k::row_bytes(cols).expect("row bytes");
+    let row_bytes = model_store::q3k::row_bytes(cols).expect("row bytes");
     assert_eq!(packed.len(), row_bytes * rows);
 
     for token in [0usize, 1, 248044] {
         let mut out = vec![0.0f32; cols];
-        model_store::q2k::decode_row(
+        model_store::q3k::decode_row(
             &packed[token * row_bytes..(token + 1) * row_bytes],
             cols,
             &mut out,
@@ -196,9 +196,9 @@ fn rung6_load_gguf_weights() {
     assert_eq!(weights.lm_head().dtype(), ScalarType::U8);
     assert_eq!(
         infer_lowbit_type(weights.lm_head(), 5120, false),
-        LOWBIT_GQH2_H
+        LOWBIT_GGML_Q6_K
     );
-    assert!(weights.gqh_header("lm_head.weight").is_some());
+    assert!(weights.gqh_header("lm_head.weight").is_none());
 
     let l0 = &weights.layers[0];
     assert!(matches!(l0.kind, LayerKind::Linear));
@@ -614,6 +614,7 @@ fn rung8_embed_row_then_prefill_gqh_qkv() {
         match rung {
             LOWBIT_GQH3 => RUNG_GQH3,
             LOWBIT_GQH2_H => RUNG_GQH2_H,
+            LOWBIT_GQH4 => RUNG_GQH4,
             other => panic!("qkv not GQH: {other}"),
         },
         &mut out,

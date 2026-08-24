@@ -1,0 +1,120 @@
+version = 1
+name = "full"
+budget_seconds = 21600
+quality_version = "v2"
+quality_case_ids = [
+  "instruction-following-1",
+  "instruction-following-2",
+  "structured-extraction-1",
+  "structured-extraction-2",
+  "arithmetic-and-reasoning-1",
+  "arithmetic-and-reasoning-2",
+  "code-completion-1",
+  "code-completion-2",
+  "long-context-retrieval-1",
+  "long-context-retrieval-2",
+  "chat-template-behavior-1",
+  "chat-template-behavior-2",
+  "repeated-run-determinism-1",
+  "repeated-run-determinism-2",
+  "ordinary-vs-mtp-token-equality-1",
+  "ordinary-vs-mtp-token-equality-2",
+]
+engines = ["supersonic", "llama-cpp"]
+decoding_policy = "greedy"
+
+[[performance_cases]]
+id = "full-short-cold-ordinary"
+prompt = "Emit a single sentence describing cold-load benchmark startup."
+max_new_tokens = 32
+warmups = 0
+repetitions = 7
+mode = "ordinary"
+cache_state = "cold-load"
+timeout_seconds = 90
+decoding_policy = "greedy"
+engines = ["supersonic", "llama-cpp"]
+
+[[performance_cases]]
+id = "full-short-warm-ordinary"
+prompt = "Emit a single sentence describing warm-resident benchmark startup."
+max_new_tokens = 32
+warmups = 1
+repetitions = 7
+mode = "ordinary"
+cache_state = "warm-resident"
+timeout_seconds = 60
+decoding_policy = "greedy"
+engines = ["supersonic", "llama-cpp"]
+
+[[performance_cases]]
+id = "full-long-cold-ordinary"
+prompt = "You are validating a long-context ordinary decode run for a narrow Qwen3.8 benchmark harness. Describe the evidence that must remain attached to the run so future reviewers can reproduce the result without guessing hidden environment or cache behavior."
+max_new_tokens = 96
+warmups = 0
+repetitions = 7
+mode = "ordinary"
+cache_state = "cold-load"
+timeout_seconds = 180
+decoding_policy = "greedy"
+engines = ["supersonic", "llama-cpp"]
+
+[[performance_cases]]
+id = "full-long-warm-ordinary"
+prompt = "You are validating a long-context warm-resident ordinary decode run for a narrow Qwen3.8 benchmark harness. Describe the evidence that must remain attached to the run so future reviewers can reproduce the result without guessing hidden environment or cache behavior."
+max_new_tokens = 96
+warmups = 1
+repetitions = 7
+mode = "ordinary"
+cache_state = "warm-resident"
+timeout_seconds = 180
+decoding_policy = "greedy"
+engines = ["supersonic", "llama-cpp"]
+
+[[performance_cases]]
+id = "full-short-cold-mtp"
+prompt = "Emit a single sentence describing cold-load MTP benchmark startup."
+max_new_tokens = 32
+warmups = 0
+repetitions = 7
+mode = "mtp"
+cache_state = "cold-load"
+timeout_seconds = 90
+decoding_policy = "greedy"
+engines = ["supersonic"]
+
+[[performance_cases]]
+id = "full-short-warm-mtp"
+prompt = "Emit a single sentence describing warm-resident MTP benchmark startup."
+max_new_tokens = 32
+warmups = 1
+repetitions = 7
+mode = "mtp"
+cache_state = "warm-resident"
+timeout_seconds = 60
+decoding_policy = "greedy"
+engines = ["supersonic"]
+
+[[performance_cases]]
+id = "full-long-cold-mtp"
+prompt = "You are validating a long-context cold-load MTP run. Describe how the benchmark should preserve exact tokens, timing evidence, and cache-state identity while still remaining fully reproducible."
+max_new_tokens = 96
+warmups = 0
+repetitions = 7
+mode = "mtp"
+cache_state = "cold-load"
+timeout_seconds = 180
+decoding_policy = "greedy"
+engines = ["supersonic"]
+
+[[performance_cases]]
+id = "full-long-warm-mtp"
+prompt = "You are validating a long-context warm-resident MTP run. Describe how the benchmark should preserve exact tokens, timing evidence, and cache-state identity while still remaining fully reproducible."
+max_new_tokens = 96
+warmups = 1
+repetitions = 7
+mode = "mtp"
+cache_state = "warm-resident"
+timeout_seconds = 180
+decoding_policy = "greedy"
+engines = ["supersonic"]
