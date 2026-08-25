@@ -3,7 +3,6 @@
 use std::env;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -511,6 +510,8 @@ pub struct DecodeEngine {
     fused_last_normed: Option<Vec<u8>>,
     /// Reusable pre-verify linear snapshot. Avoids per-round clone alloc.
     mtp_linear_snap: Option<LinearStateSnapshot>,
+    persistent_timing_slots: bool,
+    persistent_timing_layout_reported: bool,
 }
 
 impl Drop for DecodeEngine {
@@ -651,12 +652,14 @@ fn decode_argmax_token(token_bytes: &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(token_bytes))
 }
 
-fn decode_profile_enabled() -> bool {
-    decode_profile_enabled_value(env::var("SUPERSONIC_DECODE_PROF").ok().as_deref())
-}
-
-fn decode_profile_enabled_value(value: Option<&str>) -> bool {
-    matches!(value, Some(value) if !value.is_empty() && value != "0")
+fn parse_persistent_timing_slots_flag(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => Err(format!(
+            "SUPERSONIC_PERSISTENT_TIMING_SLOTS must be exactly `1` when set, got `{value}`"
+        )),
+    }
 }
 
 fn allocation_layout_fingerprint(addresses: &[usize]) -> u64 {
@@ -866,6 +869,13 @@ impl DecodeEngine {
             mtp_seq_rest: false,
             fused_last_normed: None,
             mtp_linear_snap: None,
+            persistent_timing_slots: parse_persistent_timing_slots_flag(
+                env::var("SUPERSONIC_PERSISTENT_TIMING_SLOTS")
+                    .ok()
+                    .as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?,
+            persistent_timing_layout_reported: false,
         })
     }
 
@@ -2237,7 +2247,7 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("reset decode sync: {e}"))?;
 
         let persistent_start = Instant::now();
-        let collect_timing_slots = enable_timing_slots && decode_profile_enabled();
+        let collect_timing_slots = enable_timing_slots && self.persistent_timing_slots;
         kernel_ffi::persistent_decode_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -2280,7 +2290,18 @@ impl DecodeEngine {
                 payload.len(),
                 config.num_hidden_layers * slot_bytes
             );
-            let mut maxima = [0u64; 8];
+            let mut maxima = [0u64; 9];
+            let mut nonzero = [0u64; 9];
+            let mut winners = [None; 9];
+            let mut update = |category: usize, value: u64, batch: Option<usize>| {
+                if value != 0 {
+                    nonzero[category] += 1;
+                    if value > maxima[category] {
+                        maxima[category] = value;
+                        winners[category] = batch;
+                    }
+                }
+            };
             for layer_bytes in payload.chunks_exact(slot_bytes) {
                 let slots: Vec<u64> = layer_bytes
                     .chunks_exact(8)
@@ -2288,33 +2309,57 @@ impl DecodeEngine {
                     .collect();
                 let parsed = kernel_ffi::parse_persistent_4b_timing_slots(&slots)
                     .map_err(|e| anyhow::anyhow!("persistent timing slots: {e}"))?;
-                maxima[0] = maxima[0].max(parsed.full_attn);
-                maxima[1] = maxima[1].max(parsed.full_attn_proj);
-                maxima[2] = maxima[2].max(parsed.full_attn_core.into_iter().max().unwrap_or(0));
-                maxima[3] = maxima[3].max(parsed.full_attn_out.into_iter().max().unwrap_or(0));
-                maxima[4] = maxima[4].max(parsed.linear_proj);
-                maxima[5] = maxima[5].max(parsed.linear_core.into_iter().max().unwrap_or(0));
-                maxima[6] = maxima[6].max(parsed.linear_out.into_iter().max().unwrap_or(0));
-                maxima[7] = maxima[7].max(parsed.mlp_gate_up.max(parsed.mlp_down));
+                update(0, parsed.full_attn, None);
+                update(1, parsed.full_attn_proj, None);
+                for (batch, &value) in parsed.full_attn_core.iter().enumerate() {
+                    update(2, value, Some(batch));
+                }
+                for (batch, &value) in parsed.full_attn_out.iter().enumerate() {
+                    update(3, value, Some(batch));
+                }
+                update(4, parsed.linear_proj, None);
+                for (batch, &value) in parsed.linear_core.iter().enumerate() {
+                    update(5, value, Some(batch));
+                }
+                for (batch, &value) in parsed.linear_out.iter().enumerate() {
+                    update(6, value, Some(batch));
+                }
+                update(7, parsed.mlp_gate_up, None);
+                update(8, parsed.mlp_down, None);
             }
-            let fingerprint = allocation_layout_fingerprint(&[
+            let mut layout_addresses = vec![
                 self.scratch.workspace.as_ptr() as usize,
                 self.scratch.sync_buf.as_ptr() as usize,
                 self.scratch.desc_device.as_ptr() as usize,
                 self.hidden_io.as_ptr() as usize,
                 self.normed_buf.as_ptr() as usize,
                 self.logits_buf.as_ptr() as usize,
-            ]);
-            static LAYOUT_REPORTED: OnceLock<()> = OnceLock::new();
-            if LAYOUT_REPORTED.set(()).is_ok() {
+            ];
+            for desc in &descs {
+                layout_addresses.extend([
+                    desc.input_norm_w as usize,
+                    desc.gate_proj_w as usize,
+                    desc.kv_cache_k as usize,
+                    desc.kv_cache_v as usize,
+                    desc.conv_state as usize,
+                    desc.recurrent_state as usize,
+                ]);
+            }
+            layout_addresses.retain(|&address| address != 0);
+            if !self.persistent_timing_layout_reported {
+                let fingerprint = allocation_layout_fingerprint(&layout_addresses);
                 eprintln!(
-                    "[decode-profile] persistent_4b_layout layers={} allocation_fingerprint={fingerprint:016x}",
-                    config.num_hidden_layers
+                    "[decode-profile] persistent_4b_layout scope=descriptor-and-working-buffers layers={} allocation_fingerprint={fingerprint:016x} converted_allocations=unavailable",
+                    config.num_hidden_layers,
                 );
+                self.persistent_timing_layout_reported = true;
             }
             eprintln!(
-                "[decode-profile] persistent_4b_slots full_attn={} full_attn_proj={} full_attn_core={} full_attn_out={} linear_proj={} linear_core={} linear_out={} mlp={}",
-                maxima[0], maxima[1], maxima[2], maxima[3], maxima[4], maxima[5], maxima[6], maxima[7]
+                "[decode-profile] persistent_4b_slots coverage=partial unit=raw_clock_cycles step={} sampling_mode={} execution_path=bridge-selected-partial slot_layout=shared-base full_attn_max_cycles={} full_attn_nonzero_slots={} full_attn_proj_max_cycles={} full_attn_proj_nonzero_slots={} full_attn_core_max_cycles={} full_attn_core_nonzero_slots={} full_attn_core_winner_batch={:?} full_attn_out_max_cycles={} full_attn_out_nonzero_slots={} full_attn_out_winner_batch={:?} linear_proj_max_cycles={} linear_proj_nonzero_slots={} linear_core_max_cycles={} linear_core_nonzero_slots={} linear_core_winner_batch={:?} linear_out_max_cycles={} linear_out_nonzero_slots={} linear_out_winner_batch={:?} mlp_gate_up_max_cycles={} mlp_gate_up_nonzero_slots={} mlp_down_max_cycles={} mlp_down_nonzero_slots={}",
+                seqlen_offset,
+                match sampling_mode { DecodeSamplingMode::HostLogits => "host-logits", DecodeSamplingMode::HipFastGreedy => "hip-fast-greedy" },
+                maxima[0], nonzero[0], maxima[1], nonzero[1], maxima[2], nonzero[2], winners[2], maxima[3], nonzero[3], winners[3],
+                maxima[4], nonzero[4], maxima[5], nonzero[5], winners[5], maxima[6], nonzero[6], winners[6], maxima[7], nonzero[7], maxima[8], nonzero[8],
             );
         }
 
@@ -2521,14 +2566,22 @@ mod mtp_accept_tests {
 
 #[cfg(test)]
 mod decode_profile_tests {
-    use super::{allocation_layout_fingerprint, decode_profile_enabled_value};
+    use super::{allocation_layout_fingerprint, parse_persistent_timing_slots_flag};
 
     #[test]
-    fn timing_slot_collection_is_opt_in_to_existing_profile_control() {
-        assert!(!decode_profile_enabled_value(None));
-        assert!(!decode_profile_enabled_value(Some("0")));
-        assert!(!decode_profile_enabled_value(Some("")));
-        assert!(decode_profile_enabled_value(Some("1")));
+    fn timing_slot_flag_rejects_malformed_values() {
+        assert_eq!(parse_persistent_timing_slots_flag(None).unwrap(), false);
+        assert_eq!(parse_persistent_timing_slots_flag(Some("1")).unwrap(), true);
+        assert!(parse_persistent_timing_slots_flag(Some("yes")).is_err());
+        assert!(parse_persistent_timing_slots_flag(Some("0x1")).is_err());
+    }
+
+    #[test]
+    fn timing_slot_abi_matches_scratch_allocation() {
+        assert_eq!(
+            kernel_ffi::PERSISTENT_4B_TIMING_SLOT_COUNT,
+            qwen38::scratch::PERSISTENT_4B_TIMING_SLOTS_PER_LAYER
+        );
     }
 
     #[test]

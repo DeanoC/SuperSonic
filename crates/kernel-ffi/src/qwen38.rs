@@ -20,9 +20,9 @@ pub struct Persistent4BTimingSlots {
     pub linear_proj: u64,
     pub linear_core: [u64; 8],
     pub linear_out: [u64; 8],
-    pub linear_core_conv: u64,
-    pub linear_core_recurrent: u64,
-    pub linear_core_post: u64,
+    pub linear_core_conv_reserved: [u64; 2],
+    pub linear_core_recurrent_reserved: [u64; 2],
+    pub linear_core_post_reserved: [u64; 2],
     pub mlp_gate_up: u64,
     pub mlp_down: u64,
 }
@@ -42,9 +42,9 @@ pub fn parse_persistent_4b_timing_slots(slots: &[u64]) -> Result<Persistent4BTim
         linear_proj: slots[18],
         linear_core: slots[19..27].try_into().unwrap(),
         linear_out: slots[27..35].try_into().unwrap(),
-        linear_core_conv: slots[35],
-        linear_core_recurrent: slots[37],
-        linear_core_post: slots[39],
+        linear_core_conv_reserved: slots[35..37].try_into().unwrap(),
+        linear_core_recurrent_reserved: slots[37..39].try_into().unwrap(),
+        linear_core_post_reserved: slots[39..41].try_into().unwrap(),
         mlp_gate_up: slots[41],
         mlp_down: slots[42],
     })
@@ -628,9 +628,9 @@ mod timing_slot_tests {
         assert_eq!(parsed.linear_proj, 18);
         assert_eq!(parsed.linear_core, [19, 20, 21, 22, 23, 24, 25, 26]);
         assert_eq!(parsed.linear_out, [27, 28, 29, 30, 31, 32, 33, 34]);
-        assert_eq!(parsed.linear_core_conv, 35);
-        assert_eq!(parsed.linear_core_recurrent, 37);
-        assert_eq!(parsed.linear_core_post, 39);
+        assert_eq!(parsed.linear_core_conv_reserved, [35, 36]);
+        assert_eq!(parsed.linear_core_recurrent_reserved, [37, 38]);
+        assert_eq!(parsed.linear_core_post_reserved, [39, 40]);
         assert_eq!(parsed.mlp_gate_up, 41);
         assert_eq!(parsed.mlp_down, 42);
     }
