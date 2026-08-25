@@ -2072,7 +2072,7 @@ def _engine_version(run_manifest: RunManifest, engine: EngineManifest) -> str:
     # The source commit is the deterministic SuperSonic build identity.  The
     # dirty bit is independently recorded in run.dirty and must not turn a
     # portable version into a host path or a generic "unknown" value.
-    if engine.name == "supersonic":
+    if engine.name in {"supersonic", "supersonic-wmma"}:
         value = f"source-{run_manifest.commit}"
     else:
         value = engine.pinned_version or run_manifest.config.engine_versions.get(engine.name)

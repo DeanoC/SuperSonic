@@ -526,6 +526,15 @@ class BenchmarkExecutionTests(unittest.TestCase):
             "HIP 7.14.60850-0000000",
         )
 
+    def test_wmma_version_identity_is_the_exact_source_commit(self):
+        engine = self.execution.manifest.load_engine("supersonic-wmma")
+        run_manifest = mock.Mock(commit="deadbeef", config=mock.Mock(engine_versions={}))
+
+        self.assertEqual(
+            self.execution._engine_version(run_manifest, engine),
+            "source-deadbeef",
+        )
+
     def test_pinned_peer_version_accepts_real_two_line_stderr_shape(self):
         self.peer_binary.write_text(
             "#!/bin/sh\n"
