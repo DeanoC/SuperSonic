@@ -2,4 +2,5 @@ version = 1
 name = "supersonic-scalar-lab"
 binary = "tools/supersonic-scalar-lab.py"
 version_command = ["tools/supersonic-scalar-lab.py", "--version"]
+version_pin_file = "tools/external/supersonic-scalar-lab-version.txt"
 supported_modes = ["ordinary", "mtp"]

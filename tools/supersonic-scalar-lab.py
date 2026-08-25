@@ -165,7 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if arguments == ["--version"]:
-        print(f"{ENGINE_NAME} {ENGINE_VERSION}")
+        print(ENGINE_VERSION)
         return 0
     args = build_parser().parse_args(arguments)
     try:

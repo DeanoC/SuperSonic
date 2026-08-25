@@ -104,7 +104,7 @@ class SupersonicScalarLabTests(unittest.TestCase):
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             self.assertEqual(self.lab.main(["--version"]), 0)
-        self.assertEqual(stdout.getvalue(), "supersonic-scalar-lab scalar-head-lab-v1\n")
+        self.assertEqual(stdout.getvalue(), "scalar-head-lab-v1\n")
 
     def test_script_version_is_available_without_model_arguments(self):
         completed = subprocess.run(
@@ -115,7 +115,7 @@ class SupersonicScalarLabTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "supersonic-scalar-lab scalar-head-lab-v1")
+        self.assertEqual(completed.stdout.strip(), "scalar-head-lab-v1")
 
     def test_timeout_kills_the_child_process_group(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -151,7 +151,7 @@ class SupersonicScalarLabTests(unittest.TestCase):
                 return
             try:
                 state = Path(f"/proc/{child_pid}/stat").read_text(encoding="utf-8").split()[2]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 return
             self.assertEqual(state, "Z", "timed-out descendant must not remain runnable")
 

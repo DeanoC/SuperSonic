@@ -261,6 +261,8 @@ engines = ["supersonic"]
         self.assertEqual(scalar.binary, "tools/supersonic-scalar-lab.py")
         self.assertEqual(wmma.supported_modes, ("ordinary", "mtp"))
         self.assertEqual(scalar.supported_modes, ("ordinary", "mtp"))
+        self.assertEqual(scalar.version_pin_file, "tools/external/supersonic-scalar-lab-version.txt")
+        self.assertEqual(scalar.pinned_version, "scalar-head-lab-v1")
         self.assertEqual(tuple(llama_cpp.supported_modes), ("ordinary",))
         self.assertIsNone(supersonic.version_pin_file)
         self.assertEqual(llama_cpp.version_pin_file, "tools/external/llama-cpp-version.txt")
