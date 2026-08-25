@@ -9,47 +9,6 @@ use std::ffi::{c_int, c_uint, c_void};
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 
-pub const PERSISTENT_4B_TIMING_SLOT_COUNT: usize = 43;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Persistent4BTimingSlots {
-    pub full_attn: u64,
-    pub full_attn_proj: u64,
-    pub full_attn_core: [u64; 8],
-    pub full_attn_out: [u64; 8],
-    pub linear_proj: u64,
-    pub linear_core: [u64; 8],
-    pub linear_out: [u64; 8],
-    pub linear_core_conv_reserved: [u64; 2],
-    pub linear_core_recurrent_reserved: [u64; 2],
-    pub linear_core_post_reserved: [u64; 2],
-    pub mlp_gate_up: u64,
-    pub mlp_down: u64,
-}
-
-pub fn parse_persistent_4b_timing_slots(slots: &[u64]) -> Result<Persistent4BTimingSlots, String> {
-    if slots.len() != PERSISTENT_4B_TIMING_SLOT_COUNT {
-        return Err(format!(
-            "persistent 4B timing slot buffer must contain exactly {PERSISTENT_4B_TIMING_SLOT_COUNT} slots, got {}",
-            slots.len()
-        ));
-    }
-    Ok(Persistent4BTimingSlots {
-        full_attn: slots[0],
-        full_attn_proj: slots[1],
-        full_attn_core: slots[2..10].try_into().unwrap(),
-        full_attn_out: slots[10..18].try_into().unwrap(),
-        linear_proj: slots[18],
-        linear_core: slots[19..27].try_into().unwrap(),
-        linear_out: slots[27..35].try_into().unwrap(),
-        linear_core_conv_reserved: slots[35..37].try_into().unwrap(),
-        linear_core_recurrent_reserved: slots[37..39].try_into().unwrap(),
-        linear_core_post_reserved: slots[39..41].try_into().unwrap(),
-        mlp_gate_up: slots[41],
-        mlp_down: slots[42],
-    })
-}
-
 unsafe extern "C" {
     fn supersonic_qwen35_hip_persistent_decode(
         dtype: c_int,
@@ -609,35 +568,5 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
             return Err(hip_error("hip_device_clock_khz", status));
         }
         Ok(clock_khz)
-    }
-}
-
-#[cfg(test)]
-mod timing_slot_tests {
-    use super::{parse_persistent_4b_timing_slots, PERSISTENT_4B_TIMING_SLOT_COUNT};
-
-    #[test]
-    fn parses_the_current_43_slot_abi() {
-        assert_eq!(PERSISTENT_4B_TIMING_SLOT_COUNT, 43);
-        let slots: Vec<u64> = (0..43).map(|value| value as u64).collect();
-        let parsed = parse_persistent_4b_timing_slots(&slots).expect("current slot ABI");
-        assert_eq!(parsed.full_attn, 0);
-        assert_eq!(parsed.full_attn_proj, 1);
-        assert_eq!(parsed.full_attn_core, [2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(parsed.full_attn_out, [10, 11, 12, 13, 14, 15, 16, 17]);
-        assert_eq!(parsed.linear_proj, 18);
-        assert_eq!(parsed.linear_core, [19, 20, 21, 22, 23, 24, 25, 26]);
-        assert_eq!(parsed.linear_out, [27, 28, 29, 30, 31, 32, 33, 34]);
-        assert_eq!(parsed.linear_core_conv_reserved, [35, 36]);
-        assert_eq!(parsed.linear_core_recurrent_reserved, [37, 38]);
-        assert_eq!(parsed.linear_core_post_reserved, [39, 40]);
-        assert_eq!(parsed.mlp_gate_up, 41);
-        assert_eq!(parsed.mlp_down, 42);
-    }
-
-    #[test]
-    fn rejects_non_43_slot_buffers() {
-        let error = parse_persistent_4b_timing_slots(&[0; 42]).expect_err("wrong ABI length");
-        assert!(error.to_string().contains("exactly 43"));
     }
 }

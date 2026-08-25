@@ -510,8 +510,6 @@ pub struct DecodeEngine {
     fused_last_normed: Option<Vec<u8>>,
     /// Reusable pre-verify linear snapshot. Avoids per-round clone alloc.
     mtp_linear_snap: Option<LinearStateSnapshot>,
-    persistent_timing_slots: bool,
-    persistent_timing_layout_reported: bool,
 }
 
 impl Drop for DecodeEngine {
@@ -650,30 +648,6 @@ fn decode_argmax_token(token_bytes: &[u8]) -> Result<u32> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("argmax D2H token conversion failed"))?;
     Ok(u32::from_le_bytes(token_bytes))
-}
-
-fn parse_persistent_timing_slots_flag(value: Option<&str>) -> Result<bool, String> {
-    match value {
-        None => Ok(false),
-        Some("1") => Ok(true),
-        Some(value) => Err(format!(
-            "SUPERSONIC_PERSISTENT_TIMING_SLOTS must be exactly `1` when set, got `{value}`"
-        )),
-    }
-}
-
-fn allocation_layout_fingerprint(addresses: &[usize]) -> u64 {
-    let Some(&base) = addresses.first() else {
-        return 0;
-    };
-    addresses.iter().fold(0xcbf29ce484222325, |hash, &address| {
-        let relative_pages = address.wrapping_sub(base) >> 12;
-        let alignment = address & 0xfff;
-        hash.wrapping_mul(0x100000001b3)
-            .wrapping_add(relative_pages as u64)
-            .wrapping_mul(0x100000001b3)
-            .wrapping_add(alignment as u64)
-    })
 }
 
 fn ensure_hip_fast_greedy_supported(use_4b_kernel: bool) -> Result<()> {
@@ -869,13 +843,6 @@ impl DecodeEngine {
             mtp_seq_rest: false,
             fused_last_normed: None,
             mtp_linear_snap: None,
-            persistent_timing_slots: parse_persistent_timing_slots_flag(
-                env::var("SUPERSONIC_PERSISTENT_TIMING_SLOTS")
-                    .ok()
-                    .as_deref(),
-            )
-            .map_err(|e| anyhow::anyhow!(e))?,
-            persistent_timing_layout_reported: false,
         })
     }
 
@@ -1737,7 +1704,6 @@ impl DecodeEngine {
         let output = self.decode_step_single_kernel_impl(
             token_id,
             seqlen_offset,
-            true,
             DecodeSamplingMode::HipFastGreedy,
         )?;
         Ok((output.sampled_token, output.timings))
@@ -1762,7 +1728,6 @@ impl DecodeEngine {
         let output = self.decode_step_single_kernel_impl(
             token_id,
             seqlen_offset,
-            true,
             DecodeSamplingMode::HostLogits,
         )?;
         let logits = output
@@ -2206,7 +2171,6 @@ impl DecodeEngine {
         &mut self,
         token_id: u32,
         seqlen_offset: usize,
-        enable_timing_slots: bool,
         sampling_mode: DecodeSamplingMode,
     ) -> Result<DecodeStepOutput> {
         anyhow::ensure!(self.use_4b_kernel, "single decode requires 4B kernel");
@@ -2247,7 +2211,6 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("reset decode sync: {e}"))?;
 
         let persistent_start = Instant::now();
-        let collect_timing_slots = enable_timing_slots && self.persistent_timing_slots;
         kernel_ffi::persistent_decode_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -2268,107 +2231,11 @@ impl DecodeEngine {
             1,
             None,
             self.int4_scale_device.as_ref(),
-            collect_timing_slots,
+            false,
             false,
         )
         .map_err(|e| anyhow::anyhow!("persistent decode 4B: {e}"))?;
         timings.persistent_ms = persistent_start.elapsed().as_secs_f64() * 1000.0;
-
-        if collect_timing_slots {
-            let bytes = self
-                .scratch
-                .sync_buf
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("persistent timing slots D2H: {e}"))?;
-            let slot_bytes = kernel_ffi::PERSISTENT_4B_TIMING_SLOT_COUNT * 8;
-            let payload = bytes.get(24..).ok_or_else(|| {
-                anyhow::anyhow!("persistent timing buffer missing 24-byte header")
-            })?;
-            anyhow::ensure!(
-                payload.len() == config.num_hidden_layers * slot_bytes,
-                "persistent timing buffer has {} bytes; expected exactly {}",
-                payload.len(),
-                config.num_hidden_layers * slot_bytes
-            );
-            let mut maxima = [0u64; 9];
-            let mut nonzero = [0u64; 9];
-            let mut winners = [None; 9];
-            let mut update = |category: usize, value: u64, batch: Option<usize>| {
-                if value != 0 {
-                    nonzero[category] += 1;
-                    if value > maxima[category] {
-                        maxima[category] = value;
-                        winners[category] = batch;
-                    }
-                }
-            };
-            for layer_bytes in payload.chunks_exact(slot_bytes) {
-                let slots: Vec<u64> = layer_bytes
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
-                    .collect();
-                let parsed = kernel_ffi::parse_persistent_4b_timing_slots(&slots)
-                    .map_err(|e| anyhow::anyhow!("persistent timing slots: {e}"))?;
-                update(0, parsed.full_attn, None);
-                update(1, parsed.full_attn_proj, None);
-                for (batch, &value) in parsed.full_attn_core.iter().enumerate() {
-                    update(2, value, Some(batch));
-                }
-                for (batch, &value) in parsed.full_attn_out.iter().enumerate() {
-                    update(3, value, Some(batch));
-                }
-                update(4, parsed.linear_proj, None);
-                for (batch, &value) in parsed.linear_core.iter().enumerate() {
-                    update(5, value, Some(batch));
-                }
-                for (batch, &value) in parsed.linear_out.iter().enumerate() {
-                    update(6, value, Some(batch));
-                }
-                update(7, parsed.mlp_gate_up, None);
-                update(8, parsed.mlp_down, None);
-            }
-            let mut layout_addresses = vec![
-                self.scratch.workspace.as_ptr() as usize,
-                self.scratch.sync_buf.as_ptr() as usize,
-                self.scratch.desc_device.as_ptr() as usize,
-                self.hidden_io.as_ptr() as usize,
-                self.normed_buf.as_ptr() as usize,
-                self.logits_buf.as_ptr() as usize,
-                self.weights.lm_head().as_ptr() as usize,
-            ];
-            if let Some(scales) = self.fp8_scale_device.as_ref() {
-                layout_addresses.push(scales.as_ptr() as usize);
-            }
-            if let Some(scales) = self.int4_scale_device.as_ref() {
-                layout_addresses.push(scales.as_ptr() as usize);
-            }
-            for desc in &descs {
-                layout_addresses.extend([
-                    desc.input_norm_w as usize,
-                    desc.gate_proj_w as usize,
-                    desc.kv_cache_k as usize,
-                    desc.kv_cache_v as usize,
-                    desc.conv_state as usize,
-                    desc.recurrent_state as usize,
-                ]);
-            }
-            layout_addresses.retain(|&address| address != 0);
-            if !self.persistent_timing_layout_reported {
-                let fingerprint = allocation_layout_fingerprint(&layout_addresses);
-                eprintln!(
-                    "[decode-profile] persistent_4b_layout scope=descriptor-and-working-buffers layers={} allocation_fingerprint={fingerprint:016x} converted_allocations=unavailable",
-                    config.num_hidden_layers,
-                );
-                self.persistent_timing_layout_reported = true;
-            }
-            eprintln!(
-                "[decode-profile] persistent_4b_slots coverage=partial unit=raw_clock_cycles step={} sampling_mode={} execution_path=bridge-selected-partial slot_layout=shared-base full_attn_max_cycles={} full_attn_nonzero_slots={} full_attn_proj_max_cycles={} full_attn_proj_nonzero_slots={} full_attn_core_max_cycles={} full_attn_core_nonzero_slots={} full_attn_core_winner_batch={:?} full_attn_out_max_cycles={} full_attn_out_nonzero_slots={} full_attn_out_winner_batch={:?} linear_proj_max_cycles={} linear_proj_nonzero_slots={} linear_core_max_cycles={} linear_core_nonzero_slots={} linear_core_winner_batch={:?} linear_out_max_cycles={} linear_out_nonzero_slots={} linear_out_winner_batch={:?} mlp_gate_up_max_cycles={} mlp_gate_up_nonzero_slots={} mlp_down_max_cycles={} mlp_down_nonzero_slots={}",
-                seqlen_offset,
-                match sampling_mode { DecodeSamplingMode::HostLogits => "host-logits", DecodeSamplingMode::HipFastGreedy => "hip-fast-greedy" },
-                maxima[0], nonzero[0], maxima[1], nonzero[1], maxima[2], nonzero[2], winners[2], maxima[3], nonzero[3], winners[3],
-                maxima[4], nonzero[4], maxima[5], nonzero[5], winners[5], maxima[6], nonzero[6], winners[6], maxima[7], nonzero[7], maxima[8], nonzero[8],
-            );
-        }
 
         let filled = seqlen_offset + 1;
         for (layer_idx, layer) in self.state.layers.iter_mut().enumerate() {
@@ -2568,37 +2435,5 @@ mod mtp_accept_tests {
         assert_eq!(commit_len, 2);
         assert_eq!((0usize + 1).min(3).min(32), 1);
         assert_eq!((2usize + 1).min(3).min(32), 3);
-    }
-}
-
-#[cfg(test)]
-mod decode_profile_tests {
-    use super::{allocation_layout_fingerprint, parse_persistent_timing_slots_flag};
-
-    #[test]
-    fn timing_slot_flag_rejects_malformed_values() {
-        assert_eq!(parse_persistent_timing_slots_flag(None).unwrap(), false);
-        assert_eq!(parse_persistent_timing_slots_flag(Some("1")).unwrap(), true);
-        assert!(parse_persistent_timing_slots_flag(Some("yes")).is_err());
-        assert!(parse_persistent_timing_slots_flag(Some("0x1")).is_err());
-    }
-
-    #[test]
-    fn timing_slot_abi_matches_scratch_allocation() {
-        assert_eq!(
-            kernel_ffi::PERSISTENT_4B_TIMING_SLOT_COUNT,
-            qwen38::scratch::PERSISTENT_4B_TIMING_SLOTS_PER_LAYER
-        );
-    }
-
-    #[test]
-    fn allocation_fingerprint_is_relative_and_address_free() {
-        let first = allocation_layout_fingerprint(&[0x1000, 0x5000, 0x9000]);
-        let relocated = allocation_layout_fingerprint(&[0x8100_1000, 0x8100_5000, 0x8100_9000]);
-        assert_eq!(first, relocated);
-        assert_ne!(
-            first,
-            allocation_layout_fingerprint(&[0x1000, 0x6000, 0x9000])
-        );
     }
 }
