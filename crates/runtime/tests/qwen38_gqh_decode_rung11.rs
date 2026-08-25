@@ -231,6 +231,60 @@ fn run_scalar_head_lab_repeatability_case(case: &str, prompt_text: &str, expecte
 }
 
 #[cfg(feature = "scalar-head-lab")]
+fn run_scalar_head_lab_hello_measurement(route: ScalarHeadLabRoute) {
+    const GENERATED_TOKENS: usize = 32;
+    const TIMED_DECODE_STEPS: usize = GENERATED_TOKENS - 1;
+
+    let prompt_ids = scalar_head_lab_prompt_ids("Hello", 13);
+    let Some((mut engine, _)) = build_engine(prompt_ids.len() + GENERATED_TOKENS) else {
+        return;
+    };
+    let prefill_logits = engine
+        .prefill_native(&prompt_ids)
+        .expect("scalar-head measurement prefill");
+    let mut next_token = greedy_token(&prefill_logits);
+    assert_eq!(next_token, 9419, "Hello prefill trajectory changed");
+    engine
+        .prepare_hip_gqh_decode()
+        .expect("prepare scalar-head measurement decode");
+    engine
+        .set_scalar_head_lab_route(route)
+        .expect("select fixed scalar-head measurement route");
+
+    let raw_started = std::time::Instant::now();
+    let mut tokens = vec![next_token];
+    let mut lm_head_ms = 0.0f64;
+    let mut timed_decode_steps = 0usize;
+    let mut pos = prompt_ids.len();
+    while tokens.len() < GENERATED_TOKENS {
+        let (sampled_token, timings) = engine
+            .decode_step_hip_fast_greedy(next_token, pos)
+            .unwrap_or_else(|e| panic!("scalar-head measurement decode pos={pos}: {e}"));
+        assert!(
+            timings.lm_head_ms.is_finite() && timings.lm_head_ms > 0.0,
+            "route {route:?} returned invalid lm_head_ms={} at pos={pos}",
+            timings.lm_head_ms
+        );
+        lm_head_ms += timings.lm_head_ms;
+        timed_decode_steps += 1;
+        next_token = sampled_token;
+        tokens.push(next_token);
+        pos += 1;
+    }
+    let raw_total_ms = raw_started.elapsed().as_secs_f64() * 1000.0;
+
+    assert_eq!(tokens.len(), GENERATED_TOKENS);
+    assert_eq!(timed_decode_steps, TIMED_DECODE_STEPS);
+    assert!(lm_head_ms.is_finite() && lm_head_ms > 0.0);
+    assert!(raw_total_ms.is_finite() && raw_total_ms > 0.0);
+    println!(
+        "scalar_head_lab_measurement route={route:?} prompt_tokens={} generated_tokens={} timed_decode_steps={timed_decode_steps} lm_head_ms={lm_head_ms:.6} raw_total_ms={raw_total_ms:.6} tokens={tokens:?}",
+        prompt_ids.len(),
+        tokens.len(),
+    );
+}
+
+#[cfg(feature = "scalar-head-lab")]
 #[test]
 #[ignore = "requires configured gfx1201 Q3KXL artifact"]
 fn scalar_head_lab_hello_is_repeatable() {
@@ -248,6 +302,22 @@ fn scalar_head_lab_cold_chat_is_repeatable() {
         "Emit a single sentence describing cold-load benchmark startup.",
         23,
     );
+}
+
+#[cfg(feature = "scalar-head-lab")]
+#[test]
+#[ignore = "requires configured gfx1201 Q3KXL artifact"]
+fn scalar_head_lab_measure_hello_raw_q6_scalar() {
+    let _guard = GPU.lock().expect("gpu lock");
+    run_scalar_head_lab_hello_measurement(ScalarHeadLabRoute::RawQ6Scalar);
+}
+
+#[cfg(feature = "scalar-head-lab")]
+#[test]
+#[ignore = "requires configured gfx1201 Q3KXL artifact"]
+fn scalar_head_lab_measure_hello_production_wmma() {
+    let _guard = GPU.lock().expect("gpu lock");
+    run_scalar_head_lab_hello_measurement(ScalarHeadLabRoute::ProductionWmma);
 }
 
 #[test]
