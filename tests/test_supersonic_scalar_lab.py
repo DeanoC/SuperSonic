@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -104,6 +105,17 @@ class SupersonicScalarLabTests(unittest.TestCase):
         with redirect_stdout(stdout):
             self.assertEqual(self.lab.main(["--version"]), 0)
         self.assertEqual(stdout.getvalue(), "supersonic-scalar-lab scalar-head-lab-v1\n")
+
+    def test_script_version_is_available_without_model_arguments(self):
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "supersonic-scalar-lab.py"), "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "supersonic-scalar-lab scalar-head-lab-v1")
 
     def test_timeout_kills_the_child_process_group(self):
         with tempfile.TemporaryDirectory() as temporary:
