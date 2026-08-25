@@ -106,6 +106,7 @@ class ScalarHeadCodeObjectTests(unittest.TestCase):
     def test_rejects_forbidden_instruction_families(self):
         cases = {
             "fma mix variant": ("v_fma_f32", "v_fma_mixlo_f32", "v_fma_mix_f32"),
+            "dual fma mix variant": ("v_fma_f32", "v_dual_fma_mix_f32", "v_fma_mix_f32"),
             "wmma variant": ("v_mul_f32", "v_wmma_f32_16x16x16_fp8", "v_wmma_f32_16x16x16_bf16"),
             "mfma variant": ("v_mul_f32", "v_mfma_f32_32x32x8f16", "v_mfma_f32_16x16x16bf16"),
         }

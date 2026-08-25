@@ -20,7 +20,7 @@ INSTRUCTION_PATTERNS = {
     "ds_bpermute_b32": r"\bds_bpermute_b32\b",
     "v_add_f32": r"\bv_(?:dual_)?add_f32(?:_[a-z0-9]+)?\b",
     "v_fma_f32": r"\bv_(?:dual_)?fma[ck]?_f32(?:_[a-z0-9]+)?\b",
-    "v_fma_mix_f32": r"\bv_(?:dual_)?fma_mix[a-z0-9_]*\b",
+    "v_fma_mix_f32": r"\b(?:v_fma_mix|v_dual_fma_mix)[a-z0-9_]*\b",
     "v_mfma_f32_16x16x16bf16": r"\bv_mfma[a-z0-9_]*\b",
     "v_mul_f32": r"\bv_(?:dual_)?mul_f32(?:_[a-z0-9]+)?\b",
     "v_wmma_f32_16x16x16_bf16": r"\bv_wmma[a-z0-9_]*\b",
