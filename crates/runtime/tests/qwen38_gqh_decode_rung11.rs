@@ -74,12 +74,29 @@ fn greedy_token(logits: &[f32]) -> u32 {
     DecodeEngine::greedy_sample(logits)
 }
 
+fn hip_query_policy<T, E: std::fmt::Display>(
+    query: Result<T, E>,
+    require_artifacts: bool,
+) -> Result<Option<T>, String> {
+    match query {
+        Ok(info) => Ok(Some(info)),
+        Err(error) if require_artifacts => Err(format!(
+            "HIP device 0 query failed while SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1: {error}; verify HIP_VISIBLE_DEVICES and ROCm device access"
+        )),
+        Err(error) => {
+            eprintln!("skip: HIP device 0 query failed: {error}");
+            Ok(None)
+        }
+    }
+}
+
 fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen38::config::TextConfig)> {
     let path = gguf_path()?;
     let model_dir = qwen38_model_dir()?;
-    if kernel_ffi::query_gpu_info(0).is_err() {
-        eprintln!("skip: no HIP device 0");
-        return None;
+    match hip_query_policy(kernel_ffi::query_gpu_info(0), require_gqh_artifacts()) {
+        Ok(Some(_)) => {}
+        Ok(None) => return None,
+        Err(error) => panic!("{error}"),
     }
     let ordinal = 0usize;
     let config = load_text_config(&model_dir).expect("hf config");
@@ -94,6 +111,22 @@ fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen38::config::Tex
     let engine = DecodeEngine::new(weights, ordinal, 16_480, attn_scratch, 256, true, 0)
         .expect("DecodeEngine");
     Some((engine, config))
+}
+
+#[test]
+fn hip_query_policy_rejects_strict_configured_failure() {
+    let error = hip_query_policy::<(), _>(Err("driver unavailable"), true)
+        .expect_err("strict configured HIP query must fail");
+    assert!(error.contains("HIP device 0 query failed"));
+    assert!(error.contains("driver unavailable"));
+    assert!(error.contains("SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1"));
+}
+
+#[test]
+fn hip_query_policy_allows_unconfigured_skip() {
+    let result = hip_query_policy::<(), _>(Err("driver unavailable"), false)
+        .expect("unconfigured HIP query may skip");
+    assert!(result.is_none());
 }
 
 #[cfg(feature = "scalar-head-lab")]
