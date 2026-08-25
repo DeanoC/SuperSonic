@@ -238,6 +238,36 @@ class BenchmarkExecutionTests(unittest.TestCase):
         killpg.assert_called_once_with(4321, signal.SIGKILL)
         self.assertTrue(result.timed_out)
 
+    def test_gpu_process_monitor_detects_only_numeric_pid_fields(self):
+        payload = [
+            {
+                "gpu": 1,
+                "process_list": [
+                    {"pid": 1234, "name": "candidate"},
+                    {"nested": {"pid": 5678}},
+                    {"pid": "not-a-number"},
+                ],
+            }
+        ]
+
+        self.assertEqual(self.execution._collect_process_pids(payload), {1234, 5678})
+
+    def test_gpu_process_monitor_fails_closed_on_competing_pid(self):
+        process = mock.Mock(pid=1234)
+        with (
+            mock.patch.object(self.execution.shutil, "disk_usage", return_value=mock.Mock(free=100 * 1024**3)),
+            mock.patch.object(
+                self.execution,
+                "_default_environment_probe_runner",
+                return_value='[{"gpu":1,"process_list":[{"pid":9999}]}]',
+            ),
+            mock.patch.object(self.execution, "_process_family_pids", return_value={1234}),
+            mock.patch.object(self.execution, "_kill_process_session") as kill,
+        ):
+            with self.assertRaisesRegex(self.execution._CaseError, "competing GPU process"):
+                self.execution._verify_host_monitor(process, physical_gpu="1", cwd=None)
+        kill.assert_called_once_with(process)
+
     def test_locked_real_run_records_live_process_telemetry(self):
         self.binary.write_text(
             "#!/bin/sh\n"
@@ -342,7 +372,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
     def test_budget_stops_scheduling_and_marks_incomplete(self):
         config = self.config(run_quality=False)
         runner = FakeRunner()
-        status = self.execution.run_suite(config, FakeClock([0, 599, 599.5, 601]), runner)
+        status = self.execution.run_suite(config, FakeClock([0, 0, 599, 599.5, 601]), runner)
         self.assertEqual(status.state, "incomplete")
         self.assertIn("budget_exhausted", status.errors)
         self.assertEqual(set(runner.started_case_ids), {"quick-short-cold-ordinary"})
@@ -518,6 +548,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
         records = [json.loads(path.read_text(encoding="utf-8")) for path in status.records]
         self.assertEqual(status.completed_rounds, 2)
         self.assertGreaterEqual(status.elapsed_seconds, 5.0)
+        self.assertGreaterEqual(status.performance_elapsed_seconds, 5.0)
         self.assertEqual([len(record["samples"]) for record in records], [2, 2])
         self.assertEqual(
             runner.started_case_ids,
@@ -532,6 +563,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
         manifest = json.loads((status.bundle / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"]["completed_rounds"], 2)
         self.assertGreaterEqual(manifest["status"]["elapsed_seconds"], 5.0)
+        self.assertGreaterEqual(manifest["status"]["performance_elapsed_seconds"], 5.0)
 
     def test_mtp_quality_integration_rejects_non_manifest_token_cases(self):
         quality_cases = self.execution.manifest.load_quality("v1")
@@ -572,6 +604,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
                 "supersonic-wmma": "source-test-wmma",
                 "supersonic-scalar-lab": "scalar-head-lab-v1",
             },
+            environment={"AMDSMI_GPU_METRICS_CACHE_MS": "0"},
         )
         run_manifest = self.execution.preflight(config)
         token_ids = [40, 4021, 3300, 3050, 3817, 27437, 430, 781]
@@ -587,9 +620,11 @@ class BenchmarkExecutionTests(unittest.TestCase):
                 "engine_version": "scalar-head-lab-v1",
                 "generated_text": "I cannot provide specific token IDs as they",
                 "generated_tokens": 8,
+                "lm_head_ms": 7.0,
                 "ms_per_tok": 1.0,
                 "prompt_tokens": 25,
                 "token_ids": token_ids,
+                "timed_decode_steps": 7,
                 "tokens_per_second": 1000.0,
             },
             separators=(",", ":"),
@@ -732,6 +767,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
                 "supersonic-wmma": "source-test-wmma",
                 "supersonic-scalar-lab": "scalar-head-lab-v1",
             },
+            environment={"AMDSMI_GPU_METRICS_CACHE_MS": "0"},
         )
 
         with (

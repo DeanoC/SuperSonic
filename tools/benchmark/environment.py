@@ -79,6 +79,7 @@ class RequestedTelemetry:
     memory_clock_mhz: int | None
     power_cap_watts: int | None
     performance_level: str | None
+    temperature_limit_celsius: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +111,7 @@ class TelemetrySample:
     throttle_status: int | None = None
     indep_throttle_status: int | None = None
     throttle_label: str | None = None
+    raw_amd_smi_json: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +188,7 @@ def collect_snapshot(
         memory_clock_mhz=_policy_value(clock_policy, "memory_clock_mhz"),
         power_cap_watts=_policy_value(clock_policy, "power_cap_watts"),
         performance_level=_policy_value(clock_policy, "performance_level"),
+        temperature_limit_celsius=_policy_value(clock_policy, "temperature_limit_celsius"),
     )
     cpu_governor = _read_cpu_governor(cpu_governor_reader, notes)
     verification_errors = verify_clock_policy(
@@ -255,6 +258,7 @@ def snapshot_from_observations(
         memory_clock_mhz=_policy_value(clock_policy, "memory_clock_mhz"),
         power_cap_watts=_policy_value(clock_policy, "power_cap_watts"),
         performance_level=_policy_value(clock_policy, "performance_level"),
+        temperature_limit_celsius=_policy_value(clock_policy, "temperature_limit_celsius"),
     )
     observed = tuple(
         ObservedTelemetry(
@@ -492,6 +496,8 @@ def _clock_violations(samples: tuple[ObservedTelemetry, ...], policy) -> list[st
                     f"temperature exceeded limit at sample {index}: observed "
                     f"{sample.temperature_celsius}, limit {requested_temperature_limit}"
                 )
+        elif requested_temperature_limit is not None:
+            errors.append(f"missing temperature verification at sample {index}")
     if requested_gpu is not None and loaded_gpu_samples == 0:
         errors.append("missing loaded GPU clock verification sample")
     return errors

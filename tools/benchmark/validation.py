@@ -61,7 +61,8 @@ def validate_record(record: object) -> None:
 
 
 def validate_bundle(path: str | Path, require_complete: bool) -> tuple[Path, ...]:
-    paths = _bundle_paths(Path(path))
+    root = Path(path)
+    paths = _bundle_paths(root)
     records: list[tuple[Path, dict[str, object]]] = []
     for result_path in paths:
         value = _load_json(result_path)
@@ -73,6 +74,33 @@ def validate_bundle(path: str | Path, require_complete: bool) -> tuple[Path, ...
             _validate_publishable(record, result_path)
         _validate_complete_bundle(records)
         _validate_duration_bundles(Path(path), records)
+        suites = {str(record["run"]["suite"]) for _, record in records}
+        if "full-scalar-qualification" in suites:
+            if root.is_file():
+                raise ValueError("scalar qualification publication requires its complete bundle")
+            from . import qualification
+
+            qualification_path = root / "qualification-v1.json"
+            candidate_path = root / "candidate-scalar-v1.json"
+            qualification.validate_qualification(_load_json(qualification_path))
+            candidate = _load_json(candidate_path)
+            qualification.validate_series(candidate)
+            assert isinstance(candidate, Mapping)
+            binding = _required_mapping(candidate, "binding")
+            scalar_records = [
+                record for _, record in records
+                if record["engine"]["name"] == "supersonic-scalar-lab"
+                and record["run"]["case_id"] == "scalar-qualification-short-cold-ordinary"
+            ]
+            if len(scalar_records) != 1:
+                raise ValueError("scalar qualification requires exactly one source scalar record")
+            derived = qualification.series_from_record(
+                scalar_records[0],
+                compiler_version=str(binding["compiler_version"]),
+                scalar_instruction_sha256=str(binding["scalar_instruction_sha256"]),
+            )
+            if candidate != derived:
+                raise ValueError("candidate-scalar-v1.json does not match its source scalar record")
     return paths
 
 
@@ -98,6 +126,7 @@ def headline_verification_errors(record: Mapping[str, object]) -> tuple[str, ...
             "memory_clock_mhz": requested.get("memory_clock_mhz"),
             "power_cap_watts": requested.get("power_cap_watts"),
             "performance_level": requested.get("performance_level"),
+            "temperature_limit_celsius": requested.get("temperature_limit_celsius"),
         }
         return environment.verify_clock_policy(observed_before, list(observed_samples), observed_after, policy)
     except (KeyError, TypeError, ValueError) as exc:
@@ -157,7 +186,14 @@ def _bundle_paths(path: Path) -> tuple[Path, ...]:
         return (path,)
     if not path.is_dir():
         raise ValueError(f"bundle path does not exist: {path}")
-    metadata_names = {"manifest.json", "run-manifest.json", "comparison.json"}
+    metadata_names = {
+        "manifest.json",
+        "run-manifest.json",
+        "comparison.json",
+        "baseline-v1.json",
+        "candidate-scalar-v1.json",
+        "qualification-v1.json",
+    }
     paths = tuple(
         sorted(
             candidate
@@ -374,6 +410,63 @@ def _validate_record_consistency(record: dict[str, object]) -> None:
             )
     elif sample_count != case.repetitions:
         raise ValueError(f"sample count must be exactly {case.repetitions} for {case.id}, got {sample_count}")
+    telemetry = env.get("telemetry_samples")
+    if not isinstance(telemetry, list):
+        raise ValueError("environment telemetry_samples must be an array")
+    previous_telemetry_end = -1
+    scalar_qualification = str(run["suite"]) in {"scalar-baseline", "full-scalar-qualification"}
+    association_fields = {
+        "telemetry_start_index", "telemetry_sample_count", "loaded_clock_minimum_mhz",
+        "loaded_clock_median_mhz", "loaded_clock_maximum_mhz",
+    }
+    for sample in record["samples"]:
+        has_head = "lm_head_ms" in sample
+        has_steps = "timed_decode_steps" in sample
+        if has_head != has_steps:
+            raise ValueError("lm_head_ms and timed_decode_steps must be recorded together")
+        if engine_name == "supersonic-scalar-lab" and not has_head:
+            raise ValueError("scalar lab samples require lm_head_ms and timed_decode_steps")
+        if has_head and float(sample["lm_head_ms"]) > float(sample["decode_ms"]):
+            raise ValueError("lm_head_ms cannot exceed decode_ms")
+        present_association = association_fields.intersection(sample)
+        if present_association and present_association != association_fields:
+            raise ValueError("timing telemetry association fields must be recorded together")
+        if scalar_qualification and present_association != association_fields:
+            raise ValueError("scalar qualification samples require independent telemetry associations")
+        if present_association:
+            start = int(sample["telemetry_start_index"])
+            count = int(sample["telemetry_sample_count"])
+            end = start + count
+            if start < previous_telemetry_end or end > len(telemetry):
+                raise ValueError("timing telemetry associations overlap or exceed the evidence")
+            previous_telemetry_end = end
+            associated = telemetry[start:end]
+            if any(not item.get("raw_amd_smi_json") for item in associated):
+                raise ValueError("timing telemetry association requires raw AMD SMI JSON")
+            requested = _required_mapping(env, "requested")
+            observed = tuple(_observed(item) for item in associated)
+            violations = environment.verify_clock_policy(
+                observed[0], list(observed[1:-1]), observed[-1],
+                {
+                    "name": env["clock_policy"],
+                    "gpu_clock_mhz": requested.get("gpu_clock_mhz"),
+                    "clock_tolerance_mhz": requested.get("clock_tolerance_mhz"),
+                    "memory_clock_mhz": requested.get("memory_clock_mhz"),
+                    "power_cap_watts": requested.get("power_cap_watts"),
+                    "performance_level": requested.get("performance_level"),
+                    "temperature_limit_celsius": requested.get("temperature_limit_celsius"),
+                },
+            )
+            if violations:
+                raise ValueError("timing telemetry association failed policy: " + "; ".join(violations))
+            summary = environment.loaded_clock_summary(tuple(_telemetry(item) for item in associated))
+            expected = {
+                "minimum_mhz": sample["loaded_clock_minimum_mhz"],
+                "median_mhz": sample["loaded_clock_median_mhz"],
+                "maximum_mhz": sample["loaded_clock_maximum_mhz"],
+            }
+            if any(summary[name] != expected[name] for name in expected):
+                raise ValueError("loaded-clock summary does not match associated telemetry")
 
     if env["cache_state"] != workload["cache_state"]:
         raise ValueError("environment cache_state must match workload cache_state")
@@ -522,6 +615,15 @@ def _validate_duration_bundles(
             raise ValueError("duration bundle elapsed_seconds must be finite")
         if float(elapsed) < suite.minimum_duration_seconds:
             raise ValueError("duration bundle elapsed_seconds is below the minimum duration")
+        performance_elapsed = status.get("performance_elapsed_seconds")
+        if (
+            isinstance(performance_elapsed, bool)
+            or not isinstance(performance_elapsed, (int, float))
+            or not math.isfinite(float(performance_elapsed))
+        ):
+            raise ValueError("duration bundle performance_elapsed_seconds must be finite")
+        if float(performance_elapsed) < suite.minimum_duration_seconds:
+            raise ValueError("duration bundle performance elapsed time is below the minimum duration")
         rounds = status.get("completed_rounds")
         if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
             raise ValueError("duration bundle completed_rounds must be a positive integer")
@@ -575,6 +677,25 @@ def _observed(value: Mapping[str, object]) -> environment.ObservedTelemetry:
         throttle_status=_optional_int(value, "throttle_status"),
         indep_throttle_status=_optional_int(value, "indep_throttle_status"),
         throttle_label=_optional_str(value, "throttle_label"),
+    )
+
+
+def _telemetry(value: Mapping[str, object]) -> environment.TelemetrySample:
+    observed = _observed(value)
+    return environment.TelemetrySample(
+        offset_seconds=float(value["offset_seconds"]),
+        gpu_clock_mhz=observed.gpu_clock_mhz,
+        memory_clock_mhz=observed.memory_clock_mhz,
+        power_cap_watts=observed.power_cap_watts,
+        power_watts=observed.power_watts,
+        temperature_celsius=observed.temperature_celsius,
+        gpu_utilization_percent=observed.gpu_utilization_percent,
+        memory_utilization_percent=observed.memory_utilization_percent,
+        performance_level=observed.performance_level,
+        throttle_status=observed.throttle_status,
+        indep_throttle_status=observed.indep_throttle_status,
+        throttle_label=observed.throttle_label,
+        raw_amd_smi_json=value.get("raw_amd_smi_json"),
     )
 
 

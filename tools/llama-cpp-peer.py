@@ -192,7 +192,6 @@ def run_one_shot(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
-        start_new_session=True,
     )
     previous_handlers = _install_signal_handlers(process)
     try:

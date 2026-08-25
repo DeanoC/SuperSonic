@@ -444,6 +444,10 @@ pub struct MtpSpecRound {
     pub next_token: u32,
     pub n_drafted: usize,
     pub n_accepted: usize,
+    #[cfg(feature = "scalar-head-lab")]
+    pub scalar_lm_head_ms: f64,
+    #[cfg(feature = "scalar-head-lab")]
+    pub scalar_timed_decode_steps: usize,
 }
 
 #[cfg(feature = "scalar-head-lab")]
@@ -1167,6 +1171,10 @@ impl DecodeEngine {
             next_token,
             n_drafted: drafts.len(),
             n_accepted: n_acc,
+            #[cfg(feature = "scalar-head-lab")]
+            scalar_lm_head_ms: 0.0,
+            #[cfg(feature = "scalar-head-lab")]
+            scalar_timed_decode_steps: 0,
         })
     }
 
@@ -1355,12 +1363,21 @@ impl DecodeEngine {
         let mut token = first_token;
         let mut n_acc = 0usize;
         let mut next_token = first_token;
+        #[cfg(feature = "scalar-head-lab")]
+        let mut scalar_lm_head_ms = 0.0;
+        #[cfg(feature = "scalar-head-lab")]
+        let mut scalar_timed_decode_steps = 0usize;
         let verify_steps = drafts.len() + 1;
         for i in 0..verify_steps {
             if emitted.len() >= remaining {
                 break;
             }
-            let (sampled, _) = self.decode_step_hip_fast_greedy(token, pos)?;
+            let (sampled, _timings) = self.decode_step_hip_fast_greedy(token, pos)?;
+            #[cfg(feature = "scalar-head-lab")]
+            if self.scalar_head_lab_route == ScalarHeadLabRoute::RawQ6Scalar {
+                scalar_lm_head_ms += _timings.lm_head_ms;
+                scalar_timed_decode_steps += 1;
+            }
             emitted.push(token);
             self.store_mtp_h_from_residual()?;
             pos += 1;
@@ -1389,6 +1406,10 @@ impl DecodeEngine {
             next_token,
             n_drafted: drafts.len(),
             n_accepted: n_acc,
+            #[cfg(feature = "scalar-head-lab")]
+            scalar_lm_head_ms,
+            #[cfg(feature = "scalar-head-lab")]
+            scalar_timed_decode_steps,
         })
     }
 

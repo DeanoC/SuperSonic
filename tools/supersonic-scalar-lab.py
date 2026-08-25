@@ -85,9 +85,11 @@ def normalize_output(stdout: str, stderr: str) -> dict[str, object]:
         "engine_version",
         "generated_text",
         "generated_tokens",
+        "lm_head_ms",
         "ms_per_tok",
         "prompt_tokens",
         "token_ids",
+        "timed_decode_steps",
         "tokens_per_second",
     }
     if not isinstance(payload, dict) or set(payload) != required:
@@ -108,13 +110,17 @@ def normalize_output(stdout: str, stderr: str) -> dict[str, object]:
     ):
         raise ValueError("scalar lab token_ids must match generated_tokens")
     decode_ms = _positive_number(payload["decode_ms"], "decode_ms")
+    lm_head_ms = _positive_number(payload["lm_head_ms"], "lm_head_ms")
+    timed_decode_steps = _positive_int(payload["timed_decode_steps"], "timed_decode_steps")
+    if timed_decode_steps > generated_tokens:
+        raise ValueError("timed_decode_steps cannot exceed generated_tokens")
     ms_per_tok = _positive_number(payload["ms_per_tok"], "ms_per_tok")
     tokens_per_second = _positive_number(payload["tokens_per_second"], "tokens_per_second")
     if not math.isclose(decode_ms, generated_tokens * ms_per_tok, rel_tol=1e-6, abs_tol=1e-6):
         raise ValueError("scalar lab timing is inconsistent")
     if not math.isclose(tokens_per_second, 1000.0 / ms_per_tok, rel_tol=1e-6, abs_tol=1e-6):
         raise ValueError("scalar lab timing rate is inconsistent")
-    _ = prompt_tokens
+    _ = (prompt_tokens, lm_head_ms)
     return payload
 
 

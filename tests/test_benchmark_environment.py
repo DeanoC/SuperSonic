@@ -234,6 +234,17 @@ class EnvironmentPolicyTests(unittest.TestCase):
         self.assertIn("MAD", " ".join(errors))
         self.assertIn("3%", " ".join(errors))
 
+    def test_locked_temperature_limit_rejects_hot_or_missing_samples(self):
+        hot = replace(self.before, temperature_celsius=91.0)
+        missing = replace(self.before, temperature_celsius=None)
+
+        self.assertIn("temperature exceeded", " ".join(
+            self.environment.verify_clock_policy(self.before, [hot], self.after, self.policy)
+        ))
+        self.assertIn("missing temperature", " ".join(
+            self.environment.verify_clock_policy(self.before, [missing], self.after, self.policy)
+        ))
+
     def test_locked_gpu_clock_requires_a_loaded_sample(self):
         policy = SimpleNamespace(**{**self.policy.__dict__, "gpu_clock_mhz": 2350, "clock_tolerance_mhz": 100})
         idle_before = replace(self.before, gpu_clock_mhz=412, gpu_utilization_percent=0.0)

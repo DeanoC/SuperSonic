@@ -81,9 +81,11 @@ class BenchmarkAdapterTests(unittest.TestCase):
             "engine_version": "scalar-head-lab-v1",
             "generated_text": "answer",
             "generated_tokens": 3,
+            "lm_head_ms": 3.0,
             "ms_per_tok": 4.0,
             "prompt_tokens": 7,
             "token_ids": [11, 12, 13],
+            "timed_decode_steps": 2,
             "tokens_per_second": 250.0,
         }
         log = "[supersonic_json] " + json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -92,6 +94,8 @@ class BenchmarkAdapterTests(unittest.TestCase):
 
         self.assertEqual(parsed.engine_name, "supersonic-scalar-lab")
         self.assertEqual(parsed.engine_version, "scalar-head-lab-v1")
+        self.assertEqual(parsed.lm_head_ms, 3.0)
+        self.assertEqual(parsed.timed_decode_steps, 2)
         self.assertEqual(parsed.token_ids, (11, 12, 13))
 
     def test_supersonic_chat_and_mtp_flags_follow_case_and_inputs(self):

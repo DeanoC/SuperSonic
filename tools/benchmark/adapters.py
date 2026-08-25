@@ -53,6 +53,8 @@ class ParsedOutput:
     decode_ms: float
     ms_per_tok: float
     tokens_per_second: float
+    lm_head_ms: float | None = None
+    timed_decode_steps: int | None = None
 
 
 def build_command(
@@ -288,9 +290,11 @@ def _parse_scalar_lab_output(stdout: str) -> ParsedOutput:
         "engine_version",
         "generated_text",
         "generated_tokens",
+        "lm_head_ms",
         "ms_per_tok",
         "prompt_tokens",
         "token_ids",
+        "timed_decode_steps",
         "tokens_per_second",
     }
     if not isinstance(payload, dict) or set(payload) != required:
@@ -312,6 +316,10 @@ def _parse_scalar_lab_output(stdout: str) -> ParsedOutput:
     ):
         raise ValueError("supersonic scalar token_ids must match generated_tokens")
     decode_ms = _require_finite_positive(payload["decode_ms"], "decode_ms")
+    lm_head_ms = _require_finite_positive(payload["lm_head_ms"], "lm_head_ms")
+    timed_decode_steps = _require_positive_int(payload["timed_decode_steps"], "timed_decode_steps")
+    if timed_decode_steps > generated_tokens:
+        raise ValueError("timed_decode_steps cannot exceed generated_tokens")
     ms_per_tok = _require_finite_positive(payload["ms_per_tok"], "ms_per_tok")
     tokens_per_second = _require_finite_positive(payload["tokens_per_second"], "tokens_per_second")
     _require_rate_consistency(
@@ -331,6 +339,8 @@ def _parse_scalar_lab_output(stdout: str) -> ParsedOutput:
         decode_ms=decode_ms,
         ms_per_tok=ms_per_tok,
         tokens_per_second=tokens_per_second,
+        lm_head_ms=lm_head_ms,
+        timed_decode_steps=timed_decode_steps,
     )
 
 

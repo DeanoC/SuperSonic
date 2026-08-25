@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "benchmarks/schema/qualification-v1.schema.json",
+  "type": "object",
+  "required": ["schema_version", "qualified", "limit_percent", "baseline", "candidate", "ratio", "percent_regression", "compatibility_errors"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "qualified": {"type": "boolean"},
+    "limit_percent": {"const": 5.0},
+    "baseline": {
+      "type": "object",
+      "required": ["run_id", "bundle_sha256", "binding_sha256", "sample_ids", "median_ms_per_token"],
+      "properties": {
+        "run_id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+        "bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "binding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sample_ids": {"type": "array", "minItems": 7, "items": {"type": "string", "pattern": "^[a-z0-9-]+$"}},
+        "median_ms_per_token": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["run_id", "binding_sha256", "sample_ids", "median_ms_per_token"],
+      "properties": {
+        "run_id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+        "binding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sample_ids": {"type": "array", "minItems": 7, "items": {"type": "string", "pattern": "^[a-z0-9-]+$"}},
+        "median_ms_per_token": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "ratio": {"type": "number", "minimum": 0},
+    "percent_regression": {"type": "number"},
+    "compatibility_errors": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

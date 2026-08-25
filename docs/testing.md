@@ -74,6 +74,9 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --artifact "$SUPERSONIC_GQH_GGUF" \
   --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
   --artifact-quantization GQH-Q3KXL \
+  --artifact-source-repository Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF \
+  --artifact-source-revision 91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4 \
+  --artifact-filename Qwen3.8-27B-GQH-Q3KXL.gguf --artifact-size-bytes 13440110432 \
   --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
   --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
@@ -90,6 +93,7 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
   --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
   --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
+  --temperature-limit-celsius "$SUPERSONIC_BENCHMARK_TEMPERATURE_LIMIT_CELSIUS" \
   --seed 1 \
   --run-id "$run_id" \
   --output target/benchmarks/candidate
@@ -131,6 +135,23 @@ or an evidence violation preserves completed diagnostics but makes the bundle
 ineligible for `validate --publishable`. A partial quick or full run is never
 published as a complete aggregate. Performance telemetry is report-only; a
 deterministic quality failure blocks immediately.
+
+The scalar overnight gate adds this CPU-safe contract tier:
+
+```bash
+python3 -m unittest \
+  tests.test_benchmark_qualification \
+  tests.test_ci_workflows \
+  tests.test_benchmark_environment \
+  tests.test_benchmark_execution \
+  tests.test_benchmark_validation -v
+```
+
+Before dispatch, build the feature-gated scalar example, audit its exact
+gfx1201 instruction stream, and prepare the seven-sample baseline using the
+command in [benchmarks](benchmarks.md). A missing stage timing, mismatched
+binding, unstable series, or scalar candidate above the fixed regression limit
+fails qualification while partial diagnostics remain uploadable.
 
 ### GPU integrity fail-stop policy
 

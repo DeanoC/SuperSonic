@@ -187,6 +187,7 @@ jobs:
             tests.test_amd_smi_provenance \
             tests.test_benchmark_manifests \
             tests.test_benchmark_validation \
+            tests.test_benchmark_qualification \
             tests.test_benchmark_render \
             tests.test_supersonic_bench_cli -v
 

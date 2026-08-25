@@ -217,6 +217,7 @@ class BenchmarkCompareTests(unittest.TestCase):
             (("environment", "requested", "memory_clock_mhz"), 1300, "memory_clock_mhz"),
             (("environment", "requested", "power_cap_watts"), 280, "power_cap_watts"),
             (("environment", "requested", "performance_level"), "auto", "performance_level"),
+            (("environment", "requested", "temperature_limit_celsius"), 80.0, "temperature_limit_celsius"),
             (("workload", "cache_state"), "warm-resident", "cache_state"),
             (("environment", "process_reuse"), True, "process_reuse"),
             (("workload", "measurement_boundary"), "end-to-end", "measurement_boundary"),

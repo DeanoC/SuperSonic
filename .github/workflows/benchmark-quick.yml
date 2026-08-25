@@ -37,7 +37,7 @@ jobs:
       SUPERSONIC_REQUIRE_GQH_ARTIFACTS: "1"
       SUPERSONIC_R9700_GPU_ID: ${{ vars.SUPERSONIC_R9700_GPU_ID }}
       SUPERSONIC_DEVICE: "0"
-      SUPERSONIC_GQH_GGUF: ${{ secrets.SUPERSONIC_GQH_GGUF || vars.SUPERSONIC_GQH_GGUF || '/home/deano/models/qwen38-gqh-shaped.gguf' }}
+      SUPERSONIC_GQH_GGUF: ${{ secrets.SUPERSONIC_GQH_GGUF || vars.SUPERSONIC_GQH_GGUF || '/home/deano/models/Qwen3.8-27B-GQH-Q3KXL.gguf' }}
       SUPERSONIC_GQH_GGUF_SHA256: ${{ secrets.SUPERSONIC_GQH_GGUF_SHA256 || vars.SUPERSONIC_GQH_GGUF_SHA256 }}
       SUPERSONIC_QWEN38_MODEL_DIR: ${{ secrets.SUPERSONIC_QWEN38_MODEL_DIR || vars.SUPERSONIC_QWEN38_MODEL_DIR || '/data/models/Qwen3.8-27B' }}
       SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ }}
@@ -225,6 +225,10 @@ jobs:
             --artifact "$SUPERSONIC_GQH_GGUF" \
             --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
             --artifact-quantization GQH-Q3KXL \
+            --artifact-source-repository Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF \
+            --artifact-source-revision 91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4 \
+            --artifact-filename Qwen3.8-27B-GQH-Q3KXL.gguf \
+            --artifact-size-bytes 13440110432 \
             --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
             --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
             --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \

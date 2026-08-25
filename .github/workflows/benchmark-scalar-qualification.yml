@@ -1,0 +1,222 @@
+name: Scalar control and llama.cpp six-hour qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_bundle:
+        description: Absolute host path to the immutable seven-sample scalar baseline bundle
+        required: true
+        type: string
+      baseline_bundle_sha256:
+        description: Canonical directory SHA-256 printed when the baseline was prepared
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-gfx1201-device-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Scalar, production WMMA, and pinned llama.cpp
+    runs-on: [self-hosted, linux, rocm, gfx1201]
+    timeout-minutes: 450
+    env:
+      HIP_ARCH: gfx1201
+      RUST_TEST_THREADS: "1"
+      AMDSMI_GPU_METRICS_CACHE_MS: "0"
+      SUPERSONIC_REQUIRE_GQH_ARTIFACTS: "1"
+      SUPERSONIC_R9700_GPU_ID: ${{ vars.SUPERSONIC_R9700_GPU_ID }}
+      SUPERSONIC_DEVICE: "0"
+      SUPERSONIC_GQH_GGUF: ${{ vars.SUPERSONIC_GQH_GGUF || '/home/deano/models/Qwen3.8-27B-GQH-Q3KXL.gguf' }}
+      SUPERSONIC_QWEN38_MODEL_DIR: ${{ vars.SUPERSONIC_QWEN38_MODEL_DIR || '/data/models/Qwen3.8-27B' }}
+      SUPERSONIC_LLAMA_CPP_REPO: ${{ vars.SUPERSONIC_LLAMA_CPP_REPO || '/home/deano/llama.cpp-gqh-qtypes' }}
+      SUPERSONIC_LLAMA_CPP_SERVER: ${{ vars.SUPERSONIC_LLAMA_CPP_SERVER || '/home/deano/llama.cpp-gqh-qtypes/build-hip/bin/llama-server' }}
+      SUPERSONIC_LLAMA_CPP_ARTIFACT: ${{ vars.SUPERSONIC_GQH_GGUF || '/home/deano/models/Qwen3.8-27B-GQH-Q3KXL.gguf' }}
+      SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ }}
+      SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ }}
+      SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ: ${{ vars.SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ }}
+      SUPERSONIC_BENCHMARK_POWER_CAP_WATTS: ${{ vars.SUPERSONIC_BENCHMARK_POWER_CAP_WATTS }}
+      SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL: ${{ vars.SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL }}
+      SUPERSONIC_BENCHMARK_TEMPERATURE_LIMIT_CELSIUS: ${{ vars.SUPERSONIC_BENCHMARK_TEMPERATURE_LIMIT_CELSIUS }}
+      BENCHMARK_OUTPUT_ROOT: target/benchmarks/scalar-qualification
+      BASELINE_BUNDLE: ${{ inputs.baseline_bundle }}
+      BASELINE_BUNDLE_SHA256: ${{ inputs.baseline_bundle_sha256 }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Verify host capacity, exact artifacts, peer pin, and baseline digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$BENCHMARK_OUTPUT_ROOT"
+          printf '%s\n' '{"status":"incomplete"}' > "$BENCHMARK_OUTPUT_ROOT/workflow-status.json"
+          command -v amd-smi
+          command -v rocm-smi
+          command -v hipcc
+          command -v cargo
+          command -v python3
+          available_kib="$(df --output=avail -k "$GITHUB_WORKSPACE" | tail -n 1)"
+          test "$available_kib" -ge 104857600
+          expected_sha="c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98"
+          test "$(basename "$SUPERSONIC_GQH_GGUF")" = "Qwen3.8-27B-GQH-Q3KXL.gguf"
+          test "$(stat -c %s "$SUPERSONIC_GQH_GGUF")" = "13440110432"
+          test "$(sha256sum "$SUPERSONIC_GQH_GGUF" | awk '{print $1}')" = "$expected_sha"
+          test "$(realpath "$SUPERSONIC_LLAMA_CPP_ARTIFACT")" = "$(realpath "$SUPERSONIC_GQH_GGUF")"
+          test "$(git -C "$SUPERSONIC_LLAMA_CPP_REPO" rev-parse HEAD)" = "f8dd7c36da283cf587cef3133b9287fd3a5b6fdb"
+          test -z "$(git -C "$SUPERSONIC_LLAMA_CPP_REPO" status --porcelain --untracked-files=no)"
+          expected_server="$SUPERSONIC_LLAMA_CPP_REPO/build-hip/bin/llama-server"
+          test "$(realpath "$SUPERSONIC_LLAMA_CPP_SERVER")" = "$(realpath "$expected_server")"
+          cmake --build "$SUPERSONIC_LLAMA_CPP_REPO/build-hip" --target llama-server --parallel
+          test "$("$SUPERSONIC_LLAMA_CPP_SERVER" --version 2>&1 | head -n 1)" = "version: 5 (f8dd7c3)"
+          sha256sum "$SUPERSONIC_LLAMA_CPP_SERVER" | tee "$BENCHMARK_OUTPUT_ROOT/llama-server.sha256"
+          test -d "$BASELINE_BUNDLE"
+          python3 - "$BASELINE_BUNDLE" "$BASELINE_BUNDLE_SHA256" <<'PY'
+          import sys
+          from tools.benchmark.qualification import directory_digest
+          observed = directory_digest(sys.argv[1])
+          if observed != sys.argv[2]:
+              raise SystemExit(f"baseline digest mismatch: {observed} != {sys.argv[2]}")
+          print(f"verified baseline bundle sha256={observed}")
+          PY
+          timeout --foreground 30s hipcc --version | tee "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt"
+
+      - name: Select the physical R9700 and capture immutable identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s amd-smi static --asic --bus --json | tee "$BENCHMARK_OUTPUT_ROOT/amd-smi-static.json"
+          timeout --foreground 30s amd-smi list -e --json | tee "$BENCHMARK_OUTPUT_ROOT/amd-smi-enumeration.json"
+          python3 tools/merge-amd-smi-provenance.py \
+            --asic-bus "$BENCHMARK_OUTPUT_ROOT/amd-smi-static.json" \
+            --enumeration "$BENCHMARK_OUTPUT_ROOT/amd-smi-enumeration.json" \
+            --output "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json"
+          selection="$(python3 tools/select-r9700-device.py --input "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" --override "${SUPERSONIC_R9700_GPU_ID:-}")"
+          while IFS='=' read -r name value; do
+            case "$name" in
+              SUPERSONIC_R9700_GPU_ID|SUPERSONIC_R9700_GPU_ARCH|SUPERSONIC_GPU_IDENTITY|SUPERSONIC_GPU_IDENTITY_KIND|SUPERSONIC_GPU_LOGICAL|HIP_VISIBLE_DEVICES|SUPERSONIC_DEVICE)
+                printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV" ;;
+              *) echo "unexpected selector output: $name" >&2; exit 1 ;;
+            esac
+          done <<< "$selection"
+          physical_gpu="$(awk -F= '$1=="SUPERSONIC_R9700_GPU_ID" {print $2}' <<< "$selection")"
+          SUPERSONIC_GPU_LOGICAL="$(awk -F= '$1=="SUPERSONIC_GPU_LOGICAL" {print $2}' <<< "$selection")"
+          [[ "$SUPERSONIC_GPU_LOGICAL" =~ ^[0-9]+$ ]]
+          timeout --foreground 30s rocm-smi -d "$physical_gpu" --showdriverversion | tee "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt"
+
+      - name: Verify locked policy and three consecutive idle samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ:?host operator must configure GPU clock}"
+          : "${SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ:?host operator must configure clock tolerance}"
+          : "${SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ:?host operator must configure memory clock}"
+          : "${SUPERSONIC_BENCHMARK_POWER_CAP_WATTS:?host operator must configure power cap}"
+          : "${SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL:?host operator must configure performance level}"
+          : "${SUPERSONIC_BENCHMARK_TEMPERATURE_LIMIT_CELSIUS:?host operator must configure temperature limit}"
+          physical_gpu="${SUPERSONIC_R9700_GPU_ID:?selection missing}"
+          idle=0
+          deadline=$(( $(date +%s) + 900 ))
+          while (( idle < 3 )); do
+            (( $(date +%s) < deadline )) || { echo "timed out waiting for GPU idle" >&2; exit 1; }
+            probe="$BENCHMARK_OUTPUT_ROOT/idle-$(date +%s).txt"
+            timeout --foreground 30s rocm-smi -d "$physical_gpu" --showuse --showmemuse --showtemp | tee "$probe"
+            values="$(python3 tools/parse-rocm-smi.py --input "$probe")"
+            gpu="$(sed -n 's/.*gpu_use_percent=\([^ ]*\).*/\1/p' <<< "$values")"
+            vram="$(sed -n 's/.*vram_use_percent=\([^ ]*\).*/\1/p' <<< "$values")"
+            if awk -v g="$gpu" -v v="$vram" 'BEGIN {exit !(g <= 10 && v <= 20)}'; then idle=$((idle + 1)); else idle=0; fi
+            (( idle >= 3 )) || sleep 15
+          done
+          AMDSMI_GPU_METRICS_CACHE_MS=0 timeout --foreground 30s amd-smi metric --gpu "$physical_gpu" --json \
+            | tee "$BENCHMARK_OUTPUT_ROOT/amd-smi-metric-before.json"
+          timeout --foreground 30s rocm-smi -d "$physical_gpu" --showallinfo | tee "$BENCHMARK_OUTPUT_ROOT/rocm-smi-clock-before.txt"
+
+      - name: Build both SuperSonic controls and audit the scalar code object
+        shell: bash
+        run: |
+          set -euo pipefail
+          HIP_ARCH=gfx1201 cargo build --release -p runner --bin supersonic
+          HIP_ARCH=gfx1201 cargo build --release -p supersonic-runtime --features scalar-head-lab --example scalar_head_lab
+          object="$(find target/release/build -path '*/out/qwen35_4b_megakernel_hip.o' -printf '%T@ %p\n' | sort -n | tail -n 1 | cut -d' ' -f2-)"
+          test -n "$object"
+          PATH="/opt/rocm/llvm/bin:$PATH" python3 tools/check-scalar-head-code-object.py \
+            --object "$object" --symbol supersonic_qwen38_q6_k_scalar_head_f32_kernel \
+            | tee "$BENCHMARK_OUTPUT_ROOT/scalar-instruction-audit.json"
+          python3 - "$BENCHMARK_OUTPUT_ROOT/scalar-instruction-audit.json" >> "$GITHUB_ENV" <<'PY'
+          import json, sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          print("SCALAR_INSTRUCTION_SHA256=" + value["instruction_stream_sha256"])
+          PY
+
+      - name: Run six-hour balanced three-engine candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The percent regression limit is fixed at 5%; qualification below enforces it.
+          run_id="scalar-qualification-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '%s\n' "$run_id" > "$BENCHMARK_OUTPUT_ROOT/run-id.txt"
+          export PATH="$(dirname "$SUPERSONIC_LLAMA_CPP_SERVER"):$PATH"
+          AMDSMI_GPU_METRICS_CACHE_MS=0 RUST_TEST_THREADS=1 timeout --foreground 21660s \
+            python3 tools/supersonic-bench.py run \
+            --suite full-scalar-qualification \
+            --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
+            --artifact "$SUPERSONIC_GQH_GGUF" --peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT" \
+            --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 --artifact-quantization GQH-Q3KXL \
+            --artifact-source-repository Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF \
+            --artifact-source-revision 91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4 \
+            --artifact-filename Qwen3.8-27B-GQH-Q3KXL.gguf --artifact-size-bytes 13440110432 \
+            --peer-artifact-source-repository Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF \
+            --peer-artifact-source-revision 91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4 \
+            --peer-artifact-filename Qwen3.8-27B-GQH-Q3KXL.gguf --peer-artifact-size-bytes 13440110432 \
+            --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
+            --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
+            --physical-gpu "$SUPERSONIC_R9700_GPU_ID" --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
+            --gpu-static-json "$BENCHMARK_OUTPUT_ROOT/amd-smi-provenance.json" \
+            --rocm-version-file "$BENCHMARK_OUTPUT_ROOT/rocm-driver-version.txt" \
+            --hip-version-file "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt" \
+            --gpu-arch "$SUPERSONIC_R9700_GPU_ARCH" --device "$SUPERSONIC_DEVICE" --chat \
+            --clock-policy locked --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+            --gpu-clock-tolerance-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ" \
+            --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
+            --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
+            --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
+            --temperature-limit-celsius "$SUPERSONIC_BENCHMARK_TEMPERATURE_LIMIT_CELSIUS" \
+            --seed 1 --run-id "$run_id" --output "$BENCHMARK_OUTPUT_ROOT/candidate" \
+            2>&1 | tee "$BENCHMARK_OUTPUT_ROOT/harness.log"
+
+      - name: Apply immutable scalar baseline gate and render candidate preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id="$(cat "$BENCHMARK_OUTPUT_ROOT/run-id.txt")"
+          bundle="$BENCHMARK_OUTPUT_ROOT/candidate/$run_id"
+          record="$bundle/records/scalar-qualification-short-cold-ordinary-supersonic-scalar-lab.json"
+          python3 tools/supersonic-bench.py scalar-series --record "$record" \
+            --compiler-version-file "$BENCHMARK_OUTPUT_ROOT/hipcc-version.txt" \
+            --scalar-instruction-sha256 "$SCALAR_INSTRUCTION_SHA256" \
+            --output "$bundle/candidate-scalar-v1.json"
+          python3 tools/supersonic-bench.py qualify \
+            --baseline-bundle "$BASELINE_BUNDLE" \
+            --baseline-bundle-sha256 "$BASELINE_BUNDLE_SHA256" \
+            --candidate-series "$bundle/candidate-scalar-v1.json" \
+            --output "$bundle/qualification-v1.json"
+          python3 tools/supersonic-bench.py validate --publishable "$bundle" \
+            --baseline-bundle "$BASELINE_BUNDLE" \
+            --baseline-bundle-sha256 "$BASELINE_BUNDLE_SHA256"
+          python3 tools/supersonic-bench.py render "$bundle" "$BENCHMARK_OUTPUT_ROOT/pages"
+          printf '%s\n' '{"status":"complete"}' > "$BENCHMARK_OUTPUT_ROOT/workflow-status.json"
+
+      - name: Upload complete or partial candidate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scalar-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/benchmarks/scalar-qualification
+          if-no-files-found: warn

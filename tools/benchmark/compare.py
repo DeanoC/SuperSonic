@@ -38,6 +38,7 @@ COMPARABILITY_FIELDS = (
     "environment.requested.clock_tolerance_mhz",
     "environment.requested.memory_clock_mhz",
     "environment.requested.power_cap_watts",
+    "environment.requested.temperature_limit_celsius",
     "environment.requested.performance_level",
     "environment.process_reuse",
 )

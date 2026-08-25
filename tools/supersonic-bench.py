@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.benchmark import adapters, compare, manifest, render, repeatability, validation  # noqa: E402
+from tools.benchmark import adapters, compare, manifest, qualification, render, repeatability, validation  # noqa: E402
 from tools.benchmark.execution import RunConfig, run_suite  # noqa: E402
 from tools.benchmark.model import PerformanceCase  # noqa: E402
 
@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="preflight and execute a benchmark suite")
     run.add_argument(
         "--suite",
-        choices=("quick", "full", "full-scalar-qualification"),
+        choices=("quick", "full", "full-scalar-qualification", "scalar-baseline"),
         required=True,
     )
     run.add_argument("--model-dir", type=Path, required=True)
@@ -78,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--memory-clock-mhz", type=int)
     run.add_argument("--power-cap-watts", type=int)
     run.add_argument("--performance-level")
+    run.add_argument("--temperature-limit-celsius", type=float)
     run.add_argument("--output", type=Path, default=Path("target/benchmarks/candidate"))
     run.add_argument("--seed", type=int)
     run.add_argument("--run-id")
@@ -85,6 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate", help="validate candidate or committed records")
     validate_parser.add_argument("path", type=Path)
     validate_parser.add_argument("--publishable", action="store_true")
+    validate_parser.add_argument("--baseline-bundle", type=Path)
+    validate_parser.add_argument("--baseline-bundle-sha256")
 
     compare_parser = subparsers.add_parser("compare", help="compare two validated records or bundles")
     compare_parser.add_argument("left", type=Path)
@@ -99,6 +102,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("benchmarks/results"),
         help="directory or record file containing publishable results",
     )
+
+    series = subparsers.add_parser("scalar-series", help="derive a locked seven-sample scalar series")
+    series.add_argument("--record", type=Path, required=True)
+    series.add_argument("--compiler-version-file", type=Path, required=True)
+    series.add_argument("--scalar-instruction-sha256", required=True)
+    series.add_argument("--output", type=Path, required=True)
+
+    qualify = subparsers.add_parser("qualify", help="apply the immutable scalar baseline gate")
+    qualify.add_argument("--baseline-bundle", type=Path, required=True)
+    qualify.add_argument("--baseline-bundle-sha256", required=True)
+    qualify.add_argument("--candidate-series", type=Path, required=True)
+    qualify.add_argument("--output", type=Path, required=True)
     render_parser.add_argument(
         "output_root",
         nargs="?",
@@ -146,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
             return _compare(args)
         if args.command == "render":
             return _render(args)
+        if args.command == "scalar-series":
+            return _scalar_series(args)
+        if args.command == "qualify":
+            return _qualify(args)
         if args.command == "repeatability":
             return _repeatability(args)
     except (OSError, ValueError, TypeError) as exc:
@@ -170,6 +189,7 @@ def _run(args: argparse.Namespace) -> int:
             "memory_clock_mhz": args.memory_clock_mhz,
             "power_cap_watts": args.power_cap_watts,
             "performance_level": args.performance_level,
+            "temperature_limit_celsius": args.temperature_limit_celsius,
         }
     config = RunConfig(
         suite=args.suite,
@@ -218,6 +238,35 @@ def _run(args: argparse.Namespace) -> int:
 
 def _validate(args: argparse.Namespace) -> int:
     paths = validation.validate_bundle(args.path, require_complete=args.publishable)
+    suites = {
+        str(validation._load_json(path)["run"]["suite"])
+        for path in paths
+    }
+    if args.publishable and "full-scalar-qualification" in suites:
+        if args.baseline_bundle is None or args.baseline_bundle_sha256 is None:
+            raise ValueError(
+                "publishable scalar qualification validation requires --baseline-bundle and "
+                "--baseline-bundle-sha256"
+            )
+        root = args.path if args.path.is_dir() else args.path.parent
+        observed_digest = qualification.directory_digest(args.baseline_bundle)
+        if observed_digest != args.baseline_bundle_sha256:
+            raise ValueError(
+                f"baseline bundle digest mismatch: observed {observed_digest}, "
+                f"expected {args.baseline_bundle_sha256}"
+            )
+        baseline = qualification.load_series(args.baseline_bundle)
+        candidate = qualification.load_series(root / "candidate-scalar-v1.json")
+        expected = qualification.qualify_series(
+            baseline,
+            candidate,
+            baseline_bundle_sha256=observed_digest,
+        )
+        stored = validation._load_json(root / "qualification-v1.json")
+        if stored != expected:
+            raise ValueError("qualification-v1.json does not match the pinned baseline and candidate")
+        if expected["qualified"] is not True:
+            raise ValueError("scalar candidate failed the immutable baseline gate")
     print(json.dumps({"valid": True, "publishable": bool(args.publishable), "records": [str(path) for path in paths]}, sort_keys=True))
     return 0
 
@@ -264,6 +313,46 @@ def _render(args: argparse.Namespace) -> int:
     }
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+def _scalar_series(args: argparse.Namespace) -> int:
+    record = qualification.validation._load_json(args.record)
+    compiler_version = args.compiler_version_file.read_text(encoding="utf-8").strip()
+    if not compiler_version or len(compiler_version) > 4096:
+        raise ValueError("compiler version capture must be non-empty and bounded")
+    value = qualification.series_from_record(
+        record,
+        compiler_version=compiler_version,
+        scalar_instruction_sha256=args.scalar_instruction_sha256,
+    )
+    _write_json(args.output, value)
+    print(json.dumps({"series": str(args.output)}, sort_keys=True))
+    return 0
+
+
+def _qualify(args: argparse.Namespace) -> int:
+    observed_digest = qualification.directory_digest(args.baseline_bundle)
+    if observed_digest != args.baseline_bundle_sha256:
+        raise ValueError(
+            f"baseline bundle digest mismatch: observed {observed_digest}, expected {args.baseline_bundle_sha256}"
+        )
+    baseline = qualification.load_series(args.baseline_bundle)
+    candidate = qualification.load_series(args.candidate_series)
+    result = qualification.qualify_series(
+        baseline,
+        candidate,
+        baseline_bundle_sha256=observed_digest,
+    )
+    _write_json(args.output, result)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["qualified"] else 1
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def _repeatability(args: argparse.Namespace) -> int:

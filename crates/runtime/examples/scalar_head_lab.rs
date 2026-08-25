@@ -85,6 +85,8 @@ fn main() -> Result<()> {
     let eos_ids = eos_ids(&config, &tokenizer, args.chat);
     let started = Instant::now();
     let mut generated = Vec::with_capacity(args.max_new_tokens);
+    let mut lm_head_ms = 0.0;
+    let mut timed_decode_steps = 0usize;
     if args.mode == "mtp" {
         let mut pos = prompt_ids.len();
         while generated.len() < args.max_new_tokens {
@@ -93,6 +95,8 @@ fn main() -> Result<()> {
             }
             let remaining = args.max_new_tokens - generated.len();
             let round = engine.run_mtp_spec_round(next_token, pos, remaining)?;
+            lm_head_ms += round.scalar_lm_head_ms;
+            timed_decode_steps += round.scalar_timed_decode_steps;
             for token in round.emitted {
                 generated.push(token);
                 pos += 1;
@@ -119,12 +123,16 @@ fn main() -> Result<()> {
             if generated.len() == args.max_new_tokens {
                 break;
             }
-            (next_token, _) =
+            let (sampled, timings) =
                 engine.decode_step_hip_fast_greedy(next_token, prompt_ids.len() + step)?;
+            next_token = sampled;
+            lm_head_ms += timings.lm_head_ms;
+            timed_decode_steps += 1;
         }
     }
     let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
     anyhow::ensure!(!generated.is_empty(), "scalar lab generated no tokens");
+    anyhow::ensure!(timed_decode_steps > 0, "scalar lab timed no decode steps");
     let generated_text = tokenizer
         .decode(&generated, true)
         .map_err(|e| anyhow::anyhow!("decoding scalar lab output: {e}"))?;
@@ -136,9 +144,11 @@ fn main() -> Result<()> {
         "engine_version": ENGINE_VERSION,
         "generated_text": generated_text,
         "generated_tokens": generated.len(),
+        "lm_head_ms": lm_head_ms,
         "ms_per_tok": ms_per_tok,
         "prompt_tokens": prompt_ids.len(),
         "token_ids": generated,
+        "timed_decode_steps": timed_decode_steps,
         "tokens_per_second": tokens_per_second,
     });
     println!("[supersonic_json] {}", serde_json::to_string(&payload)?);

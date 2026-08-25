@@ -67,7 +67,8 @@
       "clock_tolerance_mhz": 20,
       "memory_clock_mhz": 1249,
       "power_cap_watts": 295,
-      "performance_level": "manual"
+      "performance_level": "manual",
+      "temperature_limit_celsius": 85.0
     },
     "requested_at": "2026-08-24T12:00:00Z",
     "observed_before": {
@@ -111,7 +112,8 @@
         "performance_level": "manual",
         "throttle_status": null,
         "indep_throttle_status": 7,
-        "throttle_label": "THROTTLED"
+        "throttle_label": "THROTTLED",
+        "raw_amd_smi_json": null
       }
     ],
     "headline_eligible": true,

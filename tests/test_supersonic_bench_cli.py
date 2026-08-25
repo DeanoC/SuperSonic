@@ -47,6 +47,21 @@ class BenchmarkCliTests(unittest.TestCase):
         self.assertEqual(args.results_root, Path("benchmarks/results"))
         self.assertEqual(args.output_root, Path("target/site"))
 
+    def test_scalar_qualification_cli_requires_explicit_immutable_baseline(self):
+        cli = load_cli_module()
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "qualify",
+                "--baseline-bundle", "/baseline/run-1",
+                "--baseline-bundle-sha256", "a" * 64,
+                "--candidate-series", "/candidate/series.json",
+                "--output", "/candidate/qualification-v1.json",
+            ]
+        )
+        self.assertEqual(args.baseline_bundle, Path("/baseline/run-1"))
+        self.assertEqual(args.baseline_bundle_sha256, "a" * 64)
+
     def test_public_cli_does_not_add_runner_execution_flags(self):
         cli = load_cli_module()
         parser = cli.build_parser()

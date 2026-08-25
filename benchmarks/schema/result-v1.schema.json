@@ -342,7 +342,8 @@
             "clock_tolerance_mhz",
             "memory_clock_mhz",
             "power_cap_watts",
-            "performance_level"
+            "performance_level",
+            "temperature_limit_celsius"
           ],
           "properties": {
             "gpu_clock_mhz": {
@@ -376,6 +377,12 @@
             "performance_level": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "temperature_limit_celsius": {
+              "type": [
+                "number",
                 "null"
               ]
             }
@@ -566,7 +573,8 @@
               "performance_level",
               "throttle_status",
               "indep_throttle_status",
-              "throttle_label"
+              "throttle_label",
+              "raw_amd_smi_json"
             ],
             "properties": {
               "offset_seconds": {
@@ -636,6 +644,9 @@
                 "minimum": 0
               },
               "throttle_label": {
+                "type": ["string", "null"]
+              },
+              "raw_amd_smi_json": {
                 "type": ["string", "null"]
               }
             },
@@ -758,6 +769,34 @@
         "properties": {
           "decode_ms": {
             "type": "number",
+            "minimum": 0
+          },
+          "lm_head_ms": {
+            "type": "number",
+            "minimum": 0
+          },
+          "timed_decode_steps": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "telemetry_start_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "telemetry_sample_count": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "loaded_clock_minimum_mhz": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "loaded_clock_median_mhz": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "loaded_clock_maximum_mhz": {
+            "type": "integer",
             "minimum": 0
           },
           "tokens_per_second": {

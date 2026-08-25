@@ -36,8 +36,9 @@ EXPECTED_BUDGETS = {
     "quick": 600,
     "full": 21600,
     "full-scalar-qualification": 21600,
+    "scalar-baseline": 1200,
 }
-SCALAR_QUALIFICATION_SUITE = "full-scalar-qualification"
+SCALAR_QUALIFICATION_SUITES = frozenset(("full-scalar-qualification", "scalar-baseline"))
 APPROVED_ARTIFACT = {
     "semantic_id": "qwen3.8-27b-gqh-q3kxl-hf-91bc7e33",
     "quantization": "GQH-Q3KXL",
@@ -149,6 +150,7 @@ class BundleStatus:
     quality_failed: bool = False
     performance_report_only: bool = True
     elapsed_seconds: float = 0.0
+    performance_elapsed_seconds: float = 0.0
     completed_rounds: int = 0
 
 
@@ -199,6 +201,10 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
     if expected_budget is not None and suite.budget_seconds != expected_budget:
         raise ValueError(f"suite {suite.name} budget must be exactly {expected_budget} seconds")
     _validate_active_cases(suite)
+    if suite.name in SCALAR_QUALIFICATION_SUITES:
+        configured_environment = resolved.environment or os.environ
+        if configured_environment.get("AMDSMI_GPU_METRICS_CACHE_MS") != "0":
+            raise ValueError("scalar qualification requires AMDSMI_GPU_METRICS_CACHE_MS=0")
 
     model_dir = _required_path(resolved.model_dir, "model_dir", directory=True)
     _validate_model_files(model_dir, chat=bool(resolved.chat))
@@ -235,6 +241,16 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
     clock_policy_name = _clock_policy_name(resolved.clock_policy)
     if clock_policy_name == "locked":
         _validate_locked_policy(resolved.clock_policy)
+        if suite.name in SCALAR_QUALIFICATION_SUITES:
+            requested_policy = _policy_mapping(resolved.clock_policy)
+            scalar_required = (
+                "clock_tolerance_mhz", "performance_level", "temperature_limit_celsius"
+            )
+            scalar_missing = [key for key in scalar_required if requested_policy.get(key) in (None, "")]
+            if scalar_missing:
+                raise ValueError(
+                    "scalar qualification locked policy requires requested " + ", ".join(scalar_missing)
+                )
     if resolved.environment_snapshot is not None:
         snapshot_policy = _snapshot_policy_name(resolved.environment_snapshot)
         if snapshot_policy != clock_policy_name:
@@ -374,6 +390,7 @@ def run_suite(
         _append_error(errors, "quality_failed")
 
     scheduled = ordered_cases(run_manifest)
+    performance_started = clock()
     expected_count = len(scheduled)
     completed_rounds = 0
     if run_manifest.suite.minimum_duration_seconds > 0 and not interrupted:
@@ -381,7 +398,7 @@ def run_suite(
             run_manifest,
             scheduled,
             deadline=deadline,
-            minimum_deadline=started + run_manifest.suite.minimum_duration_seconds,
+            minimum_deadline=performance_started + run_manifest.suite.minimum_duration_seconds,
             clock=clock,
             command_runner=runner,
             quality_summaries=quality_summaries,
@@ -445,9 +462,10 @@ def run_suite(
                 break
 
     elapsed_seconds = max(0.0, float(clock()) - float(started))
+    performance_elapsed_seconds = max(0.0, float(clock()) - float(performance_started))
     duration_complete = (
         run_manifest.suite.minimum_duration_seconds == 0
-        or elapsed_seconds >= run_manifest.suite.minimum_duration_seconds
+        or performance_elapsed_seconds >= run_manifest.suite.minimum_duration_seconds
     )
     completed = len(records) == expected_count and duration_complete and not interrupted and not any(
         error in {"budget_exhausted", "case_timeout", "process_failed", "invalid_output", "interrupted"}
@@ -472,6 +490,7 @@ def run_suite(
         quality_failed=quality_failed,
         performance_report_only=True,
         elapsed_seconds=elapsed_seconds,
+        performance_elapsed_seconds=performance_elapsed_seconds,
         completed_rounds=completed_rounds,
     )
     _update_bundle_manifest(run_manifest, status)
@@ -576,6 +595,10 @@ def _merge_duration_record(
         return merged
 
     previous = json.loads(canonical_json(dict(existing)))
+    telemetry_index_offset = len(previous["environment"]["telemetry_samples"])
+    for timing_sample in merged["samples"]:
+        if "telemetry_start_index" in timing_sample:
+            timing_sample["telemetry_start_index"] += telemetry_index_offset
     previous["samples"].extend(merged["samples"])
     previous_env = previous["environment"]
     current_env = merged["environment"]
@@ -648,6 +671,7 @@ def _run_process_with_telemetry(
     sample_interval_seconds: float = 0.25,
     cwd: str | Path | None = None,
     env: Mapping[str, str] | None = None,
+    monitor_host: bool = False,
 ) -> tuple[ProcessResult, tuple[environment.TelemetrySample, ...], tuple[str, ...]]:
     vector = tuple(str(item) for item in argv)
     if not math.isfinite(float(timeout)) or float(timeout) <= 0.0:
@@ -655,6 +679,12 @@ def _run_process_with_telemetry(
     if not math.isfinite(float(sample_interval_seconds)) or float(sample_interval_seconds) <= 0.0:
         raise ValueError("telemetry sample interval must be positive")
     active_probe_runner = probe_runner or _default_environment_probe_runner
+    process_environment = dict(env) if env is not None else dict(os.environ)
+    if monitor_host:
+        if process_environment.get("HIP_VISIBLE_DEVICES") != str(physical_gpu):
+            raise _CaseError("environment_failed", "HIP_VISIBLE_DEVICES changed from the selected physical GPU")
+        if process_environment.get("SUPERSONIC_DEVICE") != "0":
+            raise _CaseError("environment_failed", "SUPERSONIC_DEVICE must remain logical device zero")
     command = environment.build_probe_command(str(physical_gpu))
     amd_metric_command = environment.build_amd_metric_command(str(physical_gpu))
     started = time.monotonic()
@@ -665,13 +695,14 @@ def _run_process_with_telemetry(
         vector,
         shell=False,
         cwd=str(cwd) if cwd is not None else None,
-        env=dict(env) if env is not None else None,
+        env=process_environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
     )
     try:
+        last_host_monitor = float("-inf")
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
@@ -704,9 +735,14 @@ def _run_process_with_telemetry(
                 )
             except subprocess.TimeoutExpired:
                 try:
+                    now = time.monotonic()
+                    if monitor_host and now - last_host_monitor >= 5.0:
+                        _verify_host_monitor(process, physical_gpu=physical_gpu, cwd=cwd)
+                        last_host_monitor = now
                     static = environment.parse_showallinfo(active_probe_runner(command), notes)
+                    raw_amd_smi_json = active_probe_runner(amd_metric_command)
                     live = environment.parse_amd_smi_metric(
-                        active_probe_runner(amd_metric_command),
+                        raw_amd_smi_json,
                         physical_gpu=str(physical_gpu),
                     )
                     observed = environment.merge_telemetry(static, live)
@@ -724,10 +760,14 @@ def _run_process_with_telemetry(
                             throttle_status=observed.throttle_status,
                             indep_throttle_status=observed.indep_throttle_status,
                             throttle_label=observed.throttle_label,
+                            raw_amd_smi_json=raw_amd_smi_json,
                         )
                     )
+                except _CaseError:
+                    raise
                 except (OSError, RuntimeError, ValueError) as exc:
-                    notes.append(f"live telemetry probe failed: {exc}")
+                    _kill_process_session(process)
+                    raise _CaseError("environment_failed", f"live telemetry probe failed: {exc}") from exc
     except BaseException:
         _kill_process_session(process)
         process.communicate()
@@ -741,6 +781,76 @@ def _kill_process_session(process: subprocess.Popen[str]) -> None:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+
+def _verify_host_monitor(
+    process: subprocess.Popen[str],
+    *,
+    physical_gpu: str,
+    cwd: str | Path | None,
+) -> None:
+    free_bytes = shutil.disk_usage(str(cwd) if cwd is not None else os.getcwd()).free
+    if free_bytes < 20 * 1024**3:
+        _kill_process_session(process)
+        raise _CaseError("environment_failed", "benchmark disk free space fell below 20 GiB")
+    try:
+        raw = _default_environment_probe_runner(
+            ("timeout", "--foreground", "30s", "amd-smi", "process", "-G", "-g", str(physical_gpu), "--json")
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        _kill_process_session(process)
+        raise _CaseError("environment_failed", f"AMD SMI process monitor failed: {exc}") from exc
+    try:
+        starts = [index for index in (raw.find("["), raw.find("{")) if index >= 0]
+        if not starts:
+            raise json.JSONDecodeError("missing JSON payload", raw, 0)
+        payload, _ = json.JSONDecoder().raw_decode(raw[min(starts):])
+    except json.JSONDecodeError as exc:
+        _kill_process_session(process)
+        raise _CaseError("environment_failed", "AMD SMI process monitor returned invalid JSON") from exc
+    observed_pids = _collect_process_pids(payload)
+    allowed_pids = _process_family_pids(process.pid)
+    competitors = sorted(observed_pids - allowed_pids)
+    if competitors:
+        _kill_process_session(process)
+        raise _CaseError(
+            "environment_failed",
+            "competing GPU process detected: " + ", ".join(str(pid) for pid in competitors),
+        )
+
+
+def _collect_process_pids(value: object) -> set[int]:
+    found: set[int] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key.lower() == "pid" and isinstance(item, int) and not isinstance(item, bool):
+                found.add(item)
+            else:
+                found.update(_collect_process_pids(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(_collect_process_pids(item))
+    return found
+
+
+def _process_family_pids(root_pid: int) -> set[int]:
+    family = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for status_path in Path("/proc").glob("[0-9]*/status"):
+            try:
+                fields = dict(
+                    line.split(":", 1) for line in status_path.read_text(encoding="utf-8").splitlines() if ":" in line
+                )
+                pid = int(status_path.parent.name)
+                parent = int(fields.get("PPid", "-1").strip())
+            except (OSError, ValueError):
+                continue
+            if parent in family and pid not in family:
+                family.add(pid)
+                changed = True
+    return family
 
 
 class _CaseError(RuntimeError):
@@ -809,6 +919,7 @@ def _execute_case(
     telemetry_samples: list[environment.TelemetrySample] = []
     telemetry_notes: list[str] = []
     telemetry_elapsed = 0.0
+    measured_telemetry: list[tuple[int, int, dict[str, int]]] = []
     probe_runner = run_manifest.config.environment_command_runner or _default_environment_probe_runner
     if live_telemetry:
         telemetry_before_at = _utc_timestamp()
@@ -830,12 +941,14 @@ def _execute_case(
                 cap=float(case.timeout_seconds),
             )
         if live_telemetry:
+            telemetry_start_index = len(telemetry_samples)
             result, invocation_telemetry, invocation_notes = _run_process_with_telemetry(
                 argv,
                 timeout=active_timeout,
                 physical_gpu=str(run_manifest.config.physical_gpu),
                 probe_runner=probe_runner,
                 env=_process_environment(run_manifest.config),
+                monitor_host=run_manifest.config.environment_command_runner is None,
             )
             telemetry_samples.extend(
                 replace(sample, offset_seconds=telemetry_elapsed + sample.offset_seconds)
@@ -843,6 +956,21 @@ def _execute_case(
             )
             telemetry_elapsed += result.duration_seconds
             telemetry_notes.extend(invocation_notes)
+            if measured:
+                invocation_errors = _verify_invocation_telemetry(
+                    invocation_telemetry,
+                    run_manifest.config.clock_policy,
+                    duration_seconds=result.duration_seconds,
+                )
+                if invocation_errors:
+                    raise _CaseError("environment_failed", "; ".join(invocation_errors))
+                measured_telemetry.append(
+                    (
+                        telemetry_start_index,
+                        len(invocation_telemetry),
+                        environment.loaded_clock_summary(invocation_telemetry),
+                    )
+                )
         else:
             result = _invoke_process(
                 command_runner,
@@ -881,7 +1009,11 @@ def _execute_case(
             observed_after=telemetry_after,
             observed_after_at=_utc_timestamp(),
             environment_map=run_manifest.config.environment or os.environ,
-            cache_evidence={"process_state": "fresh-process", "process_reuse": False},
+            cache_evidence={
+                "process_state": "fresh-process",
+                "process_reuse": False,
+                "filesystem_flush": "unavailable",
+            },
             cpu_governor_reader=run_manifest.config.cpu_governor_reader,
             evidence_notes=tuple(telemetry_notes),
         )
@@ -893,6 +1025,7 @@ def _execute_case(
         samples=parsed_samples,
         quality_summary=quality_summary,
         environment_snapshot=case_snapshot,
+        measured_telemetry=tuple(measured_telemetry),
     )
     if not promote:
         return record
@@ -900,6 +1033,45 @@ def _execute_case(
     target = run_manifest.bundle / "records" / filename
     _atomic_promote_record(record, target)
     return target
+
+
+def _verify_invocation_telemetry(
+    samples: Sequence[environment.TelemetrySample],
+    clock_policy: object,
+    *,
+    duration_seconds: float,
+) -> tuple[str, ...]:
+    if not samples:
+        return ("measured invocation has no telemetry samples",)
+    if any(not sample.raw_amd_smi_json for sample in samples):
+        return ("measured invocation is missing raw AMD SMI JSON",)
+    offsets = [float(sample.offset_seconds) for sample in samples]
+    if offsets[0] > 2.0 or float(duration_seconds) - offsets[-1] > 2.0:
+        return ("measured invocation telemetry does not cover both process edges",)
+    if any(right - left > 2.0 for left, right in zip(offsets, offsets[1:])):
+        return ("measured invocation telemetry contains a gap greater than 2 seconds",)
+    observed = [
+        environment.ObservedTelemetry(
+            gpu_clock_mhz=sample.gpu_clock_mhz,
+            memory_clock_mhz=sample.memory_clock_mhz,
+            power_cap_watts=sample.power_cap_watts,
+            power_watts=sample.power_watts,
+            temperature_celsius=sample.temperature_celsius,
+            gpu_utilization_percent=sample.gpu_utilization_percent,
+            memory_utilization_percent=sample.memory_utilization_percent,
+            performance_level=sample.performance_level,
+            throttle_status=sample.throttle_status,
+            indep_throttle_status=sample.indep_throttle_status,
+            throttle_label=sample.throttle_label,
+        )
+        for sample in samples
+    ]
+    return environment.verify_clock_policy(
+        observed[0],
+        observed[1:-1],
+        observed[-1],
+        clock_policy,
+    )
 
 
 def _run_quality(
@@ -1215,6 +1387,7 @@ def _build_record(
     samples: Sequence[adapters.ParsedOutput],
     quality_summary: Mapping[str, object],
     environment_snapshot: environment.EnvironmentSnapshot | Mapping[str, object] | None = None,
+    measured_telemetry: Sequence[tuple[int, int, Mapping[str, int]]] = (),
 ) -> dict[str, object]:
     config = run_manifest.config
     snapshot = _environment_record(config, case, environment_snapshot=environment_snapshot)
@@ -1263,8 +1436,27 @@ def _build_record(
             {
                 "decode_ms": float(sample.decode_ms),
                 "tokens_per_second": float(sample.tokens_per_second),
+                **(
+                    {
+                        "lm_head_ms": float(sample.lm_head_ms),
+                        "timed_decode_steps": int(sample.timed_decode_steps),
+                    }
+                    if sample.lm_head_ms is not None and sample.timed_decode_steps is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "telemetry_start_index": int(measured_telemetry[index][0]),
+                        "telemetry_sample_count": int(measured_telemetry[index][1]),
+                        "loaded_clock_minimum_mhz": int(measured_telemetry[index][2]["minimum_mhz"]),
+                        "loaded_clock_median_mhz": int(measured_telemetry[index][2]["median_mhz"]),
+                        "loaded_clock_maximum_mhz": int(measured_telemetry[index][2]["maximum_mhz"]),
+                    }
+                    if len(measured_telemetry) == len(samples)
+                    else {}
+                ),
             }
-            for sample in samples
+            for index, sample in enumerate(samples)
         ],
         "quality": json.loads(canonical_json(dict(quality_summary))),
         "status": {"state": "complete"},
@@ -1301,6 +1493,7 @@ def _environment_record(
         sample = {
             "offset_seconds": 0.0,
             **observed,
+            "raw_amd_smi_json": None,
         }
         evidence = (
             {"process_state": "fresh-process", "process_reuse": False}
@@ -1317,6 +1510,9 @@ def _environment_record(
                 "memory_clock_mhz": _optional_policy_int(requested.get("memory_clock_mhz")),
                 "power_cap_watts": _optional_policy_int(requested.get("power_cap_watts")),
                 "performance_level": _optional_policy_text(requested.get("performance_level")),
+                "temperature_limit_celsius": _optional_policy_float(
+                    requested.get("temperature_limit_celsius")
+                ),
             },
             "requested_at": _utc_timestamp(),
             "observed_before": dict(observed),
@@ -1354,6 +1550,7 @@ def _environment_record(
             if isinstance(sample, dict):
                 for key, default in diagnostic_defaults.items():
                     sample.setdefault(key, default)
+                sample.setdefault("raw_amd_smi_json", None)
     value["cache_state"] = case.cache_state
     value["rocm_version"] = rocm_version
     value["hip_version"] = hip_version
@@ -1462,7 +1659,7 @@ def _persist_bundle_manifest(
             digest = _digest_file(resolved_path)
             artifact_digests[resolved_path] = digest
         if (
-            run_manifest.suite.name == SCALAR_QUALIFICATION_SUITE
+            run_manifest.suite.name in SCALAR_QUALIFICATION_SUITES
             and digest != APPROVED_ARTIFACT["sha256"]
         ):
             raise ValueError("scalar qualification artifact SHA-256 does not match approved artifact")
@@ -1548,6 +1745,7 @@ def _update_bundle_manifest(run_manifest: RunManifest, status: BundleStatus) -> 
         "quality_failed": status.quality_failed,
         "performance_report_only": status.performance_report_only,
         "elapsed_seconds": status.elapsed_seconds,
+        "performance_elapsed_seconds": status.performance_elapsed_seconds,
         "completed_rounds": status.completed_rounds,
     }
     # Do not return a status until this atomic write/fsync/replace has
@@ -2226,7 +2424,7 @@ def _validate_qualification_artifact_metadata(
     suite: SuiteManifest,
     artifact: Path,
 ) -> None:
-    if suite.name != SCALAR_QUALIFICATION_SUITE:
+    if suite.name not in SCALAR_QUALIFICATION_SUITES:
         return
     primary = _artifact_source_identity(config, artifact, peer=False)
     expected = APPROVED_ARTIFACT
@@ -2248,7 +2446,9 @@ def _validate_qualification_artifact_metadata(
                 f"scalar qualification artifact {field} mismatch: "
                 f"observed {checks[field]!r}, expected {expected[field]!r}"
             )
-    if config.peer_artifact is None or Path(config.peer_artifact).resolve() != artifact.resolve():
+    if suite.name == "full-scalar-qualification" and (
+        config.peer_artifact is None or Path(config.peer_artifact).resolve() != artifact.resolve()
+    ):
         raise ValueError("scalar qualification requires all engines to use the same artifact file")
 
 
@@ -2339,6 +2539,14 @@ def _optional_policy_text(value: object) -> str | None:
     if value in (None, ""):
         return None
     return str(value)
+
+
+def _optional_policy_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError("clock policy numeric value must be finite")
+    return float(value)
 
 
 def _utc_timestamp() -> str:

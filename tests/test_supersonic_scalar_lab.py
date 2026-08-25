@@ -62,9 +62,11 @@ class SupersonicScalarLabTests(unittest.TestCase):
             "engine_version": "scalar-head-lab-v1",
             "generated_text": "answer",
             "generated_tokens": 3,
+            "lm_head_ms": 3.0,
             "ms_per_tok": 4.0,
             "prompt_tokens": 7,
             "token_ids": [11, 12, 13],
+            "timed_decode_steps": 2,
             "tokens_per_second": 250.0,
         }
         stdout = "[supersonic_json] " + json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -78,6 +80,9 @@ class SupersonicScalarLabTests(unittest.TestCase):
         wrong_route = dict(payload, engine_name="supersonic-wmma")
         with self.assertRaisesRegex(ValueError, "engine_name"):
             self.lab.normalize_output("[supersonic_json] " + json.dumps(wrong_route), "")
+        bad_head = dict(payload, lm_head_ms=0.0)
+        with self.assertRaisesRegex(ValueError, "lm_head_ms"):
+            self.lab.normalize_output("[supersonic_json] " + json.dumps(bad_head), "")
 
     def test_cli_rejects_route_and_route_environment(self):
         with self.assertRaises(SystemExit):

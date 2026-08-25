@@ -87,6 +87,19 @@ class BenchmarkManifestTests(unittest.TestCase):
             )
         )
 
+    def test_scalar_baseline_is_exactly_seven_fresh_ordinary_samples(self):
+        manifest = load_manifest_module()
+        suite = manifest.load_suite("scalar-baseline")
+
+        self.assertEqual(suite.budget_seconds, 1200)
+        self.assertEqual(suite.engines, ("supersonic-scalar-lab",))
+        self.assertEqual(len(suite.performance_cases), 1)
+        case = suite.performance_cases[0]
+        self.assertEqual(case.repetitions, 7)
+        self.assertEqual(case.mode, "ordinary")
+        self.assertEqual(case.cache_state, "cold-load")
+        self.assertEqual(case.warmups, 0)
+
     def test_suite_cases_are_positive_unique_and_reference_supported_modes(self):
         manifest = load_manifest_module()
 
@@ -343,6 +356,7 @@ engines = ["supersonic"]
                 "memory_clock_mhz",
                 "power_cap_watts",
                 "performance_level",
+                "temperature_limit_celsius",
             },
         )
         observed_required = {
@@ -379,6 +393,7 @@ engines = ["supersonic"]
             "throttle_status",
             "indep_throttle_status",
             "throttle_label",
+            "raw_amd_smi_json",
         }
         self.assertEqual(
             set(

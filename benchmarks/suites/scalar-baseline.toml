@@ -1,0 +1,20 @@
+version = 1
+name = "scalar-baseline"
+budget_seconds = 1200
+minimum_duration_seconds = 0
+quality_version = "v2"
+quality_case_ids = ["repeated-run-determinism-1", "ordinary-vs-mtp-token-equality-1"]
+engines = ["supersonic-scalar-lab"]
+decoding_policy = "greedy"
+
+[[performance_cases]]
+id = "scalar-qualification-short-cold-ordinary"
+prompt = "Emit a single sentence describing cold-load benchmark startup."
+max_new_tokens = 32
+warmups = 0
+repetitions = 7
+mode = "ordinary"
+cache_state = "cold-load"
+timeout_seconds = 60
+decoding_policy = "greedy"
+engines = ["supersonic-scalar-lab"]

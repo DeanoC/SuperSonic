@@ -119,6 +119,7 @@ class BenchmarkValidationTests(unittest.TestCase):
                 "state": "complete",
                 "records": ["one-result.json"],
                 "elapsed_seconds": 4.9,
+                "performance_elapsed_seconds": 4.9,
                 "completed_rounds": 3,
             },
         }
@@ -129,6 +130,7 @@ class BenchmarkValidationTests(unittest.TestCase):
                 self.validation.validate_bundle(self.bundle, require_complete=True)
 
             manifest["status"]["elapsed_seconds"] = 5.0
+            manifest["status"]["performance_elapsed_seconds"] = 5.0
             manifest["status"]["completed_rounds"] = 2
             (self.bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "balanced|round"):

@@ -134,6 +134,39 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotRegex(text, re.compile(r"\bgit\s+(?:commit|push)\b"))
         self.assertNotIn("deploy-pages", text)
 
+    def test_scalar_qualification_is_manual_bounded_and_baseline_gated(self):
+        workflow = WORKFLOWS / "benchmark-scalar-qualification.yml"
+        self.assertTrue(workflow.is_file(), workflow)
+        text = workflow.read_text(encoding="utf-8")
+
+        self.assertIn("workflow_dispatch:", text)
+        self.assertNotIn("pull_request:", text)
+        self.assertNotIn("push:", text)
+        self.assertIn("timeout-minutes: 450", text)
+        self.assertIn("group: benchmark-gfx1201-device-${{ github.repository }}", text)
+        self.assertRegex(text, re.compile(r"runs-on:\s*\[self-hosted,\s*linux,\s*rocm,\s*gfx1201\]"))
+        self.assertIn("--suite full-scalar-qualification", text)
+        self.assertIn("--baseline-bundle", text)
+        self.assertIn("--baseline-bundle-sha256", text)
+        self.assertIn("percent regression limit is fixed at 5%", text)
+        self.assertIn("AMDSMI_GPU_METRICS_CACHE_MS: \"0\"", text)
+        self.assertIn("RUST_TEST_THREADS: \"1\"", text)
+        self.assertIn("SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ", text)
+        self.assertIn("SUPERSONIC_BENCHMARK_POWER_CAP_WATTS", text)
+        self.assertIn("SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL", text)
+        self.assertIn("SUPERSONIC_BENCHMARK_TEMPERATURE_LIMIT_CELSIUS", text)
+        self.assertIn("f8dd7c36da283cf587cef3133b9287fd3a5b6fdb", text)
+        self.assertIn("version: 5 (f8dd7c3)", text)
+        self.assertIn("c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98", text)
+        self.assertIn("Qwen3.8-27B-GQH-Q3KXL.gguf", text)
+        self.assertIn("AMDSMI_GPU_METRICS_CACHE_MS=0", text)
+        self.assertIn("{\"status\":\"incomplete\"}", text)
+        self.assertIn("if: always()", text)
+        self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", text)
+        self.assertNotRegex(text, re.compile(r"\bgit\s+(?:commit|push)\b"))
+        self.assertNotIn("deploy-pages", text)
+        self.assertNotIn("pages: write", text)
+
     def test_pages_validates_before_deploy(self):
         workflow = WORKFLOWS / "benchmark-pages.yml"
         self.assertTrue(workflow.is_file(), workflow)
@@ -203,6 +236,7 @@ class WorkflowContractTests(unittest.TestCase):
         paths = (
             WORKFLOWS / "benchmark-quick.yml",
             WORKFLOWS / "benchmark-full.yml",
+            WORKFLOWS / "benchmark-scalar-qualification.yml",
             WORKFLOWS / "qwen38-gfx1201.yml",
         )
         groups = []
@@ -219,6 +253,7 @@ class WorkflowContractTests(unittest.TestCase):
         for path in (
             WORKFLOWS / "benchmark-quick.yml",
             WORKFLOWS / "benchmark-full.yml",
+            WORKFLOWS / "benchmark-scalar-qualification.yml",
             WORKFLOWS / "qwen38-gfx1201.yml",
         ):
             text = path.read_text(encoding="utf-8")
@@ -246,6 +281,15 @@ class WorkflowContractTests(unittest.TestCase):
             'test "$SUPERSONIC_LLAMA_CPP_ARTIFACT_SHA256" = "$expected_q3kxl_sha256"',
             full,
         )
+
+    def test_benchmark_workflows_pass_exact_artifact_source_provenance(self):
+        for name in ("benchmark-quick.yml", "benchmark-full.yml", "benchmark-scalar-qualification.yml"):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text(encoding="utf-8")
+                self.assertIn("--artifact-source-repository Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF", text)
+                self.assertIn("--artifact-source-revision 91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4", text)
+                self.assertIn("--artifact-filename Qwen3.8-27B-GQH-Q3KXL.gguf", text)
+                self.assertIn("--artifact-size-bytes 13440110432", text)
 
     def test_cpu_ci_validates_benchmark_fixtures_without_gpu(self):
         workflow = WORKFLOWS / "ci.yml"

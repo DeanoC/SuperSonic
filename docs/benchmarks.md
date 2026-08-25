@@ -94,6 +94,9 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --artifact "$SUPERSONIC_GQH_GGUF" \
   --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
   --artifact-quantization GQH-Q3KXL \
+  --artifact-source-repository Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF \
+  --artifact-source-revision 91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4 \
+  --artifact-filename Qwen3.8-27B-GQH-Q3KXL.gguf --artifact-size-bytes 13440110432 \
   --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
   --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
@@ -110,6 +113,7 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
   --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
   --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
+  --temperature-limit-celsius "$SUPERSONIC_BENCHMARK_TEMPERATURE_LIMIT_CELSIUS" \
   --seed 1 \
   --run-id "$run_id" \
   --output target/benchmarks/candidate
@@ -176,6 +180,12 @@ RUST_TEST_THREADS=1 timeout --foreground 21660s \
   --peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT" \
   --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
   --artifact-quantization GQH-Q3KXL \
+  --artifact-source-repository Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF \
+  --artifact-source-revision 91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4 \
+  --artifact-filename Qwen3.8-27B-GQH-Q3KXL.gguf --artifact-size-bytes 13440110432 \
+  --peer-artifact-source-repository Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF \
+  --peer-artifact-source-revision 91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4 \
+  --peer-artifact-filename Qwen3.8-27B-GQH-Q3KXL.gguf --peer-artifact-size-bytes 13440110432 \
   --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
   --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
   --physical-gpu "$SUPERSONIC_R9700_GPU_ID" \
@@ -238,6 +248,82 @@ manifest explicitly records cold-load, fresh-process, non-reuse semantics and
 is updated after every sample. At least one parseable rocprof JSON trace is
 required before the terminal state can be `slow-captured`.
 
+## Scalar-control overnight qualification
+
+The manual `benchmark-scalar-qualification.yml` workflow compares the
+contributor-only raw-Q6 scalar route, unchanged production WMMA, and the
+GeometricAGI pinned peer-engine commit
+`f8dd7c36da283cf587cef3133b9287fd3a5b6fdb`. All three use the same
+`Qwen3.8-27B-GQH-Q3KXL.gguf` file at revision
+`91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4`; filename, size, and SHA-256 are
+verified before execution. This workflow only uploads candidate evidence and
+never deploys Pages or mutates Git.
+
+Prepare the baseline after checking out the exact commit that will run
+overnight. Use the same selected GPU and captured provenance/version files as
+the overnight workflow:
+
+```bash
+export AMDSMI_GPU_METRICS_CACHE_MS=0
+mkdir -p target/benchmarks/scalar-qualification
+HIP_ARCH=gfx1201 cargo build --release -p supersonic-runtime \
+  --features scalar-head-lab --example scalar_head_lab
+object="$(find target/release/build -path '*/out/*megakernel_hip.o' \
+  -printf '%T@ %p\n' | sort -n | tail -n 1 | cut -d' ' -f2-)"
+PATH="/opt/rocm/llvm/bin:$PATH" python3 tools/check-scalar-head-code-object.py \
+  --object "$object" --symbol supersonic_qwen38_q6_k_scalar_head_f32_kernel \
+  > target/benchmarks/scalar-qualification/scalar-instruction-audit.json
+SCALAR_INSTRUCTION_SHA256="$(python3 -c \
+  'import json; print(json.load(open("target/benchmarks/scalar-qualification/scalar-instruction-audit.json"))["instruction_stream_sha256"])')"
+baseline_id="scalar-baseline-$(git rev-parse --short=12 HEAD)"
+python3 tools/supersonic-bench.py run \
+  --suite scalar-baseline \
+  --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" --artifact "$SUPERSONIC_GQH_GGUF" \
+  --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
+  --artifact-quantization GQH-Q3KXL \
+  --artifact-source-repository Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF \
+  --artifact-source-revision 91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4 \
+  --artifact-filename Qwen3.8-27B-GQH-Q3KXL.gguf --artifact-size-bytes 13440110432 \
+  --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
+  --chat-template-sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 \
+  --physical-gpu "$SUPERSONIC_R9700_GPU_ID" --logical-gpu "$SUPERSONIC_GPU_LOGICAL" \
+  --gpu-arch gfx1201 --device 0 --chat \
+  --gpu-static-json target/benchmarks/scalar-qualification/amd-smi-provenance.json \
+  --rocm-version-file target/benchmarks/scalar-qualification/rocm-driver-version.txt \
+  --hip-version-file target/benchmarks/scalar-qualification/hipcc-version.txt \
+  --clock-policy locked --gpu-clock-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_MHZ" \
+  --gpu-clock-tolerance-mhz "$SUPERSONIC_BENCHMARK_GPU_CLOCK_TOLERANCE_MHZ" \
+  --memory-clock-mhz "$SUPERSONIC_BENCHMARK_MEMORY_CLOCK_MHZ" \
+  --power-cap-watts "$SUPERSONIC_BENCHMARK_POWER_CAP_WATTS" \
+  --performance-level "$SUPERSONIC_BENCHMARK_PERFORMANCE_LEVEL" \
+  --temperature-limit-celsius "$SUPERSONIC_BENCHMARK_TEMPERATURE_LIMIT_CELSIUS" \
+  --seed 1 --run-id "$baseline_id" --output target/benchmarks/scalar-baselines
+baseline_bundle="target/benchmarks/scalar-baselines/$baseline_id"
+python3 tools/supersonic-bench.py scalar-series \
+  --record "$baseline_bundle/records/scalar-qualification-short-cold-ordinary.json" \
+  --compiler-version-file target/benchmarks/scalar-qualification/hipcc-version.txt \
+  --scalar-instruction-sha256 "$SCALAR_INSTRUCTION_SHA256" \
+  --output "$baseline_bundle/baseline-v1.json"
+python3 - "$baseline_bundle" <<'PY'
+import sys
+from tools.benchmark.qualification import directory_digest
+print(directory_digest(sys.argv[1]))
+PY
+```
+
+Pass the absolute bundle path and printed digest as workflow-dispatch inputs.
+The baseline binds the commit, ROCm/HIP/compiler capture, audited scalar
+instruction stream, artifact, prompt, GPU/BDF, requested clocks, power,
+performance level, cache declaration, and `lm_head_ms/timed_decode_steps`
+boundary. Both selected seven-sample series require MAD no greater than 3% of
+their median, and the candidate median may be at most 5% above baseline.
+Throttle bits and their decoded label remain verbatim diagnostics; loaded-clock
+stability and the other strict environment checks decide eligibility. Every
+timing is associated with its own non-overlapping raw AMD SMI samples and
+loaded-clock min/median/max. Missing raw telemetry, temperature above the
+configured limit, a competing GPU process, changed device mapping, or less
+than 20 GiB free disk fails the active case immediately.
+
 The schema also names `prefix-cache-empty`, `prefix-cache-populated`, and
 `prefix-cache-reset`. Those cases are explicitly unsupported by the current
 execution boundary until adapter transitions are verified. Do not add them to a
@@ -268,7 +354,9 @@ The reviewer runs validation and, for a peer comparison, the implemented
 comparator. A mismatch remains visible with reasons but produces no speedup:
 
 ```bash
-python3 tools/supersonic-bench.py validate --publishable <candidate-bundle>
+python3 tools/supersonic-bench.py validate --publishable <candidate-bundle> \
+  --baseline-bundle <immutable-baseline-bundle> \
+  --baseline-bundle-sha256 <canonical-directory-sha256>
 python3 tools/supersonic-bench.py compare <record-a> <record-b> \
   --output target/benchmarks/candidate/comparison.json
 ```
