@@ -16,6 +16,7 @@ pub mod gguf;
 pub mod gqh;
 pub mod q2k;
 pub mod q3k;
+pub mod q6_bound;
 
 /// Errors shared by the retained GGUF/GQH readers and internal FLM codecs.
 #[derive(Debug, thiserror::Error)]
