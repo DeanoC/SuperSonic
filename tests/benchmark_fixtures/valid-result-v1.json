@@ -41,7 +41,11 @@
     "quantization": "GQH-Q4",
     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "tokenizer_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "chat_template_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    "chat_template_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "source_repository": "Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF",
+    "source_revision": "91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4",
+    "filename": "Qwen3.8-27B-GQH-Q3KXL.gguf",
+    "size_bytes": 13440110432
   },
   "workload": {
     "case_id": "quick-short-cold-ordinary",

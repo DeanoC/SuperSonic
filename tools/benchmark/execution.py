@@ -82,6 +82,14 @@ class RunConfig:
     run_quality: bool = True
     artifact_semantic_id: str | None = None
     artifact_quantization: str | None = None
+    artifact_source_repository: str | None = None
+    artifact_source_revision: str | None = None
+    artifact_filename: str | None = None
+    artifact_size_bytes: int | None = None
+    peer_artifact_source_repository: str | None = None
+    peer_artifact_source_revision: str | None = None
+    peer_artifact_filename: str | None = None
+    peer_artifact_size_bytes: int | None = None
     tokenizer_sha256: str | None = None
     chat_template_sha256: str | None = None
     strict_environment: bool = False
@@ -181,6 +189,7 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
     model_dir = _required_path(resolved.model_dir, "model_dir", directory=True)
     _validate_model_files(model_dir, chat=bool(resolved.chat))
     artifact = _required_path(resolved.artifact, "artifact", directory=False, nonempty=True)
+    _validate_artifact_source(resolved, artifact, peer=False)
     _validate_model_digests(model_dir, resolved)
     physical_gpu = _required_text(resolved.physical_gpu, "physical_gpu")
     if not physical_gpu.isdigit():
@@ -219,6 +228,8 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
 
     engines = tuple(_engine_with_override(engine, resolved) for engine in (manifest.load_engine(name) for name in suite.engines))
     _validate_peer_artifact(suite, resolved)
+    if resolved.peer_artifact is not None:
+        _validate_artifact_source(resolved, Path(resolved.peer_artifact), peer=True)
     for engine in engines:
         _validate_engine_available(engine, resolved)
         _validate_engine_version(engine, resolved)
@@ -1647,6 +1658,14 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
                 "run_quality",
                 "artifact_semantic_id",
                 "artifact_quantization",
+                "artifact_source_repository",
+                "artifact_source_revision",
+                "artifact_filename",
+                "artifact_size_bytes",
+                "peer_artifact_source_repository",
+                "peer_artifact_source_revision",
+                "peer_artifact_filename",
+                "peer_artifact_size_bytes",
                 "tokenizer_sha256",
                 "chat_template_sha256",
                 "strict_environment",
@@ -1688,6 +1707,14 @@ def _config_values(config: Mapping[str, object] | object) -> dict[str, object]:
         "logical_gpu": None,
         "artifact_semantic_id": None,
         "artifact_quantization": None,
+        "artifact_source_repository": None,
+        "artifact_source_revision": None,
+        "artifact_filename": None,
+        "artifact_size_bytes": None,
+        "peer_artifact_source_repository": None,
+        "peer_artifact_source_revision": None,
+        "peer_artifact_filename": None,
+        "peer_artifact_size_bytes": None,
         "tokenizer_sha256": None,
         "chat_template_sha256": None,
         "strict_environment": False,
@@ -2092,7 +2119,7 @@ def _digest_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _artifact_identity(config: RunConfig, engine: EngineManifest) -> dict[str, str | None]:
+def _artifact_identity(config: RunConfig, engine: EngineManifest) -> dict[str, object]:
     """Return only evidence belonging to the artifact consumed by *engine*.
 
     A peer adapter gets no semantic, tokenizer, or template identity from the
@@ -2119,6 +2146,7 @@ def _artifact_identity(config: RunConfig, engine: EngineManifest) -> dict[str, s
             "sha256": digest,
             "tokenizer_sha256": None,
             "chat_template_sha256": None,
+            **_artifact_source_identity(config, artifact, peer=True),
         }
 
     artifact = Path(config.artifact)
@@ -2137,6 +2165,45 @@ def _artifact_identity(config: RunConfig, engine: EngineManifest) -> dict[str, s
         "sha256": digest,
         "tokenizer_sha256": tokenizer_digest,
         "chat_template_sha256": chat_digest,
+        **_artifact_source_identity(config, artifact, peer=False),
+    }
+
+
+def _validate_artifact_source(config: RunConfig, artifact: Path, *, peer: bool) -> None:
+    _artifact_source_identity(config, artifact, peer=peer)
+
+
+def _artifact_source_identity(config: RunConfig, artifact: Path, *, peer: bool) -> dict[str, object]:
+    prefix = "peer_artifact" if peer else "artifact"
+    primary = Path(config.artifact)
+    inherit_primary = peer and artifact.resolve() == primary.resolve()
+
+    def configured(field: str):
+        value = getattr(config, f"{prefix}_{field}")
+        if inherit_primary and value is None:
+            value = getattr(config, f"artifact_{field}")
+        return value
+
+    repository = _required_text(configured("source_repository"), f"{prefix}_source_repository")
+    revision = _required_text(configured("source_revision"), f"{prefix}_source_revision")
+    filename = _required_text(configured("filename"), f"{prefix}_filename")
+    size_bytes = configured("size_bytes")
+    if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        raise ValueError(f"{prefix}_source_revision must be a full lowercase 40-character commit")
+    if Path(filename).name != filename:
+        raise ValueError(f"{prefix}_filename must be a basename")
+    if artifact.name != filename:
+        raise ValueError(f"{prefix} filename mismatch: observed {artifact.name!r}, expected {filename!r}")
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes <= 0:
+        raise ValueError(f"{prefix}_size_bytes must be a positive integer")
+    actual_size = artifact.stat().st_size
+    if actual_size != size_bytes:
+        raise ValueError(f"{prefix} size mismatch: observed {actual_size}, expected {size_bytes}")
+    return {
+        "source_repository": repository,
+        "source_revision": revision,
+        "filename": filename,
+        "size_bytes": size_bytes,
     }
 
 

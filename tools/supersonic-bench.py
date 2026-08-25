@@ -34,6 +34,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--peer-artifact", type=Path)
     run.add_argument("--artifact-semantic-id", required=True)
     run.add_argument("--artifact-quantization", required=True)
+    run.add_argument("--artifact-source-repository", required=True)
+    run.add_argument("--artifact-source-revision", required=True)
+    run.add_argument("--artifact-filename", required=True)
+    run.add_argument("--artifact-size-bytes", type=int, required=True)
+    run.add_argument("--peer-artifact-source-repository")
+    run.add_argument("--peer-artifact-source-revision")
+    run.add_argument("--peer-artifact-filename")
+    run.add_argument("--peer-artifact-size-bytes", type=int)
     run.add_argument("--tokenizer-sha256", required=True)
     run.add_argument("--chat-template-sha256", required=True)
     run.add_argument("--physical-gpu", required=True)
@@ -180,6 +188,14 @@ def _run(args: argparse.Namespace) -> int:
         run_quality=True,
         artifact_semantic_id=args.artifact_semantic_id,
         artifact_quantization=args.artifact_quantization,
+        artifact_source_repository=args.artifact_source_repository,
+        artifact_source_revision=args.artifact_source_revision,
+        artifact_filename=args.artifact_filename,
+        artifact_size_bytes=args.artifact_size_bytes,
+        peer_artifact_source_repository=args.peer_artifact_source_repository,
+        peer_artifact_source_revision=args.peer_artifact_source_revision,
+        peer_artifact_filename=args.peer_artifact_filename,
+        peer_artifact_size_bytes=args.peer_artifact_size_bytes,
         tokenizer_sha256=args.tokenizer_sha256,
         chat_template_sha256=args.chat_template_sha256,
     )

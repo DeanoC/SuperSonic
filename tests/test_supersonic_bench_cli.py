@@ -70,6 +70,14 @@ class BenchmarkCliTests(unittest.TestCase):
                 "test-artifact",
                 "--artifact-quantization",
                 "GQH-Q3KXL",
+                "--artifact-source-repository",
+                "Geometric-AI/test-artifact",
+                "--artifact-source-revision",
+                "1111111111111111111111111111111111111111",
+                "--artifact-filename",
+                "artifact",
+                "--artifact-size-bytes",
+                "8",
                 "--tokenizer-sha256",
                 "a" * 64,
                 "--chat-template-sha256",
@@ -138,6 +146,14 @@ class BenchmarkCliTests(unittest.TestCase):
                 "qwen3.8-27b-gqh-q3kxl",
                 "--artifact-quantization",
                 "GQH-Q3KXL",
+                "--artifact-source-repository",
+                "Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF",
+                "--artifact-source-revision",
+                "91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4",
+                "--artifact-filename",
+                "Qwen3.8-27B-GQH-Q3KXL.gguf",
+                "--artifact-size-bytes",
+                "13440110432",
                 "--tokenizer-sha256",
                 "a" * 64,
                 "--chat-template-sha256",
@@ -157,6 +173,10 @@ class BenchmarkCliTests(unittest.TestCase):
 
         self.assertEqual(args.artifact_semantic_id, "qwen3.8-27b-gqh-q3kxl")
         self.assertEqual(args.artifact_quantization, "GQH-Q3KXL")
+        self.assertEqual(args.artifact_source_repository, "Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF")
+        self.assertEqual(args.artifact_source_revision, "91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4")
+        self.assertEqual(args.artifact_filename, "Qwen3.8-27B-GQH-Q3KXL.gguf")
+        self.assertEqual(args.artifact_size_bytes, 13440110432)
         self.assertEqual(args.tokenizer_sha256, "a" * 64)
         self.assertEqual(args.chat_template_sha256, "b" * 64)
 

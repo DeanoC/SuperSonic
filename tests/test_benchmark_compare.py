@@ -93,6 +93,17 @@ class BenchmarkCompareTests(unittest.TestCase):
         self.assertIsNone(result.speedup)
         self.assertIn("sha256", result.reasons)
 
+    def test_different_artifact_source_revision_never_computes_speedup(self):
+        left = copy.deepcopy(self.locked_warm)
+        right = copy.deepcopy(self.locked_warm)
+        right["artifact"]["source_revision"] = "2" * 40
+
+        result = self.compare.compare_records(left, right)
+
+        self.assertFalse(result.comparable)
+        self.assertIsNone(result.speedup)
+        self.assertIn("source_revision", result.reasons)
+
     def test_cross_physical_gpu_records_never_compute_speedup(self):
         left = copy.deepcopy(self.locked_warm)
         right = copy.deepcopy(self.locked_warm)

@@ -138,6 +138,14 @@ class BenchmarkExecutionTests(unittest.TestCase):
             },
             run_quality=run_quality,
             clock_policy="uncontrolled-clocks",
+            artifact_source_repository="Geometric-AI/test-artifact",
+            artifact_source_revision="1" * 40,
+            artifact_filename=self.artifact.name,
+            artifact_size_bytes=self.artifact.stat().st_size,
+            peer_artifact_source_repository="Geometric-AI/test-peer-artifact",
+            peer_artifact_source_revision="2" * 40,
+            peer_artifact_filename=self.peer_artifact.name,
+            peer_artifact_size_bytes=self.peer_artifact.stat().st_size,
         )
 
     def test_configured_peer_missing_fails_preflight(self):
@@ -574,6 +582,10 @@ class BenchmarkExecutionTests(unittest.TestCase):
             peer_artifact=self.artifact,
             artifact_semantic_id="qwen3.8-27b-gqh-q3kxl",
             artifact_quantization="GQH-Q3KXL",
+            peer_artifact_source_repository=None,
+            peer_artifact_source_revision=None,
+            peer_artifact_filename=None,
+            peer_artifact_size_bytes=None,
         )
         run_manifest = self.execution.preflight(config)
         supersonic = next(engine for engine in run_manifest.engines if engine.name == "supersonic")
@@ -587,6 +599,36 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.assertEqual(peer_identity["quantization"], "GQH-Q3KXL")
         self.assertIsNone(peer_identity["tokenizer_sha256"])
         self.assertIsNone(peer_identity["chat_template_sha256"])
+
+    def test_artifact_source_provenance_is_required_and_verified_before_execution(self):
+        config = self.execution.replace_config(
+            self.config(),
+            artifact_source_repository="Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF",
+            artifact_source_revision="91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4",
+            artifact_filename="qwen38.gqh.gguf",
+            artifact_size_bytes=8,
+        )
+        run_manifest = self.execution.preflight(config)
+        engine = next(item for item in run_manifest.engines if item.name == "supersonic")
+
+        self.assertEqual(
+            self.execution._artifact_identity(config, engine),
+            {
+                "semantic_id": "artifact-sha256-c7c5c1d70c5dec4416ab6158afd0b223ef40c29b1dc1f97ed9428b94d4cadb1c",
+                "quantization": "GQH-Q4",
+                "sha256": "c7c5c1d70c5dec4416ab6158afd0b223ef40c29b1dc1f97ed9428b94d4cadb1c",
+                "tokenizer_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "chat_template_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "source_repository": "Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF",
+                "source_revision": "91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4",
+                "filename": "qwen38.gqh.gguf",
+                "size_bytes": 8,
+            },
+        )
+
+        wrong_size = self.execution.replace_config(config, artifact_size_bytes=9)
+        with self.assertRaisesRegex(ValueError, "artifact size"):
+            self.execution.preflight(wrong_size)
 
     def test_fractional_deadline_timeout_is_never_rounded_up(self):
         config = self.config(run_quality=False)

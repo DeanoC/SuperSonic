@@ -46,6 +46,22 @@ class BenchmarkValidationTests(unittest.TestCase):
     def test_valid_fixture_passes(self):
         self.validation.validate_record(self.valid_record)
 
+    def test_artifact_source_provenance_is_closed_and_required(self):
+        record = copy.deepcopy(self.valid_record)
+        provenance = {
+            "source_repository": "Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF",
+            "source_revision": "91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4",
+            "filename": "Qwen3.8-27B-GQH-Q3KXL.gguf",
+            "size_bytes": 13440110432,
+        }
+        record["artifact"].update(provenance)
+
+        self.validation.validate_record(record)
+        for field in provenance:
+            missing = copy.deepcopy(record)
+            missing["artifact"].pop(field)
+            self.assert_record_invalid(missing, "missing required fields")
+
     def test_structured_toolchain_versions_are_required_and_safe(self):
         self.assertRegex(self.valid_record["environment"]["rocm_version"], r"^ROCm ")
         self.assertRegex(self.valid_record["environment"]["hip_version"], r"^HIP ")
