@@ -148,6 +148,17 @@ class BenchmarkValidationTests(unittest.TestCase):
         record["quality"]["cases"][0]["id"] = "instruction-following-2"
         self.assert_record_invalid(record, "quality")
 
+    def test_passed_mtp_equality_requires_matching_evidence_hashes(self):
+        record = copy.deepcopy(self.valid_record)
+        mtp_case = next(
+            case
+            for case in record["quality"]["cases"]
+            if case["category"] == "ordinary-vs-mtp-token-equality"
+        )
+        mtp_case["actual_hash"] = "f" * 64
+
+        self.assert_record_invalid(record, "MTP equality.*evidence hashes")
+
     def test_publishable_bundle_rejects_dirty_errors_failed_quality_and_unverified_headlines(self):
         record = copy.deepcopy(self.valid_record)
         record["run"]["dirty"] = True

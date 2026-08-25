@@ -22,7 +22,6 @@ APPROVED_CATEGORIES = {
 }
 CACHE_STATES = {
     "cold-load",
-    "warm-resident",
 }
 SUPPORTED_CACHE_STATES = {
     "cold-load",
@@ -75,7 +74,7 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertTrue(any("short" in case_id for case_id in case_ids))
         self.assertTrue(any("long" in case_id for case_id in case_ids))
         self.assertTrue(any("cold" in case_id for case_id in case_ids))
-        self.assertTrue(any("warm" in case_id for case_id in case_ids))
+        self.assertFalse(any("warm" in case_id for case_id in case_ids))
         self.assertTrue(any("ordinary" in case_id for case_id in case_ids))
         self.assertTrue(any("mtp" in case_id for case_id in case_ids))
 
@@ -104,7 +103,7 @@ class BenchmarkManifestTests(unittest.TestCase):
             self.assertEqual(case.timeout_seconds, 60)
 
         quick = manifest.load_suite("quick")
-        self.assertTrue(all(case.warmups == 1 for case in quick.performance_cases))
+        self.assertTrue(all(case.warmups == 0 for case in quick.performance_cases))
         self.assertTrue(all(case.repetitions == 3 for case in quick.performance_cases))
         self.assertTrue(all(case.mode == "ordinary" for case in quick.performance_cases))
         self.assertTrue(all(case.engines == ("supersonic",) for case in quick.performance_cases))

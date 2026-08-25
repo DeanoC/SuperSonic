@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -14,8 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.benchmark import compare, render, validation  # noqa: E402
+from tools.benchmark import adapters, compare, manifest, render, repeatability, validation  # noqa: E402
 from tools.benchmark.execution import RunConfig, run_suite  # noqa: E402
+from tools.benchmark.model import PerformanceCase  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -100,6 +102,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
     )
 
+    soak = subparsers.add_parser(
+        "repeatability",
+        help="run a bounded fresh-process soak and trace follow-ups after the first slow sample",
+    )
+    soak.add_argument("--model-dir", type=Path, required=True)
+    soak.add_argument("--artifact", type=Path, required=True)
+    soak.add_argument("--physical-gpu", required=True)
+    soak.add_argument("--output", type=Path, required=True)
+    soak.add_argument("--binary", default="./target/release/supersonic")
+    soak.add_argument("--rocprof-binary", default="rocprofv3")
+    soak.add_argument("--max-runs", type=int, default=2160)
+    soak.add_argument("--max-duration-seconds", type=float, default=21600.0)
+    soak.add_argument("--trace-attempts", type=int, default=3)
+    soak.add_argument("--slow-persistent-ms-per-token", type=float, default=55.0)
+    soak.add_argument("--timeout-seconds", type=float, default=60.0)
+    soak.add_argument("--device", type=int, default=0)
+
     return parser
 
 
@@ -115,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
             return _compare(args)
         if args.command == "render":
             return _render(args)
+        if args.command == "repeatability":
+            return _repeatability(args)
     except (OSError, ValueError, TypeError) as exc:
         print(f"supersonic-bench: {exc}", file=sys.stderr)
         return 2
@@ -223,6 +244,66 @@ def _render(args: argparse.Namespace) -> int:
     }
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+def _repeatability(args: argparse.Namespace) -> int:
+    result = repeatability.run_soak(_repeatability_config(args))
+    print(
+        json.dumps(
+            {
+                "state": result["state"],
+                "trigger_run": result["trigger_run"],
+                "samples": len(result["samples"]),
+                "followup_traces": len(result["followup_traces"]),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0 if result["state"] in {"slow-captured", "no-slow-sample", "duration-complete"} else 1
+
+
+def _repeatability_config(args: argparse.Namespace) -> repeatability.SoakConfig:
+    from dataclasses import replace
+
+    engine = replace(manifest.load_engine("supersonic"), binary=args.binary)
+    case = PerformanceCase(
+        id="repeatability-short-cold-ordinary",
+        prompt="Emit a single sentence describing cold-load benchmark startup.",
+        max_new_tokens=32,
+        warmups=0,
+        repetitions=1,
+        mode="ordinary",
+        cache_state="cold-load",
+        timeout_seconds=int(args.timeout_seconds),
+        decoding_policy="greedy",
+        engines=("supersonic",),
+    )
+    argv = adapters.build_command(
+        engine,
+        case,
+        adapters.AdapterInputs(
+            model_dir=args.model_dir,
+            artifact=args.artifact,
+            chat=True,
+            device=args.device,
+            context_size=32768,
+            sampling_seed=1,
+        ),
+    )
+    return repeatability.SoakConfig(
+        argv=argv,
+        output=args.output,
+        physical_gpu=args.physical_gpu,
+        slow_persistent_ms_per_token=args.slow_persistent_ms_per_token,
+        max_runs=args.max_runs,
+        trace_attempts=args.trace_attempts,
+        timeout_seconds=args.timeout_seconds,
+        max_duration_seconds=args.max_duration_seconds,
+        rocprof_binary=args.rocprof_binary,
+        logical_gpu=args.device,
+        hip_visible_devices=os.environ.get("HIP_VISIBLE_DEVICES", ""),
+        environment=dict(os.environ),
+    )
 
 
 def _first_record(path: Path) -> dict[str, object]:

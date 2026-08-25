@@ -107,10 +107,11 @@ These caps include checkout, static provenance, idle checks, artifact
 preflight, and the release build. A full run is never silently substituted for
 the quick gate.
 
-The harness records `cold-load` and `warm-resident` separately and keeps
-`process_reuse=false` for both. Prefix-cache cases remain unsupported until
-their adapter transitions are verified. `uncontrolled-clocks` results may be
-retained for diagnosis but are excluded from headline and peer speedup claims.
+The executable suites record only fresh-process `cold-load` evidence.
+`warm-resident` fails preflight until same-process adapter reuse is verified;
+prefix-cache cases remain unsupported until their transitions are verified.
+`uncontrolled-clocks` results may be retained for diagnosis but are excluded
+from headline and peer speedup claims.
 The candidate directory is diagnostic until a reviewer checks raw samples,
 the validator's raw-sample value/count/completeness checks, the renderer's
 deterministically derived median/MAD/count, correctness, cache/clock evidence,

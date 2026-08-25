@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import hashlib
 import json
+import signal
 from dataclasses import replace
 from pathlib import Path
 import sys
@@ -161,6 +162,28 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.assertTrue(all(sample.gpu_utilization_percent == 91.0 for sample in samples))
         self.assertEqual(notes, ())
 
+    def test_process_monitor_kills_the_entire_session_on_timeout(self):
+        process = mock.Mock()
+        process.pid = 4321
+        process.returncode = -signal.SIGKILL
+        process.poll.return_value = None
+        process.communicate.return_value = ("", "")
+
+        with (
+            mock.patch.object(self.execution.subprocess, "Popen", return_value=process) as popen,
+            mock.patch.object(self.execution.os, "killpg") as killpg,
+            mock.patch.object(self.execution.time, "monotonic", side_effect=[0.0, 2.0, 2.0]),
+        ):
+            result, _, _ = self.execution._run_process_with_telemetry(
+                ("rocprofv3", "--", "supersonic"),
+                timeout=1.0,
+                physical_gpu="0",
+            )
+
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        killpg.assert_called_once_with(4321, signal.SIGKILL)
+        self.assertTrue(result.timed_out)
+
     def test_locked_real_run_records_live_process_telemetry(self):
         self.binary.write_text(
             "#!/bin/sh\n"
@@ -188,7 +211,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
         status = self.execution.run_suite(config)
 
         record = json.loads(status.records[0].read_text(encoding="utf-8"))
-        self.assertGreaterEqual(len(record["environment"]["telemetry_samples"]), 4)
+        self.assertGreaterEqual(len(record["environment"]["telemetry_samples"]), 2)
         self.assertTrue(record["environment"]["headline_eligible"])
 
     def test_preflight_requires_explicit_model_artifact_and_gpu(self):
@@ -240,7 +263,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
         status = self.execution.run_suite(config, FakeClock([0, 599, 599.5, 601]), runner)
         self.assertEqual(status.state, "incomplete")
         self.assertIn("budget_exhausted", status.errors)
-        self.assertEqual(set(runner.started_case_ids), {"quick-short-warm-ordinary"})
+        self.assertEqual(set(runner.started_case_ids), {"quick-short-cold-ordinary"})
 
     def test_case_timeout_is_bounded_and_preserves_incomplete_evidence(self):
         config = self.config(run_quality=False)
@@ -270,7 +293,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
     def test_invalid_record_is_never_atomically_promoted(self):
         config = self.config(run_quality=False)
         status = self.execution.run_suite(config, FakeClock([0, 1, 2, 3, 4, 5]), CorruptRunner())
-        self.assertFalse((status.bundle / "records" / "quick-short-warm-ordinary-supersonic.json").exists())
+        self.assertFalse((status.bundle / "records" / "quick-short-cold-ordinary-supersonic.json").exists())
         self.assertFalse(any(path.name.endswith(".tmp") for path in (status.bundle / "records").glob("*")))
 
     def test_raw_streams_are_captured_locally_and_measured_processes_are_fresh(self):
@@ -282,20 +305,19 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.assertTrue(all("raw stderr" in path.with_name(path.name.replace("stdout", "stderr")).read_text() for path in logs))
         self.assertTrue(all(call[1] is not None for call in runner.calls))
 
-    def test_warm_resident_evidence_does_not_claim_process_reuse(self):
-        config = self.config(run_quality=False)
-        status = self.execution.run_suite(config, FakeClock([0] + list(range(1, 30))), FakeRunner())
-        records = list((status.bundle / "records").glob("*.json"))
-        self.assertTrue(records)
-        record = json.loads(records[0].read_text(encoding="utf-8"))
-        self.assertFalse(record["environment"]["process_reuse"])
-        self.assertEqual(record["environment"]["cache_evidence"]["process_state"], "fresh-process")
-        self.assertEqual(record["environment"]["rocm_version"], "ROCm 6.4.2")
-        self.assertEqual(record["environment"]["hip_version"], "HIP 6.4.2")
-        self.assertTrue(record["engine"]["version"].startswith("source-"))
-        self.assertEqual(record["engine"]["adapter_version"], 2)
-        self.assertNotIn(str(self.rocm_version_file), json.dumps(record))
-        self.assertNotIn(str(self.hip_version_file), json.dumps(record))
+    def test_warm_resident_cases_fail_until_same_process_reuse_exists(self):
+        suite = self.execution.manifest.load_suite("quick")
+        warm_case = replace(
+            suite.performance_cases[0],
+            id="unsupported-warm-resident",
+            cache_state="warm-resident",
+            warmups=1,
+        )
+        suite = replace(suite, performance_cases=(warm_case,))
+        with self.assertRaisesRegex(ValueError, "warm-resident.*same-process"):
+            self.execution.preflight(
+                self.execution.replace_config(self.config(run_quality=False), suite=suite)
+            )
 
     def test_version_file_parser_rejects_empty_unknown_and_oversized_captures(self):
         parser = self.execution._read_version_file

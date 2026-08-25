@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import random
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -641,12 +642,13 @@ def _run_process_with_telemetry(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
     try:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
-                process.kill()
+                _kill_process_session(process)
                 stdout, stderr = process.communicate()
                 return (
                     ProcessResult(
@@ -692,10 +694,18 @@ def _run_process_with_telemetry(
                 except (OSError, RuntimeError, ValueError) as exc:
                     notes.append(f"live telemetry probe failed: {exc}")
     except BaseException:
-        if process.poll() is None:
-            process.kill()
+        _kill_process_session(process)
         process.communicate()
         raise
+
+
+def _kill_process_session(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 class _CaseError(RuntimeError):
@@ -1097,7 +1107,7 @@ def _quality_performance_case(case: QualityCase, *, mode: str, engine: EngineMan
         warmups=0,
         repetitions=1,
         mode=mode,
-        cache_state="warm-resident",
+        cache_state="cold-load",
         timeout_seconds=max(1, case.max_new_tokens),
         decoding_policy=case.decoding_policy,
         engines=(engine.name,),
@@ -1799,6 +1809,12 @@ def _validate_model_digests(model_dir: Path, config: RunConfig) -> None:
 
 
 def _validate_active_cases(suite: SuiteManifest) -> None:
+    warm_cases = [case.id for case in suite.performance_cases if case.cache_state == "warm-resident"]
+    if warm_cases:
+        raise ValueError(
+            "warm-resident cases are not executable until same-process adapter reuse is verified: "
+            + ", ".join(warm_cases)
+        )
     prefix_cases = [case.id for case in suite.performance_cases if case.cache_state.startswith("prefix-cache-")]
     if prefix_cases:
         raise ValueError(

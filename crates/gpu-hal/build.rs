@@ -58,12 +58,47 @@ fn has_libhipfile(dir: &Path) -> bool {
         })
 }
 
+fn detect_rocm_lib_dir() -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    for var in ["ROCM_PATH", "HIP_PATH", "ROCM_HOME"] {
+        if let Ok(value) = env::var(var) {
+            roots.push(PathBuf::from(value));
+        }
+    }
+    roots.extend([
+        PathBuf::from("/opt/rocm"),
+        PathBuf::from("/usr"),
+        PathBuf::from("/usr/local"),
+    ]);
+    roots
+        .into_iter()
+        .flat_map(|root| [root.join("lib"), root.join("lib64")])
+        .find(|path| has_libamdhip64(path))
+}
+
+fn has_libamdhip64(dir: &Path) -> bool {
+    if dir.join("libamdhip64.so").exists() {
+        return true;
+    }
+    fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libamdhip64.so.")
+        })
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/hipfile_bridge.cc");
     println!("cargo:rerun-if-env-changed=HIP_ARCH");
     println!("cargo:rerun-if-env-changed=HIPFILE_ROOT");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=HIP_PATH");
     println!("cargo:rerun-if-env-changed=ROCM_HOME");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hip)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hipfile)");
@@ -73,6 +108,10 @@ fn main() {
         "No HIP toolchain found; install hipcc."
     );
     println!("cargo:rustc-cfg=supersonic_backend_hip");
+    let rocm_lib_dir = detect_rocm_lib_dir().expect(
+        "No ROCm amdhip64 library found under ROCM_PATH, HIP_PATH, ROCM_HOME, or standard roots.",
+    );
+    println!("cargo:rustc-link-search=native={}", rocm_lib_dir.display());
 
     let Some(hipfile_root) = detect_hipfile_root() else {
         return;

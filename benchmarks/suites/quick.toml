@@ -17,25 +17,25 @@ engines = ["supersonic"]
 decoding_policy = "greedy"
 
 [[performance_cases]]
-id = "quick-short-warm-ordinary"
+id = "quick-short-cold-ordinary"
 prompt = "Summarize why deterministic benchmarking needs fixed prompts in one sentence."
 max_new_tokens = 32
-warmups = 1
+warmups = 0
 repetitions = 3
 mode = "ordinary"
-cache_state = "warm-resident"
+cache_state = "cold-load"
 timeout_seconds = 45
 decoding_policy = "greedy"
 engines = ["supersonic"]
 
 [[performance_cases]]
-id = "quick-long-warm-ordinary"
+id = "quick-long-cold-ordinary"
 prompt = "You are benchmarking a single-sequence greedy Qwen3.8 runner. Explain how fixed prompts, exact artifacts, and repeatable timing windows keep a run comparable across commits without adding unsupported compatibility paths."
 max_new_tokens = 64
-warmups = 1
+warmups = 0
 repetitions = 3
 mode = "ordinary"
-cache_state = "warm-resident"
+cache_state = "cold-load"
 timeout_seconds = 90
 decoding_policy = "greedy"
 engines = ["supersonic"]

@@ -9,6 +9,7 @@ from .model import QualityCase, canonical_json, parse_strict_json
 
 MTP_CATEGORY = "ordinary-vs-mtp-token-equality"
 MAX_VALUE_PREVIEW = 160
+_USE_CASE_EXPECTED = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +75,7 @@ def score_mtp_pair(
     if ordinary.token_ids is None or mtp.token_ids is None:
         return _result(
             mtp_case,
+            expected=list(ordinary.token_ids) if ordinary.token_ids is not None else None,
             actual=list(mtp.token_ids) if mtp.token_ids is not None else None,
             passed=False,
             failure="ordinary/MTP token ids unavailable for exact comparison",
@@ -81,7 +83,13 @@ def score_mtp_pair(
     actual = list(mtp.token_ids)
     passed = tuple(ordinary.token_ids) == tuple(mtp.token_ids)
     failure = None if passed else "ordinary/MTP token ids did not exactly match"
-    return _result(mtp_case, actual=actual, passed=passed, failure=failure)
+    return _result(
+        mtp_case,
+        expected=list(ordinary.token_ids),
+        actual=actual,
+        passed=passed,
+        failure=failure,
+    )
 
 
 def summarize_quality(
@@ -154,16 +162,24 @@ def summarize_quality(
     }
 
 
-def _result(case: QualityCase, *, actual: object, passed: bool, failure: str | None) -> QualityResult:
+def _result(
+    case: QualityCase,
+    *,
+    actual: object,
+    passed: bool,
+    failure: str | None,
+    expected: object = _USE_CASE_EXPECTED,
+) -> QualityResult:
+    compared_expected = case.expected if expected is _USE_CASE_EXPECTED else expected
     return QualityResult(
         id=case.id,
         category=case.category,
         scorer=case.scorer,
         passed=passed,
         failure=failure,
-        expected_hash=_hash_value(case.expected),
+        expected_hash=_hash_value(compared_expected),
         actual_hash=_hash_value(actual),
-        expected_value=_display_value(case.expected),
+        expected_value=_display_value(compared_expected),
         actual_value=_display_value(actual),
     )
 
