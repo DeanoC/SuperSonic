@@ -390,6 +390,9 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.assertIn(status.state, {"failed", "incomplete"})
         self.assertIn("case_timeout", status.errors)
         self.assertTrue(all(timeout is not None and timeout > 0 for _, timeout in runner.calls))
+        error_logs = list((status.bundle / "logs").glob("*.error.log"))
+        self.assertTrue(error_logs)
+        self.assertIn("timeout", error_logs[0].read_text(encoding="utf-8"))
 
     def test_sigint_marks_suite_incomplete(self):
         config = self.config(run_quality=False)

@@ -439,6 +439,7 @@ def run_suite(
                 break
             except _CaseError as exc:
                 _append_error(errors, exc.code)
+                _write_case_error(run_manifest.bundle, case, engine, exc.message)
                 if exc.code == "budget_exhausted":
                     break
                 continue
@@ -555,6 +556,7 @@ def _run_duration_cases(
                 break
             except _CaseError as exc:
                 _append_error(errors, exc.code)
+                _write_case_error(run_manifest.bundle, case, engine, exc.message)
                 round_failed = True
                 break
             except ValueError as exc:
