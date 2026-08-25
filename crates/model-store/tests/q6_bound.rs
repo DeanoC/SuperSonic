@@ -137,6 +137,34 @@ fn bf16_rne_argmax_preserves_strict_lowest_index_ties() {
 }
 
 #[test]
+fn bf16_rne_rejects_positive_finite_overflow_to_infinity() {
+    let just_overflowing = f32::from_bits(0x7f7f_8000);
+
+    assert!(just_overflowing.is_finite());
+    assert!(f32_to_bf16_rne_finite(just_overflowing).is_err());
+}
+
+#[test]
+fn bf16_rne_rejects_negative_finite_overflow_to_infinity() {
+    let just_overflowing = f32::from_bits(0xff7f_8000);
+
+    assert!(just_overflowing.is_finite());
+    assert!(f32_to_bf16_rne_finite(just_overflowing).is_err());
+}
+
+#[test]
+fn bf16_rne_accepts_largest_f32_values_that_round_to_finite_bf16_maxima() {
+    assert_eq!(
+        f32_to_bf16_rne_finite(f32::from_bits(0x7f7f_7fff)),
+        Ok(0x7f7f)
+    );
+    assert_eq!(
+        f32_to_bf16_rne_finite(f32::from_bits(0xff7f_7fff)),
+        Ok(0xff7f)
+    );
+}
+
+#[test]
 fn raw_q6_scalar_row_rejects_wrong_shapes() {
     assert!(raw_q6_scalar_row_f32(&[0; 209], &[0; 5120]).is_err());
     assert!(raw_q6_scalar_row_f32(&[0; 20 * 210], &[0; 5119]).is_err());

@@ -296,7 +296,11 @@ pub fn f32_to_bf16_rne_finite(value: f32) -> Result<u16, String> {
     }
     let bits = value.to_bits();
     let rounding_bias = 0x7fffu32 + ((bits >> 16) & 1);
-    Ok(((bits + rounding_bias) >> 16) as u16)
+    let rounded = ((bits + rounding_bias) >> 16) as u16;
+    if rounded & 0x7f80 == 0x7f80 {
+        return Err("BF16 RNE conversion overflows finite range".into());
+    }
+    Ok(rounded)
 }
 
 pub fn argmax_f32_as_bf16(logits: &[f32]) -> Result<usize, String> {
