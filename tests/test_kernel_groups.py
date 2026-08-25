@@ -179,6 +179,14 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
             self.assertNotIn("supersonic_backend_metal", text)
             self.assertNotRegex(text, r"\b(?:nvcc|CUDA|Metal|metal)\b")
 
+    def test_gpu_hal_build_fails_closed_with_an_explicit_rocm_link_path(self):
+        build = HAL_BUILD.read_text(encoding="utf-8")
+        self.assertIn("detect_rocm_lib_dir", build)
+        self.assertIn("has_libamdhip64", build)
+        self.assertIn('cargo:rustc-link-search=native={}', build)
+        self.assertIn('cargo:rerun-if-env-changed=HIP_PATH', build)
+        self.assertIn("No ROCm amdhip64 library found", build)
+
     def test_build_manifest_is_the_only_kernel_group_source_of_truth(self):
         build = KERNEL_BUILD.read_text(encoding="utf-8")
         self.assertIn("kernel-groups.toml", build)
