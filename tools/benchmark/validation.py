@@ -407,6 +407,12 @@ def _validate_quality_summary(quality: dict[str, object], required_case_ids: tup
 
     category_counts: dict[str, dict[str, int]] = {}
     for case in cases:
+        if (
+            case["category"] == "ordinary-vs-mtp-token-equality"
+            and case["passed"]
+            and case["expected_hash"] != case["actual_hash"]
+        ):
+            raise ValueError("passed MTP equality case must have matching evidence hashes")
         bucket = category_counts.setdefault(str(case["category"]), {"passed": 0, "failed": 0, "total": 0})
         bucket["total"] += 1
         if case["passed"]:

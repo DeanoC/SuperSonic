@@ -141,6 +141,26 @@ class BenchmarkQualityTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("token", result.failure.lower())
 
+    def test_mtp_pair_evidence_uses_the_ordinary_tokens_it_compares(self):
+        quality = load_quality_module()
+        case = self.case(
+            [1, 2, 3],
+            scorer="exact_tokens",
+            case_id="mtp-evidence",
+            category="ordinary-vs-mtp-token-equality",
+        )
+
+        result = quality.score_mtp_pair(
+            self.output("ordinary", token_ids=(40, 4021, 3300)),
+            self.output("mtp", token_ids=(40, 4021, 3300)),
+            case=case,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.expected_value, "[40,4021,3300]")
+        self.assertEqual(result.actual_value, "[40,4021,3300]")
+        self.assertEqual(result.expected_hash, result.actual_hash)
+
     def test_mtp_fails_clearly_when_tokens_are_unavailable(self):
         quality = load_quality_module()
 

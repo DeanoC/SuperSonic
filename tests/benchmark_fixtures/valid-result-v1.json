@@ -268,7 +268,7 @@
         "passed": true,
         "failure": null,
         "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "actual_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "expected_value": "[1,2,3]",
         "actual_value": "[1,2,3]"
       }
