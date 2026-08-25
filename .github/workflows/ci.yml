@@ -95,6 +95,8 @@ jobs:
           echo "/opt/rocm/bin" >> "$GITHUB_PATH"
           echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
           echo "HIP_PATH=/opt/rocm" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            >> "$GITHUB_ENV"
 
       - name: Verify host tools and pinned HIP toolchain
         shell: bash

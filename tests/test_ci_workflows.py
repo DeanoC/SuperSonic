@@ -317,6 +317,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("CA8BB4727A47B4D09B4EE8969386B48A1A693C5C", text)
         self.assertIn("key_fingerprint", text)
         self.assertIn("GITHUB_PATH", text)
+        self.assertIn('LD_LIBRARY_PATH=/opt/rocm/lib', text)
+        self.assertLess(text.index('LD_LIBRARY_PATH=/opt/rocm/lib'), text.index("GQH kernel-FFI tests"))
         self.assertIn("git --version", text)
         self.assertIn("python3", text)
         self.assertIn("python3 --version", text)
