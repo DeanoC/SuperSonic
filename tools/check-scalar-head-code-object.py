@@ -16,6 +16,9 @@ from pathlib import Path
 
 
 EXPECTED_REDUCTION_STAGES = 5
+EXPECTED_MUL_COUNT = 16
+EXPECTED_FMA_COUNT = 8
+EXPECTED_XOR_OFFSETS = [16, 8, 4, 2, 1]
 INSTRUCTION_PATTERNS = {
     "ds_bpermute_b32": r"\bds_bpermute_b32\b",
     "v_add_f32": r"\bv_(?:dual_)?add_f32(?:_[a-z0-9]+)?\b",
@@ -25,7 +28,17 @@ INSTRUCTION_PATTERNS = {
     "v_mul_f32": r"\bv_(?:dual_)?mul_f32(?:_[a-z0-9]+)?\b",
     "v_wmma_f32_16x16x16_bf16": r"\bv_wmma[a-z0-9_]*\b",
 }
+FORBIDDEN_REASSOCIATION_PATTERNS = {
+    "v_add3_f32": r"\bv_(?:dual_)?add3_f32(?:_[a-z0-9]+)?\b",
+    "v_mad_f32": r"\bv_(?:dual_)?mad(?:_mix)?_f32(?:_[a-z0-9]+)?\b",
+    "v_muladd_f32": r"\bv_(?:dual_)?muladd_f32(?:_[a-z0-9]+)?\b",
+}
 OFFLOAD_IMAGE_SUFFIX = ".0.hipv4-amdgcn-amd-amdhsa--gfx1201"
+
+# This is the canonical instruction-stream digest for the supported ROCm
+# 7.14 gfx1201 kernel object. It is deliberately distinct from the container
+# object digest, which contains relocatable addresses and bundle metadata.
+PINNED_INSTRUCTION_STREAM_SHA256 = "a72c8ffba00db69dc5b29aa61238f23ed3fb1540325497d4d84a7c2608d69667"
 
 
 def _matches_symbol(candidate: str, symbol: str) -> bool:
@@ -70,6 +83,51 @@ def _kernel_metadata(metadata: str, symbol: str) -> str:
         if matching:
             matches.append(block)
     return matches[0] if len(matches) == 1 else ""
+
+
+def canonical_instruction_stream(kernel: str) -> str:
+    """Return address/comment-free selected-symbol instructions.
+
+    LLVM's AMDGPU disassembler appends the instruction address and encoding as
+    a ``//`` comment. Those bytes are not part of the generated operation
+    graph and vary with placement, while the opcode, operands, register
+    dependencies, and immediates must remain unchanged.
+    """
+
+    canonical: list[str] = []
+    for raw_line in kernel.splitlines():
+        line = raw_line.split("//", 1)[0].strip()
+        if not line:
+            continue
+        # Accept objdump variants that put the address before the instruction,
+        # while leaving immediates such as ``0x100`` untouched.
+        line = re.sub(r"^[0-9A-Fa-f]+:\s+(?=[A-Za-z_])", "", line)
+        canonical.append(" ".join(line.split()))
+    return "\n".join(canonical)
+
+
+def instruction_stream_sha256(kernel: str) -> str:
+    """Hash the selected symbol's canonical instruction stream."""
+
+    return hashlib.sha256(canonical_instruction_stream(kernel).encode("utf-8")).hexdigest()
+
+
+def _xor_offsets(kernel: str) -> list[int | str | None]:
+    offsets: list[int | str | None] = []
+    opcode = re.compile(r"^v_(?:dual_)?xor_b32(?:_[a-z0-9]+)?\s+(.+)$")
+    for line in canonical_instruction_stream(kernel).splitlines():
+        match = opcode.match(line)
+        if not match:
+            continue
+        operands = [operand.strip() for operand in match.group(1).split(",")]
+        if len(operands) < 3:
+            offsets.append(None)
+            continue
+        try:
+            offsets.append(int(operands[1], 0))
+        except ValueError:
+            offsets.append(operands[1])
+    return offsets
 
 
 def _metadata_int(metadata: str, key: str) -> int | None:
@@ -121,9 +179,14 @@ def analyze(disassembly: str, metadata: str, symbol: str) -> dict:
     kernel = _kernel_disassembly(disassembly, symbol)
     kernel_metadata = _kernel_metadata(metadata, symbol)
     rsrc1 = _descriptor_rsrc1(disassembly, kernel_metadata, metadata)
+    canonical = canonical_instruction_stream(kernel)
     instruction_counts = {
-        name: len(re.findall(pattern, kernel))
+        name: len(re.findall(pattern, canonical))
         for name, pattern in INSTRUCTION_PATTERNS.items()
+    }
+    forbidden_reassociation_counts = {
+        name: len(re.findall(pattern, canonical))
+        for name, pattern in FORBIDDEN_REASSOCIATION_PATTERNS.items()
     }
     spill_fields = {
         "private_segment_fixed_size": _metadata_int(kernel_metadata, "private_segment_fixed_size"),
@@ -138,11 +201,18 @@ def analyze(disassembly: str, metadata: str, symbol: str) -> dict:
         "fp32_round_mode": None if rsrc1 is None else ("RNE" if ((rsrc1 >> 12) & 3) == 0 else str((rsrc1 >> 12) & 3)),
         "fp32_denorm_mode": None if rsrc1 is None else ("preserve" if ((rsrc1 >> 16) & 3) == 3 else str((rsrc1 >> 16) & 3)),
         "instruction_counts": instruction_counts,
+        "instruction_stream_sha256": instruction_stream_sha256(kernel),
+        "xor_offsets": _xor_offsets(kernel),
+        "_forbidden_reassociation_counts": forbidden_reassociation_counts,
         "_missing_spill_fields": missing_spill_fields,
     }
 
 
-def find_violations(report: dict) -> list[str]:
+def find_violations(
+    report: dict,
+    *,
+    expected_instruction_stream_sha256: str | None = None,
+) -> list[str]:
     """Return every generated-code contract violation in stable order."""
     violations: list[str] = []
     if report["symbol"] is None:
@@ -165,14 +235,32 @@ def find_violations(report: dict) -> list[str]:
     ):
         if counts[forbidden]:
             violations.append(f"forbidden {forbidden} count is {counts[forbidden]}")
-    for required in ("v_mul_f32", "v_fma_f32"):
-        if counts[required] == 0:
-            violations.append(f"missing required {required}")
+    for forbidden, count in report["_forbidden_reassociation_counts"].items():
+        if count:
+            violations.append(f"forbidden {forbidden} count is {count}")
+    if counts["v_mul_f32"] != EXPECTED_MUL_COUNT:
+        violations.append(
+            f"v_mul_f32 count must be {EXPECTED_MUL_COUNT} (got {counts['v_mul_f32']})"
+        )
+    if counts["v_fma_f32"] != EXPECTED_FMA_COUNT:
+        violations.append(
+            f"v_fma_f32 count must be {EXPECTED_FMA_COUNT} (got {counts['v_fma_f32']})"
+        )
     for instruction in ("ds_bpermute_b32", "v_add_f32"):
         if counts[instruction] != EXPECTED_REDUCTION_STAGES:
             violations.append(
                 f"{instruction} count must be {EXPECTED_REDUCTION_STAGES} (got {counts[instruction]})"
             )
+    if report["xor_offsets"] != EXPECTED_XOR_OFFSETS:
+        violations.append(
+            f"xor offsets must be {EXPECTED_XOR_OFFSETS} (got {report['xor_offsets']})"
+        )
+    if expected_instruction_stream_sha256 is not None and report["instruction_stream_sha256"] != expected_instruction_stream_sha256:
+        violations.append(
+            "instruction_stream_sha256 mismatch: "
+            f"expected {expected_instruction_stream_sha256} "
+            f"(got {report['instruction_stream_sha256']})"
+        )
     return violations
 
 
@@ -218,7 +306,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     report = analyze(disassembly, metadata, args.symbol)
-    violations = find_violations(report)
+    violations = find_violations(
+        report,
+        expected_instruction_stream_sha256=PINNED_INSTRUCTION_STREAM_SHA256,
+    )
     if violations:
         print("\n".join(violations), file=sys.stderr)
         return 1

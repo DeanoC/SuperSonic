@@ -17,6 +17,11 @@ SPEC.loader.exec_module(scalar_head)
 
 SYMBOL = "supersonic_qwen38_q6_k_scalar_head_f32_kernel"
 
+# This is deliberately the fixture's own pinned digest, not the supported
+# ROCm/gfx1201 object digest. Pure parser tests inject it explicitly so they do
+# not accidentally become coupled to the real release artifact.
+BASE_FIXTURE_FINGERPRINT = "8f04084f4a7abcf6cd7e412082316fb1da01fdfcf163e9b25e549a400c36a435"
+
 DISASSEMBLY = f"""
 0000000000000000 <{SYMBOL}>:
     v_mul_f32 v0, v1, v2
@@ -31,6 +36,33 @@ DISASSEMBLY = f"""
     v_add_f32 v0, v0, v1
     ds_bpermute_b32 v0, v1
     v_add_f32 v0, v0, v1
+    v_xor_b32 v6, 16, v3
+    v_xor_b32 v7, 8, v3
+    v_xor_b32 v7, 4, v3
+    v_xor_b32 v7, 2, v3
+    v_xor_b32 v7, 1, v3
+    v_mul_f32 v8, v9, v10
+    v_mul_f32 v9, v10, v11
+    v_mul_f32 v10, v11, v12
+    v_mul_f32 v11, v12, v13
+    v_mul_f32 v12, v13, v14
+    v_mul_f32 v13, v14, v15
+    v_mul_f32 v14, v15, v16
+    v_mul_f32 v15, v16, v17
+    v_mul_f32 v16, v17, v18
+    v_mul_f32 v17, v18, v19
+    v_mul_f32 v18, v19, v20
+    v_mul_f32 v19, v20, v21
+    v_mul_f32 v20, v21, v22
+    v_mul_f32 v21, v22, v23
+    v_mul_f32 v22, v23, v24
+    v_fma_f32 v8, v9, v10, v11
+    v_fma_f32 v9, v10, v11, v12
+    v_fma_f32 v10, v11, v12, v13
+    v_fma_f32 v11, v12, v13, v14
+    v_fma_f32 v12, v13, v14, v15
+    v_fma_f32 v13, v14, v15, v16
+    v_fma_f32 v14, v15, v16, v17
 0000000000000040 <another_kernel>:
     v_fma_mix_f32 v0, v1, v2, v3
 """
@@ -60,14 +92,143 @@ class ScalarHeadCodeObjectTests(unittest.TestCase):
             {
                 "ds_bpermute_b32": 5,
                 "v_add_f32": 5,
-                "v_fma_f32": 1,
+                "v_fma_f32": 8,
                 "v_fma_mix_f32": 0,
                 "v_mfma_f32_16x16x16bf16": 0,
-                "v_mul_f32": 1,
+                "v_mul_f32": 16,
                 "v_wmma_f32_16x16x16_bf16": 0,
             },
         )
-        self.assertEqual(scalar_head.find_violations(report), [])
+        self.assertEqual(report["xor_offsets"], [16, 8, 4, 2, 1])
+        self.assertEqual(
+            scalar_head.find_violations(
+                report,
+                expected_instruction_stream_sha256=BASE_FIXTURE_FINGERPRINT,
+            ),
+            [],
+        )
+
+    def test_reports_canonical_instruction_stream_digest(self):
+        report = scalar_head.analyze(DISASSEMBLY, METADATA, SYMBOL)
+
+        self.assertEqual(
+            report["instruction_stream_sha256"],
+            BASE_FIXTURE_FINGERPRINT,
+        )
+
+    def test_canonical_digest_ignores_addresses_and_encoding_comments(self):
+        annotated = DISASSEMBLY.replace(
+            f"0000000000000000 <{SYMBOL}>:",
+            f"0000000000001000 <{SYMBOL}>:",
+        ).replace(
+            "    v_mul_f32 v0, v1, v2",
+            "    v_mul_f32 v0, v1, v2 // 0000000000001000: 10343512",
+            1,
+        )
+
+        base = scalar_head.analyze(DISASSEMBLY, METADATA, SYMBOL)
+        changed_addresses = scalar_head.analyze(annotated, METADATA, SYMBOL)
+
+        self.assertEqual(
+            changed_addresses["instruction_stream_sha256"],
+            base["instruction_stream_sha256"],
+        )
+
+    def test_rejects_order_offset_and_dependency_mutations_even_when_counts_match(self):
+        mutations = {
+            "wrong offset": DISASSEMBLY.replace(
+                "    v_xor_b32 v6, 16, v3\n",
+                "    v_xor_b32 v6, 32, v3\n",
+                1,
+            ),
+            "wrong order": DISASSEMBLY.replace(
+                "    v_xor_b32 v7, 8, v3\n    v_xor_b32 v7, 4, v3\n",
+                "    v_xor_b32 v7, 4, v3\n    v_xor_b32 v7, 8, v3\n",
+                1,
+            ),
+            "changed dependency": DISASSEMBLY.replace(
+                "    v_mul_f32 v0, v1, v2\n",
+                "    v_mul_f32 v0, v1, v9\n",
+                1,
+            ),
+        }
+
+        for label, disassembly in mutations.items():
+            with self.subTest(label=label):
+                report = scalar_head.analyze(disassembly, METADATA, SYMBOL)
+                self.assertEqual(
+                    report["instruction_counts"]["v_mul_f32"],
+                    16,
+                )
+                self.assertEqual(report["instruction_counts"]["v_fma_f32"], 8)
+                violations = scalar_head.find_violations(
+                    report,
+                    expected_instruction_stream_sha256=BASE_FIXTURE_FINGERPRINT,
+                )
+                self.assertTrue(
+                    any(
+                        "instruction_stream_sha256" in violation
+                        for violation in violations
+                    ),
+                    violations,
+                )
+
+        wrong_offset = scalar_head.analyze(mutations["wrong offset"], METADATA, SYMBOL)
+        wrong_order = scalar_head.analyze(mutations["wrong order"], METADATA, SYMBOL)
+        self.assertNotEqual(wrong_offset["xor_offsets"], [16, 8, 4, 2, 1])
+        self.assertNotEqual(wrong_order["xor_offsets"], [16, 8, 4, 2, 1])
+
+    def test_rejects_extra_mul_and_fma_instructions(self):
+        extra = DISASSEMBLY.replace(
+            f"0000000000000040 <another_kernel>:",
+            "    v_mul_f32 v25, v26, v27\n"
+            "    v_fma_f32 v25, v26, v27, v28\n"
+            f"0000000000000040 <another_kernel>:",
+            1,
+        )
+        report = scalar_head.analyze(extra, METADATA, SYMBOL)
+        violations = scalar_head.find_violations(
+            report,
+            expected_instruction_stream_sha256=BASE_FIXTURE_FINGERPRINT,
+        )
+
+        self.assertEqual(report["instruction_counts"]["v_mul_f32"], 17)
+        self.assertEqual(report["instruction_counts"]["v_fma_f32"], 9)
+        self.assertTrue(any("v_mul_f32 count must be 16" in v for v in violations), violations)
+        self.assertTrue(any("v_fma_f32 count must be 8" in v for v in violations), violations)
+
+    def test_rejects_reassociation_opcode_families(self):
+        for opcode in ("v_add3_f32", "v_mad_f32"):
+            with self.subTest(opcode=opcode):
+                disassembly = DISASSEMBLY.replace(
+                    "0000000000000040 <another_kernel>:",
+                    f"    {opcode} v25, v26, v27, v28\n"
+                    "0000000000000040 <another_kernel>:",
+                    1,
+                )
+                report = scalar_head.analyze(disassembly, METADATA, SYMBOL)
+                violations = scalar_head.find_violations(report)
+                self.assertTrue(
+                    any(f"forbidden {opcode}" in v for v in violations),
+                    violations,
+                )
+
+    def test_cli_enforces_real_pinned_fingerprint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            object_path = Path(temporary) / "code.o"
+            object_path.write_bytes(b"object")
+            stderr = io.StringIO()
+            with patch.object(
+                scalar_head,
+                "_inspect_object",
+                return_value=(DISASSEMBLY, METADATA),
+            ), redirect_stderr(stderr):
+                result = scalar_head.main(
+                    ["--object", str(object_path), "--symbol", SYMBOL]
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("instruction_stream_sha256", stderr.getvalue())
 
     def test_rejects_forbidden_or_contract_breaking_kernel_variants(self):
         cases = {
