@@ -1,7 +1,11 @@
 import importlib.util
+import io
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "check-scalar-head-code-object.py"
@@ -36,6 +40,8 @@ AMDGPU HSA Kernel Descriptor
   .symbol: {SYMBOL}
   .vgpr_count: 24
   .private_segment_fixed_size: 0
+  .sgpr_spill_count: 0
+  .vgpr_spill_count: 0
   COMPUTE_PGM_RSRC1: 0x00030002
 """
 
@@ -83,6 +89,95 @@ class ScalarHeadCodeObjectTests(unittest.TestCase):
                     any(expected in violation for violation in scalar_head.find_violations(report)),
                     scalar_head.find_violations(report),
                 )
+
+    def test_rejects_missing_spill_metadata_evidence(self):
+        for field in ("private_segment_fixed_size", "sgpr_spill_count", "vgpr_spill_count"):
+            with self.subTest(field=field):
+                report = scalar_head.analyze(
+                    DISASSEMBLY,
+                    METADATA.replace(f"  .{field}: 0\n", ""),
+                    SYMBOL,
+                )
+                self.assertIn(
+                    f"missing {field} metadata",
+                    scalar_head.find_violations(report),
+                )
+
+    def test_rejects_forbidden_instruction_families(self):
+        cases = {
+            "fma mix variant": ("v_fma_f32", "v_fma_mixlo_f32", "v_fma_mix_f32"),
+            "wmma variant": ("v_mul_f32", "v_wmma_f32_16x16x16_fp8", "v_wmma_f32_16x16x16_bf16"),
+            "mfma variant": ("v_mul_f32", "v_mfma_f32_32x32x8f16", "v_mfma_f32_16x16x16bf16"),
+        }
+        for label, (original, variant, expected) in cases.items():
+            with self.subTest(label=label):
+                report = scalar_head.analyze(DISASSEMBLY.replace(original, variant, 1), METADATA, SYMBOL)
+                self.assertTrue(
+                    any(expected in violation for violation in scalar_head.find_violations(report)),
+                    scalar_head.find_violations(report),
+                )
+
+    def test_rejects_missing_ambiguous_and_prefix_colliding_symbol_matches(self):
+        cases = {
+            "missing": (DISASSEMBLY.replace(SYMBOL, "different_kernel", 1), METADATA.replace(SYMBOL, "different_kernel")),
+            "prefix collision": (
+                DISASSEMBLY.replace(SYMBOL, f"{SYMBOL}_different_kernel", 1),
+                METADATA.replace(SYMBOL, f"{SYMBOL}_different_kernel"),
+            ),
+            "ambiguous labels": (
+                DISASSEMBLY + f"0000000000000080 <{SYMBOL}>:\n    s_endpgm\n",
+                METADATA,
+            ),
+            "ambiguous metadata": (
+                DISASSEMBLY,
+                METADATA + f"\n  .symbol: {SYMBOL}\n  .vgpr_count: 24\n",
+            ),
+        }
+        for label, (disassembly, metadata) in cases.items():
+            with self.subTest(label=label):
+                report = scalar_head.analyze(disassembly, metadata, SYMBOL)
+                self.assertIn("missing symbol in disassembly or metadata", scalar_head.find_violations(report))
+
+    def test_cli_rejects_abbreviated_options(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            object_path = Path(temporary) / "code.o"
+            object_path.write_bytes(b"object")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                scalar_head.main(["--obj", str(object_path), "--sym", SYMBOL])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--object", stderr.getvalue())
+
+    def test_inspection_extracts_the_gfx1201_offload_image_with_bounded_argv(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            object_path = Path(temporary) / "full_attention_bridge_4b.o"
+            object_path.write_bytes(b"fat-object")
+
+            def run_tool(command):
+                if command[1:] == ["--offloading", command[-1]]:
+                    Path(command[-1] + ".0.hipv4-amdgcn-amd-amdhsa--gfx1201").write_bytes(b"device-object")
+                    return "Extracting offload bundle"
+                if command[1] == "--disassemble":
+                    return DISASSEMBLY
+                if command[1] == "--notes":
+                    return METADATA
+                self.fail(f"unexpected command: {command}")
+
+            with patch.object(scalar_head, "_run_tool", side_effect=run_tool) as run:
+                disassembly, metadata = scalar_head._inspect_object(
+                    object_path,
+                    "llvm-objdump",
+                    "llvm-readobj",
+                )
+
+        self.assertEqual(disassembly, DISASSEMBLY)
+        self.assertEqual(metadata, METADATA)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[0][:2], ["llvm-objdump", "--offloading"])
+        self.assertTrue(commands[1][-1].endswith(".0.hipv4-amdgcn-amd-amdhsa--gfx1201"))
+        self.assertEqual(commands[1][1:4], ["--disassemble", "--full-contents", "--mcpu=gfx1201"])
+        self.assertEqual(commands[2][0:3], ["llvm-readobj", "--notes", "--symbols"])
 
     def test_decodes_fp32_modes_from_the_real_code_object_descriptor_layout(self):
         descriptor_disassembly = DISASSEMBLY + """
