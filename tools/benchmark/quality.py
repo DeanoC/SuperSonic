@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from pathlib import Path
 
 from .adapters import ParsedOutput
 from .model import QualityCase, canonical_json, parse_strict_json
@@ -10,6 +11,12 @@ from .model import QualityCase, canonical_json, parse_strict_json
 MTP_CATEGORY = "ordinary-vs-mtp-token-equality"
 MAX_VALUE_PREVIEW = 160
 _USE_CASE_EXPECTED = object()
+_GOLDENS_PATH = Path(__file__).resolve().parents[2] / "benchmarks" / "quality" / "scalar-mtp-goldens-v1.json"
+_GOLDEN_ENGINES = {"supersonic-wmma", "supersonic-scalar-lab"}
+_GOLDEN_CASES = {
+    "ordinary-vs-mtp-token-equality-1",
+    "ordinary-vs-mtp-token-equality-2",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +30,52 @@ class QualityResult:
     actual_hash: str
     expected_value: str
     actual_value: str
+
+
+def load_scalar_mtp_goldens(path: Path = _GOLDENS_PATH) -> dict[str, dict[str, tuple[int, ...]]]:
+    payload = parse_strict_json(path.read_text(encoding="utf-8"), context="scalar MTP goldens")
+    if not isinstance(payload, dict) or set(payload) != {
+        "version",
+        "artifact",
+        "tokenizer_sha256",
+        "chat_template_sha256",
+        "engines",
+    }:
+        raise ValueError("scalar MTP goldens must use the closed v1 shape")
+    if payload["version"] != "v1" or not isinstance(payload["engines"], dict):
+        raise ValueError("scalar MTP goldens must use version v1")
+    engines = payload["engines"]
+    if set(engines) != _GOLDEN_ENGINES:
+        raise ValueError("scalar MTP goldens must contain both SuperSonic engines")
+    result: dict[str, dict[str, tuple[int, ...]]] = {}
+    for engine_name, engine_value in engines.items():
+        if not isinstance(engine_value, dict) or set(engine_value) != {
+            "binary_sha256",
+            "instruction_stream_sha256",
+            "cases",
+        }:
+            raise ValueError(f"scalar MTP golden engine {engine_name} has an invalid shape")
+        cases = engine_value["cases"]
+        if not isinstance(cases, dict) or set(cases) != _GOLDEN_CASES:
+            raise ValueError(f"scalar MTP golden engine {engine_name} must contain both cases")
+        result[engine_name] = {}
+        for case_id, case_value in cases.items():
+            if not isinstance(case_value, dict) or set(case_value) != {
+                "prompt_sha256",
+                "token_ids",
+                "generated_text",
+            }:
+                raise ValueError(f"scalar MTP golden {engine_name}/{case_id} has an invalid shape")
+            tokens = case_value["token_ids"]
+            if (
+                not isinstance(tokens, list)
+                or not tokens
+                or len(tokens) > 8
+                or any(isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in tokens)
+            ):
+                raise ValueError(f"scalar MTP golden {engine_name}/{case_id} has invalid token ids")
+            result[engine_name][case_id] = tuple(tokens)
+    return result
 
 
 def score_case(case: QualityCase, output: ParsedOutput) -> QualityResult:
@@ -64,6 +117,7 @@ def score_mtp_pair(
     case: QualityCase | None = None,
     case_id: str | None = None,
     category: str | None = None,
+    expected_tokens: tuple[int, ...] | list[int] | None = None,
 ) -> QualityResult:
     mtp_case = _resolve_mtp_case(
         case=case,
@@ -80,12 +134,20 @@ def score_mtp_pair(
             passed=False,
             failure="ordinary/MTP token ids unavailable for exact comparison",
         )
+    expected = list(expected_tokens) if expected_tokens is not None else list(ordinary.token_ids)
     actual = list(mtp.token_ids)
-    passed = tuple(ordinary.token_ids) == tuple(mtp.token_ids)
-    failure = None if passed else "ordinary/MTP token ids did not exactly match"
+    modes_match = tuple(ordinary.token_ids) == tuple(mtp.token_ids)
+    golden_matches = list(ordinary.token_ids) == expected
+    passed = modes_match and golden_matches
+    if not modes_match:
+        failure = "ordinary/MTP token ids did not exactly match"
+    elif not golden_matches:
+        failure = "ordinary/MTP token ids matched each other but not the reviewed golden"
+    else:
+        failure = None
     return _result(
         mtp_case,
-        expected=list(ordinary.token_ids),
+        expected=expected,
         actual=actual,
         passed=passed,
         failure=failure,

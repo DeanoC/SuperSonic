@@ -28,7 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run = subparsers.add_parser("run", help="preflight and execute a benchmark suite")
-    run.add_argument("--suite", choices=("quick", "full"), required=True)
+    run.add_argument(
+        "--suite",
+        choices=("quick", "full", "full-scalar-qualification"),
+        required=True,
+    )
     run.add_argument("--model-dir", type=Path, required=True)
     run.add_argument("--artifact", type=Path, required=True)
     run.add_argument("--peer-artifact", type=Path)

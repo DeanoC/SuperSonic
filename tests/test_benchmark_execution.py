@@ -539,6 +539,79 @@ class BenchmarkExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MTP|exact_tokens|manifest"):
             self.execution._validate_mtp_quality_case(non_mtp)
 
+    def test_quality_runs_engine_specific_golden_mtp_pairs_for_both_supersonic_variants(self):
+        suite = self.execution.manifest.load_suite("full-scalar-qualification")
+        mtp_cases = tuple(
+            case
+            for case in self.execution.manifest.load_quality("v2")
+            if case.category == "ordinary-vs-mtp-token-equality"
+        )
+        suite = replace(
+            suite,
+            name="quality-two-super-test",
+            budget_seconds=600,
+            minimum_duration_seconds=0,
+            engines=("supersonic-wmma", "supersonic-scalar-lab"),
+            quality_case_ids=tuple(case.id for case in mtp_cases),
+            performance_cases=(
+                replace(
+                    suite.performance_cases[2],
+                    repetitions=1,
+                    engines=("supersonic-wmma", "supersonic-scalar-lab"),
+                ),
+            ),
+        )
+        config = self.execution.replace_config(
+            self.config(run_quality=True),
+            suite=suite,
+            engine_binaries={
+                "supersonic-wmma": self.binary,
+                "supersonic-scalar-lab": self.binary,
+            },
+            engine_versions={
+                "supersonic-wmma": "source-test-wmma",
+                "supersonic-scalar-lab": "scalar-head-lab-v1",
+            },
+        )
+        run_manifest = self.execution.preflight(config)
+        token_ids = [40, 4021, 3300, 3050, 3817, 27437, 430, 781]
+        common = (
+            '[generated_json] "I cannot provide specific token IDs as they"\n'
+            '[tokens] 40 4021 3300 3050 3817 27437 430 781\n'
+            '[result] prompt_tokens=25 generated_tokens=8 decode_ms=8.0 ms_per_tok=1.0\n'
+        )
+        scalar = "[supersonic_json] " + json.dumps(
+            {
+                "decode_ms": 8.0,
+                "engine_name": "supersonic-scalar-lab",
+                "engine_version": "scalar-head-lab-v1",
+                "generated_text": "I cannot provide specific token IDs as they",
+                "generated_tokens": 8,
+                "ms_per_tok": 1.0,
+                "prompt_tokens": 25,
+                "token_ids": token_ids,
+                "tokens_per_second": 1000.0,
+            },
+            separators=(",", ":"),
+        )
+
+        class QualityRunner(FakeRunner):
+            def __call__(self, argv, timeout=None, engine_name=None, **kwargs):
+                output = scalar if engine_name == "supersonic-scalar-lab" else common
+                return {"returncode": 0, "stdout": output, "stderr": ""}
+
+        summaries, errors, interrupted = self.execution._run_quality(
+            run_manifest,
+            deadline=600.0,
+            clock=lambda: 0.0,
+            command_runner=QualityRunner(),
+        )
+
+        self.assertFalse(interrupted)
+        self.assertEqual(errors, [])
+        self.assertEqual(summaries["supersonic-wmma"]["passed"], 2)
+        self.assertEqual(summaries["supersonic-scalar-lab"]["passed"], 2)
+
     def test_quality_timeout_allows_bounded_fresh_process_model_load(self):
         quality_case = self.execution.manifest.load_quality("v1")[0]
 
@@ -629,6 +702,47 @@ class BenchmarkExecutionTests(unittest.TestCase):
         wrong_size = self.execution.replace_config(config, artifact_size_bytes=9)
         with self.assertRaisesRegex(ValueError, "artifact size"):
             self.execution.preflight(wrong_size)
+
+    def test_scalar_qualification_rejects_wrong_approved_artifact_semantics(self):
+        approved = self.root / "Qwen3.8-27B-GQH-Q3KXL.gguf"
+        with approved.open("wb") as handle:
+            handle.truncate(13440110432)
+        suite = self.execution.manifest.load_suite("full-scalar-qualification")
+        config = self.execution.replace_config(
+            self.config(include_peer=True),
+            suite=suite,
+            artifact=approved,
+            peer_artifact=approved,
+            artifact_semantic_id="wrong-semantic-id",
+            artifact_quantization="GQH-Q3KXL",
+            artifact_source_repository="Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF",
+            artifact_source_revision="91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4",
+            artifact_filename=approved.name,
+            artifact_size_bytes=13440110432,
+            peer_artifact_source_repository=None,
+            peer_artifact_source_revision=None,
+            peer_artifact_filename=None,
+            peer_artifact_size_bytes=None,
+            engine_binaries={
+                "supersonic-wmma": self.binary,
+                "supersonic-scalar-lab": self.binary,
+                "llama-cpp": self.peer_binary,
+            },
+            engine_versions={
+                "supersonic-wmma": "source-test-wmma",
+                "supersonic-scalar-lab": "scalar-head-lab-v1",
+            },
+        )
+
+        with (
+            mock.patch.object(
+                self.execution,
+                "_digest_file",
+                return_value="c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98",
+            ),
+            self.assertRaisesRegex(ValueError, "semantic"),
+        ):
+            self.execution.preflight(config)
 
     def test_fractional_deadline_timeout_is_never_rounded_up(self):
         config = self.config(run_quality=False)

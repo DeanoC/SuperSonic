@@ -32,7 +32,21 @@ from .model import EngineManifest, PerformanceCase, QualityCase, SuiteManifest, 
 
 
 ROOT = manifest.ROOT
-EXPECTED_BUDGETS = {"quick": 600, "full": 21600}
+EXPECTED_BUDGETS = {
+    "quick": 600,
+    "full": 21600,
+    "full-scalar-qualification": 21600,
+}
+SCALAR_QUALIFICATION_SUITE = "full-scalar-qualification"
+APPROVED_ARTIFACT = {
+    "semantic_id": "qwen3.8-27b-gqh-q3kxl-hf-91bc7e33",
+    "quantization": "GQH-Q3KXL",
+    "source_repository": "Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF",
+    "source_revision": "91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4",
+    "filename": "Qwen3.8-27B-GQH-Q3KXL.gguf",
+    "size_bytes": 13440110432,
+    "sha256": "c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98",
+}
 QUALITY_CASE_TIMEOUT_SECONDS = 180
 QUICK_BUDGET_SECONDS = EXPECTED_BUDGETS["quick"]
 FULL_BUDGET_SECONDS = EXPECTED_BUDGETS["full"]
@@ -190,6 +204,7 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
     _validate_model_files(model_dir, chat=bool(resolved.chat))
     artifact = _required_path(resolved.artifact, "artifact", directory=False, nonempty=True)
     _validate_artifact_source(resolved, artifact, peer=False)
+    _validate_qualification_artifact_metadata(resolved, suite, artifact)
     _validate_model_digests(model_dir, resolved)
     physical_gpu = _required_text(resolved.physical_gpu, "physical_gpu")
     if not physical_gpu.isdigit():
@@ -894,19 +909,16 @@ def _run_quality(
     clock: Callable[[], float],
     command_runner: Callable[..., object],
 ) -> tuple[dict[str, dict[str, object]], list[str], bool]:
-    """Run deterministic quality once on SuperSonic.
-
-    Peer adapters can have deliberately different raw output capabilities (in
-    particular llama.cpp has no token IDs).  Token equality is therefore
-    scored only for manifest exact-token MTP cases on the SuperSonic pair;
-    peer records reuse the suite-level quality summary rather than invoking
-    ``score_mtp_pair`` with an unsuitable output.
-    """
+    """Run deterministic quality independently for each SuperSonic identity."""
 
     errors: list[str] = []
     interrupted = False
-    primary = next((engine for engine in run_manifest.engines if engine.name == "supersonic"), None)
-    if primary is None:
+    supers = tuple(
+        engine
+        for engine in run_manifest.engines
+        if engine.name in {"supersonic", "supersonic-wmma", "supersonic-scalar-lab"}
+    )
+    if not supers:
         _append_error(errors, "quality_failed")
         summary = quality.summarize_quality((), required_cases=run_manifest.quality_cases)
         return {engine.name: summary for engine in run_manifest.engines}, errors, False
@@ -922,77 +934,103 @@ def _run_quality(
             adapters.DEFAULT_SAMPLING_SEED if run_manifest.config.seed is None else run_manifest.config.seed
         ),
     )
-    results: list[quality.QualityResult] = []
-    for case in run_manifest.quality_cases:
-        try:
-            _validate_quality_case(case)
-            if clock() >= deadline:
-                _append_error(errors, "budget_exhausted")
+    golden_by_engine = (
+        quality.load_scalar_mtp_goldens()
+        if any(engine.name != "supersonic" for engine in supers)
+        else {}
+    )
+    summaries: dict[str, dict[str, object]] = {}
+    results_by_engine: dict[str, list[quality.QualityResult]] = {}
+
+    for engine in supers:
+        results: list[quality.QualityResult] = []
+        results_by_engine[engine.name] = results
+        for case in run_manifest.quality_cases:
+            try:
+                _validate_quality_case(case)
+                if clock() >= deadline:
+                    _append_error(errors, "budget_exhausted")
+                    break
+                if case.category == MTP_CATEGORY:
+                    ordinary = _quality_output(
+                        run_manifest,
+                        case,
+                        engine=engine,
+                        mode="ordinary",
+                        inputs=inputs,
+                        timeout=_quality_timeout(case, deadline, clock),
+                        suite_deadline=deadline,
+                        clock=clock,
+                        command_runner=command_runner,
+                        suffix=f"{engine.name}-ordinary",
+                    )
+                    mtp = _quality_output(
+                        run_manifest,
+                        case,
+                        engine=engine,
+                        mode="mtp",
+                        inputs=inputs,
+                        timeout=_quality_timeout(case, deadline, clock),
+                        suite_deadline=deadline,
+                        clock=clock,
+                        command_runner=command_runner,
+                        suffix=f"{engine.name}-mtp",
+                    )
+                    expected_tokens = (
+                        golden_by_engine.get(engine.name, {}).get(case.id)
+                        if engine.name != "supersonic"
+                        else None
+                    )
+                    if engine.name != "supersonic" and expected_tokens is None:
+                        raise ValueError(f"missing scalar MTP golden for {engine.name}/{case.id}")
+                    results.append(
+                        quality.score_mtp_pair(
+                            ordinary,
+                            mtp,
+                            case=case,
+                            expected_tokens=expected_tokens,
+                        )
+                    )
+                else:
+                    performance_case = _quality_performance_case(case, mode="ordinary", engine=engine)
+                    argv = adapters.build_command(engine, performance_case, inputs)
+                    output = _quality_process(
+                        run_manifest,
+                        case,
+                        engine,
+                        argv,
+                        timeout=_quality_timeout(case, deadline, clock),
+                        suite_deadline=deadline,
+                        clock=clock,
+                        command_runner=command_runner,
+                        suffix=f"{engine.name}-ordinary",
+                    )
+                    results.append(quality.score_case(case, output))
+            except KeyboardInterrupt:
+                _append_error(errors, "interrupted")
+                interrupted = True
                 break
-            if case.category == MTP_CATEGORY:
-                ordinary = _quality_output(
-                    run_manifest,
-                    case,
-                    mode="ordinary",
-                    inputs=inputs,
-                    timeout=_quality_timeout(case, deadline, clock),
-                    suite_deadline=deadline,
-                    clock=clock,
-                    command_runner=command_runner,
-                    suffix="ordinary",
-                )
-                mtp = _quality_output(
-                    run_manifest,
-                    case,
-                    mode="mtp",
-                    inputs=inputs,
-                    timeout=_quality_timeout(case, deadline, clock),
-                    suite_deadline=deadline,
-                    clock=clock,
-                    command_runner=command_runner,
-                    suffix="mtp",
-                )
-                results.append(quality.score_mtp_pair(ordinary, mtp, case=case))
-            else:
-                quality_case = _quality_performance_case(case, mode="ordinary", engine=primary)
-                argv = adapters.build_command(primary, quality_case, inputs)
-                output = _quality_process(
-                    run_manifest,
-                    case,
-                    primary,
-                    argv,
-                    timeout=_quality_timeout(case, deadline, clock),
-                    suite_deadline=deadline,
-                    clock=clock,
-                    command_runner=command_runner,
-                    suffix="ordinary",
-                )
-                results.append(quality.score_case(case, output))
-        except KeyboardInterrupt:
-            _append_error(errors, "interrupted")
-            interrupted = True
-            break
-        except _CaseError as exc:
-            _append_error(errors, exc.code)
-            break
-        except (OSError, TypeError, RuntimeError, ValueError) as exc:
+            except _CaseError as exc:
+                _append_error(errors, exc.code)
+                break
+            except (OSError, TypeError, RuntimeError, ValueError) as exc:
+                _append_error(errors, "quality_failed")
+                _write_quality_error(run_manifest.bundle, case, str(exc))
+                break
+        summary = quality.summarize_quality(results, required_cases=run_manifest.quality_cases)
+        if summary.get("failed", 0) or summary.get("missing_case_ids"):
             _append_error(errors, "quality_failed")
-            # Keep the diagnostic local to the bundle without putting paths or
-            # unbounded process output into the portable result record.
-            _write_quality_error(run_manifest.bundle, case, str(exc))
+        summaries[engine.name] = summary
+        if interrupted:
             break
-    primary_summary = quality.summarize_quality(results, required_cases=run_manifest.quality_cases)
-    if primary_summary.get("failed", 0) or primary_summary.get("missing_case_ids"):
-        _append_error(errors, "quality_failed")
-    summaries: dict[str, dict[str, object]] = {primary.name: primary_summary}
 
     # Run only scorer-compatible cases for the llama peer.  The two exact
     # token cases have no meaning for llama.cpp's raw format (its parser
     # intentionally returns token_ids=None), so their manifest SuperSonic MTP
     # results are carried as suite-level evidence instead of being rescored.
-    primary_results = {result.id: result for result in results}
+    primary_results = {result.id: result for result in results_by_engine[supers[0].name]}
     for peer in run_manifest.engines:
-        if peer.name == primary.name:
+        if peer.name in results_by_engine:
             continue
         peer_results: list[quality.QualityResult] = []
         for case in run_manifest.quality_cases:
@@ -1046,6 +1084,7 @@ def _quality_output(
     run_manifest: RunManifest,
     quality_case: QualityCase,
     *,
+    engine: EngineManifest,
     mode: str,
     inputs: adapters.AdapterInputs,
     timeout: float,
@@ -1054,13 +1093,12 @@ def _quality_output(
     command_runner: Callable[..., object],
     suffix: str,
 ) -> adapters.ParsedOutput:
-    primary = next(engine for engine in run_manifest.engines if engine.name == "supersonic")
-    performance_case = _quality_performance_case(quality_case, mode=mode, engine=primary)
-    argv = adapters.build_command(primary, performance_case, inputs)
+    performance_case = _quality_performance_case(quality_case, mode=mode, engine=engine)
+    argv = adapters.build_command(engine, performance_case, inputs)
     return _quality_process(
         run_manifest,
         quality_case,
-        primary,
+        engine,
         argv,
         timeout=timeout,
         suite_deadline=suite_deadline,
@@ -1410,6 +1448,7 @@ def _persist_bundle_manifest(
 ) -> None:
     config = run_manifest.config
     artifact_entries: dict[str, object] = {}
+    artifact_digests: dict[Path, str] = {}
     for engine in run_manifest.engines:
         if engine.name == "llama-cpp":
             path = Path(config.peer_artifact) if config.peer_artifact is not None else None
@@ -1417,7 +1456,16 @@ def _persist_bundle_manifest(
             path = Path(config.artifact)
         if path is None:
             continue
-        digest = _digest_file(path)
+        resolved_path = path.resolve()
+        digest = artifact_digests.get(resolved_path)
+        if digest is None:
+            digest = _digest_file(resolved_path)
+            artifact_digests[resolved_path] = digest
+        if (
+            run_manifest.suite.name == SCALAR_QUALIFICATION_SUITE
+            and digest != APPROVED_ARTIFACT["sha256"]
+        ):
+            raise ValueError("scalar qualification artifact SHA-256 does not match approved artifact")
         artifact_entries[engine.name] = {
             "name": path.name,
             "sha256": digest,
@@ -2171,6 +2219,37 @@ def _artifact_identity(config: RunConfig, engine: EngineManifest) -> dict[str, o
 
 def _validate_artifact_source(config: RunConfig, artifact: Path, *, peer: bool) -> None:
     _artifact_source_identity(config, artifact, peer=peer)
+
+
+def _validate_qualification_artifact_metadata(
+    config: RunConfig,
+    suite: SuiteManifest,
+    artifact: Path,
+) -> None:
+    if suite.name != SCALAR_QUALIFICATION_SUITE:
+        return
+    primary = _artifact_source_identity(config, artifact, peer=False)
+    expected = APPROVED_ARTIFACT
+    checks = {
+        "semantic_id": config.artifact_semantic_id,
+        "quantization": config.artifact_quantization,
+        **primary,
+    }
+    for field in (
+        "semantic_id",
+        "quantization",
+        "source_repository",
+        "source_revision",
+        "filename",
+        "size_bytes",
+    ):
+        if checks[field] != expected[field]:
+            raise ValueError(
+                f"scalar qualification artifact {field} mismatch: "
+                f"observed {checks[field]!r}, expected {expected[field]!r}"
+            )
+    if config.peer_artifact is None or Path(config.peer_artifact).resolve() != artifact.resolve():
+        raise ValueError("scalar qualification requires all engines to use the same artifact file")
 
 
 def _artifact_source_identity(config: RunConfig, artifact: Path, *, peer: bool) -> dict[str, object]:

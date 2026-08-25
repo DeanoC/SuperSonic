@@ -141,7 +141,7 @@ class BenchmarkQualityTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("token", result.failure.lower())
 
-    def test_mtp_pair_evidence_uses_the_ordinary_tokens_it_compares(self):
+    def test_mtp_pair_rejects_mutually_equal_tokens_that_miss_the_reviewed_golden(self):
         quality = load_quality_module()
         case = self.case(
             [1, 2, 3],
@@ -154,12 +154,31 @@ class BenchmarkQualityTests(unittest.TestCase):
             self.output("ordinary", token_ids=(40, 4021, 3300)),
             self.output("mtp", token_ids=(40, 4021, 3300)),
             case=case,
+            expected_tokens=(1, 2, 3),
         )
 
-        self.assertTrue(result.passed)
-        self.assertEqual(result.expected_value, "[40,4021,3300]")
+        self.assertFalse(result.passed)
+        self.assertIn("golden", result.failure)
+        self.assertEqual(result.expected_value, "[1,2,3]")
         self.assertEqual(result.actual_value, "[40,4021,3300]")
-        self.assertEqual(result.expected_hash, result.actual_hash)
+        self.assertNotEqual(result.expected_hash, result.actual_hash)
+
+    def test_scalar_mtp_goldens_are_engine_specific_and_not_quality_v2_arrays(self):
+        quality = load_quality_module()
+
+        goldens = quality.load_scalar_mtp_goldens()
+
+        expected = (40, 4021, 3300, 3050, 3817, 27437, 430, 781)
+        for engine in ("supersonic-wmma", "supersonic-scalar-lab"):
+            self.assertEqual(
+                goldens[engine]["ordinary-vs-mtp-token-equality-1"],
+                expected,
+            )
+            self.assertEqual(
+                goldens[engine]["ordinary-vs-mtp-token-equality-2"],
+                expected,
+            )
+            self.assertNotEqual(goldens[engine]["ordinary-vs-mtp-token-equality-1"], (1, 2, 3))
 
     def test_mtp_fails_clearly_when_tokens_are_unavailable(self):
         quality = load_quality_module()

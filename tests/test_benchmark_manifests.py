@@ -64,6 +64,29 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(tuple(quick.engines), ("supersonic",))
         self.assertEqual(tuple(full.engines), ("supersonic", "llama-cpp"))
 
+    def test_scalar_qualification_suite_balances_three_engines(self):
+        manifest = load_manifest_module()
+        suite = manifest.load_suite("full-scalar-qualification")
+
+        self.assertEqual(suite.budget_seconds, 21600)
+        self.assertEqual(suite.minimum_duration_seconds, 20700)
+        self.assertEqual(
+            suite.engines,
+            ("supersonic-wmma", "supersonic-scalar-lab", "llama-cpp"),
+        )
+        self.assertTrue(all(case.repetitions == 7 for case in suite.performance_cases))
+        ordinary = [case for case in suite.performance_cases if case.mode == "ordinary"]
+        mtp = [case for case in suite.performance_cases if case.mode == "mtp"]
+        self.assertTrue(ordinary)
+        self.assertTrue(mtp)
+        self.assertTrue(all(case.engines == suite.engines for case in ordinary))
+        self.assertTrue(
+            all(
+                case.engines == ("supersonic-wmma", "supersonic-scalar-lab")
+                for case in mtp
+            )
+        )
+
     def test_suite_cases_are_positive_unique_and_reference_supported_modes(self):
         manifest = load_manifest_module()
 

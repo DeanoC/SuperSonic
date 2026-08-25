@@ -1,0 +1,44 @@
+{
+  "version": "v1",
+  "artifact": {
+    "semantic_id": "qwen3.8-27b-gqh-q3kxl-hf-91bc7e33",
+    "source_revision": "91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4",
+    "sha256": "c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98"
+  },
+  "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+  "chat_template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+  "engines": {
+    "supersonic-wmma": {
+      "binary_sha256": "055dc3fcaba23befd1e1125403fec8aad0eecc35b7572ea11420dc23dc0c6d8a",
+      "instruction_stream_sha256": null,
+      "cases": {
+        "ordinary-vs-mtp-token-equality-1": {
+          "prompt_sha256": "9b526083241e3dd7e6765f5fe73a3b88b00ab6a5d54b7b2a732e0f9dc49bc39a",
+          "token_ids": [40, 4021, 3300, 3050, 3817, 27437, 430, 781],
+          "generated_text": "I cannot provide specific token IDs as they"
+        },
+        "ordinary-vs-mtp-token-equality-2": {
+          "prompt_sha256": "a99ecf5a7342e7123ac0b96c5183a4ec826203c9f82f1fccc3f051f941c34595",
+          "token_ids": [40, 4021, 3300, 3050, 3817, 27437, 430, 781],
+          "generated_text": "I cannot provide specific token IDs as they"
+        }
+      }
+    },
+    "supersonic-scalar-lab": {
+      "binary_sha256": "104086852ad2dc0450aef3327562f76d698d4e4bd2adf57d711d3cb7fcf146ab",
+      "instruction_stream_sha256": "a72c8ffba00db69dc5b29aa61238f23ed3fb1540325497d4d84a7c2608d69667",
+      "cases": {
+        "ordinary-vs-mtp-token-equality-1": {
+          "prompt_sha256": "9b526083241e3dd7e6765f5fe73a3b88b00ab6a5d54b7b2a732e0f9dc49bc39a",
+          "token_ids": [40, 4021, 3300, 3050, 3817, 27437, 430, 781],
+          "generated_text": "I cannot provide specific token IDs as they"
+        },
+        "ordinary-vs-mtp-token-equality-2": {
+          "prompt_sha256": "a99ecf5a7342e7123ac0b96c5183a4ec826203c9f82f1fccc3f051f941c34595",
+          "token_ids": [40, 4021, 3300, 3050, 3817, 27437, 430, 781],
+          "generated_text": "I cannot provide specific token IDs as they"
+        }
+      }
+    }
+  }
+}

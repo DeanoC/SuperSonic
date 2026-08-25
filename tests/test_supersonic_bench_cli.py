@@ -61,7 +61,7 @@ class BenchmarkCliTests(unittest.TestCase):
             [
                 "run",
                 "--suite",
-                "quick",
+                "full-scalar-qualification",
                 "--model-dir",
                 "/model",
                 "--artifact",
