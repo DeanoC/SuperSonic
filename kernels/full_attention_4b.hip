@@ -5751,7 +5751,11 @@ void supersonic_qwen38_q6_k_scalar_head_f32_kernel(
             const uint8_t* ql = block;
             const uint8_t* qh = block + 128;
             const int8_t* scales = reinterpret_cast<const int8_t*>(block + 192);
-            const float d = ggml_f16_to_f32_unaligned(block + 208);
+            float d = ggml_f16_to_f32_unaligned(block + 208);
+            // Materialize the exact FP16-to-F32 conversion before coefficient
+            // arithmetic. Without this tied-VGPR barrier, gfx1201 Clang folds
+            // d * scale into the mixed-precision v_fma_mix_f32 instruction.
+            asm volatile("" : "+v"(d));
 
             #pragma unroll
             for (int t = 0; t < 8; ++t) {
