@@ -2334,7 +2334,14 @@ impl DecodeEngine {
                 self.hidden_io.as_ptr() as usize,
                 self.normed_buf.as_ptr() as usize,
                 self.logits_buf.as_ptr() as usize,
+                self.weights.lm_head().as_ptr() as usize,
             ];
+            if let Some(scales) = self.fp8_scale_device.as_ref() {
+                layout_addresses.push(scales.as_ptr() as usize);
+            }
+            if let Some(scales) = self.int4_scale_device.as_ref() {
+                layout_addresses.push(scales.as_ptr() as usize);
+            }
             for desc in &descs {
                 layout_addresses.extend([
                     desc.input_norm_w as usize,
