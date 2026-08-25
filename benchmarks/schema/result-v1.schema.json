@@ -695,6 +695,10 @@
             "SUPERSONIC_DEVICE": {
               "type": "string"
             },
+            "AMDSMI_GPU_METRICS_CACHE_MS": {
+              "type": "string",
+              "const": "0"
+            },
             "RUSTFLAGS": {
               "type": "string"
             }

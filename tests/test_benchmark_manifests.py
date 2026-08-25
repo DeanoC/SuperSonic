@@ -362,6 +362,11 @@ engines = ["supersonic"]
                 "temperature_limit_celsius",
             },
         )
+        self.assertEqual(
+            schema["properties"]["environment"]["properties"]["allowlisted_environment"]
+            ["properties"]["AMDSMI_GPU_METRICS_CACHE_MS"],
+            {"type": "string", "const": "0"},
+        )
         observed_required = {
             "gpu_clock_mhz",
             "memory_clock_mhz",
