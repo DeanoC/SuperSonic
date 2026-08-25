@@ -446,6 +446,13 @@ pub struct MtpSpecRound {
     pub n_accepted: usize,
 }
 
+#[cfg(feature = "scalar-head-lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalarHeadLabRoute {
+    ProductionWmma,
+    RawQ6Scalar,
+}
+
 pub struct DecodeEngine {
     weights: Qwen38Weights,
     state: ModelState,
@@ -456,6 +463,8 @@ pub struct DecodeEngine {
     logits_buf: GpuBuffer,
     /// F32 lm_head scratch for HIP greedy: skip the 248k F32→BF16 store.
     logits_f32_buf: GpuBuffer,
+    #[cfg(feature = "scalar-head-lab")]
+    scalar_head_lab_route: ScalarHeadLabRoute,
     argmax_buf: GpuBuffer,
     lm_head_block_best_vals: GpuBuffer,
     lm_head_block_best_idxs: GpuBuffer,
@@ -809,6 +818,8 @@ impl DecodeEngine {
             normed_buf,
             logits_buf,
             logits_f32_buf,
+            #[cfg(feature = "scalar-head-lab")]
+            scalar_head_lab_route: ScalarHeadLabRoute::ProductionWmma,
             argmax_buf,
             lm_head_block_best_vals,
             lm_head_block_best_idxs,
@@ -848,6 +859,47 @@ impl DecodeEngine {
 
     pub fn weights(&self) -> &Qwen38Weights {
         &self.weights
+    }
+
+    #[cfg(feature = "scalar-head-lab")]
+    pub fn set_scalar_head_lab_route(&mut self, route: ScalarHeadLabRoute) -> Result<()> {
+        if route == ScalarHeadLabRoute::RawQ6Scalar {
+            let config = &self.weights.config;
+            anyhow::ensure!(
+                self.hidden_io.backend() == gpu_hal::Backend::Hip,
+                "raw-Q6 scalar head lab route requires HIP"
+            );
+            anyhow::ensure!(
+                self.use_4b_kernel,
+                "raw-Q6 scalar head lab route requires the single-token 4B kernel"
+            );
+            anyhow::ensure!(
+                config.hidden_size == 5_120,
+                "raw-Q6 scalar head lab route requires hidden size 5120, got {}",
+                config.hidden_size
+            );
+            anyhow::ensure!(
+                config.vocab_size == 248_320,
+                "raw-Q6 scalar head lab route requires vocabulary 248320, got {}",
+                config.vocab_size
+            );
+            let qtype = self
+                .weights
+                .lm_head_lowbit_params(config.hidden_size)
+                .map(|(qtype, _, _)| qtype)
+                .ok_or_else(|| anyhow::anyhow!("raw-Q6 scalar head lab route requires qtype 14"))?;
+            anyhow::ensure!(
+                qtype == qwen38::weights::LOWBIT_GGML_Q6_K,
+                "raw-Q6 scalar head lab route requires qtype 14, got {qtype}"
+            );
+            anyhow::ensure!(
+                kernel_ffi::prefill_ffi::device_supports_q6_scalar_head(self.ordinal)
+                    .map_err(|e| anyhow::anyhow!("query raw-Q6 scalar head support: {e}"))?,
+                "raw-Q6 scalar head lab route requires gfx1201 scalar FFI support"
+            );
+        }
+        self.scalar_head_lab_route = route;
+        Ok(())
     }
 
     pub fn set_mtp_diag(&mut self, on: bool) {
@@ -2263,33 +2315,49 @@ impl DecodeEngine {
         timings.rms_norm_ms = norm_start.elapsed().as_secs_f64() * 1000.0;
 
         let lm_start = Instant::now();
-        // Preserve the host path's BF16-rounded GQH output and tie semantics.
-        // The direct F32 lm-head route is not equivalent on the supported HIP
-        // artifact, so only the vocabulary D2H is removed here.
-        let (lm_head_out, lm_head_dtype, lm_head_label) =
-            (&mut self.logits_buf, ScalarType::BF16, "lm_head");
-        if !lm_head_lowbit(
-            self.ordinal,
-            1,
-            config.vocab_size,
-            config.hidden_size,
-            &self.normed_buf,
-            &self.weights,
-            lm_head_out,
-            lm_head_label,
-        )? {
-            kernel_ffi::matmul_rhs_transposed_4b(
+        #[cfg(feature = "scalar-head-lab")]
+        let raw_q6_scalar = self.scalar_head_lab_route == ScalarHeadLabRoute::RawQ6Scalar;
+        #[cfg(not(feature = "scalar-head-lab"))]
+        let raw_q6_scalar = false;
+        if raw_q6_scalar {
+            kernel_ffi::prefill_ffi::q6_k_scalar_head_f32(
                 self.ordinal,
-                lm_head_dtype,
-                1,
+                &self.normed_buf,
+                self.weights.lm_head(),
+                &mut self.logits_f32_buf,
+                0,
+                config.vocab_size,
+            )
+            .map_err(|e| anyhow::anyhow!("raw-Q6 scalar lm_head: {e}"))?;
+        } else {
+            // Preserve the host path's BF16-rounded GQH output and tie semantics.
+            // The direct F32 lm-head route is not equivalent on the supported HIP
+            // artifact, so only the vocabulary D2H is removed here.
+            let (lm_head_out, lm_head_dtype, lm_head_label) =
+                (&mut self.logits_buf, ScalarType::BF16, "lm_head");
+            if !lm_head_lowbit(
+                self.ordinal,
                 1,
                 config.vocab_size,
                 config.hidden_size,
                 &self.normed_buf,
-                self.weights.lm_head(),
+                &self.weights,
                 lm_head_out,
-            )
-            .map_err(|e| anyhow::anyhow!("{lm_head_label}: {e}"))?;
+                lm_head_label,
+            )? {
+                kernel_ffi::matmul_rhs_transposed_4b(
+                    self.ordinal,
+                    lm_head_dtype,
+                    1,
+                    1,
+                    config.vocab_size,
+                    config.hidden_size,
+                    &self.normed_buf,
+                    self.weights.lm_head(),
+                    lm_head_out,
+                )
+                .map_err(|e| anyhow::anyhow!("{lm_head_label}: {e}"))?;
+            }
         }
         if fast_greedy {
             gpu_hal::sync(self.ordinal)
@@ -2303,14 +2371,25 @@ impl DecodeEngine {
             argmax_start
                 .record()
                 .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax start record: {e}"))?;
-            kernel_ffi::prefill_ffi::argmax_bf16_rows(
-                self.ordinal,
-                1,
-                config.vocab_size,
-                &self.logits_buf,
-                &mut self.argmax_buf,
-            )
-            .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax: {e}"))?;
+            if raw_q6_scalar {
+                kernel_ffi::prefill_ffi::argmax_f32_as_bf16_rows(
+                    self.ordinal,
+                    1,
+                    config.vocab_size,
+                    &self.logits_f32_buf,
+                    &mut self.argmax_buf,
+                )
+                .map_err(|e| anyhow::anyhow!("raw-Q6 scalar HIP fast greedy argmax: {e}"))?;
+            } else {
+                kernel_ffi::prefill_ffi::argmax_bf16_rows(
+                    self.ordinal,
+                    1,
+                    config.vocab_size,
+                    &self.logits_buf,
+                    &mut self.argmax_buf,
+                )
+                .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax: {e}"))?;
+            }
             let argmax_end = gpu_hal::GpuEvent::new(self.ordinal)
                 .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax end event: {e}"))?;
             argmax_end
@@ -2333,6 +2412,28 @@ impl DecodeEngine {
                 decode_sampling_result(sampling_mode, None, Some(&token_bytes), timings)?;
             output.timings.token_d2h_ms = token_d2h_start.elapsed().as_secs_f64() * 1000.0;
             return Ok(output);
+        }
+
+        if raw_q6_scalar {
+            let d2h_start = Instant::now();
+            let logits_bytes = self
+                .logits_f32_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("raw-Q6 scalar logits D2H: {e}"))?;
+            timings.logits_d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
+            let logits = logits_bytes
+                .chunks_exact(4)
+                .enumerate()
+                .map(|(index, chunk)| {
+                    let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    anyhow::ensure!(
+                        value.is_finite(),
+                        "raw-Q6 scalar logit {index} is non-finite: {value}"
+                    );
+                    Ok(half::bf16::from_f32(value).to_f32())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return decode_sampling_result(sampling_mode, Some(logits), None, timings);
         }
 
         let d2h_start = Instant::now();

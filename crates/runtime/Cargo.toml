@@ -7,6 +7,10 @@ edition = "2021"
 name = "supersonic_runtime"
 path = "src/lib.rs"
 
+[features]
+default = []
+scalar-head-lab = []
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

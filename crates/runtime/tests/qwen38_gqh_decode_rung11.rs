@@ -9,6 +9,8 @@ use qwen38::scratch::required_attn_scratch_floats;
 use qwen38::weights::Qwen38Weights;
 use supersonic_runtime::chat_template::{ChatMessage, ChatTemplate};
 use supersonic_runtime::decode_engine::DecodeEngine;
+#[cfg(feature = "scalar-head-lab")]
+use supersonic_runtime::decode_engine::ScalarHeadLabRoute;
 
 static GPU: Mutex<()> = Mutex::new(());
 
@@ -97,6 +99,147 @@ fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen38::config::Tex
     let engine = DecodeEngine::new(weights, ordinal, 16_480, attn_scratch, 256, true, 0)
         .expect("DecodeEngine");
     Some((engine, config))
+}
+
+#[cfg(feature = "scalar-head-lab")]
+fn scalar_head_lab_prompt_ids(prompt_text: &str, expected_len: usize) -> Vec<u32> {
+    let model_dir = qwen38_model_dir().expect("model dir");
+    let template = ChatTemplate::try_load(&model_dir)
+        .expect("load chat template")
+        .expect("Qwen3.8 ships a chat template");
+    let prompt = template
+        .render(&[ChatMessage::text("user", prompt_text)], true)
+        .expect("render scalar-head lab prompt");
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("tokenizer.json");
+    let prompt_ids = tokenizer
+        .encode(prompt, false)
+        .expect("encode scalar-head lab prompt")
+        .get_ids()
+        .to_vec();
+    assert_eq!(
+        prompt_ids.len(),
+        expected_len,
+        "unexpected scalar-head lab prompt length for {prompt_text:?}"
+    );
+    prompt_ids
+}
+
+#[cfg(feature = "scalar-head-lab")]
+fn scalar_head_lab_generate(
+    engine: &mut DecodeEngine,
+    mut next_token: u32,
+    prompt_len: usize,
+    route: ScalarHeadLabRoute,
+) -> (Vec<u32>, f64) {
+    engine
+        .set_scalar_head_lab_route(route)
+        .expect("select fixed scalar-head lab route");
+    let started = std::time::Instant::now();
+    let mut generated = Vec::with_capacity(32);
+    let mut pos = prompt_len;
+    while generated.len() < 32 {
+        generated.push(next_token);
+        if generated.len() == 32 {
+            break;
+        }
+        (next_token, _) = engine
+            .decode_step_hip_fast_greedy(next_token, pos)
+            .unwrap_or_else(|e| panic!("scalar-head lab decode pos={pos}: {e}"));
+        pos += 1;
+    }
+    assert_eq!(generated.len(), 32, "lab route must generate 32 tokens");
+    (generated, started.elapsed().as_secs_f64() * 1000.0)
+}
+
+#[cfg(feature = "scalar-head-lab")]
+fn run_scalar_head_lab_repeatability_case(case: &str, prompt_text: &str, expected_len: usize) {
+    let prompt_ids = scalar_head_lab_prompt_ids(prompt_text, expected_len);
+
+    let Some((mut first_engine, _)) = build_engine(prompt_ids.len() + 32) else {
+        return;
+    };
+    let first_prefill = first_engine
+        .prefill_native(&prompt_ids)
+        .expect("first scalar-head lab prefill");
+    let first_token = greedy_token(&first_prefill);
+    let prefix = first_engine
+        .snapshot_prefix(first_prefill)
+        .expect("snapshot scalar-head lab prefix");
+    first_engine
+        .prepare_hip_gqh_decode()
+        .expect("prepare first scalar-head lab decode");
+    let (first_scalar, first_scalar_ms) = scalar_head_lab_generate(
+        &mut first_engine,
+        first_token,
+        prompt_ids.len(),
+        ScalarHeadLabRoute::RawQ6Scalar,
+    );
+
+    let restored_logits = first_engine
+        .restore_prefix(&prefix)
+        .expect("restore production WMMA control prefix");
+    let restored_token = greedy_token(&restored_logits);
+    assert_eq!(restored_token, first_token, "restored prefix token changed");
+    let (production_wmma, production_wmma_ms) = scalar_head_lab_generate(
+        &mut first_engine,
+        restored_token,
+        prompt_ids.len(),
+        ScalarHeadLabRoute::ProductionWmma,
+    );
+    drop(prefix);
+    drop(first_engine);
+
+    let Some((mut second_engine, _)) = build_engine(prompt_ids.len() + 32) else {
+        return;
+    };
+    let second_prefill = second_engine
+        .prefill_native(&prompt_ids)
+        .expect("second scalar-head lab prefill");
+    let second_token = greedy_token(&second_prefill);
+    second_engine
+        .prepare_hip_gqh_decode()
+        .expect("prepare second scalar-head lab decode");
+    let (second_scalar, second_scalar_ms) = scalar_head_lab_generate(
+        &mut second_engine,
+        second_token,
+        prompt_ids.len(),
+        ScalarHeadLabRoute::RawQ6Scalar,
+    );
+
+    assert_eq!(
+        first_scalar, second_scalar,
+        "raw-Q6 scalar tokens changed across fresh engines"
+    );
+    let first_wmma_divergence = first_scalar
+        .iter()
+        .zip(&production_wmma)
+        .position(|(scalar, wmma)| scalar != wmma)
+        .map(|index| (index, first_scalar[index], production_wmma[index]));
+    println!(
+        "scalar_head_lab_evidence case={case:?} prompt_tokens={} scalar_first={first_scalar:?} scalar_second={second_scalar:?} production_wmma={production_wmma:?} first_wmma_divergence={first_wmma_divergence:?} scalar_first_ms={first_scalar_ms:.3} scalar_second_ms={second_scalar_ms:.3} production_wmma_ms={production_wmma_ms:.3}",
+        prompt_ids.len(),
+    );
+}
+
+#[cfg(feature = "scalar-head-lab")]
+#[test]
+#[ignore = "requires configured gfx1201 Q3KXL artifact"]
+fn scalar_head_lab_hello_is_repeatable() {
+    let _guard = GPU.lock().expect("gpu lock");
+    run_scalar_head_lab_repeatability_case("hello", "Hello", 13);
+}
+
+#[cfg(feature = "scalar-head-lab")]
+#[test]
+#[ignore = "requires configured gfx1201 Q3KXL artifact"]
+fn scalar_head_lab_cold_chat_is_repeatable() {
+    let _guard = GPU.lock().expect("gpu lock");
+    run_scalar_head_lab_repeatability_case(
+        "cold-chat",
+        "Emit a single sentence describing cold-load benchmark startup.",
+        23,
+    );
 }
 
 #[test]
