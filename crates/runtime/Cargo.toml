@@ -11,6 +11,11 @@ path = "src/lib.rs"
 default = []
 scalar-head-lab = []
 
+[[example]]
+name = "scalar_head_lab"
+path = "examples/scalar_head_lab.rs"
+required-features = ["scalar-head-lab"]
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

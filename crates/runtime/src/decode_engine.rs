@@ -917,6 +917,48 @@ impl DecodeEngine {
         Ok(())
     }
 
+    #[cfg(feature = "scalar-head-lab")]
+    pub fn scalar_head_lab_greedy_from_normed(&self, normed_bf16: &[u8]) -> Result<u32> {
+        anyhow::ensure!(
+            self.scalar_head_lab_route == ScalarHeadLabRoute::RawQ6Scalar,
+            "scalar prefill token requires the source-fixed raw-Q6 route"
+        );
+        let hidden = self.weights.config.hidden_size;
+        let vocab = self.weights.config.vocab_size;
+        anyhow::ensure!(
+            normed_bf16.len() == hidden * ScalarType::BF16.size_in_bytes(),
+            "scalar prefill norm must contain one BF16 hidden row"
+        );
+        let normed =
+            GpuBuffer::from_host_bytes(self.ordinal, ScalarType::BF16, &[hidden], normed_bf16)
+                .map_err(|e| anyhow::anyhow!("scalar prefill norm H2D: {e}"))?;
+        let mut logits = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[vocab])
+            .map_err(|e| anyhow::anyhow!("scalar prefill logits alloc: {e}"))?;
+        let mut argmax = GpuBuffer::zeros(self.ordinal, ScalarType::U32, &[1])
+            .map_err(|e| anyhow::anyhow!("scalar prefill argmax alloc: {e}"))?;
+        kernel_ffi::prefill_ffi::q6_k_scalar_head_f32(
+            self.ordinal,
+            &normed,
+            self.weights.lm_head(),
+            &mut logits,
+            0,
+            vocab,
+        )
+        .map_err(|e| anyhow::anyhow!("scalar prefill lm_head: {e}"))?;
+        kernel_ffi::prefill_ffi::argmax_f32_as_bf16_rows(
+            self.ordinal,
+            1,
+            vocab,
+            &logits,
+            &mut argmax,
+        )
+        .map_err(|e| anyhow::anyhow!("scalar prefill argmax: {e}"))?;
+        let bytes = argmax
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("scalar prefill token D2H: {e}"))?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
     pub fn set_mtp_diag(&mut self, on: bool) {
         self.mtp_diag = on;
     }
@@ -1038,6 +1080,17 @@ impl DecodeEngine {
             }
             d
         };
+        #[cfg(feature = "scalar-head-lab")]
+        if self.scalar_head_lab_route == ScalarHeadLabRoute::RawQ6Scalar {
+            return self.run_mtp_spec_round_sequential(
+                first_token,
+                pos,
+                remaining,
+                drafts,
+                mtp_kv_start,
+                k,
+            );
+        }
         if drafts.is_empty() {
             return self.run_mtp_spec_round_sequential(
                 first_token,
