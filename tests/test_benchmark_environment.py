@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -95,6 +96,7 @@ class EnvironmentPolicyTests(unittest.TestCase):
                 "HIP_PATH": "/opt/rocm/hip",
                 "SUPERSONIC_DEVICE": "0",
                 "RUSTFLAGS": "-C target-cpu=native",
+                "AMDSMI_GPU_METRICS_CACHE_MS": "0",
                 "IGNORED_SECRET": "drop-me",
             },
             cpu_governor_reader=cpu_governor_reader or (lambda: "performance\n"),
@@ -179,6 +181,57 @@ class EnvironmentPolicyTests(unittest.TestCase):
         errors = self.environment.verify_clock_policy(idle_before, [loaded], idle_after, policy)
 
         self.assertEqual(errors, ())
+
+    def test_amd_smi_metric_records_throttle_as_advisory_clock_evidence(self):
+        payload = {
+            "gpu_data": [
+                {
+                    "gpu": 1,
+                    "usage": {"gfx_activity": {"value": 97, "unit": "%"}},
+                    "power": {
+                        "socket_power": {"value": 144, "unit": "W"},
+                        "throttle_status": "THROTTLED",
+                    },
+                    "clock": {
+                        "gfx_0": {"clk": {"value": 2313, "unit": "MHz"}},
+                        "mem_0": {"clk": {"value": 1258, "unit": "MHz"}},
+                    },
+                    "temperature": {"edge": {"value": 42, "unit": "C"}},
+                    "perf_level": "AMDSMI_DEV_PERF_LEVEL_MANUAL",
+                    "throttle": {"indep_throttle_status": 7},
+                }
+            ]
+        }
+        observed = self.environment.parse_amd_smi_metric(json.dumps(payload), physical_gpu="1")
+        merged = self.environment.merge_telemetry(self.before, observed)
+
+        self.assertEqual(merged.gpu_clock_mhz, 2313)
+        self.assertEqual(merged.memory_clock_mhz, 1258)
+        self.assertEqual(merged.performance_level, "manual")
+        self.assertEqual(merged.throttle_label, "THROTTLED")
+        self.assertIsNone(merged.throttle_status)
+        self.assertEqual(merged.indep_throttle_status, 7)
+        policy = SimpleNamespace(**{**self.policy.__dict__, "gpu_clock_mhz": 2350, "clock_tolerance_mhz": 100})
+        self.assertEqual(self.environment.verify_clock_policy(self.after, [merged], self.after, policy), ())
+
+    def test_loaded_clock_summary_ignores_idle_edges_and_retains_distribution(self):
+        idle = replace(self.before, gpu_clock_mhz=4, gpu_utilization_percent=0.0)
+        loaded = [
+            replace(self.before, gpu_clock_mhz=2313, gpu_utilization_percent=97.0),
+            replace(self.before, gpu_clock_mhz=2170, gpu_utilization_percent=92.0),
+            replace(self.before, gpu_clock_mhz=2290, gpu_utilization_percent=99.0),
+        ]
+
+        self.assertEqual(
+            self.environment.loaded_clock_summary([idle, *loaded, idle]),
+            {"count": 3, "minimum_mhz": 2170, "median_mhz": 2290, "maximum_mhz": 2313},
+        )
+
+    def test_timing_dispersion_rejects_mad_above_three_percent(self):
+        self.assertEqual(self.environment.verify_timing_dispersion([10.0] * 7), ())
+        errors = self.environment.verify_timing_dispersion([8.0, 8.0, 8.0, 10.0, 12.0, 12.0, 12.0])
+        self.assertIn("MAD", " ".join(errors))
+        self.assertIn("3%", " ".join(errors))
 
     def test_locked_gpu_clock_requires_a_loaded_sample(self):
         policy = SimpleNamespace(**{**self.policy.__dict__, "gpu_clock_mhz": 2350, "clock_tolerance_mhz": 100})
@@ -302,6 +355,7 @@ class EnvironmentPolicyTests(unittest.TestCase):
                 "HIP_PATH": "/opt/rocm/hip",
                 "SUPERSONIC_DEVICE": "0",
                 "RUSTFLAGS": "-C target-cpu=native",
+                "AMDSMI_GPU_METRICS_CACHE_MS": "0",
             },
         )
         self.assertEqual(
@@ -335,6 +389,25 @@ class EnvironmentPolicyTests(unittest.TestCase):
                     "--showallinfo",
                 ),
             ],
+        )
+
+    def test_amd_metric_probe_disables_driver_metric_cache(self):
+        command = self.environment.build_amd_metric_command("1")
+
+        self.assertEqual(
+            command,
+            (
+                "timeout",
+                "--foreground",
+                "30s",
+                "env",
+                "AMDSMI_GPU_METRICS_CACHE_MS=0",
+                "amd-smi",
+                "metric",
+                "--gpu",
+                "1",
+                "--json",
+            ),
         )
 
     def test_collect_snapshot_records_null_cpu_governor_with_evidence_note(self):

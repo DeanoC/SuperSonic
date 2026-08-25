@@ -149,18 +149,64 @@ class BenchmarkExecutionTests(unittest.TestCase):
     def test_real_process_monitor_captures_telemetry_while_child_is_running(self):
         fixture = (FIXTURES / "rocm-smi-showallinfo.txt").read_text(encoding="utf-8")
 
+        amd_metric = json.dumps(
+            {
+                "gpu_data": [
+                    {
+                        "gpu": 0,
+                        "clock": {
+                            "gfx_0": {"clk": {"value": 2313}},
+                            "mem_0": {"clk": {"value": 1258}},
+                        },
+                        "usage": {
+                            "gfx_activity": {"value": 97},
+                            "umc_activity": {"value": 12},
+                        },
+                        "power": {
+                            "socket_power": {"value": 144},
+                            "throttle_status": "THROTTLED",
+                        },
+                        "temperature": {"edge": {"value": 42}},
+                        "perf_level": "AMDSMI_DEV_PERF_LEVEL_MANUAL",
+                        "throttle": {"indep_throttle_status": 7},
+                    }
+                ]
+            }
+        )
+        commands = []
+
+        def probe(argv):
+            commands.append(argv)
+            return amd_metric if "amd-smi" in argv else fixture
+
         result, samples, notes = self.execution._run_process_with_telemetry(
             (sys.executable, "-c", "import time; time.sleep(0.12)"),
             timeout=1.0,
             physical_gpu="0",
-            probe_runner=lambda _argv: fixture,
+            probe_runner=probe,
             sample_interval_seconds=0.02,
         )
 
         self.assertEqual(result.returncode, 0)
         self.assertGreaterEqual(len(samples), 2)
-        self.assertTrue(all(sample.gpu_utilization_percent == 91.0 for sample in samples))
+        self.assertTrue(all(sample.gpu_clock_mhz == 2313 for sample in samples))
+        self.assertTrue(all(sample.gpu_utilization_percent == 97.0 for sample in samples))
+        self.assertTrue(all(sample.power_cap_watts == 295 for sample in samples))
+        self.assertTrue(all(sample.throttle_label == "THROTTLED" for sample in samples))
+        self.assertTrue(any("amd-smi" in command for command in commands))
         self.assertEqual(notes, ())
+
+    def test_successful_environment_probe_keeps_stderr_out_of_json_payload(self):
+        completed = mock.Mock(
+            returncode=0,
+            stdout='{"gpu_data": []}\n',
+            stderr="harmless device discovery warning\n",
+        )
+
+        with mock.patch.object(self.execution.subprocess, "run", return_value=completed):
+            output = self.execution._default_environment_probe_runner(("amd-smi", "metric", "--json"))
+
+        self.assertEqual(output, '{"gpu_data": []}\n')
 
     def test_process_monitor_kills_the_entire_session_on_timeout(self):
         process = mock.Mock()
@@ -195,6 +241,30 @@ class BenchmarkExecutionTests(unittest.TestCase):
         )
         self.binary.chmod(0o755)
         fixture = (FIXTURES / "rocm-smi-showallinfo.txt").read_text(encoding="utf-8")
+        amd_metric = json.dumps(
+            {
+                "gpu_data": [
+                    {
+                        "gpu": 0,
+                        "clock": {
+                            "gfx_0": {"clk": {"value": 2400}},
+                            "mem_0": {"clk": {"value": 1249}},
+                        },
+                        "usage": {
+                            "gfx_activity": {"value": 91},
+                            "umc_activity": {"value": 17},
+                        },
+                        "power": {
+                            "socket_power": {"value": 188},
+                            "throttle_status": "THROTTLED",
+                        },
+                        "temperature": {"edge": {"value": 51}},
+                        "perf_level": "AMDSMI_DEV_PERF_LEVEL_MANUAL",
+                        "throttle": {"indep_throttle_status": 7},
+                    }
+                ]
+            }
+        )
         config = self.execution.replace_config(
             self.config(suite="quick", run_quality=False),
             clock_policy={
@@ -205,7 +275,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
                 "power_cap_watts": 295,
                 "performance_level": "manual",
             },
-            environment_command_runner=lambda _argv: fixture,
+            environment_command_runner=lambda argv: amd_metric if "amd-smi" in argv else fixture,
         )
 
         status = self.execution.run_suite(config)
@@ -213,6 +283,10 @@ class BenchmarkExecutionTests(unittest.TestCase):
         record = json.loads(status.records[0].read_text(encoding="utf-8"))
         self.assertGreaterEqual(len(record["environment"]["telemetry_samples"]), 2)
         self.assertTrue(record["environment"]["headline_eligible"])
+        self.assertEqual(record["environment"]["observed_before"]["gpu_clock_mhz"], 2400)
+        self.assertEqual(record["environment"]["observed_before"]["throttle_label"], "THROTTLED")
+        self.assertEqual(record["environment"]["observed_after"]["throttle_label"], "THROTTLED")
+        self.assertEqual(record["environment"]["telemetry_samples"][0]["throttle_label"], "THROTTLED")
 
     def test_preflight_requires_explicit_model_artifact_and_gpu(self):
         for field in (

@@ -372,7 +372,10 @@
             "temperature_celsius",
             "gpu_utilization_percent",
             "memory_utilization_percent",
-            "performance_level"
+            "performance_level",
+            "throttle_status",
+            "indep_throttle_status",
+            "throttle_label"
           ],
           "properties": {
             "gpu_clock_mhz": {
@@ -428,6 +431,17 @@
                 "string",
                 "null"
               ]
+            },
+            "throttle_status": {
+              "type": ["integer", "null"],
+              "minimum": 0
+            },
+            "indep_throttle_status": {
+              "type": ["integer", "null"],
+              "minimum": 0
+            },
+            "throttle_label": {
+              "type": ["string", "null"]
             }
           },
           "additionalProperties": false
@@ -442,7 +456,10 @@
             "temperature_celsius",
             "gpu_utilization_percent",
             "memory_utilization_percent",
-            "performance_level"
+            "performance_level",
+            "throttle_status",
+            "indep_throttle_status",
+            "throttle_label"
           ],
           "properties": {
             "gpu_clock_mhz": {
@@ -498,6 +515,17 @@
                 "string",
                 "null"
               ]
+            },
+            "throttle_status": {
+              "type": ["integer", "null"],
+              "minimum": 0
+            },
+            "indep_throttle_status": {
+              "type": ["integer", "null"],
+              "minimum": 0
+            },
+            "throttle_label": {
+              "type": ["string", "null"]
             }
           },
           "additionalProperties": false
@@ -515,7 +543,10 @@
               "temperature_celsius",
               "gpu_utilization_percent",
               "memory_utilization_percent",
-              "performance_level"
+              "performance_level",
+              "throttle_status",
+              "indep_throttle_status",
+              "throttle_label"
             ],
             "properties": {
               "offset_seconds": {
@@ -575,6 +606,17 @@
                 "string",
                 "null"
               ]
+              },
+              "throttle_status": {
+                "type": ["integer", "null"],
+                "minimum": 0
+              },
+              "indep_throttle_status": {
+                "type": ["integer", "null"],
+                "minimum": 0
+              },
+              "throttle_label": {
+                "type": ["string", "null"]
               }
             },
             "additionalProperties": false

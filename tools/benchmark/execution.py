@@ -630,6 +630,7 @@ def _run_process_with_telemetry(
         raise ValueError("telemetry sample interval must be positive")
     active_probe_runner = probe_runner or _default_environment_probe_runner
     command = environment.build_probe_command(str(physical_gpu))
+    amd_metric_command = environment.build_amd_metric_command(str(physical_gpu))
     started = time.monotonic()
     deadline = started + float(timeout)
     samples: list[environment.TelemetrySample] = []
@@ -677,7 +678,12 @@ def _run_process_with_telemetry(
                 )
             except subprocess.TimeoutExpired:
                 try:
-                    observed = environment.parse_showallinfo(active_probe_runner(command), notes)
+                    static = environment.parse_showallinfo(active_probe_runner(command), notes)
+                    live = environment.parse_amd_smi_metric(
+                        active_probe_runner(amd_metric_command),
+                        physical_gpu=str(physical_gpu),
+                    )
+                    observed = environment.merge_telemetry(static, live)
                     samples.append(
                         environment.TelemetrySample(
                             offset_seconds=time.monotonic() - started,
@@ -689,6 +695,9 @@ def _run_process_with_telemetry(
                             gpu_utilization_percent=observed.gpu_utilization_percent,
                             memory_utilization_percent=observed.memory_utilization_percent,
                             performance_level=observed.performance_level,
+                            throttle_status=observed.throttle_status,
+                            indep_throttle_status=observed.indep_throttle_status,
+                            throttle_label=observed.throttle_label,
                         )
                     )
                 except (OSError, RuntimeError, ValueError) as exc:
@@ -1236,6 +1245,9 @@ def _environment_record(
             "gpu_utilization_percent": None,
             "memory_utilization_percent": None,
             "performance_level": None,
+            "throttle_status": None,
+            "indep_throttle_status": None,
+            "throttle_label": None,
         }
         sample = {
             "offset_seconds": 0.0,
@@ -1277,6 +1289,22 @@ def _environment_record(
     value = asdict(provided) if hasattr(provided, "__dataclass_fields__") else json.loads(canonical_json(dict(provided)))
     if not isinstance(value, dict):
         raise ValueError("environment_snapshot must be an object")
+    diagnostic_defaults = {
+        "throttle_status": None,
+        "indep_throttle_status": None,
+        "throttle_label": None,
+    }
+    for field in ("observed_before", "observed_after"):
+        observed = value.get(field)
+        if isinstance(observed, dict):
+            for key, default in diagnostic_defaults.items():
+                observed.setdefault(key, default)
+    samples = value.get("telemetry_samples")
+    if isinstance(samples, list):
+        for sample in samples:
+            if isinstance(sample, dict):
+                for key, default in diagnostic_defaults.items():
+                    sample.setdefault(key, default)
     value["cache_state"] = case.cache_state
     value["rocm_version"] = rocm_version
     value["hip_version"] = hip_version
@@ -1875,9 +1903,9 @@ def _default_environment_probe_runner(argv: tuple[str, ...]) -> str:
         timeout=30.0,
         check=False,
     )
-    output = _text(result.stdout) + _text(result.stderr)
     if result.returncode != 0:
         raise ValueError(f"environment probe failed with exit code {result.returncode}")
+    output = _text(result.stdout)
     if not output.strip():
         raise ValueError("environment probe returned empty evidence")
     return output
@@ -1896,16 +1924,26 @@ def _probe_environment(
     notes: list[str],
 ) -> environment.ObservedTelemetry:
     command = environment.build_probe_command(str(config.physical_gpu))
-    raw = runner(command)
-    if isinstance(raw, ProcessResult):
-        if raw.returncode != 0:
-            raise ValueError(f"environment probe failed with exit code {raw.returncode}")
-        text = raw.stdout + raw.stderr
-    else:
-        text = _text(raw)
-    if not text.strip():
-        raise ValueError("environment probe returned empty evidence")
-    return environment.parse_showallinfo(text, notes)
+    amd_metric_command = environment.build_amd_metric_command(str(config.physical_gpu))
+
+    def probe(argv: tuple[str, ...]) -> str:
+        raw = runner(argv)
+        if isinstance(raw, ProcessResult):
+            if raw.returncode != 0:
+                raise ValueError(f"environment probe failed with exit code {raw.returncode}")
+            text = raw.stdout
+        else:
+            text = _text(raw)
+        if not text.strip():
+            raise ValueError("environment probe returned empty evidence")
+        return text
+
+    static = environment.parse_showallinfo(probe(command), notes)
+    live = environment.parse_amd_smi_metric(
+        probe(amd_metric_command),
+        physical_gpu=str(config.physical_gpu),
+    )
+    return environment.merge_telemetry(static, live)
 
 
 def _required_text(value: object, label: str) -> str:

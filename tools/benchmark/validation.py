@@ -572,6 +572,9 @@ def _observed(value: Mapping[str, object]) -> environment.ObservedTelemetry:
         gpu_utilization_percent=_optional_float(value, "gpu_utilization_percent"),
         memory_utilization_percent=_optional_float(value, "memory_utilization_percent"),
         performance_level=_optional_str(value, "performance_level"),
+        throttle_status=_optional_int(value, "throttle_status"),
+        indep_throttle_status=_optional_int(value, "indep_throttle_status"),
+        throttle_label=_optional_str(value, "throttle_label"),
     )
 
 

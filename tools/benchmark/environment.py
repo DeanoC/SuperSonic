@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import json
+import math
 from pathlib import Path
 import re
+import statistics
 from typing import Callable, Mapping
 
 
@@ -14,6 +17,7 @@ ALLOWLISTED_ENVIRONMENT = (
     "HIP_PATH",
     "SUPERSONIC_DEVICE",
     "RUSTFLAGS",
+    "AMDSMI_GPU_METRICS_CACHE_MS",
 )
 
 _CACHE_STATES = frozenset(
@@ -87,6 +91,9 @@ class ObservedTelemetry:
     gpu_utilization_percent: float | None
     memory_utilization_percent: float | None
     performance_level: str | None
+    throttle_status: int | None = None
+    indep_throttle_status: int | None = None
+    throttle_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +107,9 @@ class TelemetrySample:
     gpu_utilization_percent: float | None
     memory_utilization_percent: float | None
     performance_level: str | None
+    throttle_status: int | None = None
+    indep_throttle_status: int | None = None
+    throttle_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +303,43 @@ def verify_clock_policy(before, observed, after, policy) -> tuple[str, ...]:
     return tuple(_clock_violations((before, *observed, after), policy))
 
 
+def loaded_clock_summary(samples) -> dict[str, int]:
+    clocks = [
+        sample.gpu_clock_mhz
+        for sample in samples
+        if sample.gpu_clock_mhz is not None
+        and sample.gpu_utilization_percent is not None
+        and sample.gpu_utilization_percent >= _LOADED_GPU_UTILIZATION_PERCENT
+    ]
+    if not clocks:
+        raise ValueError("loaded clock summary requires at least one loaded GPU sample")
+    return {
+        "count": len(clocks),
+        "minimum_mhz": min(clocks),
+        "median_mhz": int(statistics.median(clocks)),
+        "maximum_mhz": max(clocks),
+    }
+
+
+def verify_timing_dispersion(
+    per_token_samples: list[float] | tuple[float, ...],
+    *,
+    maximum_mad_fraction: float = 0.03,
+) -> tuple[str, ...]:
+    if len(per_token_samples) != 7:
+        return ("timing dispersion requires exactly seven samples",)
+    values = [float(value) for value in per_token_samples]
+    if any(not math.isfinite(value) or value <= 0.0 for value in values):
+        return ("timing dispersion samples must be finite and positive",)
+    median = statistics.median(values)
+    mad = statistics.median(abs(value - median) for value in values)
+    if mad > median * maximum_mad_fraction:
+        return (
+            f"timing MAD {mad:.6f} exceeds 3% of median {median:.6f}",
+        )
+    return ()
+
+
 def validate_cache_evidence(cache_state: str, evidence: Mapping[str, object]) -> None:
     if cache_state not in _CACHE_STATES:
         raise ValueError(f"unknown cache_state: {cache_state!r}")
@@ -349,6 +396,23 @@ def _build_probe_command(physical_gpu: str) -> tuple[str, ...]:
 
 def build_probe_command(physical_gpu: str) -> tuple[str, ...]:
     return _build_probe_command(physical_gpu)
+
+
+def build_amd_metric_command(physical_gpu: str) -> tuple[str, ...]:
+    if not str(physical_gpu).isdigit():
+        raise ValueError(f"physical GPU must be a numeric ordinal, got {physical_gpu!r}")
+    return (
+        "timeout",
+        "--foreground",
+        "30s",
+        "env",
+        "AMDSMI_GPU_METRICS_CACHE_MS=0",
+        "amd-smi",
+        "metric",
+        "--gpu",
+        str(physical_gpu),
+        "--json",
+    )
 
 
 def _default_cache_evidence(cache_state: str) -> dict[str, object]:
@@ -471,6 +535,99 @@ def parse_showallinfo(output: str, notes: list[str] | None = None) -> ObservedTe
     """Parse one bounded ROCm SMI telemetry probe for live monitoring."""
 
     return _parse_showallinfo(output, notes if notes is not None else [])
+
+
+def parse_amd_smi_metric(output: str, *, physical_gpu: str) -> ObservedTelemetry:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ValueError("AMD SMI metric output must be valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != {"gpu_data"}:
+        raise ValueError("AMD SMI metric output must contain exactly gpu_data")
+    records = payload["gpu_data"]
+    if not isinstance(records, list):
+        raise ValueError("AMD SMI metric gpu_data must be an array")
+    matches = [record for record in records if isinstance(record, dict) and str(record.get("gpu")) == str(physical_gpu)]
+    if len(matches) != 1:
+        raise ValueError(f"AMD SMI metric must contain exactly one GPU {physical_gpu} record")
+    record = matches[0]
+    power = _metric_mapping(record.get("power"), "power")
+    clock = _metric_mapping(record.get("clock"), "clock")
+    usage = _metric_mapping(record.get("usage"), "usage")
+    temperature = _metric_mapping(record.get("temperature"), "temperature")
+    throttle = record.get("throttle")
+    throttle_map = throttle if isinstance(throttle, Mapping) else {}
+    raw_status = power.get("throttle_status")
+    throttle_status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else None
+    throttle_label = raw_status if raw_status in ("THROTTLED", "UNTHROTTLED") else None
+    raw_indep = throttle_map.get("indep_throttle_status")
+    indep_status = raw_indep if isinstance(raw_indep, int) and not isinstance(raw_indep, bool) else None
+    perf = record.get("perf_level")
+    if isinstance(perf, str) and perf.startswith("AMDSMI_DEV_PERF_LEVEL_"):
+        perf = perf.removeprefix("AMDSMI_DEV_PERF_LEVEL_").lower()
+    elif perf is not None and not isinstance(perf, str):
+        raise ValueError("AMD SMI metric perf_level must be text or null")
+    return ObservedTelemetry(
+        gpu_clock_mhz=_metric_int(_metric_mapping(clock.get("gfx_0"), "clock.gfx_0").get("clk")),
+        memory_clock_mhz=_metric_int(_metric_mapping(clock.get("mem_0"), "clock.mem_0").get("clk")),
+        power_cap_watts=None,
+        power_watts=_metric_float(power.get("socket_power")),
+        temperature_celsius=_metric_float(temperature.get("edge")),
+        gpu_utilization_percent=_metric_float(usage.get("gfx_activity")),
+        memory_utilization_percent=_metric_float(usage.get("umc_activity")),
+        performance_level=perf,
+        throttle_status=throttle_status,
+        indep_throttle_status=indep_status,
+        throttle_label=throttle_label,
+    )
+
+
+def merge_telemetry(static: ObservedTelemetry, live: ObservedTelemetry) -> ObservedTelemetry:
+    choose = lambda current, observed: observed if observed is not None else current
+    return ObservedTelemetry(
+        gpu_clock_mhz=choose(static.gpu_clock_mhz, live.gpu_clock_mhz),
+        memory_clock_mhz=choose(static.memory_clock_mhz, live.memory_clock_mhz),
+        power_cap_watts=choose(static.power_cap_watts, live.power_cap_watts),
+        power_watts=choose(static.power_watts, live.power_watts),
+        temperature_celsius=choose(static.temperature_celsius, live.temperature_celsius),
+        gpu_utilization_percent=choose(static.gpu_utilization_percent, live.gpu_utilization_percent),
+        memory_utilization_percent=choose(
+            static.memory_utilization_percent,
+            live.memory_utilization_percent,
+        ),
+        performance_level=choose(static.performance_level, live.performance_level),
+        throttle_status=choose(static.throttle_status, live.throttle_status),
+        indep_throttle_status=choose(static.indep_throttle_status, live.indep_throttle_status),
+        throttle_label=choose(static.throttle_label, live.throttle_label),
+    )
+
+
+def _metric_mapping(value: object, label: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"AMD SMI metric {label} must be an object")
+    return value
+
+
+def _metric_float(value: object) -> float | None:
+    if value == "N/A" or value is None:
+        return None
+    if isinstance(value, Mapping):
+        value = value.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("AMD SMI metric value must be numeric or N/A")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError("AMD SMI metric value must be finite")
+    return result
+
+
+def _metric_int(value: object) -> int | None:
+    result = _metric_float(value)
+    if result is None:
+        return None
+    if not result.is_integer():
+        raise ValueError("AMD SMI clock metric must be an integer")
+    return int(result)
 
 
 def _extract_int(

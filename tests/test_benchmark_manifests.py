@@ -331,6 +331,9 @@ engines = ["supersonic"]
             "gpu_utilization_percent",
             "memory_utilization_percent",
             "performance_level",
+            "throttle_status",
+            "indep_throttle_status",
+            "throttle_label",
         }
         self.assertEqual(
             set(schema["properties"]["environment"]["properties"]["observed_before"]["required"]),
@@ -350,6 +353,9 @@ engines = ["supersonic"]
             "gpu_utilization_percent",
             "memory_utilization_percent",
             "performance_level",
+            "throttle_status",
+            "indep_throttle_status",
+            "throttle_label",
         }
         self.assertEqual(
             set(
