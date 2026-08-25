@@ -723,6 +723,7 @@ printf 'cargo|%s|GQH=%s|MODEL=%s|8192=%s|REQ=%s\\n' "$*" \
             "2026-08-23-qwen38-rocm-product-slimming.md",
             "2026-08-24-reproducible-benchmark-pages.md",
             "2026-08-24-six-hour-balanced-full-benchmark.md",
+            "2026-08-25-deterministic-raw-q6-output-head.md",
         }
         for path in superpowers_root.glob("plans/*.md"):
             self.assertIn(path.name, retained_plans, path.as_posix())
