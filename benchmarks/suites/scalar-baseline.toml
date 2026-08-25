@@ -15,6 +15,6 @@ warmups = 0
 repetitions = 7
 mode = "ordinary"
 cache_state = "cold-load"
-timeout_seconds = 60
+timeout_seconds = 120
 decoding_policy = "greedy"
 engines = ["supersonic-scalar-lab"]

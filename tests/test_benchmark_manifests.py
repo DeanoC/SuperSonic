@@ -99,6 +99,7 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(case.mode, "ordinary")
         self.assertEqual(case.cache_state, "cold-load")
         self.assertEqual(case.warmups, 0)
+        self.assertEqual(case.timeout_seconds, 120)
 
     def test_suite_cases_are_positive_unique_and_reference_supported_modes(self):
         manifest = load_manifest_module()
