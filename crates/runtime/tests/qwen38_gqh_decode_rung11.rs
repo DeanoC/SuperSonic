@@ -295,3 +295,80 @@ fn rung14_reset_refreshes_mutable_state_with_stable_descriptors() {
     assert!(logits.iter().map(|value| value * value).sum::<f32>() > 0.0);
     drop(blockers);
 }
+
+#[test]
+#[ignore = "requires R9700 artifact CI"]
+fn rung15_hip_fast_greedy_matches_host_route_and_reports_device_transfer() {
+    let _guard = GPU.lock().expect("gpu lock");
+    let Some((mut engine, _config)) = build_engine(64) else {
+        return;
+    };
+
+    let model_dir = qwen38_model_dir().expect("model dir");
+    let template = ChatTemplate::try_load(&model_dir)
+        .expect("load chat template")
+        .expect("Qwen3.8 ships a chat template");
+    let prompt = template
+        .render(&[ChatMessage::text("user", "Hello")], true)
+        .expect("render prompt");
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("tokenizer.json");
+    let prompt_ids = tokenizer
+        .encode(prompt, false)
+        .expect("encode prompt")
+        .get_ids()
+        .to_vec();
+    assert!(
+        prompt_ids.len() > 8,
+        "expected canonical multi-token prompt"
+    );
+    let prefill_logits = engine
+        .prefill_native(&prompt_ids)
+        .expect("canonical prefill");
+    let token = greedy_token(&prefill_logits);
+    let snapshot = engine
+        .snapshot_prefix(prefill_logits.clone())
+        .expect("snapshot canonical prefix");
+    let (host_logits, host_timings) = engine
+        .decode_step_4b_single_kernel_with_timings(token, prompt_ids.len())
+        .expect("host-logit decode");
+    let expected = greedy_token(&host_logits);
+    assert!(
+        host_timings.logits_d2h_ms > 0.0,
+        "host-logit route must transfer the full BF16 vocabulary row"
+    );
+
+    let restored_logits = engine
+        .restore_prefix(&snapshot)
+        .expect("restore canonical prefix");
+    assert_eq!(greedy_token(&restored_logits), token);
+    let (fast_token, fast_timings) = engine
+        .decode_step_hip_fast_greedy(token, prompt_ids.len())
+        .expect("HIP fast greedy decode");
+    println!(
+        "rung15: expected={expected} fast={fast_token} host_logits_d2h_ms={:.3} fast_rms_norm_ms={:.3} fast_lm_head_ms={:.3} fast_gpu_argmax_ms={:.3} fast_token_d2h_ms={:.3}",
+        host_timings.logits_d2h_ms,
+        fast_timings.rms_norm_ms,
+        fast_timings.lm_head_ms,
+        fast_timings.gpu_argmax_ms,
+        fast_timings.token_d2h_ms,
+    );
+    assert_eq!(
+        fast_token, expected,
+        "device argmax must match host sampling"
+    );
+    assert_eq!(fast_timings.logits_d2h_ms, 0.0);
+    assert_eq!(fast_timings.host_sampling_ms, 0.0);
+    assert!(
+        fast_timings.gpu_argmax_ms > 0.0,
+        "fast route must time the device argmax completion"
+    );
+    assert!(
+        fast_timings.token_d2h_ms > 0.0,
+        "fast route must transfer the U32 token"
+    );
+    assert!(
+        fast_timings.lm_head_ms > fast_timings.token_d2h_ms,
+        "fast route must charge lm-head completion to lm_head_ms, not token_d2h_ms"
+    );
+}

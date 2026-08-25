@@ -650,6 +650,14 @@ fn decode_argmax_token(token_bytes: &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(token_bytes))
 }
 
+fn ensure_hip_fast_greedy_supported(use_4b_kernel: bool) -> Result<()> {
+    anyhow::ensure!(
+        use_4b_kernel,
+        "decode_step_hip_fast_greedy requires the 4B kernel"
+    );
+    Ok(())
+}
+
 fn decode_sampling_result(
     sampling_mode: DecodeSamplingMode,
     logits: Option<Vec<f32>>,
@@ -1692,26 +1700,14 @@ impl DecodeEngine {
             self.hidden_io.backend() == gpu_hal::Backend::Hip,
             "decode_step_hip_fast_greedy requires HIP"
         );
-        if self.use_4b_kernel {
-            let output = self.decode_step_single_kernel_impl(
-                token_id,
-                seqlen_offset,
-                true,
-                DecodeSamplingMode::HipFastGreedy,
-            )?;
-            return Ok((output.sampled_token, output.timings));
-        }
-
-        let output = self.decode_step_non_4b(
+        ensure_hip_fast_greedy_supported(self.use_4b_kernel)?;
+        let output = self.decode_step_single_kernel_impl(
             token_id,
             seqlen_offset,
-            DecodeSamplingMode::HostLogits,
-            false,
+            true,
+            DecodeSamplingMode::HipFastGreedy,
         )?;
-        let logits = output
-            .logits
-            .ok_or_else(|| anyhow::anyhow!("HIP greedy decode missing logits"))?;
-        Ok((Self::greedy_sample(&logits), output.timings))
+        Ok((output.sampled_token, output.timings))
     }
 
     /// Backend the engine is running on. Used by callers that need to pick
@@ -2251,6 +2247,7 @@ impl DecodeEngine {
             }
         }
 
+        let fast_greedy = sampling_mode == DecodeSamplingMode::HipFastGreedy;
         let norm_start = Instant::now();
         rms_norm_rows_model(
             config,
@@ -2262,19 +2259,18 @@ impl DecodeEngine {
             &mut self.normed_buf,
             "final RMSNorm",
         )?;
+        if fast_greedy {
+            gpu_hal::sync(self.ordinal)
+                .map_err(|e| anyhow::anyhow!("HIP fast greedy RMSNorm completion: {e}"))?;
+        }
         timings.rms_norm_ms = norm_start.elapsed().as_secs_f64() * 1000.0;
 
         let lm_start = Instant::now();
-        let fast_greedy = sampling_mode == DecodeSamplingMode::HipFastGreedy;
-        let (lm_head_out, lm_head_dtype, lm_head_label) = if fast_greedy {
-            (
-                &mut self.logits_f32_buf,
-                ScalarType::F32,
-                "HIP fast greedy lm_head",
-            )
-        } else {
-            (&mut self.logits_buf, ScalarType::BF16, "lm_head")
-        };
+        // Preserve the host path's BF16-rounded GQH output and tie semantics.
+        // The direct F32 lm-head route is not equivalent on the supported HIP
+        // artifact, so only the vocabulary D2H is removed here.
+        let (lm_head_out, lm_head_dtype, lm_head_label) =
+            (&mut self.logits_buf, ScalarType::BF16, "lm_head");
         if !lm_head_lowbit(
             self.ordinal,
             1,
@@ -2298,19 +2294,38 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("{lm_head_label}: {e}"))?;
         }
+        if fast_greedy {
+            gpu_hal::sync(self.ordinal)
+                .map_err(|e| anyhow::anyhow!("HIP fast greedy lm-head completion: {e}"))?;
+        }
         timings.lm_head_ms = lm_start.elapsed().as_secs_f64() * 1000.0;
 
         if fast_greedy {
-            let argmax_start = Instant::now();
-            kernel_ffi::prefill_ffi::argmax_f32_as_bf16_rows(
+            let argmax_start = gpu_hal::GpuEvent::new(self.ordinal)
+                .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax start event: {e}"))?;
+            argmax_start
+                .record()
+                .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax start record: {e}"))?;
+            kernel_ffi::prefill_ffi::argmax_bf16_rows(
                 self.ordinal,
                 1,
                 config.vocab_size,
-                &self.logits_f32_buf,
+                &self.logits_buf,
                 &mut self.argmax_buf,
             )
             .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax: {e}"))?;
-            timings.gpu_argmax_ms = argmax_start.elapsed().as_secs_f64() * 1000.0;
+            let argmax_end = gpu_hal::GpuEvent::new(self.ordinal)
+                .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax end event: {e}"))?;
+            argmax_end
+                .record()
+                .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax end record: {e}"))?;
+            argmax_end
+                .synchronize()
+                .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax completion: {e}"))?;
+            timings.gpu_argmax_ms = f64::from(
+                gpu_hal::GpuEvent::elapsed_ms(&argmax_start, &argmax_end)
+                    .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax elapsed: {e}"))?,
+            );
 
             let token_d2h_start = Instant::now();
             let token_bytes = self
@@ -2339,7 +2354,10 @@ impl DecodeEngine {
 
 #[cfg(test)]
 mod hip_fast_greedy_tests {
-    use super::{decode_sampling_result, DecodeSamplingMode, DecodeStageTimings};
+    use super::{
+        decode_sampling_result, ensure_hip_fast_greedy_supported, DecodeSamplingMode,
+        DecodeStageTimings,
+    };
 
     #[test]
     fn device_argmax_fast_route_does_not_materialize_host_logits() {
@@ -2364,6 +2382,13 @@ mod hip_fast_greedy_tests {
         .expect("host-logit result should remain available");
         assert_eq!(host.logits, Some(logits));
         assert_eq!(host.sampled_token, 1);
+    }
+
+    #[test]
+    fn fast_greedy_rejects_non_4b_kernel_route() {
+        let error = ensure_hip_fast_greedy_supported(false).expect_err("non-4B must reject");
+        assert!(error.to_string().contains("requires the 4B kernel"));
+        ensure_hip_fast_greedy_supported(true).expect("4B fast route is supported");
     }
 }
 

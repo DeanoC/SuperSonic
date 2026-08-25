@@ -94,7 +94,7 @@ __global__ void pfx_argmax_bf16_rows_kernel(
     const unsigned int tid = threadIdx.x;
     const hip_bfloat16* row_logits = logits + row * cols;
 
-    float best_val = -1.0e30f;
+    float best_val = -INFINITY;
     uint32_t best_idx = 0;
     for (size_t col = tid; col < cols; col += blockDim.x) {
         const float val = static_cast<float>(row_logits[col]);
@@ -144,7 +144,7 @@ __global__ void pfx_argmax_f32_as_bf16_rows_kernel(
     const unsigned int tid = threadIdx.x;
     const float* row_logits = logits + row * cols;
 
-    float best_val = -1.0e30f;
+    float best_val = -INFINITY;
     uint32_t best_idx = 0;
     for (size_t col = tid; col < cols; col += blockDim.x) {
         const float val = static_cast<float>(hip_bfloat16(row_logits[col]));
