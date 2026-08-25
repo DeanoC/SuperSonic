@@ -3,6 +3,7 @@
 use std::env;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -648,6 +649,28 @@ fn decode_argmax_token(token_bytes: &[u8]) -> Result<u32> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("argmax D2H token conversion failed"))?;
     Ok(u32::from_le_bytes(token_bytes))
+}
+
+fn decode_profile_enabled() -> bool {
+    decode_profile_enabled_value(env::var("SUPERSONIC_DECODE_PROF").ok().as_deref())
+}
+
+fn decode_profile_enabled_value(value: Option<&str>) -> bool {
+    matches!(value, Some(value) if !value.is_empty() && value != "0")
+}
+
+fn allocation_layout_fingerprint(addresses: &[usize]) -> u64 {
+    let Some(&base) = addresses.first() else {
+        return 0;
+    };
+    addresses.iter().fold(0xcbf29ce484222325, |hash, &address| {
+        let relative_pages = address.wrapping_sub(base) >> 12;
+        let alignment = address & 0xfff;
+        hash.wrapping_mul(0x100000001b3)
+            .wrapping_add(relative_pages as u64)
+            .wrapping_mul(0x100000001b3)
+            .wrapping_add(alignment as u64)
+    })
 }
 
 fn ensure_hip_fast_greedy_supported(use_4b_kernel: bool) -> Result<()> {
@@ -2214,6 +2237,7 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("reset decode sync: {e}"))?;
 
         let persistent_start = Instant::now();
+        let collect_timing_slots = enable_timing_slots && decode_profile_enabled();
         kernel_ffi::persistent_decode_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -2234,11 +2258,65 @@ impl DecodeEngine {
             1,
             None,
             self.int4_scale_device.as_ref(),
-            enable_timing_slots,
+            collect_timing_slots,
             false,
         )
         .map_err(|e| anyhow::anyhow!("persistent decode 4B: {e}"))?;
         timings.persistent_ms = persistent_start.elapsed().as_secs_f64() * 1000.0;
+
+        if collect_timing_slots {
+            let bytes = self
+                .scratch
+                .sync_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("persistent timing slots D2H: {e}"))?;
+            let slot_bytes = kernel_ffi::PERSISTENT_4B_TIMING_SLOT_COUNT * 8;
+            let payload = bytes.get(24..).ok_or_else(|| {
+                anyhow::anyhow!("persistent timing buffer missing 24-byte header")
+            })?;
+            anyhow::ensure!(
+                payload.len() == config.num_hidden_layers * slot_bytes,
+                "persistent timing buffer has {} bytes; expected exactly {}",
+                payload.len(),
+                config.num_hidden_layers * slot_bytes
+            );
+            let mut maxima = [0u64; 8];
+            for layer_bytes in payload.chunks_exact(slot_bytes) {
+                let slots: Vec<u64> = layer_bytes
+                    .chunks_exact(8)
+                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                let parsed = kernel_ffi::parse_persistent_4b_timing_slots(&slots)
+                    .map_err(|e| anyhow::anyhow!("persistent timing slots: {e}"))?;
+                maxima[0] = maxima[0].max(parsed.full_attn);
+                maxima[1] = maxima[1].max(parsed.full_attn_proj);
+                maxima[2] = maxima[2].max(parsed.full_attn_core.into_iter().max().unwrap_or(0));
+                maxima[3] = maxima[3].max(parsed.full_attn_out.into_iter().max().unwrap_or(0));
+                maxima[4] = maxima[4].max(parsed.linear_proj);
+                maxima[5] = maxima[5].max(parsed.linear_core.into_iter().max().unwrap_or(0));
+                maxima[6] = maxima[6].max(parsed.linear_out.into_iter().max().unwrap_or(0));
+                maxima[7] = maxima[7].max(parsed.mlp_gate_up.max(parsed.mlp_down));
+            }
+            let fingerprint = allocation_layout_fingerprint(&[
+                self.scratch.workspace.as_ptr() as usize,
+                self.scratch.sync_buf.as_ptr() as usize,
+                self.scratch.desc_device.as_ptr() as usize,
+                self.hidden_io.as_ptr() as usize,
+                self.normed_buf.as_ptr() as usize,
+                self.logits_buf.as_ptr() as usize,
+            ]);
+            static LAYOUT_REPORTED: OnceLock<()> = OnceLock::new();
+            if LAYOUT_REPORTED.set(()).is_ok() {
+                eprintln!(
+                    "[decode-profile] persistent_4b_layout layers={} allocation_fingerprint={fingerprint:016x}",
+                    config.num_hidden_layers
+                );
+            }
+            eprintln!(
+                "[decode-profile] persistent_4b_slots full_attn={} full_attn_proj={} full_attn_core={} full_attn_out={} linear_proj={} linear_core={} linear_out={} mlp={}",
+                maxima[0], maxima[1], maxima[2], maxima[3], maxima[4], maxima[5], maxima[6], maxima[7]
+            );
+        }
 
         let filled = seqlen_offset + 1;
         for (layer_idx, layer) in self.state.layers.iter_mut().enumerate() {
@@ -2438,5 +2516,29 @@ mod mtp_accept_tests {
         assert_eq!(commit_len, 2);
         assert_eq!((0usize + 1).min(3).min(32), 1);
         assert_eq!((2usize + 1).min(3).min(32), 3);
+    }
+}
+
+#[cfg(test)]
+mod decode_profile_tests {
+    use super::{allocation_layout_fingerprint, decode_profile_enabled_value};
+
+    #[test]
+    fn timing_slot_collection_is_opt_in_to_existing_profile_control() {
+        assert!(!decode_profile_enabled_value(None));
+        assert!(!decode_profile_enabled_value(Some("0")));
+        assert!(!decode_profile_enabled_value(Some("")));
+        assert!(decode_profile_enabled_value(Some("1")));
+    }
+
+    #[test]
+    fn allocation_fingerprint_is_relative_and_address_free() {
+        let first = allocation_layout_fingerprint(&[0x1000, 0x5000, 0x9000]);
+        let relocated = allocation_layout_fingerprint(&[0x8100_1000, 0x8100_5000, 0x8100_9000]);
+        assert_eq!(first, relocated);
+        assert_ne!(
+            first,
+            allocation_layout_fingerprint(&[0x1000, 0x6000, 0x9000])
+        );
     }
 }
