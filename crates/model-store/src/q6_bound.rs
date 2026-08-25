@@ -12,6 +12,7 @@ use half::{bf16, f16};
 pub const Q6_K_VALUES: usize = 256;
 pub const Q6_K_BYTES: usize = 210;
 pub const Q8_1_VALUES: usize = 32;
+pub const SCALAR_HEAD_ACCUMULATION_DEPTH: usize = 165;
 
 #[derive(Debug, Clone)]
 pub struct DecodedQ6Block {
@@ -250,6 +251,69 @@ pub fn decode_q6_k_block(block: &[u8]) -> Result<DecodedQ6Block, String> {
         raw,
         baseline_bf16,
     })
+}
+
+#[inline(never)]
+fn rn_mul(left: f32, right: f32) -> f32 {
+    left * right
+}
+
+pub fn raw_q6_scalar_row_f32(row: &[u8], activation_bf16: &[u16]) -> Result<f32, String> {
+    if row.len() != 20 * Q6_K_BYTES || activation_bf16.len() != 5120 {
+        return Err("raw Q6 scalar row requires 4200 weight bytes and 5120 BF16 values".into());
+    }
+    let mut lanes = [0.0f32; 32];
+    for block_index in 0..20 {
+        let block =
+            decode_q6_k_block(&row[block_index * Q6_K_BYTES..(block_index + 1) * Q6_K_BYTES])?;
+        for lane in 0..32 {
+            for t in 0..8 {
+                let coordinate = lane + 32 * t;
+                let weight = rn_mul(
+                    rn_mul(block.d, f32::from(block.scales[coordinate])),
+                    f32::from(block.quants[coordinate]),
+                );
+                let x = bf16::from_bits(activation_bf16[block_index * 256 + coordinate]).to_f32();
+                lanes[lane] = weight.mul_add(x, lanes[lane]);
+            }
+        }
+    }
+    for offset in [16usize, 8, 4, 2, 1] {
+        let before = lanes;
+        for lane in 0..32 {
+            lanes[lane] = before[lane] + before[lane ^ offset];
+        }
+    }
+    lanes[0]
+        .is_finite()
+        .then_some(lanes[0])
+        .ok_or_else(|| "scalar row is non-finite".into())
+}
+
+pub fn f32_to_bf16_rne_finite(value: f32) -> Result<u16, String> {
+    if !value.is_finite() {
+        return Err("BF16 RNE conversion requires a finite F32 value".into());
+    }
+    let bits = value.to_bits();
+    let rounding_bias = 0x7fffu32 + ((bits >> 16) & 1);
+    Ok(((bits + rounding_bias) >> 16) as u16)
+}
+
+pub fn argmax_f32_as_bf16(logits: &[f32]) -> Result<usize, String> {
+    if logits.is_empty() {
+        return Err("BF16 argmax requires a non-empty F32 slice".into());
+    }
+    let first = f32::from_bits(u32::from(f32_to_bf16_rne_finite(logits[0])?) << 16);
+    let mut winner = 0usize;
+    let mut best = first;
+    for (index, &logit) in logits.iter().enumerate().skip(1) {
+        let value = f32::from_bits(u32::from(f32_to_bf16_rne_finite(logit)?) << 16);
+        if value > best {
+            winner = index;
+            best = value;
+        }
+    }
+    Ok(winner)
 }
 
 pub fn weight_block_norms(block: &DecodedQ6Block) -> WeightBlockNorms {
