@@ -71,12 +71,7 @@ fn qwen38_model_dir() -> Option<PathBuf> {
 }
 
 fn greedy_token(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|left, right| left.1.total_cmp(right.1))
-        .map(|(index, _)| index as u32)
-        .expect("logits")
+    DecodeEngine::greedy_sample(logits)
 }
 
 fn build_engine(max_context: usize) -> Option<(DecodeEngine, qwen38::config::TextConfig)> {
@@ -163,6 +158,12 @@ fn run_scalar_head_lab_repeatability_case(case: &str, prompt_text: &str, expecte
         .prefill_native(&prompt_ids)
         .expect("first scalar-head lab prefill");
     let first_token = greedy_token(&first_prefill);
+    if case == "cold-chat" {
+        assert_eq!(
+            first_token, 32,
+            "established cold-chat prefill trajectory changed"
+        );
+    }
     let prefix = first_engine
         .snapshot_prefix(first_prefill)
         .expect("snapshot scalar-head lab prefix");
@@ -216,6 +217,13 @@ fn run_scalar_head_lab_repeatability_case(case: &str, prompt_text: &str, expecte
         .zip(&production_wmma)
         .position(|(scalar, wmma)| scalar != wmma)
         .map(|index| (index, first_scalar[index], production_wmma[index]));
+    if case == "cold-chat" {
+        assert_eq!(
+            first_wmma_divergence,
+            Some((12, 8869, 9189)),
+            "raw-Q6 scalar route must retain its established same-prefix WMMA divergence"
+        );
+    }
     println!(
         "scalar_head_lab_evidence case={case:?} prompt_tokens={} scalar_first={first_scalar:?} scalar_second={second_scalar:?} production_wmma={production_wmma:?} first_wmma_divergence={first_wmma_divergence:?} scalar_first_ms={first_scalar_ms:.3} scalar_second_ms={second_scalar_ms:.3} production_wmma_ms={production_wmma_ms:.3}",
         prompt_ids.len(),

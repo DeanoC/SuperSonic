@@ -704,6 +704,21 @@ fn decode_sampling_result(
     }
 }
 
+#[cfg(feature = "scalar-head-lab")]
+fn bf16_observable_f32_logits(values: impl IntoIterator<Item = f32>) -> Result<Vec<f32>> {
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            anyhow::ensure!(
+                value.is_finite(),
+                "raw-Q6 scalar logit {index} is non-finite: {value}"
+            );
+            Ok(half::bf16::from_f32(value).to_f32())
+        })
+        .collect()
+}
+
 impl DecodeEngine {
     pub fn scratch_debug_ptr(&self) -> usize {
         self.scratch.workspace.as_ptr() as usize
@@ -2414,6 +2429,7 @@ impl DecodeEngine {
             return Ok(output);
         }
 
+        #[cfg(feature = "scalar-head-lab")]
         if raw_q6_scalar {
             let d2h_start = Instant::now();
             let logits_bytes = self
@@ -2421,18 +2437,11 @@ impl DecodeEngine {
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("raw-Q6 scalar logits D2H: {e}"))?;
             timings.logits_d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
-            let logits = logits_bytes
-                .chunks_exact(4)
-                .enumerate()
-                .map(|(index, chunk)| {
-                    let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    anyhow::ensure!(
-                        value.is_finite(),
-                        "raw-Q6 scalar logit {index} is non-finite: {value}"
-                    );
-                    Ok(half::bf16::from_f32(value).to_f32())
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let logits = bf16_observable_f32_logits(
+                logits_bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+            )?;
             return decode_sampling_result(sampling_mode, Some(logits), None, timings);
         }
 
@@ -2452,10 +2461,38 @@ impl DecodeEngine {
 
 #[cfg(test)]
 mod hip_fast_greedy_tests {
+    #[cfg(feature = "scalar-head-lab")]
+    use super::bf16_observable_f32_logits;
     use super::{
         decode_sampling_result, ensure_hip_fast_greedy_supported, DecodeSamplingMode,
         DecodeStageTimings,
     };
+
+    #[cfg(feature = "scalar-head-lab")]
+    #[test]
+    fn scalar_head_host_logits_promote_finite_values_through_bf16() {
+        let promoted = bf16_observable_f32_logits([
+            1.003_906_2,
+            1.007_812_5,
+            -2.007_812_5,
+            std::f32::consts::PI,
+        ])
+        .expect("finite logits");
+        assert_eq!(promoted, vec![1.0, 1.007_812_5, -2.0, 3.140_625]);
+    }
+
+    #[cfg(feature = "scalar-head-lab")]
+    #[test]
+    fn scalar_head_host_logits_reject_nonfinite_values() {
+        for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = bf16_observable_f32_logits([7.0, nonfinite])
+                .expect_err("non-finite scalar head logit must reject");
+            assert!(
+                error.to_string().contains("logit 1 is non-finite"),
+                "unexpected error: {error}"
+            );
+        }
+    }
 
     #[test]
     fn device_argmax_fast_route_does_not_materialize_host_logits() {
