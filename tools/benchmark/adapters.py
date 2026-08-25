@@ -154,8 +154,8 @@ def _build_scalar_lab_command(
     ]
     if inputs.chat:
         args.append("--chat")
-    if inputs.fixed_token_count:
-        args.append("--ignore-eos")
+    if not inputs.fixed_token_count:
+        args.append("--honor-eos")
     return tuple(args)
 
 

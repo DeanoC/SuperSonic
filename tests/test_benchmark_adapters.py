@@ -71,6 +71,7 @@ class BenchmarkAdapterTests(unittest.TestCase):
         self.assertEqual(scalar_argv[0], "tools/supersonic-scalar-lab.py")
         self.assertEqual(scalar_argv[scalar_argv.index("--artifact") + 1], str(self.inputs.artifact))
         self.assertEqual(scalar_argv[scalar_argv.index("--mode") + 1], "ordinary")
+        self.assertNotIn("--ignore-eos", scalar_argv)
         self.assertNotIn("--route", scalar_argv)
         self.assertNotIn("--gguf-file", scalar_argv)
 

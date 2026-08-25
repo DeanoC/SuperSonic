@@ -326,6 +326,69 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.assertEqual(record["environment"]["observed_after"]["throttle_label"], "THROTTLED")
         self.assertEqual(record["environment"]["telemetry_samples"][0]["throttle_label"], "THROTTLED")
 
+    def test_immediate_engine_failure_is_not_masked_as_missing_telemetry(self):
+        self.binary.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+        self.binary.chmod(0o755)
+        fixture = (FIXTURES / "rocm-smi-showallinfo.txt").read_text(encoding="utf-8")
+        amd_metric = json.dumps(
+            {
+                "gpu_data": [
+                    {
+                        "gpu": 0,
+                        "clock": {
+                            "gfx_0": {"clk": {"value": 2400}},
+                            "mem_0": {"clk": {"value": 1249}},
+                        },
+                        "usage": {
+                            "gfx_activity": {"value": 91},
+                            "umc_activity": {"value": 17},
+                        },
+                        "power": {"socket_power": {"value": 188}},
+                        "temperature": {"edge": {"value": 51}},
+                        "perf_level": "manual",
+                        "throttle": {},
+                    }
+                ]
+            }
+        )
+        config = self.execution.replace_config(
+            self.config(suite="quick", run_quality=False),
+            clock_policy={
+                "name": "locked",
+                "gpu_clock_mhz": 2400,
+                "clock_tolerance_mhz": 20,
+                "memory_clock_mhz": 1249,
+                "power_cap_watts": 295,
+                "performance_level": "manual",
+            },
+            environment_command_runner=lambda argv: amd_metric if "amd-smi" in argv else fixture,
+        )
+
+        run_manifest = self.execution.preflight(config)
+        case, engine = self.execution.ordered_cases(run_manifest)[0]
+        failed = self.execution.ProcessResult((str(self.binary),), 7, "", "engine failed", 0.01)
+        with (
+            mock.patch.object(
+                self.execution,
+                "_run_process_with_telemetry",
+                return_value=(failed, (), ()),
+            ),
+            self.assertRaises(self.execution._CaseError) as raised,
+        ):
+            self.execution._execute_case(
+                run_manifest,
+                case,
+                engine,
+                timeout=45.0,
+                suite_deadline=100.0,
+                case_deadline=100.0,
+                clock=lambda: 0.0,
+                command_runner=self.execution.run_process,
+                quality_summary=self.execution._quality_placeholder_summary(run_manifest.quality_cases),
+            )
+
+        self.assertEqual(raised.exception.code, "process_failed")
+
     def test_preflight_requires_explicit_model_artifact_and_gpu(self):
         for field in (
             "model_dir",

@@ -958,21 +958,6 @@ def _execute_case(
             )
             telemetry_elapsed += result.duration_seconds
             telemetry_notes.extend(invocation_notes)
-            if measured:
-                invocation_errors = _verify_invocation_telemetry(
-                    invocation_telemetry,
-                    run_manifest.config.clock_policy,
-                    duration_seconds=result.duration_seconds,
-                )
-                if invocation_errors:
-                    raise _CaseError("environment_failed", "; ".join(invocation_errors))
-                measured_telemetry.append(
-                    (
-                        telemetry_start_index,
-                        len(invocation_telemetry),
-                        environment.loaded_clock_summary(invocation_telemetry),
-                    )
-                )
         else:
             result = _invoke_process(
                 command_runner,
@@ -988,6 +973,21 @@ def _execute_case(
             raise _CaseError("case_timeout", f"{case.id}/{engine.name} exceeded {active_timeout}s timeout")
         if result.returncode != 0:
             raise _CaseError("process_failed", f"{case.id}/{engine.name} exited with {result.returncode}")
+        if measured and live_telemetry:
+            invocation_errors = _verify_invocation_telemetry(
+                invocation_telemetry,
+                run_manifest.config.clock_policy,
+                duration_seconds=result.duration_seconds,
+            )
+            if invocation_errors:
+                raise _CaseError("environment_failed", "; ".join(invocation_errors))
+            measured_telemetry.append(
+                (
+                    telemetry_start_index,
+                    len(invocation_telemetry),
+                    environment.loaded_clock_summary(invocation_telemetry),
+                )
+            )
         try:
             parsed = adapters.parse_output(engine.name, result.stdout, result.stderr)
         except ValueError as exc:
