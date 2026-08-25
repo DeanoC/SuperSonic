@@ -151,6 +151,11 @@ class ScalarHeadCodeObjectTests(unittest.TestCase):
                 "    v_mul_f32 v0, v1, v9\n",
                 1,
             ),
+            "changed reduction dependency": DISASSEMBLY.replace(
+                "    v_add_f32 v0, v0, v1\n",
+                "    v_add_f32 v0, v0, v2\n",
+                1,
+            ),
         }
 
         for label, disassembly in mutations.items():
