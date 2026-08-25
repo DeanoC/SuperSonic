@@ -198,7 +198,7 @@ class BenchmarkRenderTests(unittest.TestCase):
             self.assertIn(value, page)
         for value in (
             "locked",
-            "warm-resident",
+            "cold-load",
             "quality",
             "expected &lt;answer&gt;",
             record["run"]["commit"],

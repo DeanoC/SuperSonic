@@ -37,18 +37,6 @@ decoding_policy = "greedy"
 engines = ["supersonic", "llama-cpp"]
 
 [[performance_cases]]
-id = "full-short-warm-ordinary"
-prompt = "Emit a single sentence describing warm-resident benchmark startup."
-max_new_tokens = 32
-warmups = 1
-repetitions = 7
-mode = "ordinary"
-cache_state = "warm-resident"
-timeout_seconds = 60
-decoding_policy = "greedy"
-engines = ["supersonic", "llama-cpp"]
-
-[[performance_cases]]
 id = "full-long-cold-ordinary"
 prompt = "You are validating a long-context ordinary decode run for a narrow Qwen3.8 benchmark harness. Describe the evidence that must remain attached to the run so future reviewers can reproduce the result without guessing hidden environment or cache behavior."
 max_new_tokens = 96
@@ -56,18 +44,6 @@ warmups = 0
 repetitions = 7
 mode = "ordinary"
 cache_state = "cold-load"
-timeout_seconds = 60
-decoding_policy = "greedy"
-engines = ["supersonic", "llama-cpp"]
-
-[[performance_cases]]
-id = "full-long-warm-ordinary"
-prompt = "You are validating a long-context warm-resident ordinary decode run for a narrow Qwen3.8 benchmark harness. Describe the evidence that must remain attached to the run so future reviewers can reproduce the result without guessing hidden environment or cache behavior."
-max_new_tokens = 96
-warmups = 1
-repetitions = 7
-mode = "ordinary"
-cache_state = "warm-resident"
 timeout_seconds = 60
 decoding_policy = "greedy"
 engines = ["supersonic", "llama-cpp"]
@@ -85,18 +61,6 @@ decoding_policy = "greedy"
 engines = ["supersonic"]
 
 [[performance_cases]]
-id = "full-short-warm-mtp"
-prompt = "Emit a single sentence describing warm-resident MTP benchmark startup."
-max_new_tokens = 32
-warmups = 1
-repetitions = 7
-mode = "mtp"
-cache_state = "warm-resident"
-timeout_seconds = 60
-decoding_policy = "greedy"
-engines = ["supersonic"]
-
-[[performance_cases]]
 id = "full-long-cold-mtp"
 prompt = "You are validating a long-context cold-load MTP run. Describe how the benchmark should preserve exact tokens, timing evidence, and cache-state identity while still remaining fully reproducible."
 max_new_tokens = 96
@@ -104,18 +68,6 @@ warmups = 0
 repetitions = 7
 mode = "mtp"
 cache_state = "cold-load"
-timeout_seconds = 60
-decoding_policy = "greedy"
-engines = ["supersonic"]
-
-[[performance_cases]]
-id = "full-long-warm-mtp"
-prompt = "You are validating a long-context warm-resident MTP run. Describe how the benchmark should preserve exact tokens, timing evidence, and cache-state identity while still remaining fully reproducible."
-max_new_tokens = 96
-warmups = 1
-repetitions = 7
-mode = "mtp"
-cache_state = "warm-resident"
 timeout_seconds = 60
 decoding_policy = "greedy"
 engines = ["supersonic"]

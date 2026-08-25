@@ -23,9 +23,9 @@ class BenchmarkCompareTests(unittest.TestCase):
         self.compare = load_compare_module()
         self.locked_warm = json.loads(FIXTURE.read_text(encoding="utf-8"))
         self.uncontrolled_cold = copy.deepcopy(self.locked_warm)
-        self.uncontrolled_cold["workload"]["cache_state"] = "cold-load"
-        self.uncontrolled_cold["environment"]["cache_state"] = "cold-load"
-        self.uncontrolled_cold["workload"]["warmups"] = 0
+        self.uncontrolled_cold["workload"]["cache_state"] = "warm-resident"
+        self.uncontrolled_cold["environment"]["cache_state"] = "warm-resident"
+        self.uncontrolled_cold["workload"]["warmups"] = 1
         self.uncontrolled_cold["environment"]["clock_policy"] = "uncontrolled-clocks"
         self.uncontrolled_cold["hardware"]["clock_policy"] = "uncontrolled-clocks"
         self.uncontrolled_cold["environment"]["headline_eligible"] = False
@@ -181,7 +181,7 @@ class BenchmarkCompareTests(unittest.TestCase):
     def test_series_key_splits_all_comparable_identity_fields(self):
         base_key = self.compare.series_key(self.locked_warm)
         for path, value in (
-            (("workload", "cache_state"), "cold-load"),
+            (("workload", "cache_state"), "warm-resident"),
             (("environment", "clock_policy"), "uncontrolled-clocks"),
             (("environment", "requested", "power_cap_watts"), 280),
             (("artifact", "semantic_id"), "other-artifact"),
@@ -206,7 +206,7 @@ class BenchmarkCompareTests(unittest.TestCase):
             (("environment", "requested", "memory_clock_mhz"), 1300, "memory_clock_mhz"),
             (("environment", "requested", "power_cap_watts"), 280, "power_cap_watts"),
             (("environment", "requested", "performance_level"), "auto", "performance_level"),
-            (("workload", "cache_state"), "cold-load", "cache_state"),
+            (("workload", "cache_state"), "warm-resident", "cache_state"),
             (("environment", "process_reuse"), True, "process_reuse"),
             (("workload", "measurement_boundary"), "end-to-end", "measurement_boundary"),
         )

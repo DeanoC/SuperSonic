@@ -59,8 +59,9 @@ policies, hardware identities, workloads, or timing boundaries.
 
 Prefix-cache cases are explicitly unsupported until the execution adapters
 verify empty, populated, and reset transitions. Do not treat a named prefix
-state as evidence that a transition happened. For the supported `cold-load`
-and `warm-resident` series, the current records retain `process_reuse=false`.
+state as evidence that a transition happened. The executable suites currently
+support only fresh-process `cold-load`; `warm-resident` fails preflight until
+warmup and measurement can share one verified resident process.
 
 ## Reproduce and review
 

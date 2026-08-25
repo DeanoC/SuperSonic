@@ -4,8 +4,8 @@
     "suite": "quick",
     "suite_version": 1,
     "quality_version": "v2",
-    "case_id": "quick-short-warm-ordinary",
-    "run_id": "quick-short-warm-ordinary-supersonic-0001",
+    "case_id": "quick-short-cold-ordinary",
+    "run_id": "quick-short-cold-ordinary-supersonic-0001",
     "commit": "0123456789abcdef0123456789abcdef01234567",
     "dirty": false,
     "command": [
@@ -44,14 +44,14 @@
     "chat_template_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   },
   "workload": {
-    "case_id": "quick-short-warm-ordinary",
+    "case_id": "quick-short-cold-ordinary",
     "prompt_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "context_limit": 32768,
     "max_new_tokens": 32,
     "mode": "ordinary",
     "stop_policy": "ignore-eos",
-    "cache_state": "warm-resident",
-    "warmups": 1,
+    "cache_state": "cold-load",
+    "warmups": 0,
     "measurement_boundary": "decode"
   },
   "environment": {
@@ -113,7 +113,7 @@
       "SUPERSONIC_DEVICE": "0",
       "RUSTFLAGS": "-C target-cpu=native"
     },
-    "cache_state": "warm-resident",
+    "cache_state": "cold-load",
     "cache_evidence": {
       "process_state": "fresh-process",
       "process_reuse": false,

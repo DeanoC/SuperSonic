@@ -14,8 +14,8 @@ The suite manifests own the measurement budgets:
 - `full` runs for about six hours: it has a 20,700-second minimum inside a
   21,600-second hard budget. It is
   manually triggered after quick review or for an overnight run, and includes
-  the complete quality corpus, both cache series, MTP cases, and the configured
-  peer engine. After warmups, the seeded case/engine order runs as
+  the complete quality corpus, the verified cold-load series, MTP cases, and
+  the configured peer engine. The seeded case/engine order runs in
   balanced rounds until the minimum is reached; the reserved 900 seconds bound the final
   round and manifest finalization.
 
@@ -205,12 +205,38 @@ quality-failed bundle is diagnostic only and cannot be promoted.
 
 ## Cache and clock terminology
 
-Cache state is part of the series identity. `cold-load` uses a fresh process
-and records model-load/startup separately; `warm-resident` declares warmups
-before measured samples. Both states record `process_reuse=false`; that field
-must not be inferred from a warmup or changed to claim process reuse. A
-filesystem cache flush is never claimed unless its mechanism and verification
-are attached to the evidence.
+Cache state is part of the series identity. The executable suites currently
+support only `cold-load`: every sample uses a fresh process and reports model
+loading separately from decode. `warm-resident` fails preflight until an
+adapter can warm and measure the same resident process. Prefix-cache states
+remain rejected until their transitions are verified. A filesystem cache
+flush is never claimed unless its mechanism and verification are attached to
+the evidence.
+
+For a focused investigation of the observed fresh-process decode bimodality,
+run the bounded repeatability diagnostic:
+
+```bash
+HIP_VISIBLE_DEVICES=1 python3 tools/supersonic-bench.py repeatability \
+  --model-dir /data/models/Qwen3.8-27B \
+  --artifact /home/deano/models/qwen38-gqh-shaped.gguf \
+  --physical-gpu 1 \
+  --output target/benchmarks/repeatability/<run-id>
+```
+
+The persistent-stage threshold is a diagnostic trigger, not a performance
+gate. Every invocation retains raw streams and live clock, power, temperature,
+and utilization telemetry. A token mismatch fails immediately. On the first
+slow sample, the exact trigger logs are preserved and bounded rocprof follow-up
+reproductions collect kernel and allocation traces. Those traces are labeled
+`followup-reproduction` because profiling cannot be attached retroactively to
+the process that triggered them. The default wall-clock ceiling is 21,600
+seconds (six hours), independent of the per-process and run-count limits.
+`HIP_VISIBLE_DEVICES` must map the recorded physical GPU to the selected logical
+device; a mismatched or missing mapping fails before the first sample. The
+manifest explicitly records cold-load, fresh-process, non-reuse semantics and
+is updated after every sample. At least one parseable rocprof JSON trace is
+required before the terminal state can be `slow-captured`.
 
 The schema also names `prefix-cache-empty`, `prefix-cache-populated`, and
 `prefix-cache-reset`. Those cases are explicitly unsupported by the current
