@@ -194,6 +194,60 @@ fn prefill_bridge_result(
     Ok(())
 }
 
+const Q6_SCALAR_HEAD_LHS_ELEMS: usize = 5_120;
+const Q6_SCALAR_HEAD_ROWS: usize = 248_320;
+const Q6_SCALAR_HEAD_ROW_BYTES: usize = 20 * 210;
+const Q6_SCALAR_HEAD_RHS_BYTES: usize = Q6_SCALAR_HEAD_ROWS * Q6_SCALAR_HEAD_ROW_BYTES;
+
+#[derive(Debug, Clone, Copy)]
+struct Q6ScalarHeadShape {
+    lhs_dtype: ScalarType,
+    lhs_elems: usize,
+    rhs_dtype: ScalarType,
+    rhs_bytes: usize,
+    out_dtype: ScalarType,
+    out_elems: usize,
+    row_start: usize,
+    row_count: usize,
+}
+
+fn validate_q6_scalar_head_shape(shape: Q6ScalarHeadShape) -> Result<(), GpuError> {
+    if shape.lhs_dtype != ScalarType::BF16 || shape.lhs_elems != Q6_SCALAR_HEAD_LHS_ELEMS {
+        return Err(GpuError::InvalidArg(format!(
+            "q6 scalar head lhs must be BF16[{Q6_SCALAR_HEAD_LHS_ELEMS}], got {:?}[{}]",
+            shape.lhs_dtype, shape.lhs_elems
+        )));
+    }
+    if shape.rhs_dtype != ScalarType::U8 || shape.rhs_bytes != Q6_SCALAR_HEAD_RHS_BYTES {
+        return Err(GpuError::InvalidArg(format!(
+            "q6 scalar head rhs must be U8[{Q6_SCALAR_HEAD_RHS_BYTES} bytes], got {:?}[{} bytes]",
+            shape.rhs_dtype, shape.rhs_bytes
+        )));
+    }
+    if shape.out_dtype != ScalarType::F32 || shape.out_elems != Q6_SCALAR_HEAD_ROWS {
+        return Err(GpuError::InvalidArg(format!(
+            "q6 scalar head output must be F32[{Q6_SCALAR_HEAD_ROWS}], got {:?}[{}]",
+            shape.out_dtype, shape.out_elems
+        )));
+    }
+    if shape.row_count == 0 {
+        return Err(GpuError::InvalidArg(
+            "q6 scalar head row_count must be non-zero".into(),
+        ));
+    }
+    let row_end = shape
+        .row_start
+        .checked_add(shape.row_count)
+        .ok_or_else(|| GpuError::InvalidArg("q6 scalar head row range overflows".into()))?;
+    if row_end > Q6_SCALAR_HEAD_ROWS {
+        return Err(GpuError::InvalidArg(format!(
+            "q6 scalar head row range {}..{} exceeds {Q6_SCALAR_HEAD_ROWS}",
+            shape.row_start, row_end
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod typed_bridge_status_tests {
     use super::*;
@@ -303,6 +357,52 @@ mod typed_bridge_status_tests {
     fn gqh_dequant_gemm_boundary_flushes_only_batched_path() {
         assert!(!gqh_dequant_gemm_needs_flush(8));
         assert!(gqh_dequant_gemm_needs_flush(9));
+    }
+}
+
+#[cfg(test)]
+mod q6_scalar_head_tests {
+    use super::*;
+
+    fn valid_shape(row_start: usize, row_count: usize) -> Q6ScalarHeadShape {
+        Q6ScalarHeadShape {
+            lhs_dtype: ScalarType::BF16,
+            lhs_elems: 5_120,
+            rhs_dtype: ScalarType::U8,
+            rhs_bytes: 248_320 * 4_200,
+            out_dtype: ScalarType::F32,
+            out_elems: 248_320,
+            row_start,
+            row_count,
+        }
+    }
+
+    #[test]
+    fn q6_scalar_head_accepts_full_range_and_sixteen_row_tile() {
+        validate_q6_scalar_head_shape(valid_shape(0, 248_320)).unwrap();
+        validate_q6_scalar_head_shape(valid_shape(1_024, 16)).unwrap();
+    }
+
+    #[test]
+    fn q6_scalar_head_rejects_wrong_dtypes_and_storage_sizes() {
+        let mut shape = valid_shape(0, 1);
+        shape.out_dtype = ScalarType::BF16;
+        assert!(validate_q6_scalar_head_shape(shape).is_err());
+
+        let mut shape = valid_shape(0, 1);
+        shape.lhs_dtype = ScalarType::F32;
+        assert!(validate_q6_scalar_head_shape(shape).is_err());
+
+        let mut shape = valid_shape(0, 1);
+        shape.rhs_bytes -= 1;
+        assert!(validate_q6_scalar_head_shape(shape).is_err());
+    }
+
+    #[test]
+    fn q6_scalar_head_rejects_empty_out_of_range_and_overflowing_ranges() {
+        assert!(validate_q6_scalar_head_shape(valid_shape(0, 0)).is_err());
+        assert!(validate_q6_scalar_head_shape(valid_shape(248_319, 2)).is_err());
+        assert!(validate_q6_scalar_head_shape(valid_shape(usize::MAX, 1)).is_err());
     }
 }
 
@@ -745,6 +845,19 @@ unsafe extern "C" {
         block_best_vals: *mut c_void,
         block_best_indices: *mut c_void,
         out_indices: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen38_hip_q6_k_scalar_head_f32(
+        dtype: c_int,
+        device_ordinal: usize,
+        lhs_elems: usize,
+        rhs_bytes: usize,
+        out_elems: usize,
+        lhs: *const c_void,
+        rhs_q6: *const c_void,
+        out: *mut c_void,
+        row_start: usize,
+        row_count: usize,
     ) -> c_int;
 
     fn supersonic_qwen35_4b_hip_device_supports_wmma_i8(
@@ -2267,6 +2380,61 @@ pub fn matmul_q6_k_m16_argmax(
             ))),
         }
     })
+}
+
+/// Private raw-Q6 scalar output-head oracle for deterministic gfx1201 work.
+///
+/// This is intentionally not wired into production dispatch.
+pub fn q6_k_scalar_head_f32(
+    ordinal: usize,
+    lhs: &GpuBuffer,
+    rhs_q6: &GpuBuffer,
+    out: &mut GpuBuffer,
+    row_start: usize,
+    row_count: usize,
+) -> Result<(), GpuError> {
+    if lhs.backend() != Backend::Hip
+        || rhs_q6.backend() != Backend::Hip
+        || out.backend() != Backend::Hip
+    {
+        return Err(ffi_error(
+            "q6_k_scalar_head_f32 requires HIP buffers".into(),
+        ));
+    }
+    validate_q6_scalar_head_shape(Q6ScalarHeadShape {
+        lhs_dtype: lhs.dtype(),
+        lhs_elems: lhs.elem_count(),
+        rhs_dtype: rhs_q6.dtype(),
+        rhs_bytes: rhs_q6.len_bytes(),
+        out_dtype: out.dtype(),
+        out_elems: out.elem_count(),
+        row_start,
+        row_count,
+    })?;
+
+    let status = unsafe {
+        supersonic_qwen38_hip_q6_k_scalar_head_f32(
+            ScalarType::BF16.kernel_dtype_code(),
+            ordinal,
+            lhs.elem_count(),
+            rhs_q6.len_bytes(),
+            out.elem_count(),
+            lhs.as_ptr(),
+            rhs_q6.as_ptr(),
+            out.as_mut_ptr(),
+            row_start,
+            row_count,
+        )
+    };
+    prefill_bridge_result(Backend::Hip, "q6_k_scalar_head_f32", status)
+}
+
+pub fn device_supports_q6_scalar_head(ordinal: usize) -> Result<bool, GpuError> {
+    if gpu_hal::current_backend() != Backend::Hip {
+        return Ok(false);
+    }
+    let (arch, _) = crate::query_gpu_info(ordinal)?;
+    Ok(arch == "gfx1201")
 }
 
 pub fn device_supports_wmma_i8(ordinal: usize) -> Result<bool, GpuError> {

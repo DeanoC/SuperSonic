@@ -8090,6 +8090,60 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_q6_k_m16_argmax(
     }
 }
 
+extern "C" int supersonic_qwen38_hip_q6_k_scalar_head_f32(
+    int dtype,
+    size_t device_ordinal,
+    size_t lhs_elems,
+    size_t rhs_bytes,
+    size_t out_elems,
+    const void* lhs,
+    const void* rhs_q6,
+    void* out,
+    size_t row_start,
+    size_t row_count) {
+    constexpr size_t LHS_ELEMS = 5120;
+    constexpr size_t ROWS = 248320;
+    constexpr size_t ROW_BYTES = 20 * 210;
+    constexpr size_t RHS_BYTES = ROWS * ROW_BYTES;
+
+    if (dtype != 2) return 360;
+    if (lhs_elems != LHS_ELEMS || rhs_bytes != RHS_BYTES || out_elems != ROWS) return 361;
+    if (lhs == nullptr || rhs_q6 == nullptr || out == nullptr) return 362;
+    if (row_count == 0) return 363;
+    if (row_start > ROWS || row_count > ROWS - row_start) return 364;
+    if (device_ordinal > 0x7fffffffu) return 365;
+
+    const int ordinal = static_cast<int>(device_ordinal);
+    ScopedHipDevice scoped(ordinal);
+    if (!scoped.ok()) return prefill_backend_failure(365, scoped.status);
+
+    hipDeviceProp_t props;
+    const hipError_t props_err = hipGetDeviceProperties(&props, ordinal);
+    if (props_err != hipSuccess) return prefill_backend_failure(365, props_err);
+    if (std::strcmp(props.gcnArchName, "gfx1201") != 0) return 366;
+
+    constexpr int THREADS = 128;
+    constexpr int ROWS_PER_CTA = 4;
+    const unsigned int blocks =
+        static_cast<unsigned int>((row_count + ROWS_PER_CTA - 1) / ROWS_PER_CTA);
+    hipLaunchKernelGGL(
+        supersonic_qwen38_q6_k_scalar_head_f32_kernel,
+        dim3(blocks),
+        dim3(THREADS),
+        0,
+        0,
+        static_cast<const uint16_t*>(lhs),
+        static_cast<const uint8_t*>(rhs_q6),
+        static_cast<float*>(out),
+        static_cast<int>(row_start),
+        static_cast<int>(row_count));
+    const hipError_t launch_err = hipGetLastError();
+    const hipError_t sync_err = maybe_sync();
+    if (launch_err != hipSuccess) return prefill_backend_failure(368, launch_err);
+    if (sync_err != hipSuccess) return prefill_backend_failure(369, sync_err);
+    return 0;
+}
+
 template <typename T>
 int int4_sparse_outlier_add_device(
     int device_ordinal,

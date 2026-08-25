@@ -5709,6 +5709,81 @@ void supersonic_qwen35_matmul_q6_k_m16_tile_argmax_kernel(
 #endif
 }
 
+__device__ __forceinline__ float q6_scalar_rn_mul(float a, float b) {
+    return a * b;
+}
+
+__device__ __forceinline__ float q6_scalar_rn_fma(float a, float b, float c) {
+    return __builtin_fmaf(a, b, c);
+}
+
+__global__ __launch_bounds__(128)
+void supersonic_qwen38_q6_k_scalar_head_f32_kernel(
+    const uint16_t* lhs_bf16,
+    const uint8_t* rhs_q6,
+    float* out_f32,
+    int row_start,
+    int row_count
+) {
+    constexpr int Q6_BLOCK_BYTES = 210;
+    constexpr int Q6_BLOCK_VALUES = 256;
+    constexpr int BLOCKS_PER_ROW = 20;
+    constexpr int ROW_BYTES = BLOCKS_PER_ROW * Q6_BLOCK_BYTES;
+    constexpr int ROWS_PER_CTA = 4;
+
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int local_row = static_cast<int>(blockIdx.x) * ROWS_PER_CTA + wave;
+    if (local_row >= row_count) {
+        return;
+    }
+
+    const int global_row = row_start + local_row;
+    const uint8_t* row =
+        rhs_q6 + static_cast<size_t>(global_row) * static_cast<size_t>(ROW_BYTES);
+
+    {
+        #pragma clang fp reassociate(off)
+        #pragma clang fp contract(off)
+        float acc = 0.0f;
+        for (int block_index = 0; block_index < BLOCKS_PER_ROW; ++block_index) {
+            const uint8_t* block = row + block_index * Q6_BLOCK_BYTES;
+            const uint8_t* ql = block;
+            const uint8_t* qh = block + 128;
+            const int8_t* scales = reinterpret_cast<const int8_t*>(block + 192);
+            const float d = ggml_f16_to_f32_unaligned(block + 208);
+
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const int half_idx = t >> 2;
+                const int group = t & 3;
+                const int scale_idx = half_idx * 8 + (lane >> 4) + group * 2;
+                const int ql_offset = half_idx * 64 + lane + ((group & 1) ? 32 : 0);
+                const int qh_offset = half_idx * 32 + lane;
+                const int qh_shift = group * 2;
+                const uint8_t packed = ql[ql_offset];
+                const int lo = group >= 2 ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+                const int hi = static_cast<int>(((qh[qh_offset] >> qh_shift) & 3) << 4);
+                const int q = lo + hi - 32;
+                const float weight = q6_scalar_rn_mul(
+                    q6_scalar_rn_mul(d, static_cast<float>(scales[scale_idx])),
+                    static_cast<float>(q));
+                const int coordinate = block_index * Q6_BLOCK_VALUES + lane + 32 * t;
+                const float activation = bf16_bits_to_f32(lhs_bf16[coordinate]);
+                acc = q6_scalar_rn_fma(weight, activation, acc);
+            }
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc += __shfl_xor(acc, offset, 32);
+        }
+        if (lane == 0) {
+            out_f32[global_row] = acc;
+        }
+    }
+}
+
 template <bool TRUNC_DEQUANT = true>
 __global__ __launch_bounds__(32, 4)
 void supersonic_qwen35_matmul_q6_k_m16_tile_argmax_gfx12_kernel(
