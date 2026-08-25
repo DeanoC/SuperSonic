@@ -31,9 +31,9 @@
 
 **Interfaces:**
 - Consumes: `DecodeEngine`, `scalar-head-lab`, the fixed Hello and cold-chat templates, and strict artifact preflight.
-- Produces: `capture_scalar_correction_corpus(output: &Path) -> Result<(), String>` writing 64 records. Each record names exactly two separate files: `<state-id>.hidden.bf16le` containing 5,120 little-endian `u16` words (10,240 bytes), and `<state-id>.scalar.f32le` containing 248,320 little-endian finite `f32` words (993,280 bytes), plus each file's SHA-256, prompt ID/SHA-256, generation index, selected lowest-index BF16 token, artifact SHA-256, scalar contract version, and row-mapping version. Offsets into shared files and alternate encodings are forbidden in v1.
+- Produces: `capture_scalar_correction_corpus(output: &Path) -> Result<(), String>` writing 64 records. Each record names exactly two separate files: `<state-id>.hidden.bf16le` containing 5,120 little-endian `u16` words (10,240 bytes), and `<state-id>.scalar.f32le` containing 248,320 little-endian finite `f32` words (993,280 bytes), plus each file's SHA-256, prompt ID/SHA-256, `m1_state_index`, `input_token`, selected lowest-index BF16 `output_token`, artifact SHA-256, scalar contract version, and row-mapping version. Offsets into shared files and alternate encodings are forbidden in v1.
 
-- [ ] **Step 1: Write the failing manifest and strict-capture tests.** Assert exactly two cases, 32 states per case, prompt lengths 13 and 23, contiguous generation indices, the established 32-token vectors, hidden length 5,120, logit length 248,320, unique state IDs, canonical ordering, and failure when a configured artifact/device is unavailable.
+- [ ] **Step 1: Write the failing manifest and strict-capture tests.** Assert exactly two cases and 32 m=1 states per case. A normal 32-token generation has one prefill-selected token plus 31 m=1-selected tokens, so the corpus contract deliberately extends each case by one m=1 call: store a 33-token vector `tokens[0..33]`, require its first 32 entries to equal the established fixture, and freeze the new entry `tokens[32]` only after two independent strict-artifact captures agree. For `m1_state_index=i` in `0..32`, the recorded `input_token` is `tokens[i]` and the recorded `output_token` is `tokens[i+1]`; no prefill head is a corpus state. Also assert prompt lengths 13 and 23, contiguous state indices, hidden length 5,120, logit length 248,320, unique state IDs, canonical ordering, and failure when a configured artifact/device is unavailable.
 - [ ] **Step 2: Run RED.**
 
 ```bash
@@ -42,7 +42,7 @@ cargo test -p supersonic-runtime --features scalar-head-lab --test qwen38_gqh_de
 
 Expected: fail because the corpus manifest/capture API is absent.
 
-- [ ] **Step 3: Implement the minimal feature-gated capture.** Reuse chat rendering with `add_generation_prompt=true`; capture immediately before each m=1 output head; store binary arrays little-endian and a canonical JSON manifest containing relative paths, byte counts, SHA-256, artifact digest, commit, route `RawQ6Scalar`, and exact token.
+- [ ] **Step 3: Implement the minimal feature-gated capture.** Reuse chat rendering with `add_generation_prompt=true`; after prefill selects `tokens[0]`, drive exactly 32 m=1 calls, capturing immediately before each output head and recording the input/output mapping above. Store binary arrays little-endian and a canonical JSON manifest containing relative paths, byte counts, SHA-256, artifact digest, commit, route `RawQ6Scalar`, and the 33-token vector.
 - [ ] **Step 4: Run the CPU contract tests and two strict ignored captures.**
 
 ```bash
@@ -56,7 +56,7 @@ cargo test --release -p supersonic-runtime --features scalar-head-lab \
   -- --exact --include-ignored --test-threads=1 --nocapture
 ```
 
-Expected: 64/64 records validate and both full token lists match the fixture.
+Expected: 64/64 records validate; each 33-token vector's first 32 entries match the established fixture; both independent captures agree on the newly frozen 33rd token; and every state directly satisfies `input=tokens[i]`, `output=tokens[i+1]`.
 
 - [ ] **Step 5: Remove any general runtime accessor not needed by the fixed ignored test, prove normal-artifact isolation, and commit.**
 

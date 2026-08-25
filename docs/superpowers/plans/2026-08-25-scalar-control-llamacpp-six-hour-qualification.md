@@ -114,6 +114,9 @@ git commit -m "feat(bench): distinguish scalar and wmma engines"
 **Files:**
 - Create: `benchmarks/suites/full-scalar-qualification.toml`
 - Reuse: `benchmarks/quality/v2.json`
+- Create: `benchmarks/quality/scalar-mtp-goldens-v1.json`
+- Create: `tools/generate-scalar-mtp-goldens.py`
+- Create: `tests/test_generate_scalar_mtp_goldens.py`
 - Modify: `tools/external/llama-cpp-version.txt`
 - Modify: `tests/test_benchmark_manifests.py`
 - Modify: `tests/test_benchmark_execution.py`
@@ -126,7 +129,7 @@ git commit -m "feat(bench): distinguish scalar and wmma engines"
 - Produces: a six-hour suite with complete balanced rounds and deterministic quality gates.
 
 - [ ] **Step 1: Write RED tests** requiring `minimum_duration_seconds=20700`, `budget_seconds=21600`, all ordinary performance cases scheduled once per engine per round, alternating seeded order, seven minimum repetitions, no partial-round publication, and explicit ordinary and MTP correctness cases for both SuperSonic identities. llama.cpp remains ordinary-only.
-- [ ] **Step 2: Retain and enumerate quality v2 exactly.** The suite uses all 16 existing cases below with greedy decoding and seed 1. Run cases 1–14 in ordinary mode on all three engines. Run cases 15–16 as ordinary-versus-MTP token equality separately for `supersonic-wmma` and `supersonic-scalar-lab`; both modes must equal each other and the fixture. A missing scalar MTP result fails qualification.
+- [ ] **Step 2: Retain and enumerate quality v2 exactly.** The suite uses all 16 existing prompts below with greedy decoding and seed 1. Run cases 1–14 in ordinary mode on all three engines. Run cases 15–16 as ordinary-versus-MTP token equality separately for `supersonic-wmma` and `supersonic-scalar-lab`; each engine's two modes must equal its own reviewed artifact-backed golden. A missing scalar MTP result fails qualification. The semantic numeric arrays currently present in quality v2 are not tokenizer token-ID goldens and must not be used for this gate.
 
 | # | ID | Exact prompt | Max | Scorer / expected |
 | ---: | --- | --- | ---: | --- |
@@ -144,17 +147,18 @@ git commit -m "feat(bench): distinguish scalar and wmma engines"
 | 12 | `chat-template-behavior-2` | `System: terse. User: Reply with done.` | 4 | exact text `done` |
 | 13 | `repeated-run-determinism-1` | `Reply with the digits 1234.` | 4 | exact text `1234` |
 | 14 | `repeated-run-determinism-2` | `Reply with the digits 5678.` | 4 | exact text `5678` |
-| 15 | `ordinary-vs-mtp-token-equality-1` | `Reply with the token ids for 1 2 3.` | 8 | exact tokens `[1,2,3]` |
-| 16 | `ordinary-vs-mtp-token-equality-2` | `Reply with the token ids for 4 5 6.` | 8 | exact tokens `[4,5,6]` |
+| 15 | `ordinary-vs-mtp-token-equality-1` | `Reply with the token ids for 1 2 3.` | 8 | engine-specific exact token vector frozen by Step 4 |
+| 16 | `ordinary-vs-mtp-token-equality-2` | `Reply with the token ids for 4 5 6.` | 8 | engine-specific exact token vector frozen by Step 4 |
 
 - [ ] **Step 3: Bind artifact semantics.** Require semantic ID `qwen3.8-27b-gqh-q3kxl-hf-91bc7e33`, revision `91bc7e33c1912856dcd8d2ca4499dd8ccad13ac4`, filename `Qwen3.8-27B-GQH-Q3KXL.gguf`, quantization `GQH-Q3KXL`, size `13440110432`, and SHA-256 `c710b03bf5bf224107d0ae1567b97f1c8638ef35c5f431c39479a3ecc963bd98` for every engine. Reject a directory, symlink escape, missing file, wrong digest, or any engine silently using another path.
-- [ ] **Step 4: Make equality three-way and engine-specific.** Change `score_mtp_pair(case, ordinary, mtp)` so an `exact_tokens` fixture passes only when `ordinary.token_ids == mtp.token_ids == tuple(case.expected)`. Store distinct quality result keys `<engine>/<case>/ordinary-vs-mtp`; reject duplicate/missing WMMA or scalar pairs. Tests must show a mutually equal but fixture-wrong pair fails.
-- [ ] **Step 5: Pin peer source exactly.** Keep the non-comment pin line `version: 5 (f8dd7c3)` and require workflow evidence for full commit `f8dd7c36da283cf587cef3133b9287fd3a5b6fdb` from `https://github.com/GeometricAGI/llama.cpp/pull/1`.
-- [ ] **Step 6: Run and commit.**
+- [ ] **Step 4: Generate and review engine-specific token goldens.** After Tasks 1–2 are built, run `tools/generate-scalar-mtp-goldens.py` in strict-artifact mode for cases 15–16. For each SuperSonic engine, execute ordinary mode twice in independent fresh processes and require the two exact token vectors to agree, stay within the case token cap, and retain prompt bytes/SHA-256, chat/template/tokenizer digests, artifact identity, engine binary/code-object digest, and full stdout/stderr. Write `scalar-mtp-goldens-v1.json` only after all four repeated pairs agree; manually review the generated text and vectors before staging. Goldens are keyed by engine and case, so WMMA and scalar need not equal each other.
+- [ ] **Step 5: Make equality three-way and engine-specific.** Change `score_mtp_pair(case, ordinary, mtp, expected_tokens)` so a pair passes only when `ordinary.token_ids == mtp.token_ids == expected_tokens` from the matching engine/case golden. Store distinct quality result keys `<engine>/<case>/ordinary-vs-mtp`; reject a missing/mismatched golden, duplicate/missing WMMA or scalar pair, or any digest mismatch. Tests must show a mutually equal but golden-wrong pair fails and that v2's semantic numeric arrays are never substituted as token IDs.
+- [ ] **Step 6: Pin peer source exactly.** Keep the non-comment pin line `version: 5 (f8dd7c3)` and require workflow evidence for full commit `f8dd7c36da283cf587cef3133b9287fd3a5b6fdb` from `https://github.com/GeometricAGI/llama.cpp/pull/1`.
+- [ ] **Step 7: Run and commit.**
 
 ```bash
-python3 -m unittest tests.test_benchmark_manifests tests.test_benchmark_execution tests.test_benchmark_validation tests.test_benchmark_quality -v
-git add benchmarks/suites/full-scalar-qualification.toml tools/external/llama-cpp-version.txt tools/benchmark/quality.py tests/test_benchmark_manifests.py tests/test_benchmark_execution.py tests/test_benchmark_validation.py tests/test_benchmark_quality.py
+python3 -m unittest tests.test_benchmark_manifests tests.test_benchmark_execution tests.test_benchmark_validation tests.test_benchmark_quality tests.test_generate_scalar_mtp_goldens -v
+git add benchmarks/suites/full-scalar-qualification.toml benchmarks/quality/scalar-mtp-goldens-v1.json tools/generate-scalar-mtp-goldens.py tools/external/llama-cpp-version.txt tools/benchmark/quality.py tests/test_benchmark_manifests.py tests/test_benchmark_execution.py tests/test_benchmark_validation.py tests/test_benchmark_quality.py tests/test_generate_scalar_mtp_goldens.py
 git commit -m "feat(bench): define scalar qualification suite"
 ```
 
