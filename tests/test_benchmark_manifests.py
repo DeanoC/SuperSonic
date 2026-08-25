@@ -218,6 +218,13 @@ engines = ["supersonic"]
         self.assertEqual(supersonic.version, 1)
         self.assertEqual(llama_cpp.version, 1)
         self.assertEqual(tuple(supersonic.supported_modes), ("ordinary", "mtp"))
+
+        wmma = manifest.load_engine("supersonic-wmma")
+        scalar = manifest.load_engine("supersonic-scalar-lab")
+        self.assertEqual(wmma.binary, "./target/release/supersonic")
+        self.assertEqual(scalar.binary, "tools/supersonic-scalar-lab.py")
+        self.assertEqual(wmma.supported_modes, ("ordinary", "mtp"))
+        self.assertEqual(scalar.supported_modes, ("ordinary", "mtp"))
         self.assertEqual(tuple(llama_cpp.supported_modes), ("ordinary",))
         self.assertIsNone(supersonic.version_pin_file)
         self.assertEqual(llama_cpp.version_pin_file, "tools/external/llama-cpp-version.txt")

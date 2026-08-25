@@ -1,4 +1,5 @@
 import importlib
+import json
 from dataclasses import replace
 from pathlib import Path
 import unittest
@@ -56,6 +57,42 @@ class BenchmarkAdapterTests(unittest.TestCase):
         self.assertEqual(argv.count("--model-dir"), 1)
         self.assertEqual(argv.count("--gguf-file"), 1)
         self.assertNotIn("|", argv)
+
+    def test_scalar_and_wmma_adapters_have_distinct_source_fixed_commands(self):
+        wmma = self.manifest.load_engine("supersonic-wmma")
+        scalar = self.manifest.load_engine("supersonic-scalar-lab")
+        wmma_case = replace(self.supersonic_case, engines=("supersonic-wmma",))
+        scalar_case = replace(self.supersonic_case, engines=("supersonic-scalar-lab",))
+
+        wmma_argv = self.adapters.build_command(wmma, wmma_case, self.inputs)
+        scalar_argv = self.adapters.build_command(scalar, scalar_case, self.inputs)
+
+        self.assertEqual(wmma_argv[0], "./target/release/supersonic")
+        self.assertEqual(scalar_argv[0], "tools/supersonic-scalar-lab.py")
+        self.assertEqual(scalar_argv[scalar_argv.index("--artifact") + 1], str(self.inputs.artifact))
+        self.assertEqual(scalar_argv[scalar_argv.index("--mode") + 1], "ordinary")
+        self.assertNotIn("--route", scalar_argv)
+        self.assertNotIn("--gguf-file", scalar_argv)
+
+    def test_scalar_parser_accepts_only_the_fixed_scalar_identity(self):
+        payload = {
+            "decode_ms": 12.0,
+            "engine_name": "supersonic-scalar-lab",
+            "engine_version": "scalar-head-lab-v1",
+            "generated_text": "answer",
+            "generated_tokens": 3,
+            "ms_per_tok": 4.0,
+            "prompt_tokens": 7,
+            "token_ids": [11, 12, 13],
+            "tokens_per_second": 250.0,
+        }
+        log = "[supersonic_json] " + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+        parsed = self.adapters.parse_output("supersonic-scalar-lab", log)
+
+        self.assertEqual(parsed.engine_name, "supersonic-scalar-lab")
+        self.assertEqual(parsed.engine_version, "scalar-head-lab-v1")
+        self.assertEqual(parsed.token_ids, (11, 12, 13))
 
     def test_supersonic_chat_and_mtp_flags_follow_case_and_inputs(self):
         inputs = self.adapters.AdapterInputs(

@@ -27,6 +27,7 @@ STAGE_TIMINGS_RE = re.compile(
     re.MULTILINE,
 )
 LLAMA_CPP_JSON_RE = re.compile(r"^\[llama_cpp_json\]\s+(?P<value>.+)$", re.MULTILINE)
+SUPERSONIC_SCALAR_JSON_RE = re.compile(r"^\[supersonic_json\]\s+(?P<value>.+)$", re.MULTILINE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,17 +63,22 @@ def build_command(
     _require_engine_scope(engine, case)
     _require_supported_mode(engine, case.mode)
 
-    if engine.name == "supersonic":
+    if engine.name in ("supersonic", "supersonic-wmma"):
         return _build_supersonic_command(engine, case, inputs)
+    if engine.name == "supersonic-scalar-lab":
+        return _build_scalar_lab_command(engine, case, inputs)
     if engine.name == "llama-cpp":
         return _build_llama_cpp_command(engine, case, inputs)
     raise ValueError(f"unsupported engine adapter: {engine.name}")
 
 
 def parse_output(engine_name: str, stdout: str, stderr: str = "") -> ParsedOutput:
-    if engine_name == "supersonic":
+    if engine_name in ("supersonic", "supersonic-wmma"):
         combined = _combine_streams(stdout, stderr)
         return _parse_common_output(engine_name, combined, engine_version=None)
+    if engine_name == "supersonic-scalar-lab":
+        combined = _combine_streams(stdout, stderr)
+        return _parse_scalar_lab_output(combined)
     if engine_name == "llama-cpp":
         from .manifest import load_engine
 
@@ -121,6 +127,33 @@ def _build_supersonic_command(
         args.extend(["--context-size", str(_require_positive_int(inputs.context_size, "context_size"))])
     if case.mode == "mtp":
         args.append("--speculative-decode")
+    return tuple(args)
+
+
+def _build_scalar_lab_command(
+    engine: EngineManifest,
+    case: PerformanceCase,
+    inputs: AdapterInputs,
+) -> tuple[str, ...]:
+    args = [
+        engine.binary,
+        "--model-dir",
+        str(inputs.model_dir),
+        "--artifact",
+        str(inputs.artifact),
+        "--prompt",
+        case.prompt,
+        "--max-new-tokens",
+        str(case.max_new_tokens),
+        "--device",
+        str(_require_non_negative_int(inputs.device, "device")),
+        "--mode",
+        case.mode,
+    ]
+    if inputs.chat:
+        args.append("--chat")
+    if inputs.fixed_token_count:
+        args.append("--ignore-eos")
     return tuple(args)
 
 
@@ -235,6 +268,64 @@ def _parse_llama_cpp_output(stdout: str, *, engine_version: str | None) -> Parse
         engine_version=engine_version,
         generated_text=generated_text,
         token_ids=None,
+        prompt_tokens=prompt_tokens,
+        generated_tokens=generated_tokens,
+        decode_ms=decode_ms,
+        ms_per_tok=ms_per_tok,
+        tokens_per_second=tokens_per_second,
+    )
+
+
+def _parse_scalar_lab_output(stdout: str) -> ParsedOutput:
+    raw = _extract_exactly_one(SUPERSONIC_SCALAR_JSON_RE, stdout, "supersonic_json line")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("supersonic_json must be valid JSON") from exc
+    required = {
+        "decode_ms",
+        "engine_name",
+        "engine_version",
+        "generated_text",
+        "generated_tokens",
+        "ms_per_tok",
+        "prompt_tokens",
+        "token_ids",
+        "tokens_per_second",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError("supersonic_json must contain exactly the normalized scalar fields")
+    if payload["engine_name"] != "supersonic-scalar-lab":
+        raise ValueError("supersonic_json engine_name must be supersonic-scalar-lab")
+    if payload["engine_version"] != "scalar-head-lab-v1":
+        raise ValueError("supersonic_json engine_version must be scalar-head-lab-v1")
+    generated_text = payload["generated_text"]
+    if not isinstance(generated_text, str):
+        raise ValueError("supersonic scalar generated_text must be text")
+    prompt_tokens = _require_positive_int(payload["prompt_tokens"], "prompt_tokens")
+    generated_tokens = _require_positive_int(payload["generated_tokens"], "generated_tokens")
+    raw_tokens = payload["token_ids"]
+    if (
+        not isinstance(raw_tokens, list)
+        or len(raw_tokens) != generated_tokens
+        or any(isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in raw_tokens)
+    ):
+        raise ValueError("supersonic scalar token_ids must match generated_tokens")
+    decode_ms = _require_finite_positive(payload["decode_ms"], "decode_ms")
+    ms_per_tok = _require_finite_positive(payload["ms_per_tok"], "ms_per_tok")
+    tokens_per_second = _require_finite_positive(payload["tokens_per_second"], "tokens_per_second")
+    _require_rate_consistency(
+        decode_ms,
+        generated_tokens,
+        ms_per_tok,
+        tokens_per_second,
+        "scalar timing",
+    )
+    return ParsedOutput(
+        engine_name="supersonic-scalar-lab",
+        engine_version="scalar-head-lab-v1",
+        generated_text=generated_text,
+        token_ids=tuple(raw_tokens),
         prompt_tokens=prompt_tokens,
         generated_tokens=generated_tokens,
         decode_ms=decode_ms,

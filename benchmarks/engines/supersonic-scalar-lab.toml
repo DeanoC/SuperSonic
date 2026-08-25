@@ -1,0 +1,5 @@
+version = 1
+name = "supersonic-scalar-lab"
+binary = "tools/supersonic-scalar-lab.py"
+version_command = ["tools/supersonic-scalar-lab.py", "--version"]
+supported_modes = ["ordinary", "mtp"]

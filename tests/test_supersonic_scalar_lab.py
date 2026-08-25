@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from contextlib import redirect_stdout
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +94,12 @@ class SupersonicScalarLabTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "route environment"):
             self.lab.reject_route_environment({"SUPERSONIC_SCALAR_HEAD_ROUTE": "wmma"})
 
+    def test_version_is_available_without_model_arguments(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(self.lab.main(["--version"]), 0)
+        self.assertEqual(stdout.getvalue(), "supersonic-scalar-lab scalar-head-lab-v1\n")
+
     def test_timeout_kills_the_child_process_group(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -120,8 +128,15 @@ class SupersonicScalarLabTests(unittest.TestCase):
                 self.lab.run_command(command, timeout_seconds=0.2)
 
             child_pid = int(pid_file.read_text(encoding="utf-8"))
-            with self.assertRaises(ProcessLookupError):
+            try:
                 os.kill(child_pid, 0)
+            except ProcessLookupError:
+                return
+            try:
+                state = Path(f"/proc/{child_pid}/stat").read_text(encoding="utf-8").split()[2]
+            except FileNotFoundError:
+                return
+            self.assertEqual(state, "Z", "timed-out descendant must not remain runnable")
 
 
 if __name__ == "__main__":

@@ -157,6 +157,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv == ["--version"]:
+        print(f"{ENGINE_NAME} {ENGINE_VERSION}")
+        return 0
     args = build_parser().parse_args(argv)
     try:
         reject_route_environment(os.environ)
