@@ -575,6 +575,7 @@ impl DecodeEngineSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodeSamplingMode {
     HostLogits,
+    HipFastGreedy,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -638,6 +639,52 @@ pub struct DecodeStepOutput {
     pub logits: Option<Vec<f32>>,
     pub sampled_token: u32,
     pub timings: DecodeStageTimings,
+}
+
+fn decode_argmax_token(token_bytes: &[u8]) -> Result<u32> {
+    let token_bytes: [u8; 4] = token_bytes
+        .get(..4)
+        .ok_or_else(|| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("argmax D2H token conversion failed"))?;
+    Ok(u32::from_le_bytes(token_bytes))
+}
+
+fn decode_sampling_result(
+    sampling_mode: DecodeSamplingMode,
+    logits: Option<Vec<f32>>,
+    token_bytes: Option<&[u8]>,
+    timings: DecodeStageTimings,
+) -> Result<DecodeStepOutput> {
+    match sampling_mode {
+        DecodeSamplingMode::HostLogits => {
+            let logits =
+                logits.ok_or_else(|| anyhow::anyhow!("host-logit decode missing logits"))?;
+            let sampling_start = Instant::now();
+            let sampled_token = DecodeEngine::greedy_sample(&logits);
+            let mut timings = timings;
+            timings.host_sampling_ms += sampling_start.elapsed().as_secs_f64() * 1000.0;
+            Ok(DecodeStepOutput {
+                logits: Some(logits),
+                sampled_token,
+                timings,
+            })
+        }
+        DecodeSamplingMode::HipFastGreedy => {
+            anyhow::ensure!(
+                logits.is_none(),
+                "HIP fast greedy must not materialize host logits"
+            );
+            let token_bytes = token_bytes
+                .ok_or_else(|| anyhow::anyhow!("HIP fast greedy missing argmax token"))?;
+            let sampled_token = decode_argmax_token(token_bytes)?;
+            Ok(DecodeStepOutput {
+                logits: None,
+                sampled_token,
+                timings,
+            })
+        }
+    }
 }
 
 impl DecodeEngine {
@@ -1641,23 +1688,30 @@ impl DecodeEngine {
         token_id: u32,
         seqlen_offset: usize,
     ) -> Result<(u32, DecodeStageTimings)> {
-        let (logits, timings) = if self.use_4b_kernel {
-            self.decode_step_4b_single_kernel_with_timings(token_id, seqlen_offset)?
-        } else {
-            let output = self.decode_step_non_4b(
+        anyhow::ensure!(
+            self.hidden_io.backend() == gpu_hal::Backend::Hip,
+            "decode_step_hip_fast_greedy requires HIP"
+        );
+        if self.use_4b_kernel {
+            let output = self.decode_step_single_kernel_impl(
                 token_id,
                 seqlen_offset,
-                DecodeSamplingMode::HostLogits,
-                false,
+                true,
+                DecodeSamplingMode::HipFastGreedy,
             )?;
-            (
-                output
-                    .logits
-                    .ok_or_else(|| anyhow::anyhow!("HIP greedy decode missing logits"))?,
-                output.timings,
-            )
-        };
-        Ok((Self::greedy_sample(&logits), timings))
+            return Ok((output.sampled_token, output.timings));
+        }
+
+        let output = self.decode_step_non_4b(
+            token_id,
+            seqlen_offset,
+            DecodeSamplingMode::HostLogits,
+            false,
+        )?;
+        let logits = output
+            .logits
+            .ok_or_else(|| anyhow::anyhow!("HIP greedy decode missing logits"))?;
+        Ok((Self::greedy_sample(&logits), output.timings))
     }
 
     /// Backend the engine is running on. Used by callers that need to pick
@@ -1676,15 +1730,16 @@ impl DecodeEngine {
             self.use_4b_kernel,
             "decode_step_4b_single_kernel_with_timings requires 4B kernel"
         );
-        let (mut batch_logits, mut timings) =
-            self.decode_step_single_kernel_impl(token_id, seqlen_offset, true)?;
-        let logits = batch_logits
-            .pop()
+        let output = self.decode_step_single_kernel_impl(
+            token_id,
+            seqlen_offset,
+            true,
+            DecodeSamplingMode::HostLogits,
+        )?;
+        let logits = output
+            .logits
             .ok_or_else(|| anyhow::anyhow!("single-sequence 4B kernel timings missing logits"))?;
-        let sampling_start = Instant::now();
-        let _ = Self::greedy_sample(&logits);
-        timings.host_sampling_ms += sampling_start.elapsed().as_secs_f64() * 1000.0;
-        Ok((logits, timings))
+        Ok((logits, output.timings))
     }
 
     pub fn state_mut(&mut self) -> &mut ModelState {
@@ -2123,7 +2178,8 @@ impl DecodeEngine {
         token_id: u32,
         seqlen_offset: usize,
         enable_timing_slots: bool,
-    ) -> Result<(Vec<Vec<f32>>, DecodeStageTimings)> {
+        sampling_mode: DecodeSamplingMode,
+    ) -> Result<DecodeStepOutput> {
         anyhow::ensure!(self.use_4b_kernel, "single decode requires 4B kernel");
         let config = &self.weights.config;
         let mut timings = DecodeStageTimings::default();
@@ -2209,6 +2265,16 @@ impl DecodeEngine {
         timings.rms_norm_ms = norm_start.elapsed().as_secs_f64() * 1000.0;
 
         let lm_start = Instant::now();
+        let fast_greedy = sampling_mode == DecodeSamplingMode::HipFastGreedy;
+        let (lm_head_out, lm_head_dtype, lm_head_label) = if fast_greedy {
+            (
+                &mut self.logits_f32_buf,
+                ScalarType::F32,
+                "HIP fast greedy lm_head",
+            )
+        } else {
+            (&mut self.logits_buf, ScalarType::BF16, "lm_head")
+        };
         if !lm_head_lowbit(
             self.ordinal,
             1,
@@ -2216,23 +2282,46 @@ impl DecodeEngine {
             config.hidden_size,
             &self.normed_buf,
             &self.weights,
-            &mut self.logits_buf,
-            "lm_head",
+            lm_head_out,
+            lm_head_label,
         )? {
             kernel_ffi::matmul_rhs_transposed_4b(
                 self.ordinal,
-                ScalarType::BF16,
+                lm_head_dtype,
                 1,
                 1,
                 config.vocab_size,
                 config.hidden_size,
                 &self.normed_buf,
                 self.weights.lm_head(),
-                &mut self.logits_buf,
+                lm_head_out,
             )
-            .map_err(|e| anyhow::anyhow!("lm_head: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("{lm_head_label}: {e}"))?;
         }
         timings.lm_head_ms = lm_start.elapsed().as_secs_f64() * 1000.0;
+
+        if fast_greedy {
+            let argmax_start = Instant::now();
+            kernel_ffi::prefill_ffi::argmax_f32_as_bf16_rows(
+                self.ordinal,
+                1,
+                config.vocab_size,
+                &self.logits_f32_buf,
+                &mut self.argmax_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax: {e}"))?;
+            timings.gpu_argmax_ms = argmax_start.elapsed().as_secs_f64() * 1000.0;
+
+            let token_d2h_start = Instant::now();
+            let token_bytes = self
+                .argmax_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("HIP fast greedy argmax D2H: {e}"))?;
+            let mut output =
+                decode_sampling_result(sampling_mode, None, Some(&token_bytes), timings)?;
+            output.timings.token_d2h_ms = token_d2h_start.elapsed().as_secs_f64() * 1000.0;
+            return Ok(output);
+        }
 
         let d2h_start = Instant::now();
         let logits_bytes = self
@@ -2244,7 +2333,37 @@ impl DecodeEngine {
             .chunks_exact(2)
             .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
             .collect();
-        Ok((vec![logits], timings))
+        decode_sampling_result(sampling_mode, Some(logits), None, timings)
+    }
+}
+
+#[cfg(test)]
+mod hip_fast_greedy_tests {
+    use super::{decode_sampling_result, DecodeSamplingMode, DecodeStageTimings};
+
+    #[test]
+    fn device_argmax_fast_route_does_not_materialize_host_logits() {
+        let token = 0x0102_0304u32;
+        let fast = decode_sampling_result(
+            DecodeSamplingMode::HipFastGreedy,
+            None,
+            Some(&token.to_le_bytes()),
+            DecodeStageTimings::default(),
+        )
+        .expect("device argmax token should decode");
+        assert_eq!(fast.sampled_token, token);
+        assert!(fast.logits.is_none());
+
+        let logits = vec![-1.0, 2.0, 1.0];
+        let host = decode_sampling_result(
+            DecodeSamplingMode::HostLogits,
+            Some(logits.clone()),
+            None,
+            DecodeStageTimings::default(),
+        )
+        .expect("host-logit result should remain available");
+        assert_eq!(host.logits, Some(logits));
+        assert_eq!(host.sampled_token, 1);
     }
 }
 
