@@ -69,7 +69,7 @@ _VRAM_USE_RE = re.compile(
     re.IGNORECASE,
 )
 _PERFORMANCE_LEVEL_RE = re.compile(r"Performance\s+Level\s*:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
-_LOADED_GPU_UTILIZATION_PERCENT = 90.0
+_LOADED_GPU_UTILIZATION_PERCENT = 30.0
 
 
 @dataclass(frozen=True, slots=True)

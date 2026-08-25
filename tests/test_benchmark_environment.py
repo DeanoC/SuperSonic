@@ -220,11 +220,12 @@ class EnvironmentPolicyTests(unittest.TestCase):
             replace(self.before, gpu_clock_mhz=2313, gpu_utilization_percent=97.0),
             replace(self.before, gpu_clock_mhz=2170, gpu_utilization_percent=92.0),
             replace(self.before, gpu_clock_mhz=2290, gpu_utilization_percent=99.0),
+            replace(self.before, gpu_clock_mhz=2140, gpu_utilization_percent=50.0),
         ]
 
         self.assertEqual(
             self.environment.loaded_clock_summary([idle, *loaded, idle]),
-            {"count": 3, "minimum_mhz": 2170, "median_mhz": 2290, "maximum_mhz": 2313},
+            {"count": 4, "minimum_mhz": 2140, "median_mhz": 2230, "maximum_mhz": 2313},
         )
 
     def test_timing_dispersion_rejects_mad_above_three_percent(self):
