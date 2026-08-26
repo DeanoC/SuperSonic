@@ -380,6 +380,37 @@ pub fn invalidate_decode_cache(
     Ok(())
 }
 
+/// Restore any in-place decode weight layouts and invalidate caches owned by
+/// one engine before it starts a new session.
+pub fn reset_decode_cache(
+    ordinal: usize,
+    layers: *const c_void,
+    int4: *const c_void,
+    hidden_dim: usize,
+    intermediate_size: usize,
+) -> Result<(), GpuError> {
+    if layers.is_null() && int4.is_null() {
+        return Ok(());
+    }
+    let status = unsafe {
+        supersonic_qwen35_4b_hip_reset_decode_cache(
+            ordinal as c_int,
+            layers,
+            int4,
+            hidden_dim as c_int,
+            intermediate_size as c_int,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend_status(
+            Backend::Hip,
+            "qwen reset decode cache",
+            status,
+        ));
+    }
+    Ok(())
+}
+
 pub const RUNG_GQH3: i32 = 0;
 pub const RUNG_GQH2_H: i32 = 1;
 pub const RUNG_GQH2_C: i32 = 2;
@@ -454,6 +485,13 @@ unsafe extern "C" {
         device_ordinal: c_int,
         layers: *const c_void,
         int4: *const c_void,
+    ) -> c_int;
+    fn supersonic_qwen35_4b_hip_reset_decode_cache(
+        device_ordinal: c_int,
+        layers: *const c_void,
+        int4: *const c_void,
+        hidden_dim: c_int,
+        intermediate_size: c_int,
     ) -> c_int;
     fn supersonic_gqh_hip_ensure_tight(
         device_ordinal: c_int,

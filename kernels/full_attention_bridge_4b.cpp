@@ -29,6 +29,16 @@ extern "C" int supersonic_qwen35_4b_bf16_matmul_bridge_status(
 
 extern "C" void supersonic_gqh_hip_lock();
 extern "C" void supersonic_gqh_hip_unlock();
+extern "C" int supersonic_gqh_hip_restore_planar(
+    int device_ordinal,
+    int rung,
+    void* wire,
+    int in_dim,
+    int out_dim);
+extern "C" int supersonic_qwen35_4b_hip_invalidate_decode_cache(
+    int device_ordinal,
+    const void* layers,
+    const void* int4);
 extern "C" [[noreturn]] void supersonic_gpu_integrity_fail_stop(
     const char* operation,
     int status,
@@ -10996,6 +11006,117 @@ static hipError_t clear_mtp_prefix_snap_if_owned(int device_ordinal, const void*
     }
     s = MtpPrefixSnap{};
     return hipSuccess;
+}
+
+static int restore_gqh_projection(
+    int device_ordinal,
+    const GqhProjHdr& projection,
+    int in_dim,
+    int out_dim) {
+    if (projection.wire == nullptr || projection.rung < 0) {
+        return 0;
+    }
+    return supersonic_gqh_hip_restore_planar(
+        device_ordinal,
+        projection.rung,
+        const_cast<void*>(projection.wire),
+        in_dim,
+        out_dim);
+}
+
+static int restore_gqh_layer_weights(
+    const GqhMlpHdrs& cache,
+    int hidden_dim,
+    int intermediate_size) {
+    for (int layer = 0; layer < cache.n; ++layer) {
+        int status = restore_gqh_projection(
+            cache.device_ordinal, cache.gate[layer], hidden_dim, intermediate_size);
+        if (status == 0) {
+            status = restore_gqh_projection(
+                cache.device_ordinal, cache.up[layer], hidden_dim, intermediate_size);
+        }
+        if (status == 0) {
+            status = restore_gqh_projection(
+                cache.device_ordinal, cache.down[layer], intermediate_size, hidden_dim);
+        }
+        const GqhMixerLayer& mixer = cache.mix[layer];
+        if (status == 0 && mixer.layer_type == 1) {
+            status = restore_gqh_projection(
+                cache.device_ordinal, mixer.q, hidden_dim, mixer.q_out);
+            if (status == 0) {
+                status = restore_gqh_projection(
+                    cache.device_ordinal, mixer.k, hidden_dim, mixer.k_out);
+            }
+            if (status == 0) {
+                status = restore_gqh_projection(
+                    cache.device_ordinal, mixer.v, hidden_dim, mixer.k_out);
+            }
+            if (status == 0) {
+                status = restore_gqh_projection(
+                    cache.device_ordinal, mixer.o, mixer.attn_size, hidden_dim);
+            }
+        } else if (status == 0) {
+            status = restore_gqh_projection(
+                cache.device_ordinal, mixer.qkv, hidden_dim, mixer.qkv_out);
+            if (status == 0) {
+                status = restore_gqh_projection(
+                    cache.device_ordinal, mixer.z, hidden_dim, mixer.z_out);
+            }
+            if (status == 0) {
+                status = restore_gqh_projection(
+                    cache.device_ordinal, mixer.lin_out, mixer.val_dim, hidden_dim);
+            }
+        }
+        if (status != 0) {
+            return status;
+        }
+    }
+    return 0;
+}
+
+extern "C" int supersonic_qwen35_4b_hip_reset_decode_cache(
+    int device_ordinal,
+    const void* layers,
+    const void* int4,
+    int hidden_dim,
+    int intermediate_size) {
+    DecodeBridgeLockGuard guard;
+    ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return static_cast<int>(scoped.status);
+    }
+    const bool mlp_owned = g_gqh_mlp_hdrs.ok &&
+        g_gqh_mlp_hdrs.device_ordinal == device_ordinal &&
+        g_gqh_mlp_hdrs.layers == layers && g_gqh_mlp_hdrs.int4 == int4;
+    if (mlp_owned) {
+        // Decode uses multiple streams. Quiesce all readers once, enqueue every
+        // inverse transform on the owning device's default stream, then publish
+        // the restored layout only after a single completion barrier.
+        const hipError_t before = hipDeviceSynchronize();
+        if (before != hipSuccess) {
+            return static_cast<int>(before);
+        }
+        const int status = restore_gqh_layer_weights(
+            g_gqh_mlp_hdrs, hidden_dim, intermediate_size);
+        if (status != 0) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH reset planar restore", status, device_ordinal);
+        }
+        const hipError_t after = hipDeviceSynchronize();
+        if (after != hipSuccess) {
+            supersonic_gpu_integrity_fail_stop(
+                "GQH reset planar restore sync",
+                static_cast<int>(after),
+                device_ordinal);
+        }
+    }
+    const int invalidate_status = supersonic_qwen35_4b_hip_invalidate_decode_cache(
+        device_ordinal, layers, int4);
+    if (mlp_owned && invalidate_status != 0) {
+        supersonic_gpu_integrity_fail_stop(
+            "GQH reset cache invalidation", invalidate_status, device_ordinal);
+    }
+    return invalidate_status;
 }
 
 extern "C" int supersonic_qwen35_4b_hip_invalidate_decode_cache(
