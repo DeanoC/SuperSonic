@@ -5,6 +5,7 @@ use anyhow::Result;
 use crate::decode_engine::DecodeEngine;
 use crate::profiling::PrefillProfileScope;
 use crate::Cli;
+use gpu_hal::Backend;
 
 pub(crate) struct Qwen38Prefill {
     pub(crate) final_norm: Option<Vec<u8>>,
@@ -22,7 +23,7 @@ pub(crate) fn run_qwen38_prefill(
         cli.profile_prefill_json.as_deref(),
         "qwen3.8",
         &cli.model,
-        "hip",
+        backend_label(),
         prompt_ids.len(),
     );
     if !engine.weights().gqh_headers.is_empty() {
@@ -35,7 +36,8 @@ pub(crate) fn run_qwen38_prefill(
     kernel_ffi::gqh::gemm_flush(engine.ordinal())?;
     let next_token = DecodeEngine::greedy_sample(&result.logits);
     eprintln!(
-        "[prefill] native HIP prefill done in {:.0}ms",
+        "[prefill] native {} prefill done in {:.0}ms",
+        backend_label(),
         prefill_start.elapsed().as_secs_f64() * 1000.0
     );
     profile.finish()?;
@@ -44,4 +46,12 @@ pub(crate) fn run_qwen38_prefill(
         final_norm: result.final_norm_trace,
         next_token,
     })
+}
+
+fn backend_label() -> &'static str {
+    match gpu_hal::current_backend() {
+        Backend::Hip => "HIP",
+        #[cfg(supersonic_backend_metal)]
+        Backend::Metal => "Metal",
+    }
 }

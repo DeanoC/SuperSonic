@@ -1049,36 +1049,9 @@ pub fn compute_greedy_for_range(
     config: &TextConfig,
     start: usize,
     count: usize,
-    use_4b_kernel: bool,
+    _use_4b_kernel: bool,
     ordinal: usize,
 ) -> Result<(Vec<u32>, GpuBuffer)> {
-    if gpu_hal::current_backend() != Backend::Hip {
-        let (logits, normed) = compute_logits_for_range(
-            hidden,
-            weights,
-            config,
-            start,
-            count,
-            use_4b_kernel,
-            ordinal,
-        )?;
-        let ids = logits
-            .iter()
-            .map(|row| {
-                let mut best_idx = 0u32;
-                let mut best_val = f32::NEG_INFINITY;
-                for (idx, &val) in row.iter().enumerate() {
-                    if val > best_val {
-                        best_val = val;
-                        best_idx = idx as u32;
-                    }
-                }
-                best_idx
-            })
-            .collect();
-        return Ok((ids, normed));
-    }
-
     if count == 0 {
         return Err(anyhow::anyhow!(
             "compute_greedy_for_range: count must be > 0"
@@ -2825,7 +2798,7 @@ pub fn mtp_decode_step_greedy(
     ordinal: usize,
     kv_chunk_size: usize,
 ) -> Result<u32> {
-    let logits = mtp_decode_step(
+    mtp_decode_step_body(
         weights,
         state,
         rotary,
@@ -2835,12 +2808,20 @@ pub fn mtp_decode_step_greedy(
         ordinal,
         kv_chunk_size,
     )?;
-    Ok(logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(idx, _)| idx as u32)
-        .unwrap_or(0))
+
+    let config = &weights.config;
+    let (ids, _normed) = compute_greedy_for_range(
+        &scratch.scratch.hidden,
+        weights,
+        config,
+        0,
+        1,
+        false,
+        ordinal,
+    )?;
+    ids.into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("mtp_decode_step_greedy: missing greedy token"))
 }
 
 /// Per-layer full-attention prefill step.

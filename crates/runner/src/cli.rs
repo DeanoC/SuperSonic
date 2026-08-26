@@ -76,6 +76,14 @@ pub struct Cli {
     #[arg(long)]
     pub profile_prefill_json: Option<PathBuf>,
 
+    /// Emit a native decode allocation/copy/kernel profile.
+    #[arg(long)]
+    pub profile_decode: bool,
+
+    /// Write the native decode profile as JSON to this path.
+    #[arg(long)]
+    pub profile_decode_json: Option<PathBuf>,
+
     /// Enable Qwen3.8 NextN/MTP speculative generation.
     #[arg(long)]
     pub speculative_decode: bool,

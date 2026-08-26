@@ -2837,11 +2837,6 @@ pub fn argmax_bf16_rows(
     logits: &GpuBuffer,
     out_index: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    if gpu_hal::current_backend() != Backend::Hip {
-        return Err(ffi_error(
-            "argmax_bf16_rows requires the HIP backend".to_string(),
-        ));
-    }
     if rows == 0 || cols == 0 {
         return Err(GpuError::InvalidArg(
             "argmax_bf16_rows requires non-zero rows and cols".into(),
@@ -2868,6 +2863,7 @@ pub fn argmax_bf16_rows(
         )));
     }
 
+    crate::gqh::gemm_flush(ordinal)?;
     ffi_profile_time_result("qwen.argmax_bf16_rows", ordinal, || {
         let status = unsafe {
             supersonic_qwen35_hip_argmax_bf16_rows(

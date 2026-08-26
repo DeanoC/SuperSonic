@@ -7,8 +7,10 @@ use crate::qwen38_decode_report::{emit_qwen38_decode_report, Qwen38DecodeReport}
 use crate::qwen38_engine_setup::load_qwen38_engine;
 use crate::qwen38_prefill::run_qwen38_prefill;
 use crate::qwen38_startup::load_qwen38_startup;
+use crate::profiling::DecodeProfileScope;
 use crate::registry::{FamilyParams, RegistryEntry};
 use crate::Cli;
+use gpu_hal::Backend;
 
 pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Result<()> {
     let params = match &entry.params {
@@ -24,6 +26,15 @@ pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
     )?;
     let prefill = run_qwen38_prefill(cli, &mut setup.engine, &startup.prompt_ids)?;
     setup.engine.prepare_hip_gqh_decode()?;
+
+    let decode_profile = DecodeProfileScope::new(
+        cli.profile_decode,
+        cli.profile_decode_json.as_deref(),
+        "qwen3.8",
+        &cli.model,
+        backend_label(),
+        cli.max_new_tokens,
+    );
 
     let mut generated_ids = Vec::new();
     let mut timings = DecodeStageTimings::default();
@@ -95,6 +106,8 @@ pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
         }
     }
 
+    decode_profile.finish_with_steps(timing_steps)?;
+
     emit_qwen38_decode_report(Qwen38DecodeReport {
         tokenizer: &startup.tokenizer,
         prompt_ids: &startup.prompt_ids,
@@ -105,6 +118,14 @@ pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
         native_decode_timings: &timings,
         native_decode_timing_steps: timing_steps,
     })
+}
+
+fn backend_label() -> &'static str {
+    match gpu_hal::current_backend() {
+        Backend::Hip => "HIP",
+        #[cfg(supersonic_backend_metal)]
+        Backend::Metal => "Metal",
+    }
 }
 
 fn qwen_eos_ids(
