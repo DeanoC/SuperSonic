@@ -493,6 +493,16 @@ pub fn rung_from_ggml_type(ty: u32) -> Option<i32> {
     }
 }
 
+pub fn ggml_type_from_rung(rung: i32) -> Option<i32> {
+    match rung {
+        RUNG_GQH3 => Some(108),
+        RUNG_GQH2_H => Some(109),
+        RUNG_GQH2_C => Some(110),
+        RUNG_GQH4 => Some(111),
+        _ => None,
+    }
+}
+
 pub fn rung_from_flm_codec(semantic_id: u16) -> Option<i32> {
     match semantic_id {
         13 => Some(RUNG_GQH3),
@@ -535,7 +545,7 @@ pub fn decode(
             rows * cols
         )));
     }
-    let backend = Backend::Hip;
+    let backend = gpu_hal::current_backend();
     let status = unsafe {
         supersonic_gqh_hip_decode(
             ordinal as c_int,
@@ -587,7 +597,7 @@ pub fn dequant_gemm_bf16(
             "gqh dequant_gemm lhs/out too small".into(),
         ));
     }
-    let backend = Backend::Hip;
+    let backend = gpu_hal::current_backend();
     let status = unsafe {
         supersonic_gqh_hip_dequant_gemm_bf16(
             ordinal as c_int,
@@ -611,7 +621,7 @@ pub fn dequant_gemm_bf16(
 pub fn gemm_flush(ordinal: usize) -> Result<(), GpuError> {
     let status = unsafe { supersonic_gqh_hip_gemm_flush(ordinal as c_int) };
     if status != 0 {
-        return Err(backend_error(Backend::Hip, "gqh gemm flush", status));
+        return Err(backend_error(gpu_hal::current_backend(), "gqh gemm flush", status));
     }
     Ok(())
 }
@@ -664,7 +674,7 @@ pub fn matvec(
             y.dtype()
         )));
     }
-    let backend = Backend::Hip;
+    let backend = gpu_hal::current_backend();
     let status = unsafe {
         supersonic_gqh_hip_matvec(
             ordinal as c_int,
@@ -1179,6 +1189,9 @@ mod tests {
         assert_eq!(rung_from_flm_codec(15), Some(RUNG_GQH2_C));
         assert_eq!(rung_from_flm_codec(16), Some(RUNG_GQH4));
         assert!(rung_from_ggml_type(107).is_none());
+        assert_eq!(ggml_type_from_rung(RUNG_GQH3), Some(108));
+        assert_eq!(ggml_type_from_rung(RUNG_GQH4), Some(111));
+        assert!(ggml_type_from_rung(99).is_none());
     }
 
     #[test]

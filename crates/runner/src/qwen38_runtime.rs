@@ -87,7 +87,7 @@ pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
             }
             let (sampled, step_timings) = setup
                 .engine
-                .decode_step_hip_fast_greedy(next_token, startup.prompt_ids.len() + step)?;
+                .decode_step_greedy(next_token, startup.prompt_ids.len() + step)?;
             timings.add_assign(step_timings);
             timing_steps += 1;
             generated_ids.push(next_token);

@@ -52,3 +52,29 @@ rust_modules = [
 [[group.bridge]]
 source = "kernels/gqh_bridge.cpp"
 object = "gqh_hip.o"
+
+[[group]]
+id = "metal-qwen38-scaffold"
+backend = "metal"
+model_family = "qwen3.8"
+default_compiled = true
+notes = "Metal scaffold: shader smoke test, device query, and HIP ABI link stubs."
+kernel_sources = [
+  "kernels/metal/scaffold.metal",
+  "kernels/metal/prefill.metal",
+  "kernels/metal/prefill_attention.metal",
+  "kernels/metal/prefill_quant.metal",
+]
+native_sources = [
+  "kernels/metal/scaffold_bridge.mm",
+  "kernels/metal/metal_dispatch.mm",
+  "kernels/metal/prefill_bridge.mm",
+  "kernels/metal/prefill_bridge_rest.mm",
+  "kernels/metal/gqh_bridge.mm",
+  "kernels/metal/hip_symbol_stubs.cc",
+]
+rust_modules = [
+  "crates/kernel-ffi/src/qwen38.rs",
+  "crates/kernel-ffi/src/prefill_ffi.rs",
+  "crates/kernel-ffi/src/gqh.rs",
+]

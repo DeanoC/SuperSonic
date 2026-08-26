@@ -4,12 +4,16 @@ use std::sync::atomic::{AtomicU8, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Hip,
+    #[cfg(supersonic_backend_metal)]
+    Metal,
 }
 
 impl fmt::Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Hip => write!(f, "HIP"),
+            #[cfg(supersonic_backend_metal)]
+            Self::Metal => write!(f, "Metal"),
         }
     }
 }
@@ -141,7 +145,16 @@ static POLICY_PERSISTENT: AtomicU8 = AtomicU8::new(0);
 static POLICY_SCRATCH: AtomicU8 = AtomicU8::new(0);
 
 pub fn current_backend() -> Backend {
-    Backend::Hip
+    #[cfg(supersonic_backend_metal)]
+    {
+        return Backend::Metal;
+    }
+    #[cfg(supersonic_backend_hip)]
+    {
+        return Backend::Hip;
+    }
+    #[cfg(not(any(supersonic_backend_hip, supersonic_backend_metal)))]
+    compile_error!("gpu-hal requires exactly one of supersonic_backend_hip or supersonic_backend_metal");
 }
 
 /// Set the active memory architecture. Called once at startup after

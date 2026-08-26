@@ -1,0 +1,39 @@
+// Link stubs for decode/GQH/MMQ paths not yet ported to Metal.
+// Prefill helper symbols are implemented in prefill_bridge*.mm.
+
+extern "C" {
+
+#define SUPERSONIC_STUB(name) int name(...) { return -1; }
+#define SUPERSONIC_STUB_VOID(name) void name(...) {}
+#define SUPERSONIC_STUB_OK(name) int name(...) { return 0; }
+
+SUPERSONIC_STUB(supersonic_gpu_integrity_fail_stop)
+SUPERSONIC_STUB_VOID(supersonic_gqh_hip_enable_tight_decode)
+SUPERSONIC_STUB(supersonic_gqh_hip_ensure_tight)
+SUPERSONIC_STUB_OK(supersonic_gqh_hip_gemm_flush)
+SUPERSONIC_STUB(supersonic_gqh_hip_mix_matvec_stream)
+SUPERSONIC_STUB_OK(supersonic_gqh_hip_unregister_wires)
+SUPERSONIC_STUB_VOID(supersonic_gqh_test_inject_unregister_prestate_failure)
+SUPERSONIC_STUB(supersonic_gqh_test_inject_unregister_sync_failure)
+SUPERSONIC_STUB_VOID(supersonic_gqh_test_track_wire)
+SUPERSONIC_STUB(supersonic_gqh_test_trigger_post_enqueue_failure)
+SUPERSONIC_STUB(supersonic_qwen35_4b_hip_invalidate_decode_cache)
+SUPERSONIC_STUB(supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k)
+SUPERSONIC_STUB(supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k_residual_add)
+SUPERSONIC_STUB(supersonic_qwen35_4b_hip_matmul_q6_k_m16_argmax)
+SUPERSONIC_STUB(supersonic_qwen35_4b_hip_persistent_decode)
+SUPERSONIC_STUB(supersonic_qwen35_4b_hip_quantize_mmq_q8_1)
+SUPERSONIC_STUB_VOID(supersonic_qwen35_4b_hip_set_gqh_prepare_only)
+SUPERSONIC_STUB(supersonic_qwen35_4b_hip_standalone_matvec)
+SUPERSONIC_STUB(supersonic_qwen35_4b_test_trigger_persistent_decode_failure)
+SUPERSONIC_STUB(supersonic_qwen35_4b_test_trigger_prepare_only_failure)
+SUPERSONIC_STUB(supersonic_qwen35_hip_persistent_decode)
+SUPERSONIC_STUB(supersonic_qwen35_hip_standalone_matvec)
+SUPERSONIC_STUB(supersonic_qwen35_hip_mtp_restore_linear_prefix)
+SUPERSONIC_STUB(supersonic_qwen38_hip_q6_k_scalar_head_f32)
+
+#undef SUPERSONIC_STUB
+#undef SUPERSONIC_STUB_VOID
+#undef SUPERSONIC_STUB_OK
+
+}

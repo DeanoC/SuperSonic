@@ -33,7 +33,7 @@ RETAINED_SOURCE_ROOTS = (
 
 LEGACY_CONTENT_RE = re.compile(
     r"(?:certified[-_]kv|certifiedkv|dflash|specprefill|spec_prefill|"
-    r"metal|cuda|qwen3[.]6|qwen36)",
+    r"cuda|qwen3[.]6|qwen36)",
     re.IGNORECASE,
 )
 
@@ -41,7 +41,9 @@ LEGACY_CONTENT_RE = re.compile(
 def retained_source_text():
     for root in RETAINED_SOURCE_ROOTS:
         for path in root.rglob("*"):
-            if path.suffix not in {".rs", ".c", ".cc", ".cpp", ".h", ".hip"}:
+            if path.suffix not in {".rs", ".c", ".cc", ".cpp", ".h", ".hip", ".mm", ".metal"}:
+                continue
+            if "kernels/metal" in path.as_posix():
                 continue
             yield path, path.read_text(encoding="utf-8")
 
@@ -62,14 +64,16 @@ class KernelGroupManifestTests(unittest.TestCase):
         with MANIFEST.open("rb") as handle:
             cls.data = tomllib.load(handle)
 
-    def test_all_groups_are_hip_and_have_no_removed_source_names(self):
+    def test_all_groups_use_supported_backends_and_have_no_removed_source_names(self):
         groups = self.data["group"]
-        self.assertTrue(groups)
-
-        forbidden = re.compile(r"(?:_cuda|metal|gemma|phi|dflash|moe)", re.IGNORECASE)
+        self.assertEqual(len(groups), 3)
+        forbidden = re.compile(r"(?:_cuda|gemma|phi|dflash|moe)", re.IGNORECASE)
+        backends = {group["backend"] for group in groups}
+        self.assertEqual(backends, {"hip", "metal"})
         for group in groups:
-            self.assertEqual(group["backend"], "hip", group["id"])
             for source in manifest_sources(group):
+                if source.startswith("kernels/metal/"):
+                    continue
                 self.assertIsNone(
                     forbidden.search(source),
                     f"{group['id']} retains removed kernel source {source}",
@@ -84,11 +88,12 @@ class KernelGroupManifestTests(unittest.TestCase):
             "kernels/full_attention_4b.hip",
             "kernels/prefill_helpers.hip",
             "kernels/gqh.hip",
+            "kernels/metal/scaffold.metal",
         ):
             self.assertIn(source, all_sources)
 
 
-class HipOnlyBuildSurfaceTests(unittest.TestCase):
+class CompileTimeBackendSurfaceTests(unittest.TestCase):
     def test_active_bridges_have_no_legacy_qwen35_environment_controls(self):
         legacy_env = re.compile(
             r"(?:getenv|var(?:_os)?)\s*\(\s*\"[^\"]*QWEN35[^\"]*\"",
@@ -155,14 +160,12 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
         self.assertIn("qwen3.5", rendered)
         self.assertIn("24 total", rendered)
 
-    def test_removed_ffi_source_surfaces_are_absent(self):
+    def test_removed_legacy_ffi_source_surfaces_are_absent(self):
         removed_names = {
             "certified_kv.rs",
             "dflash.rs",
             "metal_host.rs",
-            "metal_native.rs",
             "metal_link_stubs.cc",
-            "metal_native.mm",
             "metal_native_ffi.h",
             "metal_native_ffi_contract.cc",
             "qwen36_moe",
@@ -170,22 +173,22 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
         for path in KERNEL_FFI_SRC.rglob("*"):
             self.assertNotIn(path.name, removed_names, path)
 
-    def test_build_scripts_do_not_select_or_link_removed_backends(self):
+    def test_build_scripts_select_one_compile_time_backend(self):
         kernel_build = KERNEL_BUILD.read_text(encoding="utf-8")
         hal_build = HAL_BUILD.read_text(encoding="utf-8")
         for text in (kernel_build, hal_build):
+            self.assertIn("SUPERSONIC_BACKEND", text)
+            self.assertIn("supersonic_backend_hip", text)
+            self.assertIn("supersonic_backend_metal", text)
             self.assertNotIn("SUPERSONIC_BACKENDS", text)
             self.assertNotIn("supersonic_backend_cuda", text)
-            self.assertNotIn("supersonic_backend_metal", text)
-            self.assertNotRegex(text, r"\b(?:nvcc|CUDA|Metal|metal)\b")
 
-    def test_gpu_hal_build_fails_closed_with_an_explicit_rocm_link_path(self):
+    def test_gpu_hal_build_supports_hip_and_metal_paths(self):
         build = HAL_BUILD.read_text(encoding="utf-8")
         self.assertIn("detect_rocm_lib_dir", build)
         self.assertIn("has_libamdhip64", build)
-        self.assertIn('cargo:rustc-link-search=native={}', build)
-        self.assertIn('cargo:rerun-if-env-changed=HIP_PATH', build)
-        self.assertIn("No ROCm amdhip64 library found", build)
+        self.assertIn("metal_bridge.mm", build)
+        self.assertIn('cargo:rerun-if-env-changed=SUPERSONIC_BACKEND', build)
 
     def test_build_manifest_is_the_only_kernel_group_source_of_truth(self):
         build = KERNEL_BUILD.read_text(encoding="utf-8")
@@ -214,8 +217,8 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
             ROOT / "crates" / "gpu-hal" / "src" / "lib.rs",
         )
         forbidden_public = re.compile(
-            r"\b(?:Backend::(?:Cuda|Metal)|(?:pub\s+)?(?:fn|struct|enum|type|const|static)\s+"
-            r"[^\n]*(?:certified|dflash|specprefill|metal|cuda|qwen36))",
+            r"\b(?:Backend::Cuda|(?:pub\s+)?(?:fn|struct|enum|type|const|static)\s+"
+            r"[^\n]*(?:certified|dflash|specprefill|cuda|qwen36))",
             re.IGNORECASE,
         )
         violations = []
@@ -225,19 +228,16 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
                     violations.append(f"{path}:{line_number}: {line.strip()}")
         self.assertEqual([], violations)
 
-    def test_gpu_hal_exposes_only_hip_backend_surfaces(self):
+    def test_gpu_hal_exposes_compile_time_backend_surfaces(self):
         backend = HAL_BACKEND.read_text(encoding="utf-8")
         lib = HAL_LIB.read_text(encoding="utf-8")
-        ops = HAL_OPS.read_text(encoding="utf-8")
-        self.assertRegex(backend, r"pub enum Backend\s*\{\s*Hip,\s*\}")
+        self.assertRegex(backend, r"pub enum Backend\s*\{\s*Hip,\s*Metal,\s*\}")
         self.assertNotIn("compiled_backends", backend)
-        self.assertIn("Backend::Hip\n}", backend)
-        self.assertNotIn("supersonic_backend_cuda", backend)
-        self.assertNotIn("supersonic_backend_metal", backend)
-        self.assertNotIn("mod cuda_sys", lib)
-        self.assertNotIn("mod metal_sys", lib)
-        self.assertNotIn("use crate::cuda_sys", ops)
-        self.assertNotIn("use crate::metal_sys", ops)
+        self.assertIn("Backend::Metal", backend)
+        self.assertIn("supersonic_backend_metal", backend)
+        self.assertIn("supersonic_backend_hip", backend)
+        self.assertIn("mod metal_sys", lib)
+        self.assertIn("mod ops_metal", lib)
         self.assertFalse((ROOT / "crates" / "gpu-hal" / "src" / "vmm.rs").exists())
 
     def test_hip_surfaces_have_no_disabled_non_hip_branches(self):
@@ -252,7 +252,7 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
                 f"disabled non-HIP branch remains in {path}",
             )
 
-    def test_core_and_hal_have_no_backend_selector_compatibility_surfaces(self):
+    def test_core_and_hal_have_no_runtime_backend_selector(self):
         self.assertFalse(CORE_BACKEND.exists(), "legacy core backend parser remains")
         self.assertNotIn("pub mod backend", CORE_LIB.read_text(encoding="utf-8"))
         self.assertNotIn("compiled_backends", HAL_BACKEND.read_text(encoding="utf-8"))

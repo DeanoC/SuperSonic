@@ -523,7 +523,7 @@ pub struct DecodeEngine {
 
 impl Drop for DecodeEngine {
     fn drop(&mut self) {
-        if !self.use_4b_kernel {
+        if !self.use_4b_kernel || self.hidden_io.backend() != gpu_hal::Backend::Hip {
             return;
         }
         let int4 = self
@@ -1774,6 +1774,54 @@ impl DecodeEngine {
             DecodeSamplingMode::HipFastGreedy,
         )?;
         Ok((output.sampled_token, output.timings))
+    }
+
+    /// Greedy decode step: HIP megakernel when available, otherwise the
+    /// component prefill-op path (Metal and other non-HIP backends).
+    pub fn decode_step_greedy(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(u32, DecodeStageTimings)> {
+        if self.hidden_io.backend() == gpu_hal::Backend::Hip && self.use_4b_kernel {
+            return self.decode_step_hip_fast_greedy(token_id, seqlen_offset);
+        }
+        self.decode_step_component_greedy(token_id, seqlen_offset)
+    }
+
+    fn decode_step_component_greedy(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(u32, DecodeStageTimings)> {
+        for (layer_idx, layer) in self.state.layers.iter_mut().enumerate() {
+            if self.weights.config.is_full_attention(layer_idx) {
+                layer
+                    .ensure_kv_capacity(
+                        seqlen_offset,
+                        self.ordinal,
+                        &self.weights.config,
+                        self.kv_chunk_size,
+                    )
+                    .map_err(|e| anyhow::anyhow!("ensure KV layer {layer_idx}: {e}"))?;
+            }
+        }
+        let mut scratch = match self.mtp_verify_scratch.take() {
+            Some(scratch) => scratch,
+            None => MtpVerifyScratch::new(&self.weights.config, self.ordinal)?,
+        };
+        let sampled = prefill_engine::mtp_decode_step_greedy(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            &mut scratch,
+            token_id,
+            seqlen_offset,
+            self.ordinal,
+            self.kv_chunk_size,
+        )?;
+        self.mtp_verify_scratch = Some(scratch);
+        Ok((sampled, DecodeStageTimings::default()))
     }
 
     /// Backend the engine is running on. Used by callers that need to pick

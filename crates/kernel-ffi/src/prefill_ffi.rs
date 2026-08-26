@@ -15,7 +15,7 @@ use std::time::Instant;
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 fn ffi_error(msg: String) -> GpuError {
-    GpuError::backend(Backend::Hip, msg)
+    GpuError::backend(gpu_hal::current_backend(), msg)
 }
 
 static FFI_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -354,6 +354,7 @@ mod typed_bridge_status_tests {
     }
 
     #[test]
+    #[cfg(not(supersonic_backend_metal))]
     fn gqh_dequant_gemm_boundary_flushes_only_batched_path() {
         assert!(!gqh_dequant_gemm_needs_flush(8));
         assert!(gqh_dequant_gemm_needs_flush(9));
@@ -1672,15 +1673,147 @@ fn matmul_rhs_transposed_int4_impl(
 /// matvec rereads the weight matrix once per token. Prefill instead
 /// dequantizes once and uses the tiled BF16 GEMM, matching ggml's
 /// dequant→hipBLAS fallback. Opt out with `SUPERSONIC_GQH_FORCE_FUSED=1`.
+#[cfg(not(supersonic_backend_metal))]
 const GQH_FUSED_MAX_COLS: usize = 8;
+#[cfg(not(supersonic_backend_metal))]
 const GQH_DEQUANT_GEMM_MAX_WEIGHT_BYTES: usize = 768 * 1024 * 1024;
 
+#[cfg(not(supersonic_backend_metal))]
 fn gqh_dequant_gemm_needs_flush(ncols: usize) -> bool {
     ncols > GQH_FUSED_MAX_COLS
 }
 
+#[cfg(not(supersonic_backend_metal))]
 fn gqh_force_fused() -> bool {
     std::env::var_os("SUPERSONIC_GQH_FORCE_FUSED").is_some()
+}
+
+#[cfg(supersonic_backend_metal)]
+unsafe extern "C" {
+    fn supersonic_metal_matmul_gqh_dequant(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        wire: *const c_void,
+        quant_type: c_int,
+        tensor_scale: f32,
+        grid_code: c_int,
+        out: *mut c_void,
+    ) -> c_int;
+}
+
+#[cfg(supersonic_backend_metal)]
+fn matmul_rhs_transposed_gqh_metal(
+    ordinal: usize,
+    ncols: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    tensor_scale: f32,
+    grid_code: u8,
+    rung: i32,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let quant_type = crate::gqh::ggml_type_from_rung(rung).ok_or_else(|| {
+        GpuError::InvalidArg(format!("gqh matmul unknown rung {rung}"))
+    })?;
+    let invoke = |lhs_buf: &GpuBuffer, out_buf: &mut GpuBuffer| -> Result<(), GpuError> {
+        let status = unsafe {
+            supersonic_metal_matmul_gqh_dequant(
+                lhs_buf.dtype().kernel_dtype_code(),
+                ordinal,
+                1,
+                ncols as c_int,
+                n as c_int,
+                k as c_int,
+                lhs_buf.as_ptr(),
+                rhs.as_ptr(),
+                quant_type,
+                tensor_scale,
+                grid_code as c_int,
+                out_buf.as_mut_ptr(),
+            )
+        };
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "matmul_rhs_transposed_gqh",
+            status,
+        )
+    };
+    if lhs.dtype() == ScalarType::BF16 && out.dtype() == ScalarType::BF16 {
+        return invoke(lhs, out);
+    }
+    thread_local! {
+        static GQH_METAL_LHS: std::cell::RefCell<Option<GpuBuffer>> =
+            const { std::cell::RefCell::new(None) };
+        static GQH_METAL_OUT: std::cell::RefCell<Option<GpuBuffer>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let take = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+                dtype: ScalarType,
+                elems: usize|
+     -> Result<GpuBuffer, GpuError> {
+        slot.with(|cell| {
+            let mut held = cell.borrow_mut();
+            if let Some(buf) = held.as_ref() {
+                if buf.dtype() == dtype && buf.elem_count() >= elems {
+                    return Ok(held.take().expect("scratch present"));
+                }
+            }
+            held.take();
+            GpuBuffer::zeros(ordinal, dtype, &[elems])
+        })
+    };
+    let put = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+               buf: GpuBuffer| {
+        slot.with(|cell| {
+            *cell.borrow_mut() = Some(buf);
+        });
+    };
+    let lhs_bf16 = if lhs.dtype() == ScalarType::BF16 {
+        None
+    } else {
+        let mut buf = take(&GQH_METAL_LHS, ScalarType::BF16, ncols * k)?;
+        cast(
+            ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            ncols * k,
+            lhs,
+            &mut buf,
+        )?;
+        Some(buf)
+    };
+    let mut out_bf16 = if out.dtype() == ScalarType::BF16 {
+        None
+    } else {
+        Some(take(&GQH_METAL_OUT, ScalarType::BF16, ncols * n)?)
+    };
+    let lhs_ref = lhs_bf16.as_ref().unwrap_or(lhs);
+    let out_ref = out_bf16.as_mut().unwrap_or(out);
+    invoke(lhs_ref, out_ref)?;
+    if let Some(buf) = out_bf16.as_ref() {
+        cast(
+            ordinal,
+            ScalarType::BF16,
+            ScalarType::F32,
+            ncols * n,
+            buf,
+            out,
+        )?;
+    }
+    if let Some(buf) = lhs_bf16 {
+        put(&GQH_METAL_LHS, buf);
+    }
+    if let Some(buf) = out_bf16 {
+        put(&GQH_METAL_OUT, buf);
+    }
+    Ok(())
 }
 
 pub fn matmul_rhs_transposed_gqh(
@@ -1725,6 +1858,14 @@ pub fn matmul_rhs_transposed_gqh(
             ncols * n
         )));
     }
+    #[cfg(supersonic_backend_metal)]
+    {
+        return matmul_rhs_transposed_gqh_metal(
+            ordinal, ncols, n, k, lhs, rhs, tensor_scale, grid_code, rung, out,
+        );
+    }
+    #[cfg(not(supersonic_backend_metal))]
+    {
     let dequant_bytes = n.saturating_mul(k).saturating_mul(4);
     if ncols > GQH_FUSED_MAX_COLS
         && !gqh_force_fused()
@@ -1835,8 +1976,10 @@ pub fn matmul_rhs_transposed_gqh(
         put_scratch(&GQH_Y, buf);
     }
     Ok(())
+    }
 }
 
+#[cfg(not(supersonic_backend_metal))]
 fn matmul_gqh_dequant_gemm(
     ordinal: usize,
     ncols: usize,

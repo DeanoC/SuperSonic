@@ -1,9 +1,18 @@
 mod backend;
 mod buffer;
 mod error;
+#[cfg(supersonic_backend_hip)]
 mod hip_sys;
+#[cfg(supersonic_backend_metal)]
+mod metal_sys;
+#[cfg(supersonic_backend_hip)]
 mod ops;
+#[cfg(supersonic_backend_metal)]
+mod ops_metal;
 mod scalar_type;
+
+#[cfg(supersonic_backend_metal)]
+use ops_metal as ops;
 
 pub use backend::{
     current_backend, current_buffer_policy, current_memory_architecture, current_strategy_for,

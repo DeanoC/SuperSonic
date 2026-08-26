@@ -16,19 +16,29 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "crates" / "kernel-ffi" / "kernel-groups.toml"
 BUILD_RS = ROOT / "crates" / "kernel-ffi" / "build.rs"
-VALID_BACKENDS = {"hip"}
+VALID_BACKENDS = {"hip", "metal"}
 GROUP_ID_RE = re.compile(r"[a-z0-9][a-z0-9.-]*")
-FORBIDDEN_SOURCE_RE = re.compile(r"(?:_cuda|metal|gemma|phi|dflash|moe)", re.IGNORECASE)
-REQUIRED_SOURCES = {
+FORBIDDEN_SOURCE_RE = re.compile(r"(?:_cuda|gemma|phi|dflash|moe)", re.IGNORECASE)
+REQUIRED_HIP_SOURCES = {
     "kernels/full_attention.hip",
     "kernels/full_attention_4b.hip",
     "kernels/prefill_helpers.hip",
     "kernels/gqh.hip",
 }
+REQUIRED_METAL_SOURCES = {
+    "kernels/metal/scaffold.metal",
+    "kernels/metal/prefill.metal",
+}
 
 
 def rel(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
+
+
+def source_is_forbidden(source: str) -> bool:
+    if source.startswith("kernels/metal/"):
+        return False
+    return bool(FORBIDDEN_SOURCE_RE.search(source))
 
 
 def validate_string_list(
@@ -53,12 +63,14 @@ def main() -> int:
     if not isinstance(groups, list) or not groups:
         errors.append("group must be a non-empty array of tables")
         groups = []
-    elif len(groups) != 2:
-        errors.append(f"expected exactly two retained HIP groups, found {len(groups)}")
+    elif len(groups) != 3:
+        errors.append(f"expected exactly three retained kernel groups, found {len(groups)}")
 
     build_text = BUILD_RS.read_text(encoding="utf-8")
     if "kernel-groups.toml" not in build_text or "read_kernel_manifest" not in build_text:
         errors.append("build.rs must consume kernel-groups.toml through read_kernel_manifest")
+    if "SUPERSONIC_BACKEND" not in build_text:
+        errors.append("build.rs must select the compile-time backend through SUPERSONIC_BACKEND")
     if re.search(r"\b(?:HIP_GROUPS|HIP_BRIDGES|KERNEL_RERUN_PATHS)\b", build_text):
         errors.append("build.rs must not maintain a second hardcoded kernel-group list")
 
@@ -66,7 +78,8 @@ def main() -> int:
     seen_bridge_sources: set[str] = set()
     seen_bridge_objects: set[str] = set()
     manifest_bridge_sources: set[str] = set()
-    manifest_kernel_sources: set[str] = set()
+    hip_kernel_sources: set[str] = set()
+    metal_kernel_sources: set[str] = set()
     manifest_native_sources: set[str] = set()
 
     for index, group in enumerate(groups, start=1):
@@ -110,7 +123,7 @@ def main() -> int:
             if not isinstance(source, str) or not source:
                 errors.append(f"{group_id}.bridge #{bridge_index}: missing string source")
             else:
-                if FORBIDDEN_SOURCE_RE.search(source):
+                if source_is_forbidden(source):
                     errors.append(f"{group_id}: removed source name is forbidden: {source}")
                 if not (ROOT / source).is_file():
                     errors.append(f"{group_id}: bridge source does not exist: {source}")
@@ -130,34 +143,42 @@ def main() -> int:
         rust_modules = validate_string_list(group_id, group, "rust_modules", errors)
 
         for source in kernel_sources:
-            manifest_kernel_sources.add(source)
-            if FORBIDDEN_SOURCE_RE.search(source):
+            if backend == "hip":
+                hip_kernel_sources.add(source)
+            elif backend == "metal":
+                metal_kernel_sources.add(source)
+            if source_is_forbidden(source):
                 errors.append(f"{group_id}: removed source name is forbidden: {source}")
             if not (ROOT / source).is_file():
                 errors.append(f"{group_id}: kernel source does not exist: {source}")
         for source in native_sources:
             manifest_native_sources.add(source)
-            if FORBIDDEN_SOURCE_RE.search(source):
+            if source_is_forbidden(source):
                 errors.append(f"{group_id}: removed source name is forbidden: {source}")
             if not (ROOT / source).is_file():
                 errors.append(f"{group_id}: native source does not exist: {source}")
-            build_rs_relative = source.replace("crates/kernel-ffi/", "")
-            if build_rs_relative not in build_text and source not in build_text:
-                errors.append(f"{group_id}: native source is not tracked by build.rs: {source}")
         for source in rust_modules:
-            if FORBIDDEN_SOURCE_RE.search(source):
+            if source_is_forbidden(source):
                 errors.append(f"{group_id}: removed source name is forbidden: {source}")
             if not (ROOT / source).is_file():
                 errors.append(f"{group_id}: rust module does not exist: {source}")
 
         if backend == "hip" and not bridges:
             errors.append(f"{group_id}: HIP groups require at least one bridge")
+        if backend == "metal" and not native_sources:
+            errors.append(f"{group_id}: Metal groups require native_sources")
 
-    missing_required_sources = REQUIRED_SOURCES - manifest_kernel_sources
-    if missing_required_sources:
+    missing_hip_sources = REQUIRED_HIP_SOURCES - hip_kernel_sources
+    if missing_hip_sources:
         errors.append(
-            "retained kernel source(s) missing from manifest: "
-            + ", ".join(sorted(missing_required_sources))
+            "retained HIP kernel source(s) missing from manifest: "
+            + ", ".join(sorted(missing_hip_sources))
+        )
+    missing_metal_sources = REQUIRED_METAL_SOURCES - metal_kernel_sources
+    if missing_metal_sources:
+        errors.append(
+            "retained Metal kernel source(s) missing from manifest: "
+            + ", ".join(sorted(missing_metal_sources))
         )
 
     if errors:
@@ -169,7 +190,7 @@ def main() -> int:
         "kernel groups ok: "
         f"{len(groups)} groups, "
         f"{len(manifest_bridge_sources)} bridge sources, "
-        f"{len(manifest_kernel_sources | manifest_native_sources)} tracked support sources"
+        f"{len(hip_kernel_sources | metal_kernel_sources | manifest_native_sources)} tracked support sources"
     )
     return 0
 

@@ -62,6 +62,7 @@ impl fmt::Display for ModelVariant {
 pub enum GpuArch {
     Gfx1100,
     Gfx1201,
+    AppleGpu,
     Unknown(String),
 }
 
@@ -73,6 +74,15 @@ impl GpuArch {
                 "gfx1201" => Self::Gfx1201,
                 other => Self::Unknown(other.to_owned()),
             },
+            #[cfg(supersonic_backend_metal)]
+            Backend::Metal => {
+                let normalized = name.trim().to_ascii_lowercase();
+                if normalized.contains("apple") || normalized.contains("gpu") {
+                    Self::AppleGpu
+                } else {
+                    Self::Unknown(name.to_owned())
+                }
+            }
         }
     }
 }
@@ -82,6 +92,7 @@ impl fmt::Display for GpuArch {
         match self {
             Self::Gfx1100 => write!(f, "gfx1100"),
             Self::Gfx1201 => write!(f, "gfx1201"),
+            Self::AppleGpu => write!(f, "apple-gpu"),
             Self::Unknown(s) => write!(f, "{s}"),
         }
     }
@@ -94,10 +105,16 @@ pub struct ArchProfile {
 }
 
 impl ArchProfile {
-    pub fn for_arch(_arch: &GpuArch) -> Self {
-        Self {
-            memory: MemoryArchitecture::Discrete,
-            buffer_policy: BufferPolicy::all_default(),
+    pub fn for_arch(arch: &GpuArch) -> Self {
+        match arch {
+            GpuArch::AppleGpu => Self {
+                memory: MemoryArchitecture::Unified,
+                buffer_policy: BufferPolicy::all_default(),
+            },
+            _ => Self {
+                memory: MemoryArchitecture::Discrete,
+                buffer_policy: BufferPolicy::all_default(),
+            },
         }
     }
 }
@@ -158,6 +175,23 @@ static REGISTRY: &[RegistryEntry] = &[
         model: ModelVariant::Qwen3_8_27B,
         backend: Backend::Hip,
         arch: GpuArch::Gfx1201,
+        vram: VramBudget {
+            fixed_bytes: 22 * GIB,
+            overhead_factor: 1.05,
+        },
+        params: FamilyParams::Qwen38(Qwen38KernelParams {
+            proj_buf_floats: 16_480,
+            attn_scratch_floats: 24_576,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    #[cfg(supersonic_backend_metal)]
+    RegistryEntry {
+        model: ModelVariant::Qwen3_8_27B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleGpu,
         vram: VramBudget {
             fixed_bytes: 22 * GIB,
             overhead_factor: 1.05,
@@ -231,20 +265,20 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_registry_rows_are_hip_only() {
+    fn qwen38_registry_rows_cover_supported_backends() {
         assert!(REGISTRY.iter().all(|entry| {
-            entry.backend == Backend::Hip
-                && entry.model == ModelVariant::Qwen3_8_27B
+            entry.model == ModelVariant::Qwen3_8_27B
                 && format!("{:?}", entry.model.family()) == "Qwen38"
         }));
 
-        let mut archs: Vec<_> = REGISTRY
-            .iter()
-            .map(|entry| entry.arch.to_string())
-            .collect();
-        archs.sort();
-        archs.dedup();
-        assert_eq!(archs, vec!["gfx1100", "gfx1201"]);
+        let hip_archs = supported_archs_for(&ModelVariant::Qwen3_8_27B, &Backend::Hip);
+        assert_eq!(hip_archs, vec!["gfx1100", "gfx1201"]);
+        #[cfg(supersonic_backend_metal)]
+        {
+            let metal_archs = supported_archs_for(&ModelVariant::Qwen3_8_27B, &Backend::Metal);
+            assert_eq!(metal_archs, vec!["apple-gpu"]);
+        }
+
         for unsupported in ["gfx1150", "gfx942", "sm86"] {
             assert_eq!(
                 GpuArch::from_backend_name(&Backend::Hip, unsupported),
