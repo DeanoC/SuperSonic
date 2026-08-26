@@ -488,7 +488,18 @@ pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
 }
 
 pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
-    with_device_impl(current_backend(), ordinal, || memcpy_profile("copy_d2d", dst, src, len))
+    if dst.is_null() || src.is_null() {
+        return Err(GpuError::InvalidArg("copy_d2d: null pointer".into()));
+    }
+    if len == 0 {
+        return Ok(());
+    }
+    with_device_impl(current_backend(), ordinal, || {
+        // Batched compute may have pending writes; flush before CPU memcpy on
+        // shared buffers so copy_d2d observes completed GPU kernels.
+        metal_dispatch_wait()?;
+        memcpy_profile("copy_d2d", dst, src, len)
+    })
 }
 
 pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> {

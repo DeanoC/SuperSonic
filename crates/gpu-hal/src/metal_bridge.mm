@@ -53,7 +53,7 @@ ActiveCommandBuffer& active_command_buffer() {
     return state;
 }
 
-constexpr int kMaxEncodersPerCommandBuffer = 64;
+constexpr int kMaxEncodersPerCommandBuffer = 8192;
 
 std::vector<id<MTLCommandBuffer>>& pending_command_buffers() {
     static std::vector<id<MTLCommandBuffer>> buffers;

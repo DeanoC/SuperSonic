@@ -16,6 +16,7 @@ use qwen38::weights::Qwen38Weights;
 use crate::mtp::{MtpPrefillAppendCache, MtpVerifyScratch};
 use crate::tensor_bytes::{bf16_bytes_to_f32 as decode_bf16_le, f32_to_f32_bytes as encode_f32_le};
 use kernel_ffi::prefill_ffi;
+use kernel_ffi;
 
 /// D2D copy helper shared by the retained component paths.
 fn copy_d2d_batched(
@@ -720,7 +721,7 @@ fn maybe_attn_rms_norm_rows_inplace(
     weight: Option<&GpuBuffer>,
     label: &str,
 ) -> Result<bool> {
-    if gpu_hal::current_backend() != Backend::Hip || config.rms_norm_add_unit_offset {
+    if config.rms_norm_add_unit_offset || gpu_hal::current_backend() != Backend::Hip {
         return Ok(false);
     }
     let Some(weight) = weight else {
@@ -1623,6 +1624,10 @@ impl PrefillScratch {
             .map_err(|e| anyhow::anyhow!("{label} materialize hidden BF16: {e}"))?;
         }
         Ok(())
+    }
+
+    pub(crate) fn normed(&self) -> &GpuBuffer {
+        &self.normed
     }
 
     fn rms_norm_hidden_to_normed_model(
@@ -2810,18 +2815,65 @@ pub fn mtp_decode_step_greedy(
     )?;
 
     let config = &weights.config;
-    let (ids, _normed) = compute_greedy_for_range(
-        &scratch.scratch.hidden,
-        weights,
+    let hidden_dim = config.hidden_size;
+    let vocab_size = config.vocab_size;
+    scratch.scratch.rms_norm_hidden_to_normed_model(
         config,
-        0,
-        1,
-        false,
         ordinal,
+        1,
+        hidden_dim,
+        &weights.norm_weight,
+        "decode greedy final norm",
     )?;
-    ids.into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("mtp_decode_step_greedy: missing greedy token"))
+
+    if weights.lm_head_lowbit_params(hidden_dim).is_some() {
+        if !prefill_lm_head_lowbit(
+            ordinal,
+            1,
+            vocab_size,
+            hidden_dim,
+            scratch.scratch.normed(),
+            weights,
+            &mut scratch.mtp_logits,
+            "decode greedy lm_head",
+        )? {
+            unreachable!("lowbit lm_head params were Some");
+        }
+    } else {
+        kernel_ffi::standalone_matvec(
+            ordinal,
+            ScalarType::BF16,
+            &mut scratch.mtp_logits,
+            scratch.scratch.normed(),
+            weights.lm_head(),
+            hidden_dim,
+            vocab_size,
+            &mut scratch.mtp_counter,
+        )
+        .map_err(|e| anyhow::anyhow!("decode greedy lm_head matvec: {e}"))?;
+    }
+
+    prefill_ffi::argmax_bf16_rows(
+        ordinal,
+        1,
+        vocab_size,
+        &scratch.mtp_logits,
+        &mut scratch.mtp_argmax,
+    )
+    .map_err(|e| anyhow::anyhow!("decode greedy argmax: {e}"))?;
+
+    gpu_hal::sync(ordinal).map_err(|e| anyhow::anyhow!("decode greedy sync: {e}"))?;
+
+    let ids_bytes = scratch
+        .mtp_argmax
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("decode greedy argmax D2H: {e}"))?;
+    Ok(u32::from_le_bytes([
+        ids_bytes[0],
+        ids_bytes[1],
+        ids_bytes[2],
+        ids_bytes[3],
+    ]))
 }
 
 /// Per-layer full-attention prefill step.

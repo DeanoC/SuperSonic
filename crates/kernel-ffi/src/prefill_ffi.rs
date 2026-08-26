@@ -117,10 +117,16 @@ where
     if !ffi_profile_enabled() {
         return f();
     }
-    gpu_hal::sync(ordinal)?;
+    if gpu_hal::current_backend() == Backend::Hip {
+        gpu_hal::sync(ordinal)?;
+    }
     let start = Instant::now();
     let result = f();
-    let sync_result = gpu_hal::sync(ordinal);
+    let sync_result = if gpu_hal::current_backend() == Backend::Hip {
+        Some(gpu_hal::sync(ordinal))
+    } else {
+        None
+    };
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let profile = FFI_PROFILE.get_or_init(|| Mutex::new(FfiProfileAccumulator::default()));
     let mut profile = profile.lock().expect("ffi profile mutex poisoned");
@@ -137,7 +143,9 @@ where
     entry.total_ms += elapsed_ms;
     entry.max_ms = entry.max_ms.max(elapsed_ms);
     let value = result?;
-    sync_result?;
+    if let Some(sync_result) = sync_result {
+        sync_result?;
+    }
     Ok(value)
 }
 
@@ -2639,6 +2647,41 @@ fn rms_norm_rows_impl(
             )
         };
         prefill_bridge_result(gpu_hal::current_backend(), "rms_norm_rows", status)?;
+        Ok(())
+    })
+}
+
+/// In-place RMSNorm with Qwen3.8 `(w + 1)` weight semantics.
+pub fn rms_norm_rows_inplace(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    data: &mut GpuBuffer,
+    weight: &GpuBuffer,
+) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush(ordinal)?;
+    ffi_profile_time_result("qwen.rms_norm_rows_inplace", ordinal, || {
+        let ptr = data.as_mut_ptr();
+        let status = unsafe {
+            supersonic_qwen35_hip_rms_norm(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                n_rows,
+                n_cols,
+                eps,
+                1,
+                ptr,
+                weight.as_ptr(),
+                ptr,
+            )
+        };
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "rms_norm_rows_inplace",
+            status,
+        )?;
         Ok(())
     })
 }
