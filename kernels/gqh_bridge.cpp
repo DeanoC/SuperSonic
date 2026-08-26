@@ -414,6 +414,60 @@ void gqh_ensure_tight(
     }
 }
 
+int gqh_restore_planar(
+    int device_ordinal,
+    uint8_t* wire,
+    int in_dim,
+    int out_dim,
+    int rung) {
+    const GqhWireKey key{device_ordinal, wire};
+    if (wire == nullptr || g_gqh_tight.find(key) == g_gqh_tight.end()) {
+        return 0;
+    }
+    // A padded decode allocation leaves its source wire planar.
+    if (g_gqh_padded.find(key) != g_gqh_padded.end()) {
+        return 0;
+    }
+    if ((rung != GQH_RUNG_GQH3 && rung != GQH_RUNG_GQH2_H) ||
+        in_dim <= 0 || out_dim <= 0 || (in_dim % GQH_SUPERBLOCK) != 0) {
+        return 402;
+    }
+    const int nsb = in_dim / GQH_SUPERBLOCK;
+    const int is3 = rung == GQH_RUNG_GQH3 ? 1 : 0;
+    const int stride = gqh_plane_row_bytes(nsb, is3);
+    if (stride <= 0 || stride > 48 * 1024) {
+        return 402;
+    }
+
+    const dim3 threads(256, 1, 1);
+    const dim3 blocks(static_cast<unsigned int>(out_dim));
+    if (rung == GQH_RUNG_GQH3) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_tight_to_planar_kernel<true>)),
+            blocks,
+            threads,
+            static_cast<size_t>(stride),
+            0,
+            wire,
+            nsb,
+            out_dim);
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh_tight_to_planar_kernel<false>)),
+            blocks,
+            threads,
+            static_cast<size_t>(stride),
+            0,
+            wire,
+            nsb,
+            out_dim);
+    }
+    (void)launch_result(device_ordinal, "GQH planar restore");
+    g_gqh_tight.erase(key);
+    g_gqh_ileave.erase(key);
+    return 0;
+}
+
 void gqh_ensure_padded(
     int device_ordinal,
     uint8_t* wire,
@@ -2294,6 +2348,22 @@ extern "C" int supersonic_gqh_hip_ensure_tight(
     gqh_ensure_tight(
         device_ordinal, static_cast<uint8_t*>(wire), in_dim, out_dim, rung, 0);
     return 0;
+}
+
+extern "C" int supersonic_gqh_hip_restore_planar(
+    int device_ordinal,
+    int rung,
+    void* wire,
+    int in_dim,
+    int out_dim) {
+    GqhBridgeLockGuard guard;
+    (void)gqh_gemv_flush();
+    ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
+    return gqh_restore_planar(
+        device_ordinal, static_cast<uint8_t*>(wire), in_dim, out_dim, rung);
 }
 
 extern "C" int supersonic_gqh_hip_ensure_padded(

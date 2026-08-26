@@ -74,6 +74,31 @@ fn greedy_token(logits: &[f32]) -> u32 {
     DecodeEngine::greedy_sample(logits)
 }
 
+fn generate_chat_hello_trajectory(
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    count: usize,
+) -> Vec<u32> {
+    let logits = engine
+        .prefill_native(prompt_ids)
+        .expect("chat Hello prefill");
+    let mut next = greedy_token(&logits);
+    engine
+        .prepare_hip_gqh_decode()
+        .expect("prepare chat Hello decode");
+    let mut generated = Vec::with_capacity(count);
+    let mut pos = prompt_ids.len();
+    for _ in 0..count {
+        generated.push(next);
+        let logits = engine
+            .decode_step(next, pos)
+            .unwrap_or_else(|e| panic!("chat Hello decode pos={pos}: {e}"));
+        next = greedy_token(&logits);
+        pos += 1;
+    }
+    generated
+}
+
 fn hip_query_policy<T, E: std::fmt::Display>(
     query: Result<T, E>,
     require_artifacts: bool,
@@ -506,7 +531,23 @@ fn rung13_chat_hello_generate() {
 #[ignore = "requires R9700 artifact CI"]
 fn rung14_reset_refreshes_mutable_state_with_stable_descriptors() {
     let _guard = GPU.lock().expect("gpu lock");
-    let Some((mut engine, _config)) = build_engine(16) else {
+    let model_dir = qwen38_model_dir().expect("model dir");
+    let template = ChatTemplate::try_load(&model_dir)
+        .expect("load chat template")
+        .expect("Qwen3.8 ships a chat template");
+    let prompt = template
+        .render(&[ChatMessage::text("user", "Hello")], true)
+        .expect("render chat Hello");
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("tokenizer.json");
+    let prompt_ids = tokenizer
+        .encode(prompt, false)
+        .expect("encode chat Hello")
+        .get_ids()
+        .to_vec();
+    assert_eq!(prompt_ids.len(), 13, "chat Hello prompt length");
+
+    let Some((mut engine, _config)) = build_engine(prompt_ids.len() + 8) else {
         return;
     };
 
@@ -529,7 +570,8 @@ fn rung14_reset_refreshes_mutable_state_with_stable_descriptors() {
         })
         .collect();
 
-    engine.decode_step(9419, 0).expect("initial decode");
+    let first = generate_chat_hello_trajectory(&mut engine, &prompt_ids, 8);
+    assert_eq!(first, [9419, 0, 2500, 628, 353, 1438, 488, 3242]);
     engine.reset().expect("reset model state");
     let after: Vec<usize> = engine
         .state()
@@ -544,9 +586,11 @@ fn rung14_reset_refreshes_mutable_state_with_stable_descriptors() {
         .collect();
     assert_ne!(before, after, "reset should allocate fresh recurrent state");
 
-    let logits = engine.decode_step(9419, 0).expect("decode after reset");
-    assert!(logits.iter().all(|value| value.is_finite()));
-    assert!(logits.iter().map(|value| value * value).sum::<f32>() > 0.0);
+    let second = generate_chat_hello_trajectory(&mut engine, &prompt_ids, 8);
+    assert_eq!(
+        first, second,
+        "reset must reproduce the exact chat Hello trajectory after prepared HIP GQH decode"
+    );
     drop(blockers);
 }
 

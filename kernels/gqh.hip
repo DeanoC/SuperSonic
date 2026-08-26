@@ -1364,6 +1364,59 @@ __global__ void gqh_planar_to_tight_kernel(uint8_t* data, int nsb, int rows) {
     }
 }
 
+template <bool IS_GQH3>
+__global__ void gqh_tight_to_planar_kernel(uint8_t* data, int nsb, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) {
+        return;
+    }
+    int off_r, off_lo, off_hi, stride;
+    gqh_plane_offsets(nsb, IS_GQH3 ? 1 : 0, &off_r, &off_lo, &off_hi, &stride);
+    constexpr int sb_bytes = IS_GQH3 ? GQH3_SB_BYTES : GQH2H_SB_BYTES;
+    uint8_t* smem = reinterpret_cast<uint8_t*>(gqh_dyn_smem);
+    uint8_t* row_data = data + (int64_t)row * stride;
+    const int tight_bytes = nsb * sb_bytes;
+    for (int i = static_cast<int>(threadIdx.x); i < tight_bytes;
+         i += static_cast<int>(blockDim.x)) {
+        smem[i] = row_data[i];
+    }
+    __syncthreads();
+    for (int sb = static_cast<int>(threadIdx.x); sb < nsb;
+         sb += static_cast<int>(blockDim.x)) {
+        const uint8_t* src = smem + sb * sb_bytes;
+        row_data[sb] = src[0];
+        for (int k = 0; k < 8; ++k) {
+            row_data[off_r + (sb << 3) + k] = src[1 + k];
+        }
+        if constexpr (IS_GQH3) {
+            for (int lane = 0; lane < GQH_WARP; ++lane) {
+                const uint8_t* codes = src + GQH_CODES_OFF +
+                    lane * GQH3_CODE_STRIDE;
+                const uint32_t word = static_cast<uint32_t>(codes[0]) |
+                    (static_cast<uint32_t>(codes[1]) << 8) |
+                    (static_cast<uint32_t>(codes[2]) << 16);
+                uint16_t lo = 0;
+                uint8_t hi = 0;
+#pragma unroll
+                for (int t = 0; t < GQH_PER_LANE; ++t) {
+                    const uint32_t code = (word >> (GQH3_CODE_STRIDE * t)) & 7u;
+                    lo |= static_cast<uint16_t>(code & 3u) << (2 * t);
+                    hi |= static_cast<uint8_t>((code >> 2) & 1u) << t;
+                }
+                row_data[off_lo + (sb << 6) + lane * 2] =
+                    static_cast<uint8_t>(lo);
+                row_data[off_lo + (sb << 6) + lane * 2 + 1] =
+                    static_cast<uint8_t>(lo >> 8);
+                row_data[off_hi + (sb << 5) + lane] = hi;
+            }
+        } else {
+            for (int k = 0; k < 64; ++k) {
+                row_data[off_lo + (sb << 6) + k] = src[GQH_CODES_OFF + k];
+            }
+        }
+    }
+}
+
 // Two consecutive planar rows → interleaved tight:
 //   [sb0_r0][sb0_r1][sb1_r0][sb1_r1]...
 // Dual-row GEMV then streams 2*sb_bytes of adjacent weights per superblock.

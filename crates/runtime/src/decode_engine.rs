@@ -1457,10 +1457,26 @@ impl DecodeEngine {
     }
 
     /// Reset per-session state so the engine is ready for a fresh prompt.
-    /// Weights, rotary tables, scratch allocations, and quantization scales are
-    /// untouched — only KV caches, conv/recurrent state, and the sync counters
-    /// are cleared. Used by the HTTP server between requests.
+    /// Weight values, rotary tables, scratch allocations, and quantization
+    /// scales are preserved. HIP decode-only weight layouts are normalized
+    /// before KV caches, conv/recurrent state, and sync counters are cleared.
+    /// Used by the HTTP server between requests.
     pub fn reset(&mut self) -> Result<()> {
+        if self.use_4b_kernel {
+            let int4 = self
+                .int4_scale_device
+                .as_ref()
+                .map(|buffer| buffer.as_ptr())
+                .unwrap_or(std::ptr::null());
+            kernel_ffi::gqh::reset_decode_cache(
+                self.ordinal,
+                self.scratch.desc_device.as_ptr(),
+                int4,
+                self.weights.config.hidden_size,
+                self.weights.config.intermediate_size,
+            )
+            .map_err(|e| anyhow::anyhow!("reset HIP GQH decode state: {e}"))?;
+        }
         self.state = ModelState::new(&self.weights.config, self.ordinal)
             .map_err(|e| anyhow::anyhow!("reset model state: {e}"))?;
         self.scratch
