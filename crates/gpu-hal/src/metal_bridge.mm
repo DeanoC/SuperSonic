@@ -32,6 +32,71 @@ id<MTLDevice> metal_device() {
     return device;
 }
 
+id<MTLCommandQueue> metal_queue() {
+    static id<MTLCommandQueue> queue = [metal_device() newCommandQueue];
+    return queue;
+}
+
+std::mutex& dispatch_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+struct ActiveCommandBuffer {
+    id<MTLCommandBuffer> command_buffer = nil;
+    bool has_work = false;
+    int encoder_count = 0;
+};
+
+ActiveCommandBuffer& active_command_buffer() {
+    static ActiveCommandBuffer state;
+    return state;
+}
+
+constexpr int kMaxEncodersPerCommandBuffer = 64;
+
+std::vector<id<MTLCommandBuffer>>& pending_command_buffers() {
+    static std::vector<id<MTLCommandBuffer>> buffers;
+    return buffers;
+}
+
+id<MTLCommandBuffer> ensure_command_buffer() {
+    ActiveCommandBuffer& state = active_command_buffer();
+    if (state.command_buffer == nil) {
+        state.command_buffer = [metal_queue() commandBuffer];
+        state.has_work = false;
+        state.encoder_count = 0;
+    }
+    return state.command_buffer;
+}
+
+void commit_active_command_buffer_locked() {
+    ActiveCommandBuffer& state = active_command_buffer();
+    if (state.command_buffer != nil && state.has_work) {
+        [state.command_buffer commit];
+        pending_command_buffers().push_back(state.command_buffer);
+        state.command_buffer = nil;
+        state.has_work = false;
+        state.encoder_count = 0;
+    }
+}
+
+void wait_pending_command_buffers_locked() {
+    for (id<MTLCommandBuffer> command_buffer : pending_command_buffers()) {
+        [command_buffer waitUntilCompleted];
+    }
+    pending_command_buffers().clear();
+}
+
+void note_command_buffer_work_locked() {
+    ActiveCommandBuffer& state = active_command_buffer();
+    state.has_work = true;
+    state.encoder_count += 1;
+    if (state.encoder_count >= kMaxEncodersPerCommandBuffer) {
+        commit_active_command_buffer_locked();
+    }
+}
+
 std::string normalized_arch_name(id<MTLDevice> device) {
     NSString* name = device ? device.name : nil;
     if (name == nil) {
@@ -141,6 +206,73 @@ extern "C" const void* supersonic_metal_dummy_buffer() {
         }
         ptr = contents;
         return ptr;
+    }
+}
+
+extern "C" void supersonic_metal_dispatch_wait() {
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(dispatch_mutex());
+        commit_active_command_buffer_locked();
+        wait_pending_command_buffers_locked();
+    }
+}
+
+extern "C" int supersonic_metal_copy_d2d(void* dst, const void* src, size_t len) {
+    if (dst == nullptr || src == nullptr || len == 0) {
+        return 1;
+    }
+    void* dst_buffer = nullptr;
+    void* src_buffer = nullptr;
+    size_t dst_offset = 0;
+    size_t src_offset = 0;
+    if (supersonic_metal_lookup_buffer(dst, &dst_buffer, &dst_offset) != 0 ||
+        supersonic_metal_lookup_buffer(src, &src_buffer, &src_offset) != 0) {
+        std::memcpy(dst, src, len);
+        return 0;
+    }
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(dispatch_mutex());
+        id<MTLCommandBuffer> command_buffer = ensure_command_buffer();
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        if (blit == nil) {
+            return 2;
+        }
+        [blit copyFromBuffer:(__bridge id<MTLBuffer>)src_buffer
+                  sourceOffset:src_offset
+                    toBuffer:(__bridge id<MTLBuffer>)dst_buffer
+           destinationOffset:dst_offset
+                          size:len];
+        [blit endEncoding];
+        note_command_buffer_work_locked();
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_submit_compute(
+    void* pipeline,
+    void (*configure)(id<MTLComputeCommandEncoder> encoder, bool* configured, void* ctx),
+    void* ctx) {
+    if (pipeline == nullptr || configure == nullptr) {
+        return 1;
+    }
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(dispatch_mutex());
+        id<MTLComputePipelineState> pipeline_state = (__bridge id<MTLComputePipelineState>)pipeline;
+        id<MTLCommandBuffer> command_buffer = ensure_command_buffer();
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 2;
+        }
+        [encoder setComputePipelineState:pipeline_state];
+        bool configured = true;
+        configure(encoder, &configured, ctx);
+        if (!configured) {
+            [encoder endEncoding];
+            return 3;
+        }
+        [encoder endEncoding];
+        note_command_buffer_work_locked();
+        return 0;
     }
 }
 

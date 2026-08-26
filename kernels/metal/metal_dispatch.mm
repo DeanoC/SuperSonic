@@ -45,6 +45,13 @@ std::unordered_map<std::string, id<MTLComputePipelineState>>& pipeline_cache() {
     return cache;
 }
 
+extern "C" int supersonic_metal_submit_compute(
+    void* pipeline,
+    void (*configure)(id<MTLComputeCommandEncoder> encoder, bool* configured, void* ctx),
+    void* ctx);
+
+extern "C" void supersonic_metal_dispatch_wait();
+
 bool bind_host_buffer(
     id<MTLComputeCommandEncoder> encoder,
     NSUInteger index,
@@ -114,22 +121,15 @@ bool run_command_encoder(const char* pipeline_name, Configure configure) {
         if (pipeline == nil) {
             return false;
         }
-        id<MTLCommandBuffer> command_buffer = [metal_queue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return false;
-        }
-        [encoder setComputePipelineState:pipeline];
-        bool configured = true;
-        configure(encoder, &configured);
-        if (!configured) {
-            [encoder endEncoding];
-            return false;
-        }
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        return command_buffer.error == nil;
+        struct Capture {
+            Configure* configure;
+        } capture{&configure};
+        auto trampoline = [](id<MTLComputeCommandEncoder> encoder, bool* configured, void* ctx) {
+            auto* capture = static_cast<Capture*>(ctx);
+            (*capture->configure)(encoder, configured);
+        };
+        return supersonic_metal_submit_compute(
+                   (__bridge void*)pipeline, trampoline, &capture) == 0;
     }
 }
 

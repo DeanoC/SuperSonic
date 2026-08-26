@@ -18,4 +18,6 @@ unsafe extern "C" {
         warp_size_out: *mut u32,
         clock_rate_khz_out: *mut u32,
     ) -> c_int;
+    pub(crate) fn supersonic_metal_copy_d2d(dst: *mut c_void, src: *const c_void, len: usize) -> c_int;
+    pub(crate) fn supersonic_metal_dispatch_wait();
 }

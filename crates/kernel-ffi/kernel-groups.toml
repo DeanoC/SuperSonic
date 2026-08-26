@@ -71,6 +71,7 @@ native_sources = [
   "kernels/metal/prefill_bridge.mm",
   "kernels/metal/prefill_bridge_rest.mm",
   "kernels/metal/gqh_bridge.mm",
+  "kernels/metal/decode_bridge.mm",
   "kernels/metal/hip_symbol_stubs.cc",
 ]
 rust_modules = [

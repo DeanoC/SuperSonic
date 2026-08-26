@@ -481,7 +481,10 @@ pub fn copy_storage_to_device(
 }
 
 pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
-    with_device_impl(current_backend(), ordinal, || memcpy_profile("copy_d2h", dst, src, len))
+    with_device_impl(current_backend(), ordinal, || {
+        metal_dispatch_wait()?;
+        memcpy_profile("copy_d2h", dst, src, len)
+    })
 }
 
 pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
@@ -518,8 +521,15 @@ pub fn memset_zeros_async(
 
 pub fn sync(ordinal: usize) -> Result<()> {
     with_device_impl(current_backend(), ordinal, || {
-        hal_profile_time("sync", 0, || Ok(()))
+        hal_profile_time("sync", 0, || metal_dispatch_wait())
     })
+}
+
+fn metal_dispatch_wait() -> Result<()> {
+    unsafe {
+        supersonic_metal_dispatch_wait();
+    }
+    Ok(())
 }
 
 pub struct GpuEvent {
