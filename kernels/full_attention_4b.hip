@@ -4584,12 +4584,13 @@ __global__ void supersonic_qwen35_matmul_int4_dequant_wmma_small_m_kernel(
 #endif
 }
 
+template <typename T>
 __global__ __launch_bounds__(32, 8)
 void supersonic_qwen35_quantize_mmq_q8_1_kernel(
     size_t batch_elems,
     int m,
     int k,
-    const hip_bfloat16* __restrict__ lhs,
+    const T* __restrict__ lhs,
     int quant_type,
     uint8_t* __restrict__ out
 ) {

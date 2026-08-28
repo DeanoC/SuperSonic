@@ -38,6 +38,7 @@ pub struct GgufFile {
     kv: BTreeMap<String, String>,
     gqh_headers: BTreeMap<String, GqhHeader>,
     mix_headers: BTreeMap<String, MixHeader>,
+    i32_arrays: BTreeMap<String, Vec<i32>>,
 }
 
 impl GgufFile {
@@ -63,6 +64,7 @@ impl GgufFile {
         let mut kv = BTreeMap::new();
         let mut gqh_headers = BTreeMap::new();
         let mut mix_headers = BTreeMap::new();
+        let mut i32_arrays = BTreeMap::new();
         for _ in 0..metadata_count {
             let key = cursor.read_string()?;
             let value_type = cursor.read_u32()?;
@@ -74,6 +76,7 @@ impl GgufFile {
                 &mut kv,
                 &mut gqh_headers,
                 &mut mix_headers,
+                &mut i32_arrays,
             )?;
         }
         if alignment == 0 {
@@ -129,6 +132,7 @@ impl GgufFile {
             kv,
             gqh_headers,
             mix_headers,
+            i32_arrays,
         })
     }
 
@@ -171,6 +175,13 @@ impl GgufFile {
 
     pub fn mix_header(&self, name: &str) -> Option<&MixHeader> {
         self.mix_headers.get(name)
+    }
+
+    /// A captured i32-valued metadata array (GGUF array of int32), or `None`
+    /// when the key is absent or not an i32 array. Used by the DFlash2 draft
+    /// loader for `target_layer_ids`.
+    pub fn i32_array(&self, key: &str) -> Option<&[i32]> {
+        self.i32_arrays.get(key).map(Vec::as_slice)
     }
 }
 
@@ -314,6 +325,7 @@ fn read_metadata(
     kv: &mut BTreeMap<String, String>,
     gqh_headers: &mut BTreeMap<String, GqhHeader>,
     mix_headers: &mut BTreeMap<String, MixHeader>,
+    i32_arrays: &mut BTreeMap<String, Vec<i32>>,
 ) -> Result<(), Error> {
     match value_type {
         0 | 1 => {
@@ -357,6 +369,13 @@ fn read_metadata(
             } else if key == dmix2::DMIX2_KV && elem_type == 0 {
                 let blob = cursor.take(len)?.to_vec();
                 *mix_headers = dmix2::parse_dmix2_kv(&blob)?;
+            } else if elem_type == 5 && !key.is_empty() {
+                // i32 array: capture for keys like the DFlash2 target_layer_ids.
+                let mut values = Vec::with_capacity(len);
+                for _ in 0..len {
+                    values.push(cursor.read_u32()? as i32);
+                }
+                i32_arrays.insert(key.to_string(), values);
             } else {
                 for _ in 0..len {
                     read_metadata(
@@ -367,6 +386,7 @@ fn read_metadata(
                         kv,
                         gqh_headers,
                         mix_headers,
+                        i32_arrays,
                     )?;
                 }
             }

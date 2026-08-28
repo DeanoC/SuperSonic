@@ -1115,3 +1115,117 @@ extern "C" int supersonic_qwen35_hip_full_attention_decode_flat(
     default: return 400;
     }
 }
+
+
+// ---- dflash2 dynamic depthwise conv (draft block) ----
+
+int dflash_dyn_conv_device(
+    int device_ordinal, int hidden, int nq, int K, int gs, int s,
+    const void* x, const void* base, const void* dyn, void* out,
+    int out_dtype
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (hidden <= 0 || nq <= 0 || K <= 0 || gs <= 0 || (hidden % gs) != 0) return 350;
+    constexpr int block = 256;
+    const unsigned int grid_x =
+        (static_cast<unsigned int>(hidden) + block - 1) / block;
+    if (out_dtype == 1) {
+        // F32 output: x is F32, dyn is F32, out is F32.
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(pfx_dflash_dyn_conv_f32_kernel),
+            dim3(grid_x, static_cast<unsigned int>(nq)), dim3(block), 0, 0,
+            hidden, nq, K, gs, s,
+            static_cast<const float*>(x),
+            static_cast<const float*>(base),
+            static_cast<const float*>(dyn),
+            static_cast<float*>(out));
+    } else {
+        // BF16 output (default): x is BF16, dyn is BF16, out is BF16.
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(pfx_dflash_dyn_conv_kernel),
+            dim3(grid_x, static_cast<unsigned int>(nq)), dim3(block), 0, 0,
+            hidden, nq, K, gs, s,
+            static_cast<const hip_bfloat16*>(x),
+            static_cast<const float*>(base),
+            static_cast<const hip_bfloat16*>(dyn),
+            static_cast<hip_bfloat16*>(out));
+    }
+    return launch_result(351, 352);
+}
+
+extern "C" int supersonic_dflash_dyn_conv(
+    int device_ordinal, int hidden, int nq, int K, int gs, int s,
+    const void* x, const void* base, const void* dyn, void* out,
+    int out_dtype
+) {
+    return dflash_dyn_conv_device(device_ordinal, hidden, nq, K, gs, s, x, base, dyn, out, out_dtype);
+}
+
+// ---- dflash2 target hidden-state strided scatter ----
+
+int dflash_scatter_cols_device(
+    int device_ordinal,
+    const void* src, void* dst,
+    int n_rows, int n_cols, int col_offset, int dst_stride)
+{
+    ScopedHipDevice scoped(device_ordinal);
+    if (n_rows <= 0 || n_cols <= 0 || dst_stride < n_cols) return 360;
+    constexpr int block = 256;
+    const unsigned int total = static_cast<unsigned int>(n_rows) *
+                               static_cast<unsigned int>(n_cols);
+    const unsigned int grid_x = (total + block - 1) / block;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_dflash_scatter_cols_kernel),
+        dim3(grid_x), dim3(block), 0, 0,
+        static_cast<const hip_bfloat16*>(src),
+        static_cast<hip_bfloat16*>(dst),
+        n_rows, n_cols, col_offset, dst_stride);
+    return launch_result(361, 362);
+}
+
+extern "C" int supersonic_dflash_scatter_cols(
+    int device_ordinal,
+    const void* src, void* dst,
+    int n_rows, int n_cols, int col_offset, int dst_stride)
+{
+    return dflash_scatter_cols_device(device_ordinal, src, dst,
+                                      n_rows, n_cols, col_offset, dst_stride);
+}
+
+// Batched conv-tail assembly for the chunk_len < pad case.
+extern "C" int supersonic_pfx_assemble_conv_tail_short(
+    int dtype,
+    int device_ordinal,
+    int qkv_dim,
+    int pad,
+    int chunk_len,
+    int chunk_start,
+    const void* old_tail,
+    const void* qkv,
+    void* new_tail)
+{
+    ScopedHipDevice scoped(device_ordinal);
+    if (qkv_dim <= 0 || pad <= 0 || chunk_len <= 0 || chunk_len >= pad) return 370;
+    const int keep_old = pad - chunk_len;
+    const int total = qkv_dim * pad;
+    const int block = 256;
+    const int grid_x = (total + block - 1) / block;
+    if (dtype == 1) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(pfx_assemble_conv_tail_short_kernel<float>),
+            dim3(grid_x), dim3(block), 0, 0,
+            qkv_dim, pad, chunk_len, keep_old, chunk_start,
+            static_cast<const float*>(old_tail),
+            static_cast<const float*>(qkv),
+            static_cast<float*>(new_tail));
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(pfx_assemble_conv_tail_short_kernel<hip_bfloat16>),
+            dim3(grid_x), dim3(block), 0, 0,
+            qkv_dim, pad, chunk_len, keep_old, chunk_start,
+            static_cast<const hip_bfloat16*>(old_tail),
+            static_cast<const hip_bfloat16*>(qkv),
+            static_cast<hip_bfloat16*>(new_tail));
+    }
+    return launch_result(371, 372);
+}

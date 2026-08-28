@@ -3,7 +3,7 @@
 //! Decode is bit-exact against the geo-lucebox CPU reference and the
 //! `tests/gqh-vectors` wires. Do not reassociate the float products.
 
-mod tables {
+pub(crate) mod tables {
     include!("gqh_tables.rs");
 }
 

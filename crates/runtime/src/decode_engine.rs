@@ -876,6 +876,11 @@ impl DecodeEngine {
         &self.weights
     }
 
+    /// Whether the 4B fused megakernel is available for this engine.
+    pub fn use_4b_kernel(&self) -> bool {
+        self.use_4b_kernel
+    }
+
     #[cfg(feature = "scalar-head-lab")]
     pub fn set_scalar_head_lab_route(&mut self, route: ScalarHeadLabRoute) -> Result<()> {
         if route == ScalarHeadLabRoute::RawQ6Scalar {
@@ -1083,7 +1088,7 @@ impl DecodeEngine {
                 }
             }
         } else {
-            let result = self.verify_block_prefill_append_impl(&block, pos, true, None)?;
+            let result = self.verify_block_prefill_append_impl(&block, pos, true, None, None)?;
             let verify_ms = t0.elapsed().as_secs_f64() * 1000.0;
             let greedy = result
                 .target_next
@@ -1263,6 +1268,40 @@ impl DecodeEngine {
                 ls.set_kv_filled(new_len);
             }
         }
+    }
+
+    /// Public wrapper for DFlash2 spec-decode to commit full-attention KV
+    /// after a verified block.
+    pub fn commit_fused_kv_filled_public(&mut self, new_len: usize) {
+        self.commit_fused_kv_filled(new_len);
+    }
+
+    /// DFlash2: snapshot the linear-attention state before a verify round
+    /// so it can be restored on partial acceptance.
+    pub fn snapshot_linear_for_spec(&mut self) -> Result<()> {
+        self.ensure_mtp_linear_snap()
+    }
+
+    /// DFlash2: restore the linear-attention snapshot, rewind full-attention
+    /// KV to `pos`, and replay `committed` tokens (including the seed) through
+    /// the fast greedy decode megakernel. Returns the target's greedy
+    /// prediction after the last replayed token (the bonus token).
+    pub fn replay_committed_prefix(&mut self, committed: &[u32], pos: usize) -> Result<u32> {
+        anyhow::ensure!(!committed.is_empty(), "dflash replay empty prefix");
+        let ordinal = self.ordinal;
+        let snap = self
+            .mtp_linear_snap
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("dflash replay missing linear snapshot"))?;
+        restore_linear_state(&mut self.state, snap, ordinal)?;
+        self.rewind_full_kv_filled(pos);
+
+        let mut next_token = committed[0];
+        for (i, &token) in committed.iter().enumerate() {
+            let (sampled, _) = self.decode_step_hip_fast_greedy(token, pos + i)?;
+            next_token = sampled;
+        }
+        Ok(next_token)
     }
 
     fn mtp_replay_committed_prefix(
@@ -1543,6 +1582,7 @@ impl DecodeEngine {
             self.use_4b_kernel,
             false,
             None,
+            None,
         )?;
 
         // Reset sync counters for the decode kernel
@@ -1567,6 +1607,7 @@ impl DecodeEngine {
             self.prefill_chunk_size,
             self.use_4b_kernel,
             false,
+            None,
             None,
         )?;
         self.scratch
@@ -1848,6 +1889,7 @@ impl DecodeEngine {
         pos_offset: usize,
         greedy_only: bool,
         greedy_compare_tokens: Option<&[u32]>,
+        dflash_capture: Option<&mut prefill_engine::DflashTargetCapture>,
     ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
         if tokens.is_empty() {
             anyhow::bail!("verify_block_prefill_append: tokens must be non-empty");
@@ -1883,12 +1925,68 @@ impl DecodeEngine {
             greedy_only,
             greedy_compare_tokens,
             &mut cache,
+            dflash_capture,
         )?;
         self.mtp_prefill_append_cache = Some(cache);
         self.scratch
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("reset sync after prefill append verify: {e}"))?;
         Ok(result)
+    }
+
+    /// DFlash2: prefill the target prompt while capturing post-MLP hidden
+    /// states at the draft target layers into `capture`.
+    pub fn prefill_with_dflash_capture(
+        &mut self,
+        prompt_ids: &[u32],
+        capture: &mut prefill_engine::DflashTargetCapture,
+    ) -> Result<prefill_engine::PrefillResult> {
+        let result = prefill_engine::prefill(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prompt_ids,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.use_4b_kernel,
+            false,
+            None,
+            Some(capture),
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after dflash prefill: {e}"))?;
+        Ok(result)
+    }
+
+    /// DFlash2: verify a draft block through the target while capturing
+    /// post-MLP hidden states at the draft target layers. Returns the
+    /// target greedy argmax for each position (`target_next`).
+    pub fn verify_block_dflash(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+        capture: &mut prefill_engine::DflashTargetCapture,
+    ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
+        self.verify_block_prefill_append_impl(tokens, pos_offset, true, None, Some(capture))
+    }
+
+    /// DFlash2: capture-only pass — run `tokens` through the target's
+    /// prefill-append path to record hidden states at the draft target
+    /// layers, without computing logits. Used by the hybrid verify path
+    /// (fused megakernel for greedy + this for capture).
+    pub fn capture_block_dflash(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+        capture: &mut prefill_engine::DflashTargetCapture,
+    ) -> Result<()> {
+        // Run prefill-append with greedy_only=true and capture, discard
+        // the result (we only need the capture side-effect).
+        let _ =
+            self.verify_block_prefill_append_impl(tokens, pos_offset, true, None, Some(capture))?;
+        Ok(())
     }
 
     /// Qwen3.8 MTP fused verify: single `persistent_decode_4b` megakernel
@@ -1924,6 +2022,18 @@ impl DecodeEngine {
         Ok(self
             .verify_block_fused_decode_ex(tokens, pos_offset, false)?
             .0)
+    }
+
+    /// DFlash2: fused megakernel verify for greedy predictions (no capture).
+    /// Returns the target's greedy argmax for each position.
+    pub fn verify_block_fused_greedy(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Result<Vec<u32>> {
+        Ok(self
+            .verify_block_fused_decode_ex(tokens, pos_offset, true)?
+            .1)
     }
 
     fn verify_block_fused_decode_greedy(

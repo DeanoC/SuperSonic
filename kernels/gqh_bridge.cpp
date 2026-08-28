@@ -363,8 +363,9 @@ void gqh_ensure_tight(
     int in_dim,
     int out_dim,
     int rung,
-    hipStream_t stream) {
-    if (!g_gqh_allow_tight || wire == nullptr) {
+    hipStream_t stream,
+    bool force = false) {
+    if ((!g_gqh_allow_tight && !force) || wire == nullptr) {
         return;
     }
     if (rung != GQH_RUNG_GQH3 && rung != GQH_RUNG_GQH2_H) {
@@ -599,6 +600,18 @@ void launch_gqh4_tight(
         }
         return;
     }
+    // Wide verify arm (DFlash2 block 9..16): one block folds all columns
+    // against one weight load. kCols=16 reuses the weight wire across columns
+    // the way the 2..8 arm does; the `c >= ncol` guard skips inactive columns
+    // for partial widths. Ports PR #35's exact-width f32 multicol arm.
+    if (ncols > 8 && ncols <= 16) {
+        g.y = 1;
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME((gqh4_matvec_tight_kernel<kAcc, kRows, kNsb, 16>)),
+            g, threads, 0, stream, packed, xv, yv, in_dim, out_dim,
+            tensor_scale, grid4, x_col_stride, y_col_stride, row_off, ncols);
+        return;
+    }
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME((gqh4_matvec_tight_kernel<kAcc, kRows, kNsb, 1>)),
         g, threads, 0, stream, packed, xv, yv, in_dim, out_dim,
@@ -673,6 +686,20 @@ void launch_gqh12_tight(
                 tensor_scale, mag, x_col_stride, y_col_stride, ileave, row_off,
                 ncols);
         }
+        return;
+    }
+    // Wide verify arm (DFlash2 block 9..16): one block folds all columns
+    // against one weight load, matching the 2..8 arm's reuse. The `c >= ncol`
+    // guard skips inactive columns for partial widths. Ports PR #35's
+    // exact-width f32 multicol arm for the GQH3/GQH2H rungs.
+    if (ncols > 8 && ncols <= 16) {
+        g.y = 1;
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                (gqh_matvec_tight_kernel<IS_GQH3, kAcc, kRows, kPad, kNsb, 16>)),
+            g, threads, 0, stream, packed, xv, yv, in_dim, out_dim,
+            tensor_scale, mag, x_col_stride, y_col_stride, ileave, row_off,
+            ncols);
         return;
     }
     hipLaunchKernelGGL(
@@ -2384,4 +2411,196 @@ extern "C" int supersonic_gqh_hip_ensure_padded(
     gqh_ensure_padded(
         device_ordinal, static_cast<uint8_t*>(wire), in_dim, out_dim, rung, 0);
     return 0;
+}
+
+// GQH i8 activation quantization pre-pass: quantize f32 activations [ncols,
+// in_dim] (column-major, x_col_stride) to int8 codes + per-8-group f32 scales.
+// Ports PR #35's gqh_quant_x. See gqh_quant_x_i8_kernel for the layout and the
+// GQH_Q8_XSCALE fold.
+extern "C" int supersonic_gqh_hip_quant_x_i8(
+    int device_ordinal,
+    const void* x,
+    void* qx,
+    void* qxs,
+    int ncols,
+    int in_dim,
+    int64_t x_col_stride) {
+    GqhBridgeLockGuard guard;
+    if (x == nullptr || qx == nullptr || qxs == nullptr) {
+        return 405;
+    }
+    if (ncols <= 0 || in_dim <= 0 || in_dim % GQH_PER_LANE != 0) {
+        return 406;
+    }
+    if (x_col_stride < in_dim) {
+        return 407;
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
+    const int ngroups = in_dim / GQH_PER_LANE;
+    const dim3 blocks(static_cast<unsigned int>(ngroups),
+                      static_cast<unsigned int>(ncols), 1);
+    const dim3 threads(GQH_WARP, 1, 1);
+    hipLaunchKernelGGL(
+        gqh_quant_x_i8_kernel,
+        blocks, threads, 0, 0,
+        static_cast<const float*>(x),
+        static_cast<int8_t*>(qx),
+        static_cast<float*>(qxs),
+        ncols, in_dim, x_col_stride);
+    return launch_result(device_ordinal, "GQH quant_x_i8 launch");
+}
+
+// Standalone GQH i8 weight-LUT bake (device-side q8_round, ports PR #35's
+// gqh_q8_level). Exposed so a harness verifies the device bake matches the host
+// denominator search bit-for-bit. rung: 0=GQH3, 1=GQH2_H, 3=GQH4.
+extern "C" int supersonic_gqh_hip_bake_q8_lut(
+    int device_ordinal,
+    void* out,
+    int rung,
+    int grid_code,
+    int q8n,
+    int nlev) {
+    GqhBridgeLockGuard guard;
+    if (out == nullptr || nlev <= 0 || nlev > 16) {
+        return 405;
+    }
+    if (grid_code < 0 || grid_code >= GQH_GRID_CODES) {
+        return 406;
+    }
+    if (q8n < 1 || q8n > 127) {
+        return 407;
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
+    const dim3 threads(nlev, 1, 1);
+    hipLaunchKernelGGL(
+        gqh_bake_q8_lut_kernel,
+        dim3(1), threads, 0, 0,
+        static_cast<int8_t*>(out), rung, grid_code, q8n, nlev);
+    return launch_result(device_ordinal, "GQH bake_q8_lut launch");
+}
+
+// GQH i8 multicol matvec launch: takes pre-quantized int8 activations (qx, qxs
+// from the pre-pass) and does the dp4a dot with the baked int8 weight LUT.
+// Ports PR #35's int8 verify arm. Currently supports GQH3/GQH2_H (the primary
+// verify rungs); GQH4 falls back to the f32 path.
+extern "C" int supersonic_gqh_hip_matvec_i8(
+    int device_ordinal,
+    int rung,
+    const void* wire,
+    const void* qx,
+    const void* qxs,
+    void* y,
+    int in_dim,
+    int out_dim,
+    int ncols,
+    int q8n,
+    int64_t qx_col_stride,
+    int64_t qxs_col_stride,
+    int64_t y_col_stride,
+    float tensor_scale,
+    int grid_code) {
+    GqhBridgeLockGuard guard;
+    (void)gqh_gemv_flush();
+    if (rung != GQH_RUNG_GQH3 && rung != GQH_RUNG_GQH2_H) {
+        // GQH4 i8 arm is not yet implemented; caller must use the f32 path.
+        return 408;
+    }
+    if (qx == nullptr || qxs == nullptr || wire == nullptr || y == nullptr) {
+        return 405;
+    }
+    if (ncols <= 0 || in_dim <= 0 || out_dim <= 0) {
+        return 406;
+    }
+    if (in_dim % GQH_SUPERBLOCK != 0) {
+        return 409;
+    }
+    if (q8n < 1 || q8n > 127) {
+        return 410;
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    if (!scoped.ok()) {
+        return backend_failure(421, scoped.status);
+    }
+    // The i8 kernel requires the tight AoS wire layout. Convert the planar wire
+    // in place *without* setting the global g_gqh_allow_tight flag: forcing the
+    // flag here would flip the f32 matvec tests onto the tight path and break
+    // their bit-exact (planar) assertions. In production tight is enabled once
+    // during weight loading; here we force the one-shot conversion directly.
+    // When tight is NOT globally enabled (tests), this is a *private* conversion:
+    // we restore the wire to planar after the matvec (gqh_restore_planar) so the
+    // transient buffer does not leave a stale g_gqh_tight pointer-cache entry
+    // that a later planar buffer's reused device pointer would falsely match.
+    const bool private_tight = !g_gqh_allow_tight;
+    uint8_t* wire_mut = const_cast<uint8_t*>(static_cast<const uint8_t*>(wire));
+    hipStream_t stream = 0;
+    gqh_ensure_tight(
+        device_ordinal, wire_mut,
+        in_dim, out_dim, rung, stream, /*force=*/true);
+    if (!gqh_is_tight(device_ordinal, wire)) {
+        return 412;  // tight conversion failed
+    }
+    const uint8_t* packed = gqh_decode_wire(device_ordinal, static_cast<const uint8_t*>(wire));
+    if (packed == nullptr) {
+        return 413;
+    }
+    const int nsb = in_dim / GQH_SUPERBLOCK;
+    const bool is_gqh3 = (rung == GQH_RUNG_GQH3);
+    const float4 mag = is_gqh3 ? load_gqh3_mag(grid_code) : load_gqh2h_mag(grid_code);
+    const int kTightWarps = 4;
+    const int kRows = 1;
+    dim3 blocks(static_cast<unsigned int>((out_dim + kTightWarps - 1) / kTightWarps),
+                1, 1);
+    if (blocks.x == 0) {
+        blocks.x = 1;
+    }
+    const dim3 threads(GQH_WARP * kTightWarps, 1, 1);
+    auto* qxv = static_cast<const int8_t*>(qx);
+    auto* qxsv = static_cast<const float*>(qxs);
+    auto* yv = static_cast<float*>(y);
+
+#define GQH_I8_DISPATCH(KCOLS)                                              \
+    do {                                                                    \
+        if (is_gqh3) {                                                      \
+            hipLaunchKernelGGL(                                              \
+                HIP_KERNEL_NAME((gqh_matvec_i8_tight_kernel<true, false, 0, KCOLS>)), \
+                blocks, threads, 0, 0, packed, qxv, qxsv, yv,                \
+                in_dim, out_dim, tensor_scale, mag, q8n,                     \
+                qx_col_stride, qxs_col_stride, y_col_stride,                 \
+                g_gqh_row_off, ncols);                                      \
+        } else {                                                            \
+            hipLaunchKernelGGL(                                              \
+                HIP_KERNEL_NAME((gqh_matvec_i8_tight_kernel<false, false, 0, KCOLS>)), \
+                blocks, threads, 0, 0, packed, qxv, qxsv, yv,                \
+                in_dim, out_dim, tensor_scale, mag, q8n,                     \
+                qx_col_stride, qxs_col_stride, y_col_stride,                 \
+                g_gqh_row_off, ncols);                                      \
+        }                                                                   \
+    } while (0)
+
+    if (ncols == 1) {
+        GQH_I8_DISPATCH(1);
+    } else if (ncols <= 3) {
+        GQH_I8_DISPATCH(3);
+    } else if (ncols <= 4) {
+        GQH_I8_DISPATCH(4);
+    } else if (ncols <= 8) {
+        GQH_I8_DISPATCH(8);
+    } else if (ncols <= 16) {
+        GQH_I8_DISPATCH(16);
+    } else {
+        return 411;
+    }
+#undef GQH_I8_DISPATCH
+    const int launch_rc = launch_result(device_ordinal, "GQH matvec_i8 launch");
+    if (private_tight) {
+        (void)gqh_restore_planar(
+            device_ordinal, wire_mut, in_dim, out_dim, rung);
+    }
+    return launch_rc;
 }

@@ -670,3 +670,104 @@ fn rung15_hip_fast_greedy_matches_host_route_and_reports_device_transfer() {
         "fast route must charge lm-head completion to lm_head_ms, not token_d2h_ms"
     );
 }
+
+/// MTP int8-verify token equality (PR #35's `ordinary-vs-i8` gate).
+///
+/// The int8 verify arm (`GGML_GQH_I8DOT=1`) quantizes the verify matvec
+/// activations to int8 and runs a dp4a dot. It is not bit-exact, but its error
+/// must not flip any greedy argmax, so the MTP token stream with the int8 arm
+/// on equals the ordinary greedy stream. The greedy decode uses the fused
+/// megakernel (unaffected by the int8 arm), giving an independent reference.
+#[test]
+#[ignore = "requires R9700 artifact CI"]
+fn mtp_i8_verify_token_equality_matches_greedy() {
+    let _guard = GPU.lock().expect("gpu lock");
+    let Some((mut engine, _config)) = build_engine(64) else {
+        return;
+    };
+    let model_dir = qwen38_model_dir().expect("model dir");
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("tokenizer.json");
+    let template = ChatTemplate::try_load(&model_dir)
+        .expect("load chat template")
+        .expect("Qwen3.8 ships a chat template");
+    let prompt = template
+        .render(&[ChatMessage::text("user", "Hello")], true)
+        .expect("render chat");
+    let prompt_ids = tokenizer
+        .encode(prompt.as_str(), false)
+        .expect("encode prompt")
+        .get_ids()
+        .to_vec();
+    const N: usize = 16;
+
+    // Greedy reference (the decode megakernel is unaffected by GGML_GQH_I8DOT).
+    let mut greedy = Vec::with_capacity(N);
+    let logits = engine.prefill_native(&prompt_ids).expect("greedy prefill");
+    engine
+        .prepare_hip_gqh_decode()
+        .expect("prepare greedy decode");
+    let mut next = greedy_token(&logits);
+    let mut pos = prompt_ids.len();
+    for _ in 0..N {
+        greedy.push(next);
+        let logits = engine
+            .decode_step(next, pos)
+            .unwrap_or_else(|e| panic!("greedy decode pos={pos}: {e}"));
+        next = greedy_token(&logits);
+        pos += 1;
+    }
+
+    // MTP with the int8 verify arm on.
+    std::env::set_var("GGML_GQH_I8DOT", "1");
+    let mtp_result: Result<Vec<u32>, Box<dyn std::error::Error>> = (|| {
+        let Some((mut mtp, _)) = build_engine(64) else {
+            return Ok(Vec::new());
+        };
+        mtp.set_mtp_spec(true);
+        let prefill = mtp.prefill_native_with_final_norm(&prompt_ids)?;
+        let normed = prefill
+            .final_norm_trace
+            .as_deref()
+            .ok_or("MTP requires prefill final-norm hidden state")?;
+        mtp.seed_mtp_h_from_normed(normed)?;
+        mtp.prepare_hip_gqh_decode()?;
+        let mut emitted = Vec::with_capacity(N);
+        let mut next_token = greedy_token(&prefill.logits);
+        let mut seqlen_offset = prompt_ids.len();
+        while emitted.len() < N {
+            let remaining = N - emitted.len();
+            let round = mtp.run_mtp_spec_round(next_token, seqlen_offset, remaining)?;
+            for token in round.emitted {
+                emitted.push(token);
+                seqlen_offset += 1;
+                if emitted.len() >= N {
+                    break;
+                }
+            }
+            next_token = round.next_token;
+            if round.n_drafted == 0 {
+                break;
+            }
+        }
+        Ok(emitted)
+    })();
+    std::env::remove_var("GGML_GQH_I8DOT");
+
+    let mtp_tokens = mtp_result.expect("MTP int8 generation");
+    if mtp_tokens.is_empty() {
+        return;
+    }
+    assert_eq!(
+        mtp_tokens.len(),
+        greedy.len(),
+        "MTP int8 emitted {} tokens, greedy emitted {}",
+        mtp_tokens.len(),
+        greedy.len()
+    );
+    assert_eq!(
+        mtp_tokens, greedy,
+        "MTP int8 verify token stream must match ordinary greedy"
+    );
+    println!("mtp_i8 equality: {} tokens match greedy", mtp_tokens.len());
+}

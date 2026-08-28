@@ -1030,3 +1030,120 @@ __global__ void pfx_full_attention_decode_flat_kernel(
         out_row[local_dims[i]] = pfx_from_float<T>(local_acc[i] * shared_inv_denom);
     }
 }
+
+
+// ---- DFlash2 dynamic depthwise conv (draft block) ----
+//
+// Causal 1D conv over the nq draft block positions with kernel size K and
+// per-group dynamic coefficients (the DFlash2 "dyn conv" that wraps each
+// draft attention/FFN as a prepare/finish tap pair). For tap index s
+// (0 = prepare on the sub-block input, 1 = finish on the sub-block output):
+//   dyn      = proj @ x_norm            [nq, 2*K*groups]   (computed by caller)
+//   coef     = base[s][k] (per element) + dyn[s][k] (per group, broadcast)
+//   out[e,l] = sum_k coef[e,l,k] * x[e, l-k]   (x[e, l-k] = 0 for l < k)
+//
+// Layouts (row-major, contiguous first axis):
+//   x:    BF16 [nq, hidden]        x[l*hidden + e]
+//   base: F32 [K*K, hidden]        base[(s*K + k)*hidden + e]
+//   dyn:  BF16 [nq, 2*K*groups]    dyn[l*(2*K*groups) + (s*K+k)*groups + g]
+//   out:  BF16 [nq, hidden]        out[l*hidden + e]
+// out must not alias x (the k>=1 taps read un-shifted x rows that would be
+// overwritten if out == x); the caller uses a disjoint output buffer.
+__global__ void pfx_dflash_dyn_conv_kernel(
+    int hidden, int nq, int K, int gs, int s,
+    const hip_bfloat16* __restrict__ x,
+    const float* __restrict__ base,
+    const hip_bfloat16* __restrict__ dyn,
+    hip_bfloat16* __restrict__ out
+) {
+    const int e = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int l = static_cast<int>(blockIdx.y);
+    if (e >= hidden || l >= nq) return;
+    const int groups = hidden / gs;
+    const int g = e / gs;
+    const int two_kg = 2 * K * groups;
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        const float coef = base[(s * K + k) * hidden + e] +
+            pfx_to_float(dyn[l * two_kg + (s * K + k) * groups + g]);
+        const float xval = (l >= k) ? pfx_to_float(x[(l - k) * hidden + e]) : 0.0f;
+        acc += coef * xval;
+    }
+    out[l * hidden + e] = pfx_from_float<hip_bfloat16>(acc);
+}
+
+// F32-precision variant: x and out are F32, dyn is BF16 (from the Q8_0 matmul).
+// The computation is identical (F32 throughout); only the output is stored as
+// F32 instead of truncated to BF16.
+__global__ void pfx_dflash_dyn_conv_f32_kernel(
+    int hidden, int nq, int K, int gs, int s,
+    const float* __restrict__ x,
+    const float* __restrict__ base,
+    const float* __restrict__ dyn,
+    float* __restrict__ out
+) {
+    const int e = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int l = static_cast<int>(blockIdx.y);
+    if (e >= hidden || l >= nq) return;
+    const int groups = hidden / gs;
+    const int g = e / gs;
+    const int two_kg = 2 * K * groups;
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        const float coef = base[(s * K + k) * hidden + e] +
+            dyn[l * two_kg + (s * K + k) * groups + g];
+        const float xval = (l >= k) ? x[(l - k) * hidden + e] : 0.0f;
+        acc += coef * xval;
+    }
+    out[l * hidden + e] = acc;
+}
+
+// ---- dflash2 target hidden-state strided scatter ----
+//
+// Scatters a contiguous src [n_rows, n_cols] BF16 block into a strided
+// region of dst: dst[r * dst_stride + col_offset + c] = src[r * n_cols + c].
+// Used to capture a target layer's post-MLP hidden state into the
+// concatenated [seq_len, ntl * hidden] dflash target_hidden buffer.
+
+__global__ void pfx_dflash_scatter_cols_kernel(
+    const hip_bfloat16* __restrict__ src,
+    hip_bfloat16* __restrict__ dst,
+    int n_rows, int n_cols, int col_offset, int dst_stride)
+{
+    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int total = n_rows * n_cols;
+    if (idx >= total) return;
+    const int r = idx / n_cols;
+    const int c = idx % n_cols;
+    dst[r * dst_stride + col_offset + c] = src[r * n_cols + c];
+}
+
+// Batched conv-tail assembly for the chunk_len < pad case (incremental
+// decode / DFlash2 capture). Replaces the per-channel D2D copy loop
+// (qkv_dim * pad individual copies) with a single parallel kernel.
+// new_tail[ch * pad + t] = (t < keep_old && chunk_start > 0)
+//     ? old_tail[ch * pad + chunk_len + t]
+//     : (t >= keep_old) ? qkv[(t - keep_old) * qkv_dim + ch] : 0
+template <typename T>
+__global__ void pfx_assemble_conv_tail_short_kernel(
+    int qkv_dim, int pad, int chunk_len, int keep_old, int chunk_start,
+    const T* __restrict__ old_tail,  // [qkv_dim, pad]
+    const T* __restrict__ qkv,        // [chunk_len, qkv_dim]
+    T* __restrict__ new_tail          // [qkv_dim, pad]
+) {
+    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int total = qkv_dim * pad;
+    if (idx >= total) return;
+    const int channel = idx / pad;
+    const int tap = idx - channel * pad;
+    if (tap < keep_old) {
+        if (chunk_start > 0) {
+            new_tail[idx] = old_tail[channel * pad + chunk_len + tap];
+        } else {
+            new_tail[idx] = static_cast<T>(0);
+        }
+    } else {
+        const int t = tap - keep_old;
+        new_tail[idx] = qkv[t * qkv_dim + channel];
+    }
+}

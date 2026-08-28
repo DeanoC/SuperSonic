@@ -7609,6 +7609,7 @@ static int matmul_ggml_pair_swiglu_wmma_bf16_device(
     return 0;
 }
 
+template <typename T>
 static int quantize_mmq_q8_1_device(
     int device_ordinal,
     size_t batch_elems,
@@ -7631,7 +7632,7 @@ static int quantize_mmq_q8_1_device(
 
     const int blocks_per_row = (k + 127) / 128;
     hipLaunchKernelGGL(
-        supersonic_qwen35_quantize_mmq_q8_1_kernel,
+        supersonic_qwen35_quantize_mmq_q8_1_kernel<T>,
         dim3(blocks_per_row, m, static_cast<unsigned int>(batch_elems)),
         dim3(32),
         0,
@@ -7639,7 +7640,7 @@ static int quantize_mmq_q8_1_device(
         batch_elems,
         m,
         k,
-        static_cast<const hip_bfloat16*>(lhs),
+        static_cast<const T*>(lhs),
         quant_type,
         static_cast<uint8_t*>(out));
     hipError_t launch_err = hipGetLastError();
@@ -7931,6 +7932,18 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
     }
 
     switch (dtype) {
+    case 1: {
+        // F32 output for the DFlash2 draft forward. The scalar kernel
+        // dequantizes Q8_0 to F32, reads an F32 lhs, accumulates in F32, and
+        // stores F32 — matching the upstream ggml F32 compute type so draft
+        // activations never pass through a BF16 truncation. The WMMA path
+        // stores BF16 only, so F32 output uses the scalar kernel. The caller
+        // must supply an F32 lhs (the scalar kernel reads `lhs` as
+        // `const float*`); a BF16 lhs would be reinterpreted as garbage.
+        return matmul_int4_dequant_device<float>(
+            static_cast<int>(device_ordinal), batch_elems, m, n, k,
+            lhs, rhs_int4, scale, zero, awq_inv_scale, group_size, quant_type, out);
+    }
     case 2: {
         // The tiled WMMA kernel fetches one (scale, zero) pair per BK-wide
         // K slab per row, so it's only correct when every BK-aligned slab
@@ -8031,8 +8044,11 @@ extern "C" int supersonic_qwen35_4b_hip_quantize_mmq_q8_1(
     int quant_type,
     void* out) {
     switch (dtype) {
+    case 1:
+        return quantize_mmq_q8_1_device<float>(
+            static_cast<int>(device_ordinal), batch_elems, m, k, lhs, quant_type, out);
     case 2:
-        return quantize_mmq_q8_1_device(
+        return quantize_mmq_q8_1_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, k, lhs, quant_type, out);
     default:
         return 304;

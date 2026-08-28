@@ -355,8 +355,8 @@ mod typed_bridge_status_tests {
 
     #[test]
     fn gqh_dequant_gemm_boundary_flushes_only_batched_path() {
-        assert!(!gqh_dequant_gemm_needs_flush(8));
-        assert!(gqh_dequant_gemm_needs_flush(9));
+        assert!(!gqh_dequant_gemm_needs_flush(16));
+        assert!(gqh_dequant_gemm_needs_flush(17));
     }
 }
 
@@ -1012,6 +1012,43 @@ unsafe extern "C" {
         xs: *const c_void,
         out: *mut c_void,
     ) -> c_int;
+
+    // ---- DFlash2 dynamic depthwise conv (draft block) ----
+    fn supersonic_pfx_assemble_conv_tail_short(
+        dtype: c_int,
+        device_ordinal: usize,
+        qkv_dim: c_int,
+        pad: c_int,
+        chunk_len: c_int,
+        chunk_start: c_int,
+        old_tail: *const c_void,
+        qkv: *const c_void,
+        new_tail: *mut c_void,
+    ) -> c_int;
+    fn supersonic_dflash_dyn_conv(
+        device_ordinal: usize,
+        hidden: c_int,
+        nq: c_int,
+        k: c_int,
+        gs: c_int,
+        s: c_int,
+        x: *const c_void,
+        base: *const c_void,
+        dyn_: *const c_void,
+        out: *mut c_void,
+        out_dtype: c_int,
+    ) -> c_int;
+
+    // ---- DFlash2 target hidden-state strided scatter ----
+    fn supersonic_dflash_scatter_cols(
+        device_ordinal: usize,
+        src: *const c_void,
+        dst: *mut c_void,
+        n_rows: c_int,
+        n_cols: c_int,
+        col_offset: c_int,
+        dst_stride: c_int,
+    ) -> c_int;
 }
 
 // --- Safe wrappers ---
@@ -1632,9 +1669,21 @@ fn matmul_rhs_transposed_int4_impl(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     ffi_profile_time_result("qwen.matmul_rhs_transposed_int4", ordinal, || {
+        // Derive the compute/output dtype from the `out` buffer. The scalar
+        // kernel reuses the same template parameter `T` for both the lhs
+        // read and the output store, so an F32 output requires an F32 lhs;
+        // reject the mismatch rather than silently misreading a BF16 lhs as
+        // F32. A BF16 output keeps the existing WMMA/scalar BF16 path.
+        let out_dtype = out.dtype();
+        if out_dtype == ScalarType::F32 && lhs.dtype() != ScalarType::F32 {
+            return Err(GpuError::InvalidArg(format!(
+                "matmul_rhs_transposed_int4: F32 output requires F32 lhs (got {:?})",
+                lhs.dtype()
+            )));
+        }
         let status = unsafe {
             supersonic_qwen35_4b_hip_matmul_int4_dequant(
-                ScalarType::BF16.kernel_dtype_code(),
+                out_dtype.kernel_dtype_code(),
                 ordinal,
                 batch_elems,
                 m as c_int,
@@ -1672,7 +1721,7 @@ fn matmul_rhs_transposed_int4_impl(
 /// matvec rereads the weight matrix once per token. Prefill instead
 /// dequantizes once and uses the tiled BF16 GEMM, matching ggml's
 /// dequant→hipBLAS fallback. Opt out with `SUPERSONIC_GQH_FORCE_FUSED=1`.
-const GQH_FUSED_MAX_COLS: usize = 8;
+const GQH_FUSED_MAX_COLS: usize = 16;
 const GQH_DEQUANT_GEMM_MAX_WEIGHT_BYTES: usize = 768 * 1024 * 1024;
 
 fn gqh_dequant_gemm_needs_flush(ncols: usize) -> bool {
@@ -1681,6 +1730,153 @@ fn gqh_dequant_gemm_needs_flush(ncols: usize) -> bool {
 
 fn gqh_force_fused() -> bool {
     std::env::var_os("SUPERSONIC_GQH_FORCE_FUSED").is_some()
+}
+
+/// PR #35's int8 activation arm switch. Serving runs with the i8 dot on
+/// (`GGML_GQH_I8DOT=1`); the exact f32 matvec stays the default so the
+/// correctness gates (official vectors, ordinary-vs-MTP token equality) remain
+/// bit-exact. Mirrors geo-lucebox's `GGML_GQH_I8DOT` policy.
+fn gqh_i8_dot_enabled() -> bool {
+    match std::env::var("GGML_GQH_I8DOT") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
+}
+
+/// The fused-matvec (verify) int8 arm. When the i8 dot is enabled and the
+/// rung's level grid fits int8's 127:1 range, quantize the activations to int8
+/// and run the dp4a matvec ([`crate::gqh::matvec_i8`]). The kernel folds
+/// `127/q8n` into `tensor_scale` and `qxs` folds both `/127`s, so this passes
+/// the ORIGINAL `tensor_scale` and the denominator from
+/// [`model_store::gqh_q8::q8_denom_eff`].
+///
+/// Returns `Ok(true)` when the i8 arm ran, `Ok(false)` when it declined so the
+/// caller falls back to the exact f32 matvec. Declines when the i8 dot is off,
+/// `ncols` exceeds the kernel's 16-column arm, the rung has no int8 arm
+/// (GQH4/GQH2_C), the input dim is not a 256-superblock multiple, or the grid
+/// is not int8-representable.
+pub(crate) fn try_matmul_gqh_i8_dot(
+    ordinal: usize,
+    ncols: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    tensor_scale: f32,
+    grid_code: u8,
+    rung: i32,
+    out: &mut GpuBuffer,
+) -> Result<bool, GpuError> {
+    use crate::gqh::{RUNG_GQH2_H, RUNG_GQH3};
+    if ncols == 0 || ncols > GQH_FUSED_MAX_COLS {
+        return Ok(false);
+    }
+    let ms_rung = match rung {
+        RUNG_GQH3 => model_store::gqh_q8::GqhRung::Gqh3,
+        RUNG_GQH2_H => model_store::gqh_q8::GqhRung::Gqh2H,
+        _ => return Ok(false),
+    };
+    if k % 256 != 0 {
+        return Ok(false);
+    }
+    let Some(q8n) = model_store::gqh_q8::q8_denom_eff(ms_rung, grid_code) else {
+        return Ok(false);
+    };
+    if !model_store::gqh_q8::q8_grid_representable(ms_rung, grid_code, q8n) {
+        return Ok(false);
+    }
+    thread_local! {
+        static GQH_I8_X: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };
+        static GQH_I8_QX: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };
+        static GQH_I8_QXS: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };
+        static GQH_I8_Y: std::cell::RefCell<Option<GpuBuffer>> = const { std::cell::RefCell::new(None) };
+    }
+    let take = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+                dtype: ScalarType,
+                elems: usize|
+     -> Result<GpuBuffer, GpuError> {
+        slot.with(|cell| {
+            let mut held = cell.borrow_mut();
+            if let Some(buf) = held.as_ref() {
+                if buf.dtype() == dtype && buf.elem_count() >= elems {
+                    return Ok(held.take().expect("scratch present"));
+                }
+            }
+            held.take();
+            GpuBuffer::zeros(ordinal, dtype, &[elems])
+        })
+    };
+    let put = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+               buf: GpuBuffer| {
+        slot.with(|cell| {
+            *cell.borrow_mut() = Some(buf);
+        });
+    };
+
+    let x_f32 = if lhs.dtype() == ScalarType::F32 {
+        None
+    } else {
+        let mut buf = take(&GQH_I8_X, ScalarType::F32, ncols * k)?;
+        cast(
+            ordinal,
+            ScalarType::BF16,
+            ScalarType::F32,
+            ncols * k,
+            lhs,
+            &mut buf,
+        )?;
+        Some(buf)
+    };
+    let x_ref = x_f32.as_ref().unwrap_or(lhs);
+
+    let ngroups = k / 8;
+    let mut qx = take(&GQH_I8_QX, ScalarType::U8, ncols * k)?;
+    let mut qxs = take(&GQH_I8_QXS, ScalarType::F32, ncols * ngroups)?;
+    crate::gqh::quant_x_i8(ordinal, x_ref, &mut qx, &mut qxs, ncols, k, k)?;
+
+    let mut y_f32 = if out.dtype() == ScalarType::F32 {
+        None
+    } else {
+        Some(take(&GQH_I8_Y, ScalarType::F32, ncols * n)?)
+    };
+    let y_ref = y_f32.as_mut().unwrap_or(out);
+    crate::gqh::matvec_i8(
+        ordinal,
+        rung,
+        rhs,
+        &qx,
+        &qxs,
+        y_ref,
+        k,
+        n,
+        ncols,
+        q8n,
+        k,
+        ngroups,
+        n,
+        tensor_scale,
+        grid_code,
+    )?;
+    if let Some(y) = y_f32.as_ref() {
+        cast(
+            ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            ncols * n,
+            y,
+            out,
+        )?;
+    }
+
+    if let Some(buf) = x_f32 {
+        put(&GQH_I8_X, buf);
+    }
+    put(&GQH_I8_QX, qx);
+    put(&GQH_I8_QXS, qxs);
+    if let Some(buf) = y_f32 {
+        put(&GQH_I8_Y, buf);
+    }
+    Ok(true)
 }
 
 pub fn matmul_rhs_transposed_gqh(
@@ -1754,6 +1950,22 @@ pub fn matmul_rhs_transposed_gqh(
         {
             crate::gqh::gemm_flush(ordinal)?;
         }
+        return Ok(());
+    }
+    if gqh_i8_dot_enabled()
+        && try_matmul_gqh_i8_dot(
+            ordinal,
+            ncols,
+            n,
+            k,
+            lhs,
+            rhs,
+            tensor_scale,
+            grid_code,
+            rung,
+            out,
+        )?
+    {
         return Ok(());
     }
     thread_local! {
@@ -2242,7 +2454,7 @@ pub fn quantize_mmq_q8_1(
     ffi_profile_time_result_key(profile_key, ordinal, || {
         let status = unsafe {
             supersonic_qwen35_4b_hip_quantize_mmq_q8_1(
-                ScalarType::BF16.kernel_dtype_code(),
+                lhs.dtype().kernel_dtype_code(),
                 ordinal,
                 batch_elems,
                 m as c_int,
@@ -2685,6 +2897,134 @@ pub fn element_add(
         prefill_bridge_result(gpu_hal::current_backend(), "element_add", status)?;
         Ok(())
     })
+}
+
+/// DFlash2 dynamic depthwise conv over the draft block (nq positions).
+///
+/// `out[l,e] = sum_k (base[s,k,e] + dyn[s,k,e/gs,l]) * x[l-k,e]` (zero for
+/// `l < k`), where `base` is F32 `[K*K, hidden]`, `dyn` is BF16 `[nq, 2*K*groups]`
+/// and `x`/`out` are BF16 `[nq, hidden]`. `s` is the tap (0 = prepare, 1 =
+/// finish). `out` must not alias `x`.
+pub fn dflash_dyn_conv(
+    ordinal: usize,
+    out_dtype: ScalarType,
+    hidden: usize,
+    nq: usize,
+    k: usize,
+    gs: usize,
+    s: usize,
+    x: &GpuBuffer,
+    base: &GpuBuffer,
+    dyn_: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush(ordinal)?;
+    let dtype_code = out_dtype.kernel_dtype_code();
+    let status = unsafe {
+        supersonic_dflash_dyn_conv(
+            ordinal,
+            hidden as c_int,
+            nq as c_int,
+            k as c_int,
+            gs as c_int,
+            s as c_int,
+            x.as_ptr(),
+            base.as_ptr(),
+            dyn_.as_ptr(),
+            out.as_mut_ptr(),
+            dtype_code,
+        )
+    };
+    prefill_bridge_result(gpu_hal::current_backend(), "dflash_dyn_conv", status)?;
+    Ok(())
+}
+
+/// Batched conv-tail assembly for the incremental decode case where
+/// `chunk_len < pad`. Replaces the per-channel D2D copy loop with a
+/// single parallel kernel launch. `old_tail` is `[qkv_dim, pad]`,
+/// `qkv` is `[chunk_len, qkv_dim]`, `new_tail` is `[qkv_dim, pad]`.
+pub fn assemble_conv_tail_short(
+    ordinal: usize,
+    dtype: ScalarType,
+    qkv_dim: usize,
+    pad: usize,
+    chunk_len: usize,
+    chunk_start: usize,
+    old_tail: &GpuBuffer,
+    qkv: &GpuBuffer,
+    new_tail: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush(ordinal)?;
+    let status = unsafe {
+        supersonic_pfx_assemble_conv_tail_short(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            qkv_dim as c_int,
+            pad as c_int,
+            chunk_len as c_int,
+            chunk_start as c_int,
+            old_tail.as_ptr() as *const c_void,
+            qkv.as_ptr() as *const c_void,
+            new_tail.as_mut_ptr() as *mut c_void,
+        )
+    };
+    prefill_bridge_result(
+        gpu_hal::current_backend(),
+        "assemble_conv_tail_short",
+        status,
+    )?;
+    Ok(())
+}
+
+/// Strided column scatter for DFlash2 target hidden-state capture.
+/// Copies `src[r * n_cols + c]` into `dst[r * dst_stride + col_offset + c]`
+/// for r in [0, n_rows), c in [0, n_cols). Both buffers are BF16.
+pub fn dflash_scatter_cols(
+    ordinal: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+    n_rows: usize,
+    n_cols: usize,
+    col_offset: usize,
+    dst_stride: usize,
+) -> Result<(), GpuError> {
+    dflash_scatter_cols_raw(
+        ordinal,
+        src.as_ptr(),
+        dst.as_mut_ptr(),
+        n_rows,
+        n_cols,
+        col_offset,
+        dst_stride,
+    )
+}
+
+/// Raw-pointer variant of [`dflash_scatter_cols`] for writing into a strided
+/// sub-region of a larger buffer (e.g. scattering a capture layer's hidden
+/// state into the concatenated dflash target_hidden buffer at an offset).
+pub fn dflash_scatter_cols_raw(
+    ordinal: usize,
+    src: *const std::ffi::c_void,
+    dst: *mut std::ffi::c_void,
+    n_rows: usize,
+    n_cols: usize,
+    col_offset: usize,
+    dst_stride: usize,
+) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush(ordinal)?;
+    let status = unsafe {
+        supersonic_dflash_scatter_cols(
+            ordinal,
+            src,
+            dst,
+            n_rows as c_int,
+            n_cols as c_int,
+            col_offset as c_int,
+            dst_stride as c_int,
+        )
+    };
+    prefill_bridge_result(gpu_hal::current_backend(), "dflash_scatter_cols", status)?;
+    Ok(())
 }
 
 pub fn argmax_bf16_rows(

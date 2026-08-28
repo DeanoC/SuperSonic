@@ -2412,3 +2412,241 @@ __global__ void gqh_mix_matvec_kernel(
         }
     }
 }
+
+// ---- GQH i8 activation quantization pre-pass --------------------------------
+//
+// Ports PR #35's gqh_quant_x: quantize f32 activations to int8 codes with one
+// scale per 8-weight group (GQH_PER_LANE), matching GQH's 16-weight sub-block so
+// the group boundary never straddles a sub-block ratio. The stored scale folds
+// BOTH /127s (GQH_Q8_XSCALE = 1/(127*127)) so the matvec's per-row scale chain
+// stays d_real * ratio * qxs -- one v_mul per row per superblock, none per column.
+//
+// Layout: qx[ncols * in] int8 codes (column-major, stride = in) then qxs[ncols *
+// (in/8)] f32 group scales (column-major, stride = in/8). Both grown on demand
+// by the caller and never freed here.
+#define GQH_Q8_XSCALE_F (1.0f / (127.0f * 127.0f))
+
+__global__ void gqh_quant_x_i8_kernel(
+    const float* __restrict__ x,
+    int8_t* __restrict__ qx,
+    float* __restrict__ qxs,
+    int ncols,
+    int in_dim,
+    int64_t x_col_stride) {
+    // One block per (column, group-of-8). 32 threads cooperatively quantize the
+    // 8 activations of one group: each thread holds one value, the warp reduces
+    // amax via shfl, then each thread rounds its own code.
+    const int group = blockIdx.x;
+    const int col = blockIdx.y;
+    if (col >= ncols) {
+        return;
+    }
+    const int ngroups = in_dim / GQH_PER_LANE;
+    if (group >= ngroups) {
+        return;
+    }
+    const int tid = threadIdx.x;  // 0..7 are active; 8..31 idle
+    const int t = tid;
+    float v = 0.0f;
+    if (t < GQH_PER_LANE) {
+        const int j = group * GQH_PER_LANE + t;
+        v = x[(int64_t)col * x_col_stride + j];
+    }
+    float amax = fabsf(v);
+#pragma unroll
+    for (int m = 1; m < GQH_PER_LANE; m <<= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, m, GQH_WARP));
+    }
+    // amax is now uniform across lanes 0..7 (and garbage-but-unused on 8..31).
+    int8_t code = 0;
+    if (t < GQH_PER_LANE) {
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int q = __float2int_rn(v * inv);
+        if (q > 127) {
+            q = 127;
+        }
+        if (q < -127) {
+            q = -127;
+        }
+        code = static_cast<int8_t>(q);
+        qx[(int64_t)col * in_dim + group * GQH_PER_LANE + t] = code;
+    }
+    if (t == 0) {
+        qxs[(int64_t)col * ngroups + group] = amax * GQH_Q8_XSCALE_F;
+    }
+}
+
+// ---- GQH i8 weight LUT bake (device-side q8_round) -------------------------
+//
+// Ports PR #35's gqh_q8_level(level, n) = __float2int_rn(level * n) clamped to
+// [-127, 127]. The matvec bakes the level grid to int8 once per block in LDS
+// (see the prologue); this standalone kernel exposes the SAME arithmetic so a
+// harness can verify the device bake matches the host denominator search
+// (model_store::gqh_q8::q8_round) bit-for-bit. The extreme-entry invariant
+// (amax == 1.0 -> q8_round(+-1.0, n) == +-n) is what makes the bake safe.
+__global__ void gqh_bake_q8_lut_kernel(
+    int8_t* __restrict__ out,
+    int rung,
+    int grid_code,
+    int q8n,
+    int nlev) {
+    const int i = threadIdx.x;
+    if (i >= nlev) {
+        return;
+    }
+    float level = 0.0f;
+    if (rung == 0) {        // GQH3
+        level = gqh_bits(GQH3_GRID[grid_code][i]);
+    } else if (rung == 3) { // GQH4
+        level = gqh_bits(GQH4_GRID[grid_code][i]);
+    } else if (rung == 1) { // GQH2_H
+        level = gqh_bits(GQH2H_GRID[grid_code][i]);
+    }
+    const int q = __float2int_rn(level * (float) q8n);
+    int clamped = q > 127 ? 127 : (q < -127 ? -127 : q);
+    out[i] = static_cast<int8_t>(clamped);
+}
+
+// 4-wide signed int8 dot product accumulating to int32 (dp4a). On RDNA3
+// (gfx1100) and RDNA4 (gfx1201) this maps to __builtin_amdgcn_sudot4, the
+// same intrinsic llama.cpp's dp4a helper uses for those archs. The result
+// is exact in int32 for |dot| <= 8 * 127 * 127 = 129032 (well inside 2^24),
+// so the float conversion in the matvec is loss-free.
+static __device__ __forceinline__ int supersonic_gqh_dp4a(int a, int b, int c) {
+#if defined(__HIP_PLATFORM_AMD__) && (defined(__GFX11__) || defined(__GFX12__))
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    const int8_t* pa = reinterpret_cast<const int8_t*>(&a);
+    const int8_t* pb = reinterpret_cast<const int8_t*>(&b);
+    return c + pa[0]*pb[0] + pa[1]*pb[1] + pa[2]*pb[2] + pa[3]*pb[3];
+#endif
+}
+
+// ---- GQH i8 multicol matvec (the fast verify arm) ---------------------------
+//
+// Ports PR #35's int8 dot arm. Takes PRE-QUANTIZED int8 activations (qx, qxs
+// from gqh_quant_x_i8_kernel) instead of f32, bakes the level grid to int8
+// once per block (s_q8, via q8n = the grid's denominator), and does a dp4a dot
+// instead of fmaf. The scale chain folds 127/q8n into tensor_scale (PR #35's
+// t_scale *= 127/q8n) and qxs already folds both /127s, so:
+//   acc += s_b * qxs[group] * (float)dot
+// matches the f32 product level * s_b_true * v. Not bit-exact (int8 rounds
+// every level), but tolerance-bounded by the weight LUT step (row_max/127).
+//
+// Reuses gqh_load_tight_lane (same wire load, same s_b, same cw); only the
+// inner dot changes. kRows=1, kCols up to 16 (DFlash2 verify block).
+template <bool IS_GQH3, bool kAcc, int kNsb = 0, int kCols = 1>
+__global__ void gqh_matvec_i8_tight_kernel(
+    const uint8_t* __restrict__ data,
+    const int8_t* __restrict__ qx,
+    const float* __restrict__ qxs,
+    float* __restrict__ y,
+    int in, int out,
+    float tensor_scale,
+    float4 mag,
+    int q8n,
+    int64_t qx_col_stride,
+    int64_t qxs_col_stride,
+    int64_t y_col_stride,
+    int row_off,
+    int ncols) {
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int lane = threadIdx.x % GQH_WARP;
+    const int col0 = (kCols == 1) ? (int)blockIdx.y : 0;
+    const int ncol = (kCols == 1) ? 1 : (ncols < kCols ? ncols : kCols);
+    const int warp = threadIdx.x / GQH_WARP;
+    const int row0 = (blockIdx.x * warps_per_block + warp) + row_off;
+
+    __shared__ float s_ratio[16];
+    __shared__ int8_t s_q8[8];
+    if (threadIdx.x < 16) {
+        s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+    }
+    // Bake the level grid to int8 once: q8_round(level * q8n) clamped.
+    if (threadIdx.x < 8) {
+        const float level = gqh_level<IS_GQH3>(threadIdx.x, mag);
+        int q = __float2int_rn(level * (float)q8n);
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        s_q8[threadIdx.x] = static_cast<int8_t>(q);
+    }
+    __syncthreads();
+    if (row0 >= row_off + out) {
+        return;
+    }
+
+    // Fold 127/q8n into tensor_scale (PR #35's t_scale *= 127/q8n).
+    const float t_scale_eff = tensor_scale * (127.0f / (float)q8n);
+
+    const int nsb = kNsb > 0 ? kNsb : (in / GQH_SUPERBLOCK);
+    constexpr int sb_bytes = IS_GQH3 ? GQH3_SB_BYTES : GQH2H_SB_BYTES;
+    // The tight conversion writes AoS superblocks in-place into the planar
+    // buffer, so the row pitch is the PLANAR stride (from gqh_plane_offsets),
+    // not nsb * sb_bytes. Matches the f32 tight kernel's row_pitch = stride.
+    int off_r, off_lo, off_hi, stride;
+    gqh_plane_offsets(nsb, IS_GQH3 ? 1 : 0, &off_r, &off_lo, &off_hi, &stride);
+    (void)off_r; (void)off_lo; (void)off_hi;
+    const int row_pitch = stride;
+    const uint8_t* __restrict__ rowbase0 = data + (int64_t)row0 * row_pitch;
+    const int j0 = lane * GQH_PER_LANE;
+    const int sub = j0 >> 4;
+    const int ngroups = in / GQH_PER_LANE;
+
+    float acc0[kCols];
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+        acc0[c] = 0.0f;
+    }
+    for (int sb = 0; sb < nsb; ++sb) {
+        const gqh_tight_lane p = gqh_load_tight_lane<IS_GQH3>(
+            rowbase0, sb, sb_bytes, lane, sub, t_scale_eff, s_ratio);
+        // Pack 8 int8 weight codes from s_q8 into two int32 for dp4a.
+        int wq0 = 0, wq1 = 0;
+#pragma unroll
+        for (int t = 0; t < GQH_PER_LANE; ++t) {
+            const int code = gqh_code_at<IS_GQH3>(p.cw, t);
+            const int8_t w8 = s_q8[code];
+            if (t < 4) {
+                wq0 |= ((int)w8 & 0xff) << (8 * t);
+            } else {
+                wq1 |= ((int)w8 & 0xff) << (8 * (t - 4));
+            }
+        }
+        const int group = sb * (GQH_SUPERBLOCK / GQH_PER_LANE) + lane;
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (c >= ncol) {
+                break;
+            }
+            // Load 8 int8 activation codes for this column/group.
+            const int8_t* xc = qx + (int64_t)(col0 + c) * qx_col_stride + group * GQH_PER_LANE;
+            int xq0, xq1;
+            memcpy(&xq0, xc, 4);
+            memcpy(&xq1, xc + 4, 4);
+            int dot = supersonic_gqh_dp4a(wq0, xq0, 0);
+            dot = supersonic_gqh_dp4a(wq1, xq1, dot);
+            const float xsc = qxs[(int64_t)(col0 + c) * qxs_col_stride + group];
+            acc0[c] += p.s_b * xsc * (float)dot;
+        }
+    }
+#pragma unroll
+    for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            acc0[c] += gqh_warp_shfl_down(acc0[c], off);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (c >= ncol) {
+                break;
+            }
+            const int64_t yi = (int64_t)(col0 + c) * y_col_stride + row0;
+            if constexpr (kAcc) {
+                y[yi] = gqh_bf16_round(y[yi] + gqh_bf16_round(acc0[c]));
+            } else {
+                y[yi] = acc0[c];
+            }
+        }
+    }
+}

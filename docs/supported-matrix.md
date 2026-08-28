@@ -25,6 +25,16 @@ physical device, waits for selected-device idleness, builds with
 `HIP_ARCH=gfx1201`, checks the configured artifact pair, and compares ordinary
 and NextN/MTP token arrays.
 
+The R9700 lane additionally carries an optional NextN/MTP int8 verify arm.
+When `GGML_GQH_I8DOT=1` is set, the fused-matvec verify path quantizes
+activations to int8 and runs a dp4a dot against a baked int8 weight LUT instead
+of the f32 matvec. The arm declines (and falls back to the exact f32 matvec)
+when a rung's level grid does not fit int8's range, the rung has no int8 arm,
+or the input dim is not a 256-element superblock multiple. Its support gate is
+ordinary-vs-int8 token equality: the MTP token stream with the int8 arm on
+must equal the ordinary greedy stream, checked by the
+`mtp_i8_verify_token_equality_matches_greedy` artifact test.
+
 ## Failure boundary
 
 The `--model` value must be `qwen3.8-27b`; the model directory and custom GQH

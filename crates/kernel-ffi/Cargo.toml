@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
+model-store = { path = "../model-store" }
 half = "2"
 serde_json = "1"
 thiserror = "2"
@@ -13,4 +14,3 @@ thiserror = "2"
 cc = "1"
 
 [dev-dependencies]
-model-store = { path = "../model-store" }

@@ -32,5 +32,6 @@ support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
 gate_commands = [
   "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 python3 tools/check-qwen38-artifacts.py --require-8192",
   "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 RUST_TEST_THREADS=1 cargo test --release -p qwen38 --test qwen38_gqh_gguf_crawl -- --include-ignored --test-threads=1",
+  "SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1 RUST_TEST_THREADS=1 cargo test --release -p supersonic-runtime --test qwen38_gqh_decode_rung11 mtp_i8 -- --ignored --test-threads=1 --nocapture",
 ]
-notes = "Qwen3.8-27B custom GQH GGUF lane on the R9700 gfx1201 runner."
+notes = "Qwen3.8-27B custom GQH GGUF lane on the R9700 gfx1201 runner; optional NextN/MTP int8 dp4a verify arm (GGML_GQH_I8DOT=1) gated on q8 grid representability, with ordinary-vs-i8 token equality."

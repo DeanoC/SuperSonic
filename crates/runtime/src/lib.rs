@@ -6,6 +6,8 @@
 
 pub mod chat_template;
 pub mod decode_engine;
+pub mod dflash_spec;
+pub mod draft_engine;
 pub mod mtp;
 pub mod prefill_engine;
 pub mod tensor_bytes;

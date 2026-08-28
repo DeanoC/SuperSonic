@@ -31,9 +31,24 @@ RETAINED_SOURCE_ROOTS = (
 )
 
 
+# DFlash2 draft-model speculative decode is a retained feature, so the bare
+# dflash substring is scoped to the legacy family (dflash_fused, dflash_mtp,
+# mtp_dflash) that must stay out of retained sources; DFlash2 names such as
+# DFlash2, dflash_dyn_conv, and dflash_scatter_cols are permitted.  The
+# runtime identifier allowlist lives in check-retained-source-terms.py.
 LEGACY_CONTENT_RE = re.compile(
-    r"(?:certified[-_]kv|certifiedkv|dflash|specprefill|spec_prefill|"
-    r"metal|cuda|qwen3[.]6|qwen36)",
+    r"(?:certified[-_]kv|certifiedkv|dflash[_-]?(?:fused|mtp)|mtp[_-]?dflash|"
+    r"specprefill|spec_prefill|metal|cuda|qwen3[.]6|qwen36)",
+    re.IGNORECASE,
+)
+
+# Public FFI/backend surfaces must not expose removed backends.  The dflash
+# alternation is scoped to the legacy family so the retained DFlash2 FFI
+# surfaces (dflash_dyn_conv, dflash_scatter_cols, dflash_scatter_cols_raw)
+# are permitted while dflash_fused_* / dflash_mtp_* stay rejected.
+FORBIDDEN_PUBLIC_RE = re.compile(
+    r"\b(?:Backend::(?:Cuda|Metal)|(?:pub\s+)?(?:fn|struct|enum|type|const|static)\s+"
+    r"[^\n]*(?:certified|dflash[_-]?(?:fused|mtp)|mtp[_-]?dflash|specprefill|metal|cuda|qwen36))",
     re.IGNORECASE,
 )
 
@@ -213,17 +228,61 @@ class HipOnlyBuildSurfaceTests(unittest.TestCase):
             ROOT / "crates" / "gpu-hal" / "src" / "backend.rs",
             ROOT / "crates" / "gpu-hal" / "src" / "lib.rs",
         )
-        forbidden_public = re.compile(
-            r"\b(?:Backend::(?:Cuda|Metal)|(?:pub\s+)?(?:fn|struct|enum|type|const|static)\s+"
-            r"[^\n]*(?:certified|dflash|specprefill|metal|cuda|qwen36))",
-            re.IGNORECASE,
-        )
         violations = []
         for path in api_files:
             for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-                if forbidden_public.search(line):
+                if FORBIDDEN_PUBLIC_RE.search(line):
                     violations.append(f"{path}:{line_number}: {line.strip()}")
         self.assertEqual([], violations)
+
+    def test_legacy_and_public_res_catch_legacy_dflash_but_permit_dflash2(self):
+        legacy_content = (
+            "dflash_fused_verify_cache",
+            "DFlashFusedVerifyCache",
+            "dflash_mtp_cache",
+            "DFlashMtpCache",
+            "mtp_dflash_cache",
+            "MtpDFlashCache",
+            "fn dflash_mtp_decode_step() {}",
+            "pub fn dflash_fused_verify_cache() -> usize",
+        )
+        dflash2_content = (
+            "DFlash2 dynamic depthwise conv",
+            "dflash2 target hidden-state scatter",
+            "pub fn dflash_dyn_conv(",
+            "pub fn dflash_scatter_cols(",
+            "pub fn dflash_scatter_cols_raw(",
+            "fn supersonic_dflash_dyn_conv(",
+            "fn supersonic_dflash_scatter_cols(",
+            "dflash_capture",
+            "DflashTargetCapture",
+            "verify_block_dflash",
+            "capture_block_dflash",
+            "prefill_with_dflash_capture",
+            "concatenated dflash target_hidden",
+            "dflash lm_head f32-in",
+            "dflash replay empty prefix",
+            "DflashSpecDecoder",
+            "dflash_spec",
+        )
+        for term in legacy_content:
+            self.assertIsNotNone(LEGACY_CONTENT_RE.search(term), term)
+        for term in dflash2_content:
+            self.assertIsNone(LEGACY_CONTENT_RE.search(term), term)
+        for term in (
+            "pub fn dflash_fused_verify_cache() -> usize",
+            "pub fn dflash_mtp_cache() -> usize",
+            "fn dflash_mtp_decode_step() {}",
+        ):
+            self.assertIsNotNone(FORBIDDEN_PUBLIC_RE.search(term), term)
+        for term in (
+            "pub fn dflash_dyn_conv(",
+            "pub fn dflash_scatter_cols(",
+            "pub fn dflash_scatter_cols_raw(",
+            "fn supersonic_dflash_dyn_conv(",
+            "fn supersonic_dflash_scatter_cols(",
+        ):
+            self.assertIsNone(FORBIDDEN_PUBLIC_RE.search(term), term)
 
     def test_gpu_hal_exposes_only_hip_backend_surfaces(self):
         backend = HAL_BACKEND.read_text(encoding="utf-8")

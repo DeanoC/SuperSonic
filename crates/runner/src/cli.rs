@@ -80,6 +80,11 @@ pub struct Cli {
     #[arg(long)]
     pub speculative_decode: bool,
 
+    /// Draft model GGUF artifact for speculative decoding. When present,
+    /// enables draft-model speculative decode (DFlash2) instead of NextN/MTP.
+    #[arg(long)]
+    pub draft_gguf_file: Option<PathBuf>,
+
     /// Process the prompt in chunks (0 means no chunking).
     #[arg(long, default_value = "0")]
     pub prefill_chunk_size: usize,
@@ -136,7 +141,6 @@ mod tests {
             "Gemma",
             "Phi",
             "Llama",
-            "DFlash",
             "SpecPrefill",
             "Certified",
         ] {
