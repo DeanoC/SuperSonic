@@ -59,6 +59,57 @@ struct DraftScratch {
     conv_buf: GpuBuffer,
     // F32 lhs cast temp for the fc matmul (target_hidden arrives BF16).
     mm_lhs_f32: GpuBuffer,
+    // BF16 staging slice for incremental context-KV appends.
+    append_target: GpuBuffer,
+}
+
+/// Per-layer drafter K/V cache in `[head, sequence, head_dim]` layout.
+struct DraftKvCache {
+    k: Vec<GpuBuffer>,
+    v: Vec<GpuBuffer>,
+    context: usize,
+}
+
+impl DraftKvCache {
+    fn empty() -> Self {
+        Self {
+            k: Vec::new(),
+            v: Vec::new(),
+            context: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.k.clear();
+        self.v.clear();
+        self.context = 0;
+    }
+
+    fn ensure(&mut self, ordinal: usize, cfg: &DraftConfig, seq_len: usize) -> Result<()> {
+        anyhow::ensure!(seq_len > 0, "draft KV cache needs a positive sequence");
+        let shape = &[cfg.n_kv_heads, seq_len, cfg.head_dim];
+        if self.k.is_empty() || self.v.is_empty() {
+            self.k = (0..cfg.n_layers)
+                .map(|_| {
+                    GpuBuffer::zeros(ordinal, ScalarType::F32, shape).context("draft K cache alloc")
+                })
+                .collect::<Result<_>>()?;
+            self.v = (0..cfg.n_layers)
+                .map(|_| {
+                    GpuBuffer::zeros(ordinal, ScalarType::F32, shape).context("draft V cache alloc")
+                })
+                .collect::<Result<_>>()?;
+            return Ok(());
+        }
+        for buffer in self.k.iter_mut().chain(self.v.iter_mut()) {
+            if buffer.shape()[1] < seq_len {
+                *buffer = buffer
+                    .grow_seq_dim(1, seq_len)
+                    .context("draft KV cache grow")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl DraftScratch {
@@ -88,6 +139,7 @@ impl DraftScratch {
             conv_dyn_ffn: one(ScalarType::F32)?,
             conv_buf: one(ScalarType::F32)?,
             mm_lhs_f32: one(ScalarType::F32)?,
+            append_target: one(ScalarType::BF16)?,
         })
     }
 }
@@ -106,6 +158,7 @@ pub struct DraftEngine {
     weights: DraftGpuWeights,
     rotary: RotaryTables,
     scratch: Mutex<DraftScratch>,
+    kv_cache: Mutex<DraftKvCache>,
     /// Selector predecessor codebook, Q8_0-packed on host for CPU dequant
     /// during chain tracing. `[vocab, row_bytes(rank)]` U8, or empty when the
     /// drafter GGUF ships no selector.
@@ -152,6 +205,7 @@ impl DraftEngine {
             weights,
             rotary,
             scratch: Mutex::new(scratch),
+            kv_cache: Mutex::new(DraftKvCache::empty()),
             pred_cb_host,
             succ_cb_host,
         })
@@ -159,6 +213,167 @@ impl DraftEngine {
 
     pub fn config(&self) -> &DraftConfig {
         &self.weights.config
+    }
+
+    pub fn cached_context(&self) -> usize {
+        self.kv_cache.lock().expect("draft KV cache lock").context
+    }
+
+    fn append_context(
+        &self,
+        sc: &mut DraftScratch,
+        kv: &mut DraftKvCache,
+        target_hidden: &GpuBuffer,
+        ctx_len: usize,
+    ) -> Result<()> {
+        let start = kv.context;
+        if start == ctx_len {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            ctx_len > start,
+            "draft context shrank from {start} to {ctx_len}"
+        );
+        let cfg = &self.weights.config;
+        let hidden = cfg.hidden;
+        let ntl = cfg.n_target_layers;
+        let n_kv = cfg.n_kv_heads;
+        let hd = cfg.head_dim;
+        let kv_dim = n_kv * hd;
+        let ordinal = self.ordinal;
+        let bf16_elem = ScalarType::BF16.size_in_bytes();
+        let f32_elem = ScalarType::F32.size_in_bytes();
+        kv.ensure(ordinal, cfg, ctx_len)?;
+        let cache_seq_len =
+            kv.k.first()
+                .map(|buffer| buffer.shape()[1])
+                .unwrap_or(ctx_len);
+
+        const APPEND_CHUNK: usize = 64;
+        for chunk_start in (start..ctx_len).step_by(APPEND_CHUNK) {
+            let rows = APPEND_CHUNK.min(ctx_len - chunk_start);
+            let elems = rows * ntl * hidden;
+
+            ensure(&mut sc.append_target, ordinal, ScalarType::BF16, elems)?;
+            gpu_hal::copy_d2d(
+                ordinal,
+                sc.append_target.as_mut_ptr(),
+                target_hidden.offset_ptr(chunk_start * ntl * hidden * bf16_elem),
+                elems * bf16_elem,
+            )
+            .context("draft append target slice copy")?;
+
+            ensure(&mut sc.mm_lhs_f32, ordinal, ScalarType::F32, elems)?;
+            prefill_ffi::cast(
+                ordinal,
+                ScalarType::BF16,
+                ScalarType::F32,
+                elems,
+                &sc.append_target,
+                &mut sc.mm_lhs_f32,
+            )
+            .context("draft append target cast")?;
+            self.draft_matmul_q8_f32(
+                &sc.mm_lhs_f32,
+                &self.weights.fc,
+                rows,
+                hidden,
+                ntl * hidden,
+                &mut sc.fc_out,
+            )
+            .context("draft append fc matmul")?;
+            ensure(&mut sc.normed, ordinal, ScalarType::F32, rows * hidden)?;
+            prefill_ffi::rms_norm_rows_plain(
+                ordinal,
+                ScalarType::F32,
+                rows,
+                hidden,
+                cfg.rms_eps,
+                &sc.fc_out,
+                &self.weights.hidden_norm,
+                &mut sc.normed,
+            )
+            .context("draft append feature norm")?;
+
+            for (il, layer) in self.weights.layers.iter().enumerate() {
+                ensure(&mut sc.k_buf, ordinal, ScalarType::F32, rows * kv_dim)?;
+                ensure(&mut sc.v_buf, ordinal, ScalarType::F32, rows * kv_dim)?;
+                self.draft_matmul_q8_f32(&sc.normed, &layer.k, rows, kv_dim, hidden, &mut sc.k_buf)
+                    .with_context(|| format!("draft append layer {il} K"))?;
+                self.draft_matmul_q8_f32(&sc.normed, &layer.v, rows, kv_dim, hidden, &mut sc.v_buf)
+                    .with_context(|| format!("draft append layer {il} V"))?;
+
+                ensure(&mut sc.k_normed, ordinal, ScalarType::F32, rows * kv_dim)?;
+                prefill_ffi::rms_norm_rows_plain(
+                    ordinal,
+                    ScalarType::F32,
+                    rows * n_kv,
+                    hd,
+                    cfg.rms_eps,
+                    &sc.k_buf,
+                    &layer.k_norm,
+                    &mut sc.k_normed,
+                )
+                .with_context(|| format!("draft append layer {il} K norm"))?;
+                prefill_ffi::apply_rope_prefill(
+                    ordinal,
+                    ScalarType::F32,
+                    rows,
+                    n_kv,
+                    hd,
+                    hd,
+                    &self.rotary.cos,
+                    &self.rotary.sin,
+                    chunk_start,
+                    &mut sc.k_normed,
+                )
+                .with_context(|| format!("draft append layer {il} K rope"))?;
+
+                ensure(&mut sc.attn_k, ordinal, ScalarType::F32, rows * kv_dim)?;
+                ensure(&mut sc.attn_v, ordinal, ScalarType::F32, rows * kv_dim)?;
+                prefill_ffi::transpose_shd_hsd(
+                    ordinal,
+                    ScalarType::F32,
+                    rows,
+                    n_kv,
+                    hd,
+                    &sc.k_normed,
+                    &mut sc.attn_k,
+                )
+                .with_context(|| format!("draft append layer {il} K transpose"))?;
+                prefill_ffi::transpose_shd_hsd(
+                    ordinal,
+                    ScalarType::F32,
+                    rows,
+                    n_kv,
+                    hd,
+                    &sc.v_buf,
+                    &mut sc.attn_v,
+                )
+                .with_context(|| format!("draft append layer {il} V transpose"))?;
+
+                for head in 0..n_kv {
+                    let src = head * rows * hd * f32_elem;
+                    let dst = (head * cache_seq_len + chunk_start) * hd * f32_elem;
+                    gpu_hal::copy_d2d(
+                        ordinal,
+                        kv.k[il].offset_ptr(dst) as *mut std::ffi::c_void,
+                        sc.attn_k.offset_ptr(src),
+                        rows * hd * f32_elem,
+                    )
+                    .with_context(|| format!("draft append layer {il} K head {head}"))?;
+                    gpu_hal::copy_d2d(
+                        ordinal,
+                        kv.v[il].offset_ptr(dst) as *mut std::ffi::c_void,
+                        sc.attn_v.offset_ptr(src),
+                        rows * hd * f32_elem,
+                    )
+                    .with_context(|| format!("draft append layer {il} V head {head}"))?;
+                }
+            }
+        }
+        kv.context = ctx_len;
+        Ok(())
     }
 
     /// DFlash2 selector chain: produce draft tokens using the selector's
@@ -324,52 +539,13 @@ impl DraftEngine {
         let ordinal = self.ordinal;
         let mut sc = self.scratch.lock().expect("draft scratch lock");
 
-        // ── 1. Feature fusion: fc @ target_hidden -> rms_norm * hidden_norm.
-        // target_hidden arrives as BF16 [ctx_len, ntl*hidden] (captured from the
-        // target prefill/verify post-MLP residual). Cast it to F32 and run the
-        // F32 matmul path (scalar kernel, F32 accumulation, F32 output) so the
-        // fc output never passes through a BF16 truncation — matching the
-        // upstream ggml F32 compute type.
-        let s: &mut DraftScratch = &mut sc;
-        // fc: [hidden, ntl*hidden] packed, lhs [ctx_len, ntl*hidden] F32 -> F32 out.
-        ensure(
-            &mut s.mm_lhs_f32,
-            ordinal,
-            ScalarType::F32,
-            ctx_len * cfg.n_target_layers * hidden,
-        )?;
-        prefill_ffi::cast(
-            ordinal,
-            ScalarType::BF16,
-            ScalarType::F32,
-            ctx_len * cfg.n_target_layers * hidden,
-            target_hidden,
-            &mut s.mm_lhs_f32,
-        )
-        .context("draft fc lhs cast bf16->f32")?;
-        self.draft_matmul_q8_f32(
-            &s.mm_lhs_f32,
-            &self.weights.fc,
-            ctx_len,
-            hidden,
-            cfg.n_target_layers * hidden,
-            &mut s.fc_out,
-        )?;
-        // RMSNorm per ctx row + hidden_norm scale (F32).
-        ensure(&mut s.normed, ordinal, ScalarType::F32, ctx_len * hidden)?;
-        prefill_ffi::rms_norm_rows_plain(
-            ordinal,
-            ScalarType::F32,
-            ctx_len,
-            hidden,
-            eps,
-            &s.fc_out,
-            &self.weights.hidden_norm,
-            &mut s.normed,
-        )
-        .context("draft fc rms_norm")?;
-        // target_feat (normed) for K/V projections — F32 [ctx_len, hidden].
-        let target_feat = dup_buffer(ordinal, &s.normed)?;
+        let mut kv = self.kv_cache.lock().expect("draft KV cache lock");
+        if ctx_len < kv.context {
+            kv.reset();
+        }
+        self.append_context(&mut sc, &mut kv, target_hidden, ctx_len)?;
+        kv.ensure(ordinal, cfg, total_k)?;
+
         // ── 2. h = noise_embed (cast BF16 -> F32 into scratch h).
         ensure(&mut sc.h, ordinal, ScalarType::F32, nq * hidden)?;
         prefill_ffi::cast(
@@ -386,13 +562,12 @@ impl DraftEngine {
         for (il, layer) in self.weights.layers.iter().enumerate() {
             self.draft_layer(
                 &mut sc,
+                &mut kv,
                 layer,
-                &target_feat,
                 ctx_len,
                 nq,
                 total_k,
                 positions_q,
-                positions_k,
                 il,
             )?;
         }
@@ -432,13 +607,12 @@ impl DraftEngine {
     fn draft_layer(
         &self,
         sc: &mut DraftScratch,
+        kv: &mut DraftKvCache,
         layer: &DraftGpuLayer,
-        target_feat: &GpuBuffer,
         ctx_len: usize,
         nq: usize,
         total_k: usize,
         positions_q: &[usize],
-        positions_k: &[usize],
         il: usize,
     ) -> Result<()> {
         let cfg = &self.weights.config;
@@ -524,54 +698,14 @@ impl DraftEngine {
         // Q = wq @ hn(prepared) -> [nq, q_dim] F32 (conv_buf is F32 lhs).
         ensure(&mut sc.q_buf, ordinal, ScalarType::F32, nq * q_dim)?;
         self.draft_matmul_q8_f32(&sc.conv_buf, &layer.q, nq, q_dim, hidden, &mut sc.q_buf)?;
-        // K/V from target_feat (ctx) and hn (noise), concatenated along sequence.
-        // K_ctx/V_ctx: wk/wv @ target_feat -> [ctx_len, kv_dim] F32
-        // K_noise/V_noise: wk/wv @ hn -> [nq, kv_dim] F32
-        ensure(&mut sc.k_buf, ordinal, ScalarType::F32, total_k * kv_dim)?;
-        ensure(&mut sc.v_buf, ordinal, ScalarType::F32, total_k * kv_dim)?;
-        // ctx part: target_feat is F32 lhs directly (F32 matmul path).
-        self.draft_matmul_q8_f32(
-            target_feat,
-            &layer.k,
-            ctx_len,
-            kv_dim,
-            hidden,
-            &mut sc.k_buf,
-        )?;
-        self.draft_matmul_q8_f32(
-            target_feat,
-            &layer.v,
-            ctx_len,
-            kv_dim,
-            hidden,
-            &mut sc.v_buf,
-        )?;
-        // noise part (appended after ctx). Write into the tail of k_buf/v_buf.
-        // The noise K/V use hn (the conv-prepared normed hidden = conv_buf),
-        // not target_feat. conv_buf is F32 lhs directly (F32 matmul path).
-        let noise_k_off = ctx_len * kv_dim;
-        let mut k_noise = GpuBuffer::alloc(ordinal, ScalarType::F32, &[nq * kv_dim])
-            .with_context(|| format!("draft layer {il} k_noise alloc"))?;
-        let mut v_noise = GpuBuffer::alloc(ordinal, ScalarType::F32, &[nq * kv_dim])
-            .with_context(|| format!("draft layer {il} v_noise alloc"))?;
-        self.draft_matmul_q8_f32(&sc.conv_buf, &layer.k, nq, kv_dim, hidden, &mut k_noise)?;
-        self.draft_matmul_q8_f32(&sc.conv_buf, &layer.v, nq, kv_dim, hidden, &mut v_noise)?;
-        gpu_hal::copy_d2d(
-            ordinal,
-            sc.k_buf.offset_ptr(noise_k_off * f32_elem) as *mut std::ffi::c_void,
-            k_noise.as_ptr(),
-            nq * kv_dim * f32_elem,
-        )
-        .with_context(|| format!("draft layer {il} k_noise copy"))?;
-        gpu_hal::copy_d2d(
-            ordinal,
-            sc.v_buf.offset_ptr(noise_k_off * f32_elem) as *mut std::ffi::c_void,
-            v_noise.as_ptr(),
-            nq * kv_dim * f32_elem,
-        )
-        .with_context(|| format!("draft layer {il} v_noise copy"))?;
+        // Noise K/V are written to the cache tail before attention. The
+        // committed prefix was appended incrementally and retains its exact
+        // per-head norm, RoPE, and layout.
+        ensure(&mut sc.k_buf, ordinal, ScalarType::F32, nq * kv_dim)?;
+        ensure(&mut sc.v_buf, ordinal, ScalarType::F32, nq * kv_dim)?;
+        self.draft_matmul_q8_f32(&sc.conv_buf, &layer.k, nq, kv_dim, hidden, &mut sc.k_buf)?;
+        self.draft_matmul_q8_f32(&sc.conv_buf, &layer.v, nq, kv_dim, hidden, &mut sc.v_buf)?;
 
-        // Per-head Q/K RMSNorm + scale (F32). rms_norm_rows over [n_rows=nq*n_heads, hd].
         ensure(&mut sc.q_normed, ordinal, ScalarType::F32, nq * q_dim)?;
         prefill_ffi::rms_norm_rows_plain(
             ordinal,
@@ -584,11 +718,11 @@ impl DraftEngine {
             &mut sc.q_normed,
         )
         .with_context(|| format!("draft layer {il} q_norm"))?;
-        ensure(&mut sc.k_normed, ordinal, ScalarType::F32, total_k * kv_dim)?;
+        ensure(&mut sc.k_normed, ordinal, ScalarType::F32, nq * kv_dim)?;
         prefill_ffi::rms_norm_rows_plain(
             ordinal,
             ScalarType::F32,
-            total_k * n_kv,
+            nq * n_kv,
             hd,
             eps,
             &sc.k_buf,
@@ -597,7 +731,6 @@ impl DraftEngine {
         )
         .with_context(|| format!("draft layer {il} k_norm"))?;
 
-        // RoPE: Q over positions_q, K over positions_k (F32).
         let q_pos0 = positions_q.first().copied().unwrap_or(0);
         prefill_ffi::apply_rope_prefill(
             ordinal,
@@ -612,25 +745,23 @@ impl DraftEngine {
             &mut sc.q_normed,
         )
         .with_context(|| format!("draft layer {il} q rope"))?;
-        let k_pos0 = positions_k.first().copied().unwrap_or(0);
         prefill_ffi::apply_rope_prefill(
             ordinal,
             ScalarType::F32,
-            total_k,
+            nq,
             n_kv,
             hd,
             hd,
             &self.rotary.cos,
             &self.rotary.sin,
-            k_pos0,
+            q_pos0,
             &mut sc.k_normed,
         )
         .with_context(|| format!("draft layer {il} k rope"))?;
 
-        // Transpose Q/K/V from [S,H,D] to [H,S,D] for the attention kernel (F32).
         ensure(&mut sc.attn_q, ordinal, ScalarType::F32, nq * q_dim)?;
-        ensure(&mut sc.attn_k, ordinal, ScalarType::F32, total_k * kv_dim)?;
-        ensure(&mut sc.attn_v, ordinal, ScalarType::F32, total_k * kv_dim)?;
+        ensure(&mut sc.attn_k, ordinal, ScalarType::F32, nq * kv_dim)?;
+        ensure(&mut sc.attn_v, ordinal, ScalarType::F32, nq * kv_dim)?;
         prefill_ffi::transpose_shd_hsd(
             ordinal,
             ScalarType::F32,
@@ -644,7 +775,7 @@ impl DraftEngine {
         prefill_ffi::transpose_shd_hsd(
             ordinal,
             ScalarType::F32,
-            total_k,
+            nq,
             n_kv,
             hd,
             &sc.k_normed,
@@ -654,13 +785,32 @@ impl DraftEngine {
         prefill_ffi::transpose_shd_hsd(
             ordinal,
             ScalarType::F32,
-            total_k,
+            nq,
             n_kv,
             hd,
             &sc.v_buf,
             &mut sc.attn_v,
         )
         .with_context(|| format!("draft layer {il} v transpose"))?;
+
+        for head in 0..n_kv {
+            let src = head * nq * hd * f32_elem;
+            let dst = (head * total_k + ctx_len) * hd * f32_elem;
+            gpu_hal::copy_d2d(
+                ordinal,
+                kv.k[il].offset_ptr(dst) as *mut std::ffi::c_void,
+                sc.attn_k.offset_ptr(src),
+                nq * hd * f32_elem,
+            )
+            .with_context(|| format!("draft layer {il} cache K head {head}"))?;
+            gpu_hal::copy_d2d(
+                ordinal,
+                kv.v[il].offset_ptr(dst) as *mut std::ffi::c_void,
+                sc.attn_v.offset_ptr(src),
+                nq * hd * f32_elem,
+            )
+            .with_context(|| format!("draft layer {il} cache V head {head}"))?;
+        }
 
         // Attention: bidirectional (non-causal) within the block (F32 Q/K/V).
         ensure(&mut sc.attn_out_f32, ordinal, ScalarType::F32, nq * q_dim)?;
@@ -676,8 +826,8 @@ impl DraftEngine {
             scale,
             q_pos0 + nq - 1,
             &sc.attn_q,
-            &sc.attn_k,
-            &sc.attn_v,
+            &kv.k[il],
+            &kv.v[il],
             &mut sc.attn_out_f32,
         )
         .with_context(|| format!("draft layer {il} attention"))?;
@@ -854,11 +1004,9 @@ impl DraftEngine {
     }
 
     /// Q8_0 dequant matmul for the DFlash2 draft forward: F32 lhs → F32
-    /// output with F32 accumulation, dispatching the scalar Q8_0
-    /// dequant-matmul kernel (the WMMA path stores BF16 only). This matches
-    /// the upstream ggml F32 compute type — the draft activations never
-    /// pass through a BF16 truncation. `lhs` must be F32; the FFI rejects a
-    /// dtype mismatch.
+    /// output. The m16 WMMA kernel computes in BF16, so activations are staged
+    /// to BF16 and results are widened back to F32. The drafter only proposes
+    /// tokens; target verification remains the exact greedy authority.
     fn draft_matmul_q8_f32(
         &self,
         lhs_f32: &GpuBuffer,
@@ -871,11 +1019,78 @@ impl DraftEngine {
         let qtype = qwen38::weights::LOWBIT_GGML_Q8_0;
         let ordinal = self.ordinal;
         ensure(out, ordinal, ScalarType::F32, m * n)?;
-        prefill_ffi::matmul_rhs_transposed_int4(
-            ordinal, 1, m, n, k, lhs_f32, rhs, rhs, rhs, None, 0, qtype, out,
-        )
-        .context("draft_matmul_q8_f32")?;
-        Ok(())
+        thread_local! {
+            static LHS_BF16: std::cell::RefCell<Option<GpuBuffer>> =
+                const { std::cell::RefCell::new(None) };
+            static OUT_BF16: std::cell::RefCell<Option<GpuBuffer>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let take_scratch =
+            |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+             elems: usize|
+             -> Result<GpuBuffer> {
+                slot.with(|cell| {
+                    let mut held = cell.borrow_mut();
+                    if held.as_ref().is_some_and(|buffer| {
+                        buffer.dtype() == ScalarType::BF16 && buffer.elem_count() >= elems
+                    }) {
+                        return Ok(held.take().expect("scratch present"));
+                    }
+                    held.take();
+                    GpuBuffer::alloc(ordinal, ScalarType::BF16, &[elems])
+                        .context("draft Q8 BF16 scratch alloc")
+                })
+            };
+        let put_scratch =
+            |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+             buffer: GpuBuffer| {
+                slot.with(|cell| *cell.borrow_mut() = Some(buffer));
+            };
+
+        let lhs_elems = m * k;
+        let out_elems = m * n;
+        let mut lhs_bf16 = take_scratch(&LHS_BF16, lhs_elems)?;
+        let mut out_bf16 = take_scratch(&OUT_BF16, out_elems)?;
+        let result = (|| -> Result<()> {
+            prefill_ffi::cast(
+                ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                lhs_elems,
+                lhs_f32,
+                &mut lhs_bf16,
+            )
+            .context("draft Q8 lhs BF16 cast")?;
+            prefill_ffi::matmul_rhs_transposed_int4(
+                ordinal,
+                1,
+                m,
+                n,
+                k,
+                &lhs_bf16,
+                rhs,
+                rhs,
+                rhs,
+                None,
+                0,
+                qtype,
+                &mut out_bf16,
+            )
+            .context("draft_matmul_q8_wmma")?;
+            prefill_ffi::cast(
+                ordinal,
+                ScalarType::BF16,
+                ScalarType::F32,
+                out_elems,
+                &out_bf16,
+                out,
+            )
+            .context("draft Q8 output F32 cast")?;
+            Ok(())
+        })();
+        put_scratch(&LHS_BF16, lhs_bf16);
+        put_scratch(&OUT_BF16, out_bf16);
+        result
     }
 }
 
@@ -893,13 +1108,4 @@ fn residual_add(
     prefill_ffi::element_add(ordinal, ScalarType::F32, total_elems, lhs, src, dst)
         .map_err(|e| anyhow::anyhow!("draft residual_add: {e}"))?;
     Ok(())
-}
-
-/// Allocate a new GPU buffer and copy `src` into it (device-to-device).
-fn dup_buffer(ordinal: usize, src: &GpuBuffer) -> Result<GpuBuffer> {
-    let mut dst =
-        GpuBuffer::alloc(ordinal, src.dtype(), src.shape()).context("dup_buffer alloc")?;
-    gpu_hal::copy_d2d(ordinal, dst.as_mut_ptr(), src.as_ptr(), src.len_bytes())
-        .context("dup_buffer copy")?;
-    Ok(dst)
 }

@@ -218,6 +218,7 @@ pub fn prefill_append_verify_cached(
     greedy_compare_tokens: Option<&[u32]>,
     cache: &mut MtpPrefillAppendCache,
     dflash_capture: Option<&mut crate::prefill_engine::DflashTargetCapture>,
+    rollback_capture: Option<&mut crate::prefill_engine::DflashRollbackCapture>,
 ) -> Result<PrefillAppendVerifyResult> {
     crate::prefill_engine::prefill_append_verify_cached(
         weights,
@@ -232,6 +233,7 @@ pub fn prefill_append_verify_cached(
         greedy_compare_tokens,
         cache,
         dflash_capture,
+        rollback_capture,
     )
 }
 

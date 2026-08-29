@@ -50,9 +50,7 @@ class BenchmarkCompareTests(unittest.TestCase):
     def test_comparable_records_compute_ratio_from_decode_medians(self):
         faster = copy.deepcopy(self.locked_warm)
         faster["samples"] = [
-            {"decode_ms": 15.0, "tokens_per_second": 2133.3333333333},
-            {"decode_ms": 14.0, "tokens_per_second": 2285.7142857143},
-            {"decode_ms": 16.0, "tokens_per_second": 2000.0},
+            {"decode_ms": 15.0, "tokens_per_second": 2000.0},
         ]
 
         result = self.compare.compare_records(self.locked_warm, faster)
@@ -62,6 +60,41 @@ class BenchmarkCompareTests(unittest.TestCase):
         self.assertEqual(result.left.median, 30.0)
         self.assertEqual(result.right.median, 15.0)
         self.assertEqual(result.speedup, 2.0)
+
+    def test_int8_control_mismatch_forbids_speedup(self):
+        float_control = copy.deepcopy(self.locked_warm)
+        int8_control = copy.deepcopy(self.locked_warm)
+        float_control["environment"]["allowlisted_environment"]["GGML_GQH_I8DOT"] = "0"
+        int8_control["environment"]["allowlisted_environment"]["GGML_GQH_I8DOT"] = "1"
+
+        result = self.compare.compare_records(float_control, int8_control)
+
+        self.assertFalse(result.comparable)
+        self.assertIsNone(result.speedup)
+        self.assertIn("GGML_GQH_I8DOT", result.reasons)
+        self.assertNotEqual(
+            self.compare.series_key(float_control),
+            self.compare.series_key(int8_control),
+        )
+
+    def test_missing_int8_control_defaults_to_enabled(self):
+        enabled = copy.deepcopy(self.locked_warm)
+        missing = copy.deepcopy(self.locked_warm)
+        enabled["environment"]["allowlisted_environment"]["GGML_GQH_I8DOT"] = "1"
+        del missing["environment"]["allowlisted_environment"]["GGML_GQH_I8DOT"]
+
+        default_result = self.compare.compare_records(enabled, missing)
+        self.assertTrue(default_result.comparable)
+        self.assertEqual(
+            self.compare.series_key(enabled),
+            self.compare.series_key(missing),
+        )
+
+        float_control = copy.deepcopy(self.locked_warm)
+        float_control["environment"]["allowlisted_environment"]["GGML_GQH_I8DOT"] = "0"
+        control_result = self.compare.compare_records(float_control, missing)
+        self.assertFalse(control_result.comparable)
+        self.assertIn("GGML_GQH_I8DOT", control_result.reasons)
 
     def test_forged_uncontrolled_records_never_compute_speedup(self):
         left = copy.deepcopy(self.locked_warm)
@@ -92,6 +125,34 @@ class BenchmarkCompareTests(unittest.TestCase):
         self.assertFalse(result.comparable)
         self.assertIsNone(result.speedup)
         self.assertIn("sha256", result.reasons)
+
+    def test_draft_identity_is_series_identity_for_dflash_records_only(self):
+        left = copy.deepcopy(self.locked_warm)
+        left["workload"]["mode"] = "dflash"
+        left["workload"]["case_id"] = "quick-geo-humaneval-has-close-elements-dflash"
+        left["workload"]["dflash_block_size"] = 16
+        left["run"]["case_id"] = "quick-geo-humaneval-has-close-elements-dflash"
+        left["draft_artifact"] = {
+            "semantic_id": "qwen3.8-27b-dflash2-q8-canonical",
+            "quantization": "Q8_0",
+            "sha256": "a" * 64,
+        }
+        right = copy.deepcopy(left)
+
+        self.assertTrue(self.compare.compare_records(left, right).comparable)
+        self.assertNotIn("draft_artifact", self.locked_warm)
+        self.assertEqual(self.compare.series_key(self.locked_warm).count("draft_artifact="), 0)
+        self.assertIn("workload.dflash_block_size=16", self.compare.series_key(left))
+        self.assertNotIn("dflash_block_size=", self.compare.series_key(self.locked_warm))
+
+        right["draft_artifact"]["sha256"] = "b" * 64
+        right["workload"]["dflash_block_size"] = 8
+        result = self.compare.compare_records(left, right)
+
+        self.assertFalse(result.comparable)
+        self.assertIn("draft_artifact_sha256", result.reasons)
+        self.assertIn("workload_dflash_block_size", result.reasons)
+        self.assertNotEqual(self.compare.series_key(left), self.compare.series_key(right))
 
     def test_cross_physical_gpu_records_never_compute_speedup(self):
         left = copy.deepcopy(self.locked_warm)
@@ -157,7 +218,7 @@ class BenchmarkCompareTests(unittest.TestCase):
             "workload.context_limit": ("workload", "context_limit", 4096),
             "workload.max_new_tokens": ("workload", "max_new_tokens", 64),
             "workload.mode": ("workload", "mode", "mtp"),
-            "workload.stop_policy": ("workload", "stop_policy", "honor-eos"),
+            "workload.stop_policy": ("workload", "stop_policy", "ignore-eos"),
             "workload.warmups": ("workload", "warmups", 2),
             "workload.measurement_boundary": ("workload", "measurement_boundary", "end-to-end"),
             "environment.requested.power_cap_watts": ("environment", "requested", {"power_cap_watts": 280}),

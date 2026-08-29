@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use gpu_hal::{GpuBuffer, ScalarType};
 use model_store::dflash::{load_draft, DraftWeights};
 use model_store::dflash_ref::draft_forward;
+use supersonic_runtime::dflash_spec::DflashSpecDecoder;
 use supersonic_runtime::draft_engine::DraftEngine;
 
 fn require_artifacts() -> bool {
@@ -26,6 +27,21 @@ fn draft_path() -> Option<PathBuf> {
         if require_artifacts() {
             panic!(
                 "SUPERSONIC_DFLASH_DRAFT_GGUF points to a missing drafter: {}",
+                path.display()
+            );
+        }
+        return None;
+    }
+    Some(path)
+}
+
+fn model_dir() -> Option<PathBuf> {
+    let value = std::env::var_os("SUPERSONIC_QWEN38_MODEL_DIR")?;
+    let path = PathBuf::from(value);
+    if !path.is_dir() {
+        if require_artifacts() {
+            panic!(
+                "SUPERSONIC_QWEN38_MODEL_DIR points to a missing directory: {}",
                 path.display()
             );
         }
@@ -168,9 +184,8 @@ fn run_parity(weights: &DraftWeights, ordinal: usize, ctx_len: usize, nq: usize)
     let gpu_l2 = (gpu_out_f32.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()).sqrt();
     eprintln!("diag: cpu_l2={cpu_l2:.2} gpu_l2={gpu_l2:.2}");
     let label = format!("dflash parity ctx={ctx_len} nq={nq}");
-    // The draft forward runs the full F32 path (scalar Q8_0 matmul with F32
-    // accumulation and F32 output, F32 SwiGLU), matching the upstream ggml F32
-    // compute type. The residual error is F32-vs-F64 accumulation only.
+    // The draft forward stages F32 activations to BF16 for m16 WMMA matmuls
+    // and casts BF16 output back to F32; target verification remains greedy.
     assert_close(&cpu_out, &gpu_out_f32, 0.15, 5.0, &label);
 }
 
@@ -196,6 +211,47 @@ fn dflash_draft_gpu_matches_cpu_reference() {
     run_parity(&weights, ordinal, 2, 1);
     run_parity(&weights, ordinal, 2, 2);
     run_parity(&weights, ordinal, 2, 8);
+    run_parity(&weights, ordinal, 27, 8);
+    run_parity(&weights, ordinal, 27, 16);
+}
+
+#[test]
+fn dflash_spec_decoder_uses_active_width_16() {
+    let Some(draft_path) = draft_path() else {
+        eprintln!("skip: SUPERSONIC_DFLASH_DRAFT_GGUF not set");
+        return;
+    };
+    let Some(model_dir) = model_dir() else {
+        eprintln!("skip: SUPERSONIC_QWEN38_MODEL_DIR not set");
+        return;
+    };
+    match kernel_ffi::query_gpu_info(0) {
+        Ok(_) => {}
+        Err(e) => {
+            if require_artifacts() {
+                panic!("HIP device 0 unavailable: {e}");
+            }
+            eprintln!("skip: HIP device 0 unavailable: {e}");
+            return;
+        }
+    }
+    let weights = load_draft(&draft_path).unwrap_or_else(|e| panic!("load_draft: {e}"));
+    let target_config = qwen38::gguf_ingest::load_text_config(&model_dir)
+        .unwrap_or_else(|e| panic!("load target config: {e}"));
+    let draft_gpu = weights
+        .upload(0)
+        .unwrap_or_else(|e| panic!("upload draft: {e}"));
+    let decoder = DflashSpecDecoder::new(
+        draft_gpu,
+        0,
+        64,
+        target_config.hidden_size,
+        target_config.num_hidden_layers,
+        &target_config,
+    )
+    .unwrap_or_else(|e| panic!("build DFlash decoder: {e}"));
+
+    assert_eq!(decoder.block_size(), 16);
 }
 
 #[test]
@@ -281,6 +337,112 @@ fn dflash_fc_matmul_gpu_matches_cpu() {
         &cpu_out[0..4.min(cpu_out.len())]
     );
     assert_close(&cpu_out, &gpu_out, 0.15, 2.0, "fc matmul");
+}
+
+#[test]
+fn dflash_draft_context_cache_tracks_incremental_rows() {
+    let Some(path) = draft_path() else {
+        eprintln!("skip: SUPERSONIC_DFLASH_DRAFT_GGUF not set");
+        return;
+    };
+    match kernel_ffi::query_gpu_info(0) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("skip: HIP device 0 unavailable: {e}");
+            return;
+        }
+    }
+    let ordinal = 0usize;
+    let weights = load_draft(&path).unwrap_or_else(|e| panic!("load_draft: {e}"));
+    let cfg = weights.config.clone();
+    let gpu_weights = weights
+        .upload(ordinal)
+        .unwrap_or_else(|e| panic!("upload: {e}"));
+    let engine = DraftEngine::new(gpu_weights, ordinal, 64)
+        .unwrap_or_else(|e| panic!("DraftEngine::new: {e}"));
+
+    let first_ctx = 2usize;
+    let nq = 16;
+    let first_target: Vec<f32> = (0..first_ctx * cfg.n_target_layers * cfg.hidden)
+        .map(|i| (((i % 11) as f32) - 5.0) / 9.0)
+        .collect();
+    let first_noise: Vec<f32> = (0..nq * cfg.hidden)
+        .map(|i| (((i % 7) as f32) - 3.0) / 5.0)
+        .collect();
+    let first_target_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[first_target.len()],
+        &f32_to_bf16_bytes(&first_target),
+    )
+    .unwrap_or_else(|e| panic!("upload first target: {e}"));
+    let first_noise_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[first_noise.len()],
+        &f32_to_bf16_bytes(&first_noise),
+    )
+    .unwrap_or_else(|e| panic!("upload first noise: {e}"));
+    let first_q: Vec<usize> = (0..nq).map(|i| first_ctx + i).collect();
+    let first_k: Vec<usize> = (0..first_ctx + nq).collect();
+    let _ = engine
+        .forward(&first_target_gpu, &first_noise_gpu, &first_q, &first_k)
+        .unwrap_or_else(|e| panic!("first forward: {e}"));
+    assert_eq!(engine.cached_context(), first_ctx);
+
+    let ctx_len = 10usize;
+    let target_hidden: Vec<f32> = (0..ctx_len * cfg.n_target_layers * cfg.hidden)
+        .map(|i| (((i % 11) as f32) - 5.0) / 9.0)
+        .collect();
+    let noise_embed: Vec<f32> = (0..nq * cfg.hidden)
+        .map(|i| (((i % 7) as f32) - 3.0) / 5.0)
+        .collect();
+    let target_bytes = f32_to_bf16_bytes(&target_hidden);
+    let target_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[target_hidden.len()],
+        &target_bytes,
+    )
+    .unwrap_or_else(|e| panic!("upload target_hidden: {e}"));
+    let noise_bytes = f32_to_bf16_bytes(&noise_embed);
+    let noise_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[noise_embed.len()],
+        &noise_bytes,
+    )
+    .unwrap_or_else(|e| panic!("upload noise_embed: {e}"));
+    let positions_q: Vec<usize> = (0..nq).map(|i| ctx_len + i).collect();
+    let positions_k: Vec<usize> = (0..ctx_len + nq).collect();
+
+    let gpu_out = engine
+        .forward(&target_gpu, &noise_gpu, &positions_q, &positions_k)
+        .unwrap_or_else(|e| panic!("forward: {e}"));
+    assert_eq!(engine.cached_context(), ctx_len);
+    let gpu_bytes = gpu_out
+        .to_host_bytes()
+        .unwrap_or_else(|e| panic!("download output: {e}"));
+    let gpu_f32: Vec<f32> = gpu_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let cpu_out = draft_forward(
+        &weights,
+        &cfg,
+        &target_hidden,
+        &noise_embed,
+        &positions_q,
+        &positions_k,
+    )
+    .unwrap_or_else(|e| panic!("draft_forward: {e}"));
+    assert_close(
+        &cpu_out,
+        &gpu_f32,
+        0.15,
+        3.0,
+        "incremental draft context cache",
+    );
 }
 
 #[test]

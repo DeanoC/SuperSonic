@@ -32,6 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model-dir", type=Path, required=True)
     run.add_argument("--artifact", type=Path, required=True)
     run.add_argument("--peer-artifact", type=Path)
+    run.add_argument("--draft-artifact", type=Path)
+    run.add_argument("--draft-artifact-semantic-id")
+    run.add_argument("--draft-artifact-quantization")
     run.add_argument("--artifact-semantic-id", required=True)
     run.add_argument("--artifact-quantization", required=True)
     run.add_argument("--tokenizer-sha256", required=True)
@@ -164,6 +167,9 @@ def _run(args: argparse.Namespace) -> int:
         model_dir=args.model_dir,
         artifact=args.artifact,
         peer_artifact=args.peer_artifact,
+        draft_artifact=args.draft_artifact,
+        draft_artifact_semantic_id=args.draft_artifact_semantic_id,
+        draft_artifact_quantization=args.draft_artifact_quantization,
         physical_gpu=args.physical_gpu,
         gpu_arch=gpu_arch,
         gpu_static_json=args.gpu_static_json,
@@ -276,6 +282,7 @@ def _repeatability_config(args: argparse.Namespace) -> repeatability.SoakConfig:
         cache_state="cold-load",
         timeout_seconds=int(args.timeout_seconds),
         decoding_policy="greedy",
+        stop_policy="ignore-eos",
         engines=("supersonic",),
     )
     argv = adapters.build_command(

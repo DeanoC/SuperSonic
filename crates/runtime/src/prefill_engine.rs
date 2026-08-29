@@ -270,11 +270,26 @@ fn ensure_mmq_q8_1_workspace<'a>(
         .ok_or_else(|| anyhow::anyhow!("{label}: missing workspace after allocation"))
 }
 
+const Q6_K_MMQ_LM_HEAD_MAX_M: usize = 160;
+
 pub(crate) fn q6_k_mmq_lm_head_enabled(m: usize) -> bool {
     if env::var_os("SUPERSONIC_DISABLE_Q6_K_MMQ_LM_HEAD").is_some() {
         return false;
     }
-    env::var_os("SUPERSONIC_ENABLE_Q6_K_MMQ_LM_HEAD").is_some() || m == 8
+    m <= Q6_K_MMQ_LM_HEAD_MAX_M
+}
+
+#[cfg(test)]
+mod q6_k_mmq_lm_head_tests {
+    use super::q6_k_mmq_lm_head_enabled;
+
+    #[test]
+    fn enables_mmq_through_the_maximum_lm_head_width() {
+        assert!(q6_k_mmq_lm_head_enabled(8));
+        assert!(q6_k_mmq_lm_head_enabled(16));
+        assert!(q6_k_mmq_lm_head_enabled(160));
+        assert!(!q6_k_mmq_lm_head_enabled(161));
+    }
 }
 
 fn q6_k_lm_head_argmax_fused_enabled() -> bool {
@@ -524,6 +539,68 @@ fn maybe_matmul_ggml_mlp_gate_up_pair(
         swiglu_out,
     )
     .map_err(|e| anyhow::anyhow!("ggml MLP gate/up split SwiGLU: {e}"))?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_matmul_gqh_mlp_gate_up_pair(
+    ordinal: usize,
+    seq_len: usize,
+    intermediate: usize,
+    hidden_dim: usize,
+    lhs: &GpuBuffer,
+    gate_weight: &GpuBuffer,
+    up_weight: &GpuBuffer,
+    gate_out: &mut GpuBuffer,
+    up_out: &mut GpuBuffer,
+    swiglu_out: &mut GpuBuffer,
+) -> Result<bool> {
+    let gate_qtype = qwen38::weights::infer_lowbit_type(gate_weight, hidden_dim, false);
+    let up_qtype = qwen38::weights::infer_lowbit_type(up_weight, hidden_dim, false);
+    if gate_qtype != up_qtype || !qwen38::weights::is_gqh_qtype(gate_qtype) {
+        return Ok(false);
+    }
+    let Some(rung) = kernel_ffi::gqh::rung_from_ggml_type(gate_qtype as u32) else {
+        return Ok(false);
+    };
+    let Some(gate_header) = kernel_ffi::gqh::lookup_header(ordinal, gate_weight.as_ptr()) else {
+        return Ok(false);
+    };
+    let Some(up_header) = kernel_ffi::gqh::lookup_header(ordinal, up_weight.as_ptr()) else {
+        return Ok(false);
+    };
+
+    let paired = prefill_ffi::try_matmul_gqh_i8_dot_pair(
+        ordinal,
+        seq_len,
+        intermediate,
+        hidden_dim,
+        lhs,
+        gate_weight,
+        gate_header.tensor_scale,
+        gate_header.grid_code,
+        rung,
+        up_weight,
+        up_header.tensor_scale,
+        up_header.grid_code,
+        rung,
+        gate_out,
+        up_out,
+    )
+    .map_err(|e| anyhow::anyhow!("gqh MLP gate/up pair: {e}"))?;
+    if !paired {
+        return Ok(false);
+    }
+
+    prefill_ffi::swiglu_mul(
+        ordinal,
+        ScalarType::BF16,
+        seq_len * intermediate,
+        gate_out,
+        up_out,
+        swiglu_out,
+    )
+    .map_err(|e| anyhow::anyhow!("gqh MLP gate/up SwiGLU: {e}"))?;
     Ok(true)
 }
 
@@ -1527,6 +1604,138 @@ impl DflashTargetCapture {
     }
 }
 
+/// Per-token target state captured during a DFlash2 verify block.
+///
+/// `recurrent` stores an F16 state after every verify token for every linear
+/// layer. `qkv` stores the pre-convolution QKV rows and `conv_tail` stores the
+/// pre-round convolution tail needed to restore any accepted prefix.
+pub struct DflashRollbackCapture {
+    recurrent: GpuBuffer,
+    qkv: GpuBuffer,
+    conv_tail: GpuBuffer,
+    token_capacity: usize,
+    conv_tail_len: usize,
+    state_elems: usize,
+    qkv_dim: usize,
+}
+
+impl DflashRollbackCapture {
+    pub fn new(config: &TextConfig, token_capacity: usize, ordinal: usize) -> Result<Self> {
+        anyhow::ensure!(
+            token_capacity > 0,
+            "dflash rollback capture needs a positive token capacity"
+        );
+        let linear_layer_count = (0..config.num_hidden_layers)
+            .filter(|&idx| !config.is_full_attention(idx))
+            .count();
+        anyhow::ensure!(
+            linear_layer_count > 0,
+            "dflash rollback capture needs at least one linear layer"
+        );
+        let khd = config.linear_key_head_dim;
+        let vhd = config.linear_value_head_dim;
+        let state_elems = config.linear_num_value_heads * khd * vhd;
+        let qkv_dim = config.linear_num_key_heads * khd * 2 + config.linear_num_value_heads * vhd;
+        let conv_tail_len = config.linear_conv_kernel_dim - 1;
+        let recurrent = GpuBuffer::alloc(
+            ordinal,
+            ScalarType::F16,
+            &[linear_layer_count, token_capacity, state_elems],
+        )
+        .map_err(|e| anyhow::anyhow!("dflash rollback recurrent alloc: {e}"))?;
+        let qkv = GpuBuffer::alloc(
+            ordinal,
+            ScalarType::BF16,
+            &[linear_layer_count, token_capacity, qkv_dim],
+        )
+        .map_err(|e| anyhow::anyhow!("dflash rollback qkv alloc: {e}"))?;
+        let conv_tail = GpuBuffer::alloc(
+            ordinal,
+            ScalarType::BF16,
+            &[linear_layer_count, qkv_dim, conv_tail_len],
+        )
+        .map_err(|e| anyhow::anyhow!("dflash rollback conv tail alloc: {e}"))?;
+        Ok(Self {
+            recurrent,
+            qkv,
+            conv_tail,
+            token_capacity,
+            conv_tail_len,
+            state_elems,
+            qkv_dim,
+        })
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.token_capacity
+    }
+
+    pub fn capture_dtype(&self) -> ScalarType {
+        self.recurrent.dtype()
+    }
+
+    pub(crate) fn capture_conv_tail(
+        &mut self,
+        ordinal: usize,
+        layer_slot: usize,
+        src: &GpuBuffer,
+    ) -> Result<()> {
+        let bytes = self.conv_tail_len * self.qkv_dim * ScalarType::BF16.size_in_bytes();
+        let elem = ScalarType::BF16.size_in_bytes();
+        let dst = self
+            .conv_tail
+            .offset_ptr(layer_slot * self.qkv_dim * self.conv_tail_len * elem)
+            as *mut c_void;
+        copy_d2d_batched(ordinal, dst, src.as_ptr(), bytes)
+            .map_err(|e| anyhow::anyhow!("dflash rollback conv tail capture: {e}"))
+    }
+
+    fn capture_qkv(
+        &mut self,
+        ordinal: usize,
+        layer_slot: usize,
+        src: &GpuBuffer,
+        rows: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            rows <= self.token_capacity,
+            "dflash rollback qkv rows {rows} exceed capacity {}",
+            self.token_capacity
+        );
+        let bytes = rows * self.qkv_dim * ScalarType::BF16.size_in_bytes();
+        let elem = ScalarType::BF16.size_in_bytes();
+        let row_offset = layer_slot * self.token_capacity;
+        let dst = self.qkv.offset_ptr(row_offset * self.qkv_dim * elem) as *mut c_void;
+        copy_d2d_batched(ordinal, dst, src.as_ptr(), bytes)
+            .map_err(|e| anyhow::anyhow!("dflash rollback qkv capture: {e}"))
+    }
+
+    fn recurrent_layer_ptr(&self, layer_slot: usize) -> *mut c_void {
+        let elem = ScalarType::F16.size_in_bytes();
+        self.recurrent
+            .offset_ptr(layer_slot * self.token_capacity * self.state_elems * elem)
+            as *mut c_void
+    }
+
+    pub(crate) fn recurrent_token_ptr(&self, layer_slot: usize, token: usize) -> *const c_void {
+        let elem = ScalarType::F16.size_in_bytes();
+        let offset = (layer_slot * self.token_capacity + token) * self.state_elems * elem;
+        self.recurrent.offset_ptr(offset)
+    }
+
+    pub(crate) fn qkv_layer_ptr(&self, layer_slot: usize) -> *const c_void {
+        let elem = ScalarType::BF16.size_in_bytes();
+        self.qkv
+            .offset_ptr(layer_slot * self.token_capacity * self.qkv_dim * elem)
+    }
+
+    pub(crate) fn conv_tail_layer_ptr(&self, layer_slot: usize) -> *const c_void {
+        let elem = ScalarType::BF16.size_in_bytes();
+        self.conv_tail
+            .offset_ptr(layer_slot * self.qkv_dim * self.conv_tail_len * elem)
+    }
+}
+
 /// Result of a prefill pass.
 pub struct PrefillResult {
     /// Logits for the last token position [vocab_size] as F32 on CPU.
@@ -2364,6 +2573,7 @@ fn prefill_inner(
                     ordinal,
                     trace_linear_debug,
                     debug_trace_slot,
+                    None,
                 )?;
             }
 
@@ -2575,6 +2785,7 @@ pub fn prefill_append_verify_cached(
     greedy_compare_tokens: Option<&[u32]>,
     cache: &mut MtpPrefillAppendCache,
     dflash_capture: Option<&mut DflashTargetCapture>,
+    rollback_capture: Option<&mut DflashRollbackCapture>,
 ) -> Result<PrefillAppendVerifyResult> {
     prefill_append_verify_impl(
         weights,
@@ -2589,6 +2800,7 @@ pub fn prefill_append_verify_cached(
         greedy_compare_tokens,
         Some(cache),
         dflash_capture,
+        rollback_capture,
     )
 }
 
@@ -2606,6 +2818,7 @@ fn prefill_append_verify_impl(
     greedy_compare_tokens: Option<&[u32]>,
     cache: Option<&mut MtpPrefillAppendCache>,
     mut dflash_capture: Option<&mut DflashTargetCapture>,
+    mut rollback_capture: Option<&mut DflashRollbackCapture>,
 ) -> Result<PrefillAppendVerifyResult> {
     if token_ids.is_empty() {
         return Err(anyhow::anyhow!("prefill_append_verify: token_ids is empty"));
@@ -2646,6 +2859,8 @@ fn prefill_append_verify_impl(
     let scratch = &mut cache.scratch;
     let chunk_conv_tail = &mut cache.chunk_conv_tail;
     let token_ids_gpu = &mut cache.token_ids_gpu;
+    let mut rollback_layer_slot = 0usize;
+    let mut conv_tail_layer_slot = 0usize;
 
     for idx in 0..config.num_hidden_layers {
         if config.is_full_attention(idx) {
@@ -2663,7 +2878,11 @@ fn prefill_append_verify_impl(
                 conv_tail_bytes,
             )
             .map_err(|e| anyhow::anyhow!("append seed conv tail layer {idx}: {e}"))?;
+            if let Some(capture) = rollback_capture.as_deref_mut() {
+                capture.capture_conv_tail(ordinal, conv_tail_layer_slot, conv_state)?;
+            }
         }
+        conv_tail_layer_slot += 1;
         if profile {
             ms_seed += t_seed.elapsed().as_secs_f64() * 1000.0;
         }
@@ -2749,6 +2968,10 @@ fn prefill_append_verify_impl(
             let chunk_tail = chunk_conv_tail[idx]
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("append missing conv tail for layer {idx}"))?;
+            let rollback_layer = rollback_capture
+                .as_deref_mut()
+                .map(|capture| (capture, rollback_layer_slot));
+            rollback_layer_slot += 1;
             prefill_linear_attention_layer(
                 weights,
                 state,
@@ -2762,6 +2985,7 @@ fn prefill_append_verify_impl(
                 ordinal,
                 false,
                 &mut no_debug_trace,
+                rollback_layer,
             )?;
             if profile {
                 ms_linear_attn += t_linear.elapsed().as_secs_f64() * 1000.0;
@@ -3017,6 +3241,7 @@ fn mtp_decode_step_body(
                 ordinal,
                 false,
                 &mut no_debug_trace,
+                None,
             )?;
         }
 
@@ -3741,6 +3966,7 @@ fn prefill_linear_attention_layer(
     ordinal: usize,
     trace_linear_debug: bool,
     linear_debug_trace: &mut Option<LinearLayerDebugTrace>,
+    mut rollback: Option<(&mut DflashRollbackCapture, usize)>,
 ) -> Result<()> {
     let lw = weights.layers[idx]
         .linear
@@ -3820,6 +4046,9 @@ fn prefill_linear_attention_layer(
             lw.qkv_proj_awq_inv_scale.as_ref(),
             weights.int4_group_size,
         )?;
+    }
+    if let Some((rollback_capture, rollback_slot)) = rollback.as_mut() {
+        rollback_capture.capture_qkv(ordinal, *rollback_slot, &scratch.proj_buf, chunk_len)?;
     }
     if trace_linear_debug {
         let normed_bytes = scratch
@@ -4487,8 +4716,6 @@ fn prefill_linear_attention_layer(
 
     // 11. Delta recurrent prefill.
     let state_elems = nv * khd * vhd;
-    let elem_bytes_f32 = ScalarType::F32.size_in_bytes();
-    let out_rows = chunk_len + khd;
     let zero_recurrent;
     let recurrent_initial = if let Some(rec_state) = state.layers[idx].recurrent_state.as_ref() {
         if let Some(dir) = linear_layer_dump_dir(idx) {
@@ -4500,80 +4727,79 @@ fn prefill_linear_attention_layer(
             .map_err(|e| anyhow::anyhow!("zero recurrent alloc: {e}"))?;
         &zero_recurrent
     };
-    prefill_ffi::delta_recurrent_prefill(
+    let state_trace = rollback
+        .as_ref()
+        .map(|(capture, slot)| capture.recurrent_layer_ptr(*slot));
+    if let Some(state_trace) = state_trace {
+        prefill_ffi::delta_recurrent_prefill_trace(
+            ordinal,
+            ScalarType::F32,
+            nv,
+            chunk_len,
+            khd,
+            vhd,
+            recurrent_initial,
+            &scratch.linear_q_trans,
+            &scratch.linear_k_trans,
+            &scratch.linear_v_trans,
+            &scratch.linear_beta,
+            &scratch.linear_g,
+            &mut scratch.linear_delta_out,
+            state_trace,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent trace: {e}"))?;
+    } else {
+        prefill_ffi::delta_recurrent_prefill(
+            ordinal,
+            ScalarType::F32,
+            nv,
+            chunk_len,
+            khd,
+            vhd,
+            recurrent_initial,
+            &scratch.linear_q_trans,
+            &scratch.linear_k_trans,
+            &scratch.linear_v_trans,
+            &scratch.linear_beta,
+            &scratch.linear_g,
+            &mut scratch.linear_delta_out,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent: {e}"))?;
+    }
+
+    // 12. Extract recurrent state and BF16 attention output in one launch.
+    let recurrent_state = state.layers[idx]
+        .recurrent_state
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
+    prefill_ffi::delta_recurrent_extract(
         ordinal,
-        ScalarType::F32,
         nv,
         chunk_len,
         khd,
         vhd,
-        recurrent_initial,
-        &scratch.linear_q_trans,
-        &scratch.linear_k_trans,
-        &scratch.linear_v_trans,
-        &scratch.linear_beta,
-        &scratch.linear_g,
-        &mut scratch.linear_delta_out,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent: {e}"))?;
-
-    // 12. Extract recurrent state and attention output from the F32 result.
-    let state_f32 = GpuBuffer::alloc(ordinal, ScalarType::F32, &[nv, khd, vhd])
-        .map_err(|e| anyhow::anyhow!("state_f32 alloc: {e}"))?;
-    let state_bytes_per_head = khd * vhd * elem_bytes_f32;
-    let out_stride = out_rows * vhd * elem_bytes_f32;
-    let attn_offset = chunk_len * vhd * elem_bytes_f32;
-    for h in 0..nv {
-        let src_off = h * out_stride + attn_offset;
-        let dst_off = h * state_bytes_per_head;
-        copy_d2d_batched(
-            ordinal,
-            state_f32.offset_ptr(dst_off) as *mut c_void,
-            scratch.linear_delta_out.offset_ptr(src_off),
-            state_bytes_per_head,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} recurrent state extract h={h}: {e}"))?;
-    }
-    if let Some(rec_state) = state.layers[idx].recurrent_state.as_mut() {
-        copy_d2d_batched(
-            ordinal,
-            rec_state.as_ptr() as *mut c_void,
-            state_f32.as_ptr(),
-            state_elems * elem_bytes_f32,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} recurrent state writeback: {e}"))?;
-    }
-    let state_bytes_debug = state_f32
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("layer {idx} debug state_f32 D2H: {e}"))?;
-
-    let attn_output_f32 = GpuBuffer::alloc(ordinal, ScalarType::F32, &[nv, chunk_len, vhd])
-        .map_err(|e| anyhow::anyhow!("attn_output_f32 alloc: {e}"))?;
-    let attn_bytes_per_head = chunk_len * vhd * ScalarType::F32.size_in_bytes();
-    let out_stride = out_rows * vhd * ScalarType::F32.size_in_bytes();
-    for h in 0..nv {
-        let src_off = h * out_stride;
-        let dst_off = h * attn_bytes_per_head;
-        copy_d2d_batched(
-            ordinal,
-            attn_output_f32.offset_ptr(dst_off) as *mut c_void,
-            scratch.linear_delta_out.offset_ptr(src_off),
-            attn_bytes_per_head,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn output extract h={h}: {e}"))?;
-    }
-    prefill_ffi::cast(
-        ordinal,
-        ScalarType::F32,
-        ScalarType::BF16,
-        nv * chunk_len * vhd,
-        &attn_output_f32,
+        &scratch.linear_delta_out,
+        recurrent_state,
         &mut scratch.linear_attn_output,
     )
-    .map_err(|e| anyhow::anyhow!("layer {idx} attn output cast: {e}"))?;
-    let attn_output_f32_debug = attn_output_f32
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("layer {idx} debug attn_output_f32 D2H: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent extract: {e}"))?;
+
+    let state_bytes_debug = if trace_linear_debug {
+        recurrent_state
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug recurrent state D2H: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let attn_output_f32_debug = if trace_linear_debug {
+        let bf16_bytes = scratch
+            .linear_attn_output
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug attn D2H: {e}"))?;
+        encode_f32_le(&decode_bf16_le(&bf16_bytes))
+    } else {
+        Vec::new()
+    };
     let _ = is_last_chunk; // recurrent state is now always written; flag still gates conv_state above.
     if trace_linear_debug {
         let trace = linear_debug_trace
@@ -4781,28 +5007,41 @@ fn prefill_mlp_layer(
     let hidden_dim = config.hidden_size;
     let intermediate = config.intermediate_size;
 
-    let paired_gate_up = maybe_matmul_ggml_mlp_gate_up_pair(
+    let paired_gqh_gate_up = maybe_matmul_gqh_mlp_gate_up_pair(
         ordinal,
-        1,
         seq_len,
         intermediate,
         hidden_dim,
         &scratch.normed,
         &lw.gate_proj_w,
-        lw.gate_proj_scale.as_ref(),
-        lw.gate_proj_int8_scale.as_ref(),
-        lw.gate_proj_int4_scale.as_ref(),
-        lw.gate_proj_int4_zero.as_ref(),
-        lw.gate_proj_awq_inv_scale.as_ref(),
         &lw.up_proj_w,
-        lw.up_proj_scale.as_ref(),
-        lw.up_proj_int8_scale.as_ref(),
-        lw.up_proj_int4_scale.as_ref(),
-        lw.up_proj_int4_zero.as_ref(),
-        lw.up_proj_awq_inv_scale.as_ref(),
         &mut scratch.proj_buf,
+        &mut scratch.proj_buf2,
         &mut scratch.mlp_buf,
     )?;
+    let paired_gate_up = paired_gqh_gate_up
+        || maybe_matmul_ggml_mlp_gate_up_pair(
+            ordinal,
+            1,
+            seq_len,
+            intermediate,
+            hidden_dim,
+            &scratch.normed,
+            &lw.gate_proj_w,
+            lw.gate_proj_scale.as_ref(),
+            lw.gate_proj_int8_scale.as_ref(),
+            lw.gate_proj_int4_scale.as_ref(),
+            lw.gate_proj_int4_zero.as_ref(),
+            lw.gate_proj_awq_inv_scale.as_ref(),
+            &lw.up_proj_w,
+            lw.up_proj_scale.as_ref(),
+            lw.up_proj_int8_scale.as_ref(),
+            lw.up_proj_int4_scale.as_ref(),
+            lw.up_proj_int4_zero.as_ref(),
+            lw.up_proj_awq_inv_scale.as_ref(),
+            &mut scratch.proj_buf,
+            &mut scratch.mlp_buf,
+        )?;
 
     if !paired_gate_up {
         // gate_proj: normed [seq, hidden] x gate_w [intermediate, hidden]^T -> [seq, intermediate]

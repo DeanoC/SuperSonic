@@ -19,18 +19,26 @@ use gpu_hal::{GpuBuffer, ScalarType};
 
 use crate::decode_engine::DecodeEngine;
 use crate::draft_engine::DraftEngine;
-use crate::prefill_engine::{self, DflashTargetCapture};
+use crate::prefill_engine::{self, DflashRollbackCapture, DflashTargetCapture};
 
 /// Result of one DFlash2 speculative round.
 pub struct DflashSpecRound {
     /// All tokens emitted this round (accepted drafts + bonus).
     pub emitted: Vec<u32>,
+    /// The complete block passed through target verification.
+    pub verified_block: Vec<u32>,
     /// The target's greedy token for the next round (bonus or last verified).
     pub next_token: u32,
     /// Number of draft tokens proposed (excluding the seed last_tok).
     pub n_drafted: usize,
     /// Number of draft tokens accepted.
     pub n_accepted: usize,
+    pub verify_path: DflashVerifyPath,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DflashVerifyPath {
+    Component,
 }
 
 /// Telemetry summary.
@@ -45,6 +53,7 @@ pub struct DflashSpecDecoder {
     ordinal: usize,
     draft: DraftEngine,
     capture: DflashTargetCapture,
+    rollback: DflashRollbackCapture,
     mask_token_id: u32,
     block_size: usize,
     /// [block_size, hidden] BF16 — noise embedding scratch.
@@ -54,6 +63,8 @@ pub struct DflashSpecDecoder {
     n_accepted: u32,
     n_drafted: u32,
 }
+
+const ACTIVE_BLOCK_SIZE: usize = 16;
 
 impl DflashSpecDecoder {
     /// Build a DFlash2 decoder from uploaded draft weights.
@@ -65,12 +76,15 @@ impl DflashSpecDecoder {
         ordinal: usize,
         max_ctx: usize,
         hidden: usize,
+        target_layer_count: usize,
+        target_config: &qwen38::config::TextConfig,
     ) -> Result<Self> {
         let cfg = &draft_weights.config;
         let ntl = cfg.n_target_layers;
-        let block_size = cfg.block_size;
+        let block_size = ACTIVE_BLOCK_SIZE;
         let mask_token_id = cfg.mask_token_id;
-        let target_layer_ids = cfg.target_layer_ids.clone();
+        let target_layer_ids =
+            target_capture_layer_ids(target_layer_count, ntl, &cfg.target_layer_ids)?;
 
         // RoPE table sized to max_ctx + block_size (the max position the
         // draft will ever see).
@@ -80,6 +94,8 @@ impl DflashSpecDecoder {
 
         let capture = DflashTargetCapture::new(ordinal, max_ctx, ntl, hidden, target_layer_ids)
             .context("build dflash capture buffer")?;
+        let rollback = DflashRollbackCapture::new(target_config, block_size, ordinal)
+            .context("build dflash rollback capture")?;
 
         let noise_embed = GpuBuffer::alloc(ordinal, ScalarType::BF16, &[block_size, hidden])
             .context("dflash noise_embed alloc")?;
@@ -88,6 +104,7 @@ impl DflashSpecDecoder {
             ordinal,
             draft,
             capture,
+            rollback,
             mask_token_id,
             block_size,
             noise_embed,
@@ -184,6 +201,21 @@ impl DflashSpecDecoder {
         let positions_q: Vec<usize> = (ctx_len..ctx_len + q_len).collect();
         let positions_k: Vec<usize> = (0..total_k).collect();
 
+        let trace_ctx = std::env::var("SUPERSONIC_DFLASH_TRACE_CTX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        if trace_ctx == Some(ctx_len) {
+            std::fs::write(
+                "/tmp/supersonic-dflash-trace-target.bf16",
+                self.capture.target_hidden.to_host_bytes()?,
+            )
+            .context("dflash trace target write")?;
+            std::fs::write(
+                "/tmp/supersonic-dflash-trace-noise.bf16",
+                self.noise_embed.to_host_bytes()?,
+            )
+            .context("dflash trace noise write")?;
+        }
         let t_draft = Instant::now();
         let draft_hidden = self
             .draft
@@ -195,6 +227,13 @@ impl DflashSpecDecoder {
             )
             .context("dflash draft forward")?;
         let draft_ms = t_draft.elapsed().as_secs_f64() * 1000.0;
+        if trace_ctx == Some(ctx_len) {
+            std::fs::write(
+                "/tmp/supersonic-dflash-trace-hidden.f32",
+                draft_hidden.to_host_bytes()?,
+            )
+            .context("dflash trace hidden write")?;
+        }
 
         // ── 3. Project through target lm_head → logits → argmax → draft tokens.
         let t_proj = Instant::now();
@@ -214,115 +253,119 @@ impl DflashSpecDecoder {
         // lm_head top-K candidates, scoring each with a learned bigram
         // transition (pred_cb/succ_cb codebooks) — this is the path the
         // upstream uses and is essential for high acceptance.
-        let draft_tokens = match self
+        let t_select = Instant::now();
+        let selected = self
             .draft
             .select_chain(&draft_hidden, &logits, last_tok, q_len)
-            .context("dflash selector chain")?
-        {
-            Some(tokens) => tokens,
-            None => {
-                let mut tokens = Vec::with_capacity(q_len);
-                tokens.push(last_tok);
-                for row in 1..q_len {
-                    tokens.push(argmax_f32(&logits[row]));
-                }
-                tokens
-            }
-        };
+            .context("dflash selector chain")?;
+        let select_ms = t_select.elapsed().as_secs_f64() * 1000.0;
+        let draft_tokens = dflash_tokens_from_selector(selected, &logits, last_tok, q_len)?;
         // draft_tokens = [last_tok, tok_1, ..., tok_{q_len-1}]
         // = q_len elements. The verify block is these q_len tokens.
 
         if std::env::var_os("SUPERSONIC_DFLASH_PROFILE").is_some() {
+            let argmax_tokens: Vec<u32> = (1..q_len).map(|row| argmax_f32(&logits[row])).collect();
             eprintln!(
-                "[dflash-profile] ctx={ctx_len} draft={q_len} draft_ms={draft_ms:.1} proj_ms={proj_ms:.1} tokens={:?}",
-                &draft_tokens[1..]
+                "[dflash-profile] ctx={ctx_len} draft={q_len} draft_ms={draft_ms:.1} proj_ms={proj_ms:.1} select_ms={select_ms:.1} selector={:?} argmax={:?}",
+                &draft_tokens[1..],
+                argmax_tokens
             );
         }
 
-        // ── 4. Verify: hybrid path.
-        // (a) Fused megakernel verify for greedy predictions (fast, single
-        //     kernel launch over all 64 layers for all block tokens).
-        // (b) After acceptance, capture-only pass for the committed prefix
-        //     (prefill-append through 64 layers, capturing at 5 target layers).
-        //
-        // The fused verify is much faster than the prefill-append path (one
-        // megakernel launch vs ~640 individual kernel launches). The capture
-        // pass only processes the committed prefix (typically 2-3 tokens),
-        // not the full block.
-        let max_block = (remaining + 1).min(q_len);
+        // ── 4. Verify through the batched component path. The integrated
+        // capture records target features and per-token rollback intermediates
+        // in the same causal B-token forward.
+        let max_block = remaining.min(q_len);
         let block: Vec<u32> = draft_tokens[..max_block].to_vec();
 
         // Snapshot the linear-attention state before the verify mutates it.
         engine.snapshot_linear_for_spec()?;
 
         let t_verify = Instant::now();
-        // The fused 4B megakernel has a shared-memory budget of ~15872 floats;
-        // with hidden=5120, B<=3 fits. For larger blocks, use the prefill-append
-        // path (which uses global memory, no LDS constraint).
-        let fused_cap = 15872 / engine.weights().config.hidden_size.max(1);
-        let use_fused = engine.use_4b_kernel() && block.len() <= fused_cap;
-        let greedy = if use_fused {
-            engine
-                .verify_block_fused_greedy(&block, committed)
-                .context("dflash fused verify")?
-        } else {
-            let result = engine
-                .verify_block_dflash(&block, committed, &mut self.capture)
-                .context("dflash verify")?;
-            result.target_next.unwrap_or_default()
-        };
+        let verify = engine
+            .verify_block_dflash_with_rollback(
+                &block,
+                committed,
+                &mut self.capture,
+                &mut self.rollback,
+            )
+            .context("dflash verify")?;
+        let greedy = verify
+            .target_next
+            .ok_or_else(|| anyhow::anyhow!("dflash component verify missing greedy predictions"))?;
         let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+        anyhow::ensure!(
+            greedy.len() >= block.len(),
+            "dflash component verify returned {} greedy predictions for {} tokens",
+            greedy.len(),
+            block.len()
+        );
 
         // ── 5. Acceptance: longest prefix where draft matches target.
         // greedy[i] = target's prediction for position committed+i+1.
         // drafts[i] = draft's prediction for position committed+i+1.
         let mut n_acc = 0usize;
-        let drafts = &block[1..]; // proposed tokens [p1, ..., p_{q_len-1}]
+        let drafts = &block[1..];
         while n_acc < drafts.len() && n_acc < greedy.len() && drafts[n_acc] == greedy[n_acc] {
             n_acc += 1;
         }
-        // commit_len = n_acc + 1 (last_tok + n_acc accepted drafts), capped.
-        let commit_len = (n_acc + 1).min(block.len()).min(remaining + 1);
-        let bonus_tok = greedy[commit_len.saturating_sub(1)];
+
+        let accepted_len = n_acc + 1;
+        let fast_plan = if n_acc < drafts.len() && accepted_len <= remaining {
+            Some(dflash_fast_rollback_plan(
+                &block, n_acc, &greedy, remaining,
+            )?)
+        } else {
+            None
+        };
+        let use_fast_rollback = fast_plan.is_some();
+
+        // Fast rollback defers the correction to the next round's seed,
+        // matching the upstream chain policy. Full rounds already have the
+        // correct final state and need no rollback.
+        let mut plan = if let Some(plan) = fast_plan {
+            plan
+        } else {
+            dflash_commit_plan(&block, n_acc, &greedy, remaining)?
+        };
+        let commit_len = plan.commit_tokens.len();
 
         if std::env::var_os("SUPERSONIC_DFLASH_PROFILE").is_some() {
             eprintln!(
-                "[dflash-profile] verify_ms={verify_ms:.1} n_acc={n_acc} commit={commit_len} bonus={bonus_tok}"
+                "[dflash-profile] verify_ms={verify_ms:.1} root={last_tok} n_acc={n_acc} commit={commit_len} greedy={greedy:?} commit_tokens={:?} next={}",
+                plan.commit_tokens, plan.next_token
             );
         }
 
-        // ── 6. Commit / replay + capture.
-        let (emitted, next_token) = if commit_len == block.len() {
-            // Full accept: commit KV for the entire block.
-            engine.commit_fused_kv_filled_public(committed + commit_len);
-            let mut emitted = block[1..commit_len].to_vec();
-            emitted.push(bonus_tok);
-            (emitted, bonus_tok)
-        } else {
-            // Partial accept: restore linear state, rewind KV, replay the
-            // committed prefix (last_tok + accepted drafts) through the fast
-            // greedy decode megakernel.
-            let replay_block = &block[..commit_len];
-            let replay_bonus = engine.replay_committed_prefix(replay_block, committed)?;
-            let mut emitted = block[1..commit_len].to_vec();
-            emitted.push(replay_bonus);
-            (emitted, replay_bonus)
-        };
+        // ── 6. Commit / replay + capture. Partial acceptance may need a
+        // replay to leave the target state at the committed prefix.
+        let needs_replay = !use_fast_rollback && commit_len < block.len();
+        let mut replay_ms = 0.0_f64;
+        if use_fast_rollback {
+            let t_rollback = Instant::now();
+            engine.rollback_dflash_prefix(&self.rollback, commit_len)?;
+            replay_ms = t_rollback.elapsed().as_secs_f64() * 1000.0;
+        } else if needs_replay {
+            let t_replay = Instant::now();
+            let replay = engine.replay_committed_prefix_dflash(
+                &block,
+                commit_len,
+                committed,
+                &mut self.capture,
+                &mut self.rollback,
+            )?;
+            let replay_next = replay
+                .target_next
+                .as_ref()
+                .and_then(|next_tokens| next_tokens.get(commit_len - 1).copied())
+                .ok_or_else(|| anyhow::anyhow!("dflash replay missing greedy next token"))?;
+            plan.next_token = dflash_next_token(plan.next_token, Some(replay_next));
+            replay_ms = t_replay.elapsed().as_secs_f64() * 1000.0;
+        }
+        engine.commit_fused_kv_filled_public(committed + commit_len);
 
-        // ── 7. Capture hidden states for the committed prefix.
-        // On the fused path, the prefill-append capture wasn't run during
-        // verify, so we run a capture-only pass for the committed positions.
-        // On the non-fused path, capture already happened during verify.
-        if use_fused && commit_len > 0 {
-            let t_cap = Instant::now();
-            let capture_block = &block[..commit_len];
-            engine
-                .capture_block_dflash(capture_block, committed, &mut self.capture)
-                .context("dflash capture")?;
-            let cap_ms = t_cap.elapsed().as_secs_f64() * 1000.0;
-            if std::env::var_os("SUPERSONIC_DFLASH_PROFILE").is_some() {
-                eprintln!("[dflash-profile] capture_ms={cap_ms:.1} n_cap={commit_len}");
-            }
+        if std::env::var_os("SUPERSONIC_DFLASH_PROFILE").is_some() {
+            eprintln!("[dflash-profile] replay_ms={replay_ms:.1} n_commit={commit_len}");
         }
         self.capture.committed = committed + commit_len;
 
@@ -332,12 +375,147 @@ impl DflashSpecDecoder {
         self.n_drafted += n_drafted as u32;
 
         Ok(DflashSpecRound {
-            emitted,
-            next_token,
+            emitted: plan.commit_tokens,
+            verified_block: block,
+            next_token: plan.next_token,
             n_drafted,
             n_accepted: n_acc,
+            verify_path: DflashVerifyPath::Component,
         })
     }
+}
+
+fn target_capture_layer_ids(
+    target_layer_count: usize,
+    capture_layer_count: usize,
+    artifact_layer_ids: &[usize],
+) -> anyhow::Result<Vec<usize>> {
+    anyhow::ensure!(
+        target_layer_count >= 2,
+        "dflash target capture needs at least 2 target layers, got {target_layer_count}"
+    );
+    anyhow::ensure!(
+        capture_layer_count >= 2,
+        "dflash target capture needs at least 2 capture layers, got {capture_layer_count}"
+    );
+    anyhow::ensure!(
+        artifact_layer_ids.len() == capture_layer_count,
+        "dflash target capture IDs have {} entries, expected {capture_layer_count}",
+        artifact_layer_ids.len()
+    );
+    for &layer_id in artifact_layer_ids {
+        anyhow::ensure!(
+            layer_id < target_layer_count,
+            "dflash target capture layer {layer_id} must be within the target layer count {target_layer_count}"
+        );
+    }
+    Ok(artifact_layer_ids.to_vec())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DflashCommitPlan {
+    commit_tokens: Vec<u32>,
+    next_token: u32,
+}
+
+fn dflash_commit_plan(
+    block: &[u32],
+    accepted: usize,
+    greedy: &[u32],
+    remaining: usize,
+) -> anyhow::Result<DflashCommitPlan> {
+    anyhow::ensure!(!block.is_empty(), "dflash commit plan: empty block");
+    anyhow::ensure!(
+        greedy.len() >= block.len(),
+        "dflash commit plan: greedy predictions {} are shorter than block {}",
+        greedy.len(),
+        block.len()
+    );
+    let accepted = accepted.min(block.len() - 1);
+
+    let mut commit_tokens = if accepted == block.len() - 1 {
+        block.to_vec()
+    } else {
+        let mut tokens = block[..accepted + 1].to_vec();
+        tokens.push(greedy[accepted]);
+        tokens
+    };
+    if commit_tokens.len() > remaining {
+        commit_tokens.truncate(remaining);
+    }
+    let next_token = greedy[commit_tokens.len() - 1];
+
+    Ok(DflashCommitPlan {
+        commit_tokens,
+        next_token,
+    })
+}
+
+/// Build an upstream-style partial commit that defers the correction token.
+///
+/// The correction becomes the next round's seed instead of being processed in
+/// this round. This keeps the draft feature context at the accepted boundary and
+/// allows the target's per-token state capture to replace replay.
+fn dflash_fast_rollback_plan(
+    block: &[u32],
+    accepted: usize,
+    greedy: &[u32],
+    remaining: usize,
+) -> anyhow::Result<DflashCommitPlan> {
+    anyhow::ensure!(!block.is_empty(), "dflash fast rollback: empty block");
+    anyhow::ensure!(
+        greedy.len() >= block.len(),
+        "dflash fast rollback: greedy predictions {} are shorter than block {}",
+        greedy.len(),
+        block.len()
+    );
+    let accepted = accepted.min(block.len() - 1);
+    let commit_len = accepted + 1;
+    anyhow::ensure!(
+        commit_len <= remaining,
+        "dflash fast rollback commit length {commit_len} exceeds remaining {remaining}"
+    );
+
+    Ok(DflashCommitPlan {
+        commit_tokens: block[..commit_len].to_vec(),
+        next_token: greedy[commit_len - 1],
+    })
+}
+
+fn dflash_tokens_from_selector(
+    selected: Option<Vec<u32>>,
+    logits: &[Vec<f32>],
+    last_tok: u32,
+    q_len: usize,
+) -> Result<Vec<u32>> {
+    anyhow::ensure!(q_len > 0, "dflash selector needs a non-empty block");
+    anyhow::ensure!(
+        logits.len() >= q_len,
+        "dflash selector logits {} are shorter than block {}",
+        logits.len(),
+        q_len
+    );
+    if let Some(tokens) = selected {
+        anyhow::ensure!(
+            tokens.len() == q_len,
+            "dflash selector returned {} tokens for block {q_len}",
+            tokens.len()
+        );
+        let mut tokens = tokens;
+        tokens[0] = last_tok;
+        return Ok(tokens);
+    }
+
+    let mut tokens = Vec::with_capacity(q_len);
+    tokens.push(last_tok);
+    for row in 1..q_len {
+        tokens.push(argmax_f32(&logits[row]));
+    }
+    Ok(tokens)
+}
+
+fn dflash_next_token(verify_next: u32, replay_next: Option<u32>) -> u32 {
+    replay_next.unwrap_or(verify_next)
 }
 
 fn argmax_f32(slice: &[f32]) -> u32 {
@@ -350,4 +528,112 @@ fn argmax_f32(slice: &[f32]) -> u32 {
         }
     }
     best_idx as u32
+}
+
+#[cfg(test)]
+mod dflash_commit_tests {
+    use super::{
+        dflash_commit_plan, dflash_fast_rollback_plan, dflash_next_token,
+        dflash_tokens_from_selector, target_capture_layer_ids,
+    };
+
+    #[test]
+    fn partial_acceptance_commits_root_accepted_drafts_and_correction() {
+        let block = vec![13, 271, 22916, 6970, 279, 37550, 33075, 888];
+        let greedy = vec![198, 760, 3841, 13477, 37550, 33075, 888, 279];
+
+        let plan = dflash_commit_plan(&block, 3, &greedy, 100).unwrap();
+        assert_eq!(plan.commit_tokens, vec![13, 271, 22916, 6970, 13477]);
+        assert_eq!(plan.next_token, 37550);
+    }
+
+    #[test]
+    fn zero_acceptance_commits_root_and_target_correction() {
+        let block = vec![13, 271, 22916, 6970, 279, 37550, 33075, 888];
+        let greedy = vec![198, 760, 3841, 13477, 37550, 33075, 888, 279];
+
+        let plan = dflash_commit_plan(&block, 0, &greedy, 100).unwrap();
+        assert_eq!(plan.commit_tokens, vec![13, 198]);
+        assert_eq!(plan.next_token, 760);
+    }
+
+    #[test]
+    fn replay_replaces_verify_next_after_partial_correction() {
+        // The verify row is conditioned on the rejected draft token; the replay
+        // row is conditioned on the committed correction and is authoritative.
+        assert_eq!(dflash_next_token(11316, Some(760)), 760);
+        assert_eq!(dflash_next_token(760, None), 760);
+    }
+
+    #[test]
+    fn selector_chain_takes_precedence_over_argmax() {
+        let selected = Some(vec![13, 271, 22916, 6970, 279, 37550, 33075, 888]);
+        let logits = vec![vec![0.0, 1.0]; 8];
+
+        let tokens = dflash_tokens_from_selector(selected, &logits, 13, 8).unwrap();
+
+        assert_eq!(tokens, vec![13, 271, 22916, 6970, 279, 37550, 33075, 888]);
+    }
+
+    #[test]
+    fn selector_chain_overwrites_root_with_committed_token() {
+        let selected = Some(vec![999, 271, 22916, 6970, 279, 37550, 33075, 888]);
+        let logits = vec![vec![0.0, 1.0]; 8];
+
+        let tokens = dflash_tokens_from_selector(selected, &logits, 13, 8).unwrap();
+
+        assert_eq!(tokens, vec![13, 271, 22916, 6970, 279, 37550, 33075, 888]);
+    }
+
+    #[test]
+    fn argmax_fallback_starts_from_committed_root() {
+        let selected = None;
+        let logits = vec![vec![0.0, 1.0], vec![3.0, 2.0], vec![1.0, 4.0]];
+
+        let tokens = dflash_tokens_from_selector(selected, &logits, 13, 3).unwrap();
+
+        assert_eq!(tokens, vec![13, 0, 1]);
+    }
+
+    #[test]
+    fn target_capture_layers_match_geo_lucebox_loader() {
+        assert_eq!(
+            target_capture_layer_ids(64, 5, &[5, 19, 33, 47, 61]).unwrap(),
+            vec![5, 19, 33, 47, 61]
+        );
+        assert!(target_capture_layer_ids(64, 5, &[5, 19, 33, 47, 64])
+            .unwrap_err()
+            .to_string()
+            .contains("within the target layer count"));
+    }
+
+    #[test]
+    fn fast_rollback_defers_partial_correction_to_next_seed() {
+        let block = vec![13, 271, 22916, 6970, 279, 37550, 33075, 888];
+        let greedy = vec![198, 760, 3841, 13477, 37550, 33075, 888, 279];
+
+        let plan = dflash_fast_rollback_plan(&block, 3, &greedy, 100).unwrap();
+        assert_eq!(plan.commit_tokens, vec![13, 271, 22916, 6970]);
+        assert_eq!(plan.next_token, 13477);
+    }
+
+    #[test]
+    fn fast_rollback_supports_short_prefix() {
+        let block = vec![13, 271, 22916, 6970, 279, 37550, 33075, 888];
+        let greedy = vec![198, 760, 3841, 13477, 37550, 33075, 888, 279];
+
+        let plan = dflash_fast_rollback_plan(&block, 1, &greedy, 100).unwrap();
+        assert_eq!(plan.commit_tokens, vec![13, 271]);
+        assert_eq!(plan.next_token, 760);
+    }
+
+    #[test]
+    fn full_acceptance_commits_block_without_extra_correction() {
+        let block = vec![13, 198, 760, 3841, 13477, 37550, 33075, 888];
+        let greedy = vec![198, 760, 3841, 13477, 37550, 33075, 888, 279];
+
+        let plan = dflash_commit_plan(&block, 7, &greedy, 100).unwrap();
+        assert_eq!(plan.commit_tokens, block);
+        assert_eq!(plan.next_token, 279);
+    }
 }

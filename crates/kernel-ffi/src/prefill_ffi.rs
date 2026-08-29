@@ -942,6 +942,34 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_delta_recurrent_prefill_trace(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state: *const c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        out: *mut c_void,
+        state_trace: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_delta_recurrent_extract(
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        recurrent_out: *const c_void,
+        recurrent_state: *mut c_void,
+        attn_output: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_fill_conv_tail(
         dtype: c_int,
         device_ordinal: usize,
@@ -1207,6 +1235,116 @@ pub fn linear_prefill_conv_pack(
         if status != 0 {
             return Err(ffi_error(format!(
                 "linear_prefill_conv_pack failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Delta recurrent accumulation with per-token F16 state capture.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_recurrent_prefill_trace(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    out: &mut GpuBuffer,
+    state_trace: *mut c_void,
+) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush(ordinal)?;
+    ffi_profile_time_result("qwen.delta_recurrent_prefill_trace", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_delta_recurrent_prefill_trace(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_heads,
+                seq_len,
+                k_head_dim,
+                v_head_dim,
+                initial_state.as_ptr(),
+                query.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
+                beta.as_ptr(),
+                g.as_ptr(),
+                out.as_mut_ptr(),
+                state_trace,
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "delta_recurrent_prefill_trace failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Extract the last convolution tail from a raw `[S, C]` QKV pointer.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_conv_state_raw(
+    ordinal: usize,
+    dtype: ScalarType,
+    seq_len: usize,
+    channels: usize,
+    kern_minus_1: usize,
+    src: *const c_void,
+    dst: *mut c_void,
+) -> Result<(), GpuError> {
+    ffi_profile_time_result("qwen.extract_conv_state", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_extract_conv_state(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                seq_len,
+                channels,
+                kern_minus_1,
+                src,
+                dst,
+            )
+        };
+        prefill_bridge_result(gpu_hal::current_backend(), "extract_conv_state", status)?;
+        Ok(())
+    })
+}
+
+/// Extract the recurrent state and BF16 attention rows from the delta
+/// recurrent prefill output in one device kernel launch.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_recurrent_extract(
+    ordinal: usize,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    recurrent_out: &GpuBuffer,
+    recurrent_state: &mut GpuBuffer,
+    attn_output: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    ffi_profile_time_result("qwen.delta_recurrent_extract", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_delta_recurrent_extract(
+                ordinal,
+                batch_heads,
+                seq_len,
+                k_head_dim,
+                v_head_dim,
+                recurrent_out.as_ptr(),
+                recurrent_state.as_mut_ptr(),
+                attn_output.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "delta_recurrent_extract failed: {status}"
             )));
         }
         Ok(())
@@ -1635,21 +1773,31 @@ pub fn matmul_rhs_transposed_int4(
     quant_type: i32,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    matmul_rhs_transposed_int4_impl(
-        ordinal,
-        batch_elems,
-        m,
-        n,
-        k,
-        lhs,
-        rhs_int4,
-        scale,
-        zero,
-        awq_inv_scale,
-        group_size,
-        quant_type,
-        out,
-    )
+    let profile_key = if std::env::var_os("SUPERSONIC_FFI_PROFILE_SHAPES").is_some() {
+        format!(
+            "qwen.matmul_rhs_transposed_int4[b={} m={} n={} k={} g={} qt={}]",
+            batch_elems, m, n, k, group_size, quant_type
+        )
+    } else {
+        "qwen.matmul_rhs_transposed_int4".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        matmul_rhs_transposed_int4_impl(
+            ordinal,
+            batch_elems,
+            m,
+            n,
+            k,
+            lhs,
+            rhs_int4,
+            scale,
+            zero,
+            awq_inv_scale,
+            group_size,
+            quant_type,
+            out,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1732,14 +1880,13 @@ fn gqh_force_fused() -> bool {
     std::env::var_os("SUPERSONIC_GQH_FORCE_FUSED").is_some()
 }
 
-/// PR #35's int8 activation arm switch. Serving runs with the i8 dot on
-/// (`GGML_GQH_I8DOT=1`); the exact f32 matvec stays the default so the
-/// correctness gates (official vectors, ordinary-vs-MTP token equality) remain
-/// bit-exact. Mirrors geo-lucebox's `GGML_GQH_I8DOT` policy.
+/// PR #35's int8 activation arm switch. Serving defaults to the i8 dot, matching
+/// geo-lucebox; `GGML_GQH_I8DOT=0` is retained only as an explicit measured
+/// control for qualification runs.
 fn gqh_i8_dot_enabled() -> bool {
     match std::env::var("GGML_GQH_I8DOT") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
+        Ok(v) => v != "0",
+        Err(_) => true,
     }
 }
 
@@ -1767,13 +1914,14 @@ pub(crate) fn try_matmul_gqh_i8_dot(
     rung: i32,
     out: &mut GpuBuffer,
 ) -> Result<bool, GpuError> {
-    use crate::gqh::{RUNG_GQH2_H, RUNG_GQH3};
+    use crate::gqh::{RUNG_GQH2_H, RUNG_GQH3, RUNG_GQH4};
     if ncols == 0 || ncols > GQH_FUSED_MAX_COLS {
         return Ok(false);
     }
     let ms_rung = match rung {
         RUNG_GQH3 => model_store::gqh_q8::GqhRung::Gqh3,
         RUNG_GQH2_H => model_store::gqh_q8::GqhRung::Gqh2H,
+        RUNG_GQH4 => model_store::gqh_q8::GqhRung::Gqh4,
         _ => return Ok(false),
     };
     if k % 256 != 0 {
@@ -1829,10 +1977,17 @@ pub(crate) fn try_matmul_gqh_i8_dot(
     };
     let x_ref = x_f32.as_ref().unwrap_or(lhs);
 
-    let ngroups = k / 8;
+    let use_sb2 = ncols == 16 && (rung == RUNG_GQH3 || rung == RUNG_GQH4) && k % 512 == 0;
+    let group_width = if use_sb2 { 16 } else { 8 };
+    let ngroups = k / group_width;
     let mut qx = take(&GQH_I8_QX, ScalarType::U8, ncols * k)?;
-    let mut qxs = take(&GQH_I8_QXS, ScalarType::F32, ncols * ngroups)?;
-    crate::gqh::quant_x_i8(ordinal, x_ref, &mut qx, &mut qxs, ncols, k, k)?;
+    let qxs_elems = if use_sb2 { ngroups } else { ncols * ngroups };
+    let mut qxs = take(&GQH_I8_QXS, ScalarType::F32, qxs_elems)?;
+    if use_sb2 {
+        crate::gqh::quant_x_i8_wide16(ordinal, x_ref, &mut qx, &mut qxs, ncols, k, k)?;
+    } else {
+        crate::gqh::quant_x_i8(ordinal, x_ref, &mut qx, &mut qxs, ncols, k, k)?;
+    }
 
     let mut y_f32 = if out.dtype() == ScalarType::F32 {
         None
@@ -1875,6 +2030,204 @@ pub(crate) fn try_matmul_gqh_i8_dot(
     put(&GQH_I8_QXS, qxs);
     if let Some(buf) = y_f32 {
         put(&GQH_I8_Y, buf);
+    }
+    Ok(true)
+}
+
+/// Width-16 GQH gate/up pair for the i8 dot arm. The pair shares one activation
+/// quantization and one HIP launch while preserving each half's tensor scale,
+/// grid, and q8 denominator.
+pub fn try_matmul_gqh_i8_dot_pair(
+    ordinal: usize,
+    ncols: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_a: &GpuBuffer,
+    tensor_scale_a: f32,
+    grid_code_a: u8,
+    rung_a: i32,
+    rhs_b: &GpuBuffer,
+    tensor_scale_b: f32,
+    grid_code_b: u8,
+    rung_b: i32,
+    out_a: &mut GpuBuffer,
+    out_b: &mut GpuBuffer,
+) -> Result<bool, GpuError> {
+    use crate::gqh::{RUNG_GQH3, RUNG_GQH4};
+    if !gqh_i8_dot_enabled()
+        || ncols != 16
+        || rung_a != rung_b
+        || (rung_a != RUNG_GQH3 && rung_a != RUNG_GQH4)
+        || k % 512 != 0
+    {
+        return Ok(false);
+    }
+    let ms_rung = match rung_a {
+        RUNG_GQH3 => model_store::gqh_q8::GqhRung::Gqh3,
+        RUNG_GQH4 => model_store::gqh_q8::GqhRung::Gqh4,
+        _ => return Ok(false),
+    };
+    let Some(q8n_a) = model_store::gqh_q8::q8_denom_eff(ms_rung, grid_code_a) else {
+        return Ok(false);
+    };
+    let Some(q8n_b) = model_store::gqh_q8::q8_denom_eff(ms_rung, grid_code_b) else {
+        return Ok(false);
+    };
+    if !model_store::gqh_q8::q8_grid_representable(ms_rung, grid_code_a, q8n_a)
+        || !model_store::gqh_q8::q8_grid_representable(ms_rung, grid_code_b, q8n_b)
+    {
+        return Ok(false);
+    }
+    if lhs.dtype() != ScalarType::BF16 && lhs.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh i8 pair lhs must be bf16/f32, got {:?}",
+            lhs.dtype()
+        )));
+    }
+    if (out_a.dtype() != ScalarType::BF16 && out_a.dtype() != ScalarType::F32)
+        || (out_b.dtype() != ScalarType::BF16 && out_b.dtype() != ScalarType::F32)
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh i8 pair outputs must be bf16/f32, got {:?}/{:?}",
+            out_a.dtype(),
+            out_b.dtype()
+        )));
+    }
+    if lhs.elem_count() < ncols * k
+        || out_a.elem_count() < ncols * n
+        || out_b.elem_count() < ncols * n
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh i8 pair buffers are too small: lhs={} out_a={} out_b={} need {}x{}",
+            lhs.elem_count(),
+            out_a.elem_count(),
+            out_b.elem_count(),
+            ncols,
+            n
+        )));
+    }
+
+    thread_local! {
+        static GQH_I8_PAIR_X: std::cell::RefCell<Option<GpuBuffer>> =
+            const { std::cell::RefCell::new(None) };
+        static GQH_I8_PAIR_QX: std::cell::RefCell<Option<GpuBuffer>> =
+            const { std::cell::RefCell::new(None) };
+        static GQH_I8_PAIR_QXS: std::cell::RefCell<Option<GpuBuffer>> =
+            const { std::cell::RefCell::new(None) };
+        static GQH_I8_PAIR_Y_A: std::cell::RefCell<Option<GpuBuffer>> =
+            const { std::cell::RefCell::new(None) };
+        static GQH_I8_PAIR_Y_B: std::cell::RefCell<Option<GpuBuffer>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let take = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+                dtype: ScalarType,
+                elems: usize|
+     -> Result<GpuBuffer, GpuError> {
+        slot.with(|cell| {
+            let mut held = cell.borrow_mut();
+            if let Some(buf) = held.as_ref() {
+                if buf.dtype() == dtype && buf.elem_count() >= elems {
+                    return Ok(held.take().expect("scratch present"));
+                }
+            }
+            held.take();
+            GpuBuffer::zeros(ordinal, dtype, &[elems])
+        })
+    };
+    let put = |slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<GpuBuffer>>>,
+               buf: GpuBuffer| {
+        slot.with(|cell| {
+            *cell.borrow_mut() = Some(buf);
+        });
+    };
+
+    let x_f32 = if lhs.dtype() == ScalarType::F32 {
+        None
+    } else {
+        let mut buf = take(&GQH_I8_PAIR_X, ScalarType::F32, ncols * k)?;
+        cast(
+            ordinal,
+            ScalarType::BF16,
+            ScalarType::F32,
+            ncols * k,
+            lhs,
+            &mut buf,
+        )?;
+        Some(buf)
+    };
+    let x_ref = x_f32.as_ref().unwrap_or(lhs);
+    let ngroups = k / 16;
+    let mut qx = take(&GQH_I8_PAIR_QX, ScalarType::U8, ncols * k)?;
+    let mut qxs = take(&GQH_I8_PAIR_QXS, ScalarType::F32, ngroups)?;
+    crate::gqh::quant_x_i8_wide16(ordinal, x_ref, &mut qx, &mut qxs, ncols, k, k)?;
+
+    let mut y_a_f32 = if out_a.dtype() == ScalarType::F32 {
+        None
+    } else {
+        Some(take(&GQH_I8_PAIR_Y_A, ScalarType::F32, ncols * n)?)
+    };
+    let mut y_b_f32 = if out_b.dtype() == ScalarType::F32 {
+        None
+    } else {
+        Some(take(&GQH_I8_PAIR_Y_B, ScalarType::F32, ncols * n)?)
+    };
+    let y_a_ref = y_a_f32.as_mut().unwrap_or(out_a);
+    let y_b_ref = y_b_f32.as_mut().unwrap_or(out_b);
+    crate::gqh::matvec_i8_pair(
+        ordinal,
+        rung_a,
+        rhs_a,
+        rhs_b,
+        &qx,
+        &qxs,
+        y_a_ref,
+        y_b_ref,
+        k,
+        n,
+        ncols,
+        q8n_a,
+        q8n_b,
+        k,
+        ngroups,
+        n,
+        n,
+        tensor_scale_a,
+        tensor_scale_b,
+        grid_code_a,
+        grid_code_b,
+    )?;
+    if let Some(y_a) = y_a_f32.as_ref() {
+        cast(
+            ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            ncols * n,
+            y_a,
+            out_a,
+        )?;
+    }
+    if let Some(y_b) = y_b_f32.as_ref() {
+        cast(
+            ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            ncols * n,
+            y_b,
+            out_b,
+        )?;
+    }
+
+    if let Some(buf) = x_f32 {
+        put(&GQH_I8_PAIR_X, buf);
+    }
+    put(&GQH_I8_PAIR_QX, qx);
+    put(&GQH_I8_PAIR_QXS, qxs);
+    if let Some(buf) = y_a_f32 {
+        put(&GQH_I8_PAIR_Y_A, buf);
+    }
+    if let Some(buf) = y_b_f32 {
+        put(&GQH_I8_PAIR_Y_B, buf);
     }
     Ok(true)
 }
@@ -2847,6 +3200,31 @@ pub fn cast(
     cast_impl(ordinal, input_dtype, output_dtype, total_elems, input, out)
 }
 
+pub fn cast_raw(
+    ordinal: usize,
+    input_dtype: ScalarType,
+    output_dtype: ScalarType,
+    total_elems: usize,
+    input: *const c_void,
+    out: *mut c_void,
+) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush(ordinal)?;
+    ffi_profile_time_result("qwen.cast", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_cast(
+                input_dtype.kernel_dtype_code(),
+                output_dtype.kernel_dtype_code(),
+                ordinal,
+                total_elems,
+                input,
+                out,
+            )
+        };
+        prefill_bridge_result(gpu_hal::current_backend(), "cast", status)?;
+        Ok(())
+    })
+}
+
 fn cast_impl(
     ordinal: usize,
     input_dtype: ScalarType,
@@ -2966,6 +3344,41 @@ pub fn assemble_conv_tail_short(
             old_tail.as_ptr() as *const c_void,
             qkv.as_ptr() as *const c_void,
             new_tail.as_mut_ptr() as *mut c_void,
+        )
+    };
+    prefill_bridge_result(
+        gpu_hal::current_backend(),
+        "assemble_conv_tail_short",
+        status,
+    )?;
+    Ok(())
+}
+
+/// Raw-pointer variant of [`assemble_conv_tail_short`] for rollback captures.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_conv_tail_short_raw(
+    ordinal: usize,
+    dtype: ScalarType,
+    qkv_dim: usize,
+    pad: usize,
+    chunk_len: usize,
+    chunk_start: usize,
+    old_tail: *const c_void,
+    qkv: *const c_void,
+    new_tail: *mut c_void,
+) -> Result<(), GpuError> {
+    crate::gqh::gemm_flush(ordinal)?;
+    let status = unsafe {
+        supersonic_pfx_assemble_conv_tail_short(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            qkv_dim as c_int,
+            pad as c_int,
+            chunk_len as c_int,
+            chunk_start as c_int,
+            old_tail,
+            qkv,
+            new_tail,
         )
     };
     prefill_bridge_result(

@@ -446,6 +446,17 @@ unsafe extern "C" {
         ncols: c_int,
         in_dim: c_int,
         x_col_stride: i64,
+        stream: *mut c_void,
+    ) -> c_int;
+    fn supersonic_gqh_hip_quant_x_i8_wide16(
+        device_ordinal: c_int,
+        x: *const c_void,
+        qx: *mut c_void,
+        qxs: *mut c_void,
+        ncols: c_int,
+        in_dim: c_int,
+        x_col_stride: i64,
+        stream: *mut c_void,
     ) -> c_int;
     fn supersonic_gqh_hip_bake_q8_lut(
         device_ordinal: c_int,
@@ -471,6 +482,33 @@ unsafe extern "C" {
         y_col_stride: i64,
         tensor_scale: f32,
         grid_code: c_int,
+        accumulate: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+    fn supersonic_gqh_hip_matvec_i8_pair(
+        device_ordinal: c_int,
+        rung_a: c_int,
+        rung_b: c_int,
+        wire_a: *const c_void,
+        wire_b: *const c_void,
+        qx: *const c_void,
+        qxs: *const c_void,
+        y_a: *mut c_void,
+        y_b: *mut c_void,
+        in_dim: c_int,
+        out_dim: c_int,
+        ncols: c_int,
+        q8n_a: c_int,
+        q8n_b: c_int,
+        qx_col_stride: i64,
+        qxs_col_stride: i64,
+        y_col_stride_a: i64,
+        y_col_stride_b: i64,
+        tensor_scale_a: f32,
+        tensor_scale_b: f32,
+        grid_code_a: c_int,
+        grid_code_b: c_int,
+        stream: *mut c_void,
     ) -> c_int;
 
     fn supersonic_gqh_hip_dequant_gemm_bf16(
@@ -549,6 +587,9 @@ unsafe extern "C" {
         tensor_scale: f32,
         grid_code: c_int,
     ) -> c_int;
+
+    #[cfg(test)]
+    fn supersonic_gqh_test_wide_verify_rows(ncols: c_int) -> c_int;
 }
 
 fn backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
@@ -760,10 +801,90 @@ pub fn quant_x_i8(
             ncols as c_int,
             in_dim as c_int,
             x_col_stride as i64,
+            std::ptr::null_mut(),
         )
     };
     if status != 0 {
         return Err(backend_error(Backend::Hip, "gqh quant_x_i8", status));
+    }
+    Ok(())
+}
+
+/// Geo PR #35's width-16 shared-activation int8 pre-pass.
+///
+/// The layout matches the GQH4 SB2 matvec: `qx` remains column-major with
+/// stride `in_dim`, while `qxs` has one scale per 16-activation group shared by
+/// all 16 columns.
+pub fn quant_x_i8_wide16(
+    ordinal: usize,
+    x: &GpuBuffer,
+    qx: &mut GpuBuffer,
+    qxs: &mut GpuBuffer,
+    ncols: usize,
+    in_dim: usize,
+    x_col_stride: usize,
+) -> Result<(), GpuError> {
+    if x.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh quant_x_i8_wide16 x must be f32, got {:?}",
+            x.dtype()
+        )));
+    }
+    if qx.dtype() != ScalarType::U8 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh quant_x_i8_wide16 qx must be u8 (int8), got {:?}",
+            qx.dtype()
+        )));
+    }
+    if qxs.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh quant_x_i8_wide16 qxs must be f32, got {:?}",
+            qxs.dtype()
+        )));
+    }
+    if ncols != 16 || in_dim == 0 || in_dim % 16 != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh quant_x_i8_wide16 needs ncols=16 and in_dim {in_dim} a positive multiple of 16"
+        )));
+    }
+    if x_col_stride < in_dim {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh quant_x_i8_wide16 x_col_stride {x_col_stride} < in_dim {in_dim}"
+        )));
+    }
+    if x.elem_count() < ncols * x_col_stride {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh quant_x_i8_wide16 x has {} elems, need {ncols}*{x_col_stride}",
+            x.elem_count()
+        )));
+    }
+    if qx.elem_count() < ncols * in_dim {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh quant_x_i8_wide16 qx has {} elems, need {ncols}*{in_dim}",
+            qx.elem_count()
+        )));
+    }
+    let ngroups = in_dim / 16;
+    if qxs.elem_count() < ngroups {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh quant_x_i8_wide16 qxs has {} elems, need {ngroups}",
+            qxs.elem_count()
+        )));
+    }
+    let status = unsafe {
+        supersonic_gqh_hip_quant_x_i8_wide16(
+            ordinal as c_int,
+            x.as_ptr() as *const c_void,
+            qx.as_mut_ptr() as *mut c_void,
+            qxs.as_mut_ptr() as *mut c_void,
+            ncols as c_int,
+            in_dim as c_int,
+            x_col_stride as i64,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(backend_error(Backend::Hip, "gqh quant_x_i8_wide16", status));
     }
     Ok(())
 }
@@ -877,10 +998,93 @@ pub fn matvec_i8(
             y_col_stride as i64,
             tensor_scale,
             grid_code as c_int,
+            0,
+            std::ptr::null_mut(),
         )
     };
     if status != 0 {
         return Err(backend_error(Backend::Hip, "gqh matvec_i8", status));
+    }
+    Ok(())
+}
+
+/// Width-16 GQH gate/up pair using the shared-activation int8 SB2 arm. The two
+/// projections may use different grids and q8 denominators, but must use the
+/// same rung and output geometry.
+pub fn matvec_i8_pair(
+    ordinal: usize,
+    rung: i32,
+    wire_a: &GpuBuffer,
+    wire_b: &GpuBuffer,
+    qx: &GpuBuffer,
+    qxs: &GpuBuffer,
+    y_a: &mut GpuBuffer,
+    y_b: &mut GpuBuffer,
+    in_dim: usize,
+    out_dim: usize,
+    ncols: usize,
+    q8n_a: i32,
+    q8n_b: i32,
+    qx_col_stride: usize,
+    qxs_col_stride: usize,
+    y_col_stride_a: usize,
+    y_col_stride_b: usize,
+    tensor_scale_a: f32,
+    tensor_scale_b: f32,
+    grid_code_a: u8,
+    grid_code_b: u8,
+) -> Result<(), GpuError> {
+    if qx.dtype() != ScalarType::U8 {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh matvec_i8_pair qx must be u8 (int8), got {:?}",
+            qx.dtype()
+        )));
+    }
+    if qxs.dtype() != ScalarType::F32
+        || y_a.dtype() != ScalarType::F32
+        || y_b.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh matvec_i8_pair qxs/y must be f32, got {:?}/{:?}/{:?}",
+            qxs.dtype(),
+            y_a.dtype(),
+            y_b.dtype()
+        )));
+    }
+    if !(1..=127).contains(&q8n_a) || !(1..=127).contains(&q8n_b) {
+        return Err(GpuError::InvalidArg(format!(
+            "gqh matvec_i8_pair q8n {q8n_a}/{q8n_b} must be in 1..=127"
+        )));
+    }
+    let status = unsafe {
+        supersonic_gqh_hip_matvec_i8_pair(
+            ordinal as c_int,
+            rung as c_int,
+            rung as c_int,
+            wire_a.as_ptr() as *const c_void,
+            wire_b.as_ptr() as *const c_void,
+            qx.as_ptr() as *const c_void,
+            qxs.as_ptr() as *const c_void,
+            y_a.as_mut_ptr() as *mut c_void,
+            y_b.as_mut_ptr() as *mut c_void,
+            in_dim as c_int,
+            out_dim as c_int,
+            ncols as c_int,
+            q8n_a as c_int,
+            q8n_b as c_int,
+            qx_col_stride as i64,
+            qxs_col_stride as i64,
+            y_col_stride_a as i64,
+            y_col_stride_b as i64,
+            tensor_scale_a,
+            tensor_scale_b,
+            grid_code_a as c_int,
+            grid_code_b as c_int,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(backend_error(Backend::Hip, "gqh matvec_i8_pair", status));
     }
     Ok(())
 }
@@ -1955,9 +2159,37 @@ mod tests {
         };
         use model_store::gqh::GqhRung as MsRung;
         use model_store::gqh_q8::{q8_denom_eff, GqhRung as Q8Rung};
-        let (name, cpu_rung, rung, rows, cols) = ("gqh3", MsRung::Gqh3, RUNG_GQH3, 4, 512);
-        let (wire, weights) = load_case(name, rows, cols);
-        let (scale, grid_code, packed) = split_wire(cpu_rung, &wire);
+        let (name, cpu_rung, rung, cols) = ("gqh3", MsRung::Gqh3, RUNG_GQH3, 5120);
+        let (fixture_wire, fixture_weights) = load_case(name, 4, 512);
+        let (scale, grid_code, fixture_packed) = split_wire(cpu_rung, &fixture_wire);
+        const ROWS: usize = 512;
+        const FIXTURE_ROWS: usize = 4;
+        const FIXTURE_COLS: usize = 512;
+        let column_tiles = cols / FIXTURE_COLS;
+        let fixture_row_bytes = fixture_packed.len() / FIXTURE_ROWS;
+        let wire = {
+            let mut expanded = fixture_wire[..5].to_vec();
+            for row in 0..ROWS {
+                let fixture_row = row % FIXTURE_ROWS;
+                let start = fixture_row * fixture_row_bytes;
+                let source = &fixture_packed[start..start + fixture_row_bytes];
+                for _ in 0..column_tiles {
+                    expanded.extend_from_slice(source);
+                }
+            }
+            expanded
+        };
+        let mut weights = Vec::with_capacity(cols * ROWS);
+        for row in 0..ROWS {
+            let fixture_row = row % FIXTURE_ROWS;
+            let source =
+                &fixture_weights[fixture_row * FIXTURE_COLS..(fixture_row + 1) * FIXTURE_COLS];
+            for _ in 0..column_tiles {
+                weights.extend_from_slice(source);
+            }
+        }
+        let packed = &wire[5..];
+        let rows = ROWS;
         let device = device_packed(cpu_rung, rows, cols, packed);
         let packed_buf =
             GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[device.len()], &device)
@@ -2064,6 +2296,313 @@ mod tests {
         eprintln!("[i8-matvec] max_rel = {max_rel:.4} (tolerance {I8_DENSE_REL})");
     }
 
+    /// The persistent-decode MLP uses the per-8-group activation quantizer with
+    /// a 16-column verify block. This path must match the f32 reference before
+    /// the fused DFlash target can enable it.
+    #[test]
+    fn hip_matvec_i8_multicol_width16_matches_f32_within_tolerance() {
+        let Some(ordinal) = require_hip() else {
+            return;
+        };
+        use model_store::gqh::GqhRung as MsRung;
+        use model_store::gqh_q8::{q8_denom_eff, GqhRung as Q8Rung};
+        let (name, cpu_rung, rung, rows, cols) = ("gqh3", MsRung::Gqh3, RUNG_GQH3, 4, 512);
+        let (wire, weights) = load_case(name, rows, cols);
+        let (scale, grid_code, packed) = split_wire(cpu_rung, &wire);
+        let device = device_packed(cpu_rung, rows, cols, packed);
+        let packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[device.len()], &device)
+                .expect("upload packed");
+
+        const NCOLS: usize = 16;
+        let x: Vec<f32> = (0..NCOLS * cols)
+            .map(|idx| {
+                let column = idx / cols;
+                let position = idx % cols;
+                (((column + position) % 19) as f32 - 9.0) / 7.0
+            })
+            .collect();
+        let mut y_ref = vec![0.0f32; NCOLS * rows];
+        let mut row_norms = vec![0.0f64; rows];
+        let mut column_norms = vec![0.0f64; NCOLS];
+        for row in 0..rows {
+            row_norms[row] = weights[row * cols..(row + 1) * cols]
+                .iter()
+                .map(|value| (*value as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
+        }
+        for column in 0..NCOLS {
+            column_norms[column] = x[column * cols..(column + 1) * cols]
+                .iter()
+                .map(|value| (*value as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            for row in 0..rows {
+                let mut sum = 0.0f64;
+                for position in 0..cols {
+                    sum +=
+                        weights[row * cols + position] as f64 * x[column * cols + position] as f64;
+                }
+                y_ref[column * rows + row] = sum as f32;
+            }
+        }
+
+        let ngroups = cols / 8;
+        let x_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[NCOLS * cols], &f32_bytes(&x))
+                .expect("upload x");
+        let mut qx = GpuBuffer::zeros(ordinal, ScalarType::U8, &[NCOLS * cols]).expect("qx");
+        let mut qxs = GpuBuffer::zeros(ordinal, ScalarType::F32, &[NCOLS * ngroups]).expect("qxs");
+        quant_x_i8(ordinal, &x_buf, &mut qx, &mut qxs, NCOLS, cols, cols).expect("quant_x_i8");
+
+        let q8n = q8_denom_eff(Q8Rung::Gqh3, grid_code).expect("q8 denominator");
+        let mut y = GpuBuffer::zeros(ordinal, ScalarType::F32, &[NCOLS * rows]).expect("y");
+        matvec_i8(
+            ordinal,
+            rung,
+            &packed_buf,
+            &qx,
+            &qxs,
+            &mut y,
+            cols,
+            rows,
+            NCOLS,
+            q8n,
+            cols,
+            ngroups,
+            rows,
+            scale,
+            grid_code,
+        )
+        .expect("matvec_i8");
+
+        let got = read_f32(&y);
+        const I8_DENSE_REL: f64 = 2e-2;
+        let mut max_rel = 0.0f64;
+        for column in 0..NCOLS {
+            for row in 0..rows {
+                let index = column * rows + row;
+                let bound = I8_DENSE_REL * row_norms[row] * column_norms[column];
+                let error = (got[index] as f64 - y_ref[index] as f64).abs();
+                let rel = if bound > 1e-30 { error / bound } else { 0.0 };
+                max_rel = max_rel.max(rel);
+                assert!(
+                    error <= bound,
+                    "width-16 i8 matvec [{column},{row}] error {error:.6} > bound {bound:.6} (rel {rel:.4})",
+                );
+            }
+        }
+        eprintln!("[i8-matvec width16] max_rel = {max_rel:.4} (tolerance {I8_DENSE_REL})");
+
+        let accumulated_initial = vec![1.0f32; NCOLS * rows];
+        let mut accumulated = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[accumulated_initial.len()],
+            &f32_bytes(&accumulated_initial),
+        )
+        .expect("upload accumulated y");
+        let status = unsafe {
+            supersonic_gqh_hip_matvec_i8(
+                ordinal as c_int,
+                rung,
+                packed_buf.as_ptr() as *const c_void,
+                qx.as_ptr() as *const c_void,
+                qxs.as_ptr() as *const c_void,
+                accumulated.as_mut_ptr() as *mut c_void,
+                cols as c_int,
+                rows as c_int,
+                NCOLS as c_int,
+                q8n,
+                cols as i64,
+                ngroups as i64,
+                rows as i64,
+                scale,
+                grid_code as c_int,
+                1,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, 0, "width-16 accumulating matvec_i8");
+        let accumulated_got = read_f32(&accumulated);
+        for column in 0..NCOLS {
+            for row in 0..rows {
+                let index = column * rows + row;
+                let bound = I8_DENSE_REL * row_norms[row % 4] * column_norms[column] + 1e-3;
+                let bound = bound as f32;
+                let expected = y_ref[index] + 1.0;
+                let error = (accumulated_got[index] - expected).abs();
+                assert!(
+                    error <= bound,
+                    "width-16 accumulating matvec_i8 [{column},{row}] error {error:.6} > bound {bound:.6}",
+                );
+            }
+        }
+    }
+
+    /// GQH3's packed 3-bit wire is the remaining hot SB2 rung. The width-16
+    /// shared-scale layout must remain inside PR #35's dense tolerance.
+    #[test]
+    fn hip_matvec_i8_gqh3_sb2_dense_matches_f32_within_tolerance() {
+        let Some(ordinal) = require_hip() else {
+            return;
+        };
+        use model_store::gqh::GqhRung as MsRung;
+        use model_store::gqh_q8::{q8_denom_eff, GqhRung as Q8Rung};
+
+        const I8_DENSE_REL: f64 = 2e-2;
+        let (wire, weights) = load_case("gqh3", 4, 512);
+        let (scale, grid_code, packed) = split_wire(MsRung::Gqh3, &wire);
+        let device = device_packed(MsRung::Gqh3, 4, 512, packed);
+        let wire_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[device.len()], &device)
+                .expect("upload GQH3 SB2 wire");
+
+        let ncols = 16;
+        let x: Vec<f32> = (0..ncols * 512)
+            .map(|idx| {
+                let column = idx / 512;
+                let position = idx % 512;
+                (((column + position) % 19) as f32 - 9.0) / 7.0
+            })
+            .collect();
+        let mut y_ref = vec![0.0f32; ncols * 4];
+        let mut row_norms = vec![0.0f64; 4];
+        let mut col_norms = vec![0.0f64; ncols];
+        for row in 0..4 {
+            row_norms[row] = weights[row * 512..(row + 1) * 512]
+                .iter()
+                .map(|value| (*value as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
+        }
+        for column in 0..ncols {
+            col_norms[column] = x[column * 512..(column + 1) * 512]
+                .iter()
+                .map(|value| (*value as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            for row in 0..4 {
+                let mut sum = 0.0f64;
+                for position in 0..512 {
+                    sum += weights[row * 512 + position] as f64 * x[column * 512 + position] as f64;
+                }
+                y_ref[column * 4 + row] = sum as f32;
+            }
+        }
+
+        let x_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[ncols * 512], &f32_bytes(&x))
+                .expect("upload GQH3 SB2 x");
+        let mut qx =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[ncols * 512]).expect("GQH3 SB2 qx");
+        let mut qxs =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[512 / 16]).expect("GQH3 SB2 qxs");
+        quant_x_i8_wide16(ordinal, &x_buf, &mut qx, &mut qxs, ncols, 512, 512)
+            .expect("GQH3 SB2 activation quantization");
+        let mut y = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * 4]).expect("GQH3 SB2 y");
+        let q8n = q8_denom_eff(Q8Rung::Gqh3, grid_code).expect("GQH3 denominator");
+        matvec_i8(
+            ordinal,
+            RUNG_GQH3,
+            &wire_buf,
+            &qx,
+            &qxs,
+            &mut y,
+            512,
+            4,
+            ncols,
+            q8n,
+            512,
+            512 / 16,
+            4,
+            scale,
+            grid_code,
+        )
+        .expect("GQH3 SB2 matvec");
+
+        let got = read_f32(&y);
+        for column in 0..ncols {
+            for row in 0..4 {
+                let index = column * 4 + row;
+                let bound = I8_DENSE_REL * row_norms[row] * col_norms[column];
+                let error = (got[index] as f64 - y_ref[index] as f64).abs();
+                assert!(
+                    error <= bound,
+                    "gqh3 SB2 [{column},{row}] error {error:.6} > bound {bound:.6}",
+                );
+            }
+        }
+
+        let mut distinct_device = device;
+        let last_code = distinct_device.len().checked_sub(1).expect("wire bytes");
+        distinct_device[last_code] ^= 0x5a;
+        let wire_b_buf = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U8,
+            &[distinct_device.len()],
+            &distinct_device,
+        )
+        .expect("upload distinct GQH3 SB2 wire");
+        let mut y_b =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * 4]).expect("GQH3 SB2 distinct y");
+        matvec_i8(
+            ordinal,
+            RUNG_GQH3,
+            &wire_b_buf,
+            &qx,
+            &qxs,
+            &mut y_b,
+            512,
+            4,
+            ncols,
+            q8n,
+            512,
+            512 / 16,
+            4,
+            scale,
+            grid_code,
+        )
+        .expect("GQH3 SB2 distinct single-tensor matvec");
+        let got_b = read_f32(&y_b);
+        assert_ne!(
+            got, got_b,
+            "distinct pair wire must produce distinct output"
+        );
+
+        let mut pair_a =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * 4]).expect("GQH3 SB2 pair y_a");
+        let mut pair_b =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * 4]).expect("GQH3 SB2 pair y_b");
+        matvec_i8_pair(
+            ordinal,
+            RUNG_GQH3,
+            &wire_buf,
+            &wire_b_buf,
+            &qx,
+            &qxs,
+            &mut pair_a,
+            &mut pair_b,
+            512,
+            4,
+            ncols,
+            q8n,
+            q8n,
+            512,
+            512 / 16,
+            4,
+            4,
+            scale,
+            scale,
+            grid_code,
+            grid_code,
+        )
+        .expect("GQH3 SB2 pair matvec");
+        assert_eq!(read_f32(&pair_a), got, "GQH3 pair half A");
+        assert_eq!(read_f32(&pair_b), got_b, "GQH3 pair half B");
+    }
+
     /// The i8 dispatch helper (`try_matmul_gqh_i8_dot`) that
     /// `matmul_rhs_transposed_gqh` calls when `GGML_GQH_I8DOT` is on: it must
     /// run the int8 arm for representable gqh3/gqh2_h grids and match the f32
@@ -2151,9 +2690,9 @@ mod tests {
             eprintln!("[i8-dispatch {name}] max_rel = {max_rel:.4} (tolerance {I8_DENSE_REL})");
         }
 
-        // Decline: GQH4 has no int8 arm; the dispatch returns Ok(false) before
-        // touching the weight buffer, so a gqh3 wire paired with the GQH4 rung
-        // is a safe decline probe.
+        // Decline: GQH2_C has no int8 arm; the dispatch returns Ok(false)
+        // before touching the weight buffer, so a gqh3 wire paired with the
+        // GQH2_C rung is a safe decline probe.
         let (wire, _weights) = load_case("gqh3", 4, 512);
         let (scale, grid_code, packed) = split_wire(MsRung::Gqh3, &wire);
         let device = device_packed(MsRung::Gqh3, 4, 512, packed);
@@ -2162,10 +2701,19 @@ mod tests {
         let x_buf = GpuBuffer::zeros(ordinal, ScalarType::F32, &[512]).expect("x");
         let mut y_buf = GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("y");
         let ran = crate::prefill_ffi::try_matmul_gqh_i8_dot(
-            ordinal, 1, 4, 512, &x_buf, &rhs_buf, scale, grid_code, RUNG_GQH4, &mut y_buf,
+            ordinal,
+            1,
+            4,
+            512,
+            &x_buf,
+            &rhs_buf,
+            scale,
+            grid_code,
+            RUNG_GQH2_C,
+            &mut y_buf,
         )
         .expect("try_matmul_gqh_i8_dot decline");
-        assert!(!ran, "GQH4 must decline the int8 arm");
+        assert!(!ran, "GQH2_C must decline the int8 arm");
     }
 
     /// Wide multicol matvec (DFlash2 verify blocks 9..16) must be bit-exact
@@ -2238,6 +2786,263 @@ mod tests {
                     &got,
                     &want,
                     &format!("{name} multicol ncols={ncols} {rows}x{cols}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_verify_row_contract_matches_geo() {
+        assert_eq!(unsafe { supersonic_gqh_test_wide_verify_rows(13) }, 2);
+        assert_eq!(unsafe { supersonic_gqh_test_wide_verify_rows(16) }, 4);
+    }
+
+    /// GQH4's 16-level nibble wire is the other hot verify rung; its dense i8
+    /// result must stay inside the same PR #35 tolerance as GQH3/GQH2_H.
+    #[test]
+    fn hip_matvec_i8_gqh4_dense_matches_f32_within_tolerance() {
+        let Some(ordinal) = require_hip() else {
+            return;
+        };
+        use model_store::gqh::{decode_row, GqhHeader, GqhRung as MsRung};
+        use model_store::gqh_q8::{q8_denom_eff, GqhRung as Q8Rung};
+
+        const I8_DENSE_REL: f64 = 2e-2;
+        let rows = 4usize;
+        let cols = 512usize;
+        let nsb = cols / 256;
+        let row_bytes = nsb * 137;
+        let mut packed = vec![0u8; rows * row_bytes];
+        for row in 0..rows {
+            for superblock in 0..nsb {
+                let base = row * row_bytes + superblock * 137;
+                packed[base] = 0x38;
+                packed[base + 1..base + 9].fill(0xff);
+                for j in 0..256usize {
+                    let code = ((row + superblock + j) & 15) as u8;
+                    let byte = base + 9 + (j >> 1);
+                    if j & 1 == 1 {
+                        packed[byte] |= code << 4;
+                    } else {
+                        packed[byte] |= code;
+                    }
+                }
+            }
+        }
+
+        let header = GqhHeader {
+            qtype: 111,
+            tensor_scale: 1.0,
+            grid_code: 2,
+        };
+        let mut weights = vec![0.0f32; rows * cols];
+        for row in 0..rows {
+            decode_row(
+                MsRung::Gqh4,
+                &packed[row * row_bytes..(row + 1) * row_bytes],
+                cols,
+                Some(header.clone()),
+                &mut weights[row * cols..(row + 1) * cols],
+            )
+            .expect("decode synthetic GQH4 row");
+        }
+
+        let ncols = 16usize;
+        let x: Vec<f32> = (0..ncols * cols)
+            .map(|idx| {
+                let column = idx / cols;
+                let position = idx % cols;
+                (((column + position) % 19) as f32 - 9.0) / 7.0
+            })
+            .collect();
+        let mut y_ref = vec![0.0f32; ncols * rows];
+        let mut row_norms = vec![0.0f64; rows];
+        let mut col_norms = vec![0.0f64; ncols];
+        for row in 0..rows {
+            row_norms[row] = weights[row * cols..(row + 1) * cols]
+                .iter()
+                .map(|value| (*value as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
+        }
+        for column in 0..ncols {
+            col_norms[column] = x[column * cols..(column + 1) * cols]
+                .iter()
+                .map(|value| (*value as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            for row in 0..rows {
+                let mut sum = 0.0f64;
+                for position in 0..cols {
+                    sum +=
+                        weights[row * cols + position] as f64 * x[column * cols + position] as f64;
+                }
+                y_ref[column * rows + row] = sum as f32;
+            }
+        }
+
+        let ngroups = cols / 8;
+        let x_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[ncols * cols], &f32_bytes(&x))
+                .expect("upload synthetic GQH4 x");
+        let mut qx_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[ncols * cols]).expect("qx");
+        let mut qxs_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * ngroups]).expect("qxs");
+        quant_x_i8(
+            ordinal,
+            &x_buf,
+            &mut qx_buf,
+            &mut qxs_buf,
+            ncols,
+            cols,
+            cols,
+        )
+        .expect("quant synthetic GQH4 x");
+        let wire_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[packed.len()], &packed)
+                .expect("upload synthetic GQH4 wire");
+        let mut y_buf = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * rows]).expect("y");
+        let q8n = q8_denom_eff(Q8Rung::Gqh4, 2).expect("GQH4 denominator");
+        matvec_i8(
+            ordinal,
+            RUNG_GQH4,
+            &wire_buf,
+            &qx_buf,
+            &qxs_buf,
+            &mut y_buf,
+            cols,
+            rows,
+            ncols,
+            q8n,
+            cols,
+            ngroups,
+            rows,
+            header.tensor_scale,
+            header.grid_code,
+        )
+        .expect("GQH4 i8 matvec");
+
+        let got = read_f32(&y_buf);
+        let mut max_rel = 0.0f64;
+        for column in 0..ncols {
+            for row in 0..rows {
+                let index = column * rows + row;
+                let bound = I8_DENSE_REL * row_norms[row] * col_norms[column];
+                let error = (got[index] as f64 - y_ref[index] as f64).abs();
+                let relative = if bound > 1e-30 { error / bound } else { 0.0 };
+                max_rel = max_rel.max(relative);
+                assert!(
+                    error <= bound,
+                    "gqh4 i8 [{column},{row}] error {error:.6} > bound {bound:.6}",
+                );
+            }
+        }
+        eprintln!("[i8-matvec gqh4] max_rel = {max_rel:.4} (tolerance {I8_DENSE_REL})");
+
+        let wide_ngroups = cols / 16;
+        let mut wide_qx_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[ncols * cols]).expect("wide qx");
+        let mut wide_qxs_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[wide_ngroups]).expect("wide qxs");
+        quant_x_i8_wide16(
+            ordinal,
+            &x_buf,
+            &mut wide_qx_buf,
+            &mut wide_qxs_buf,
+            ncols,
+            cols,
+            cols,
+        )
+        .expect("quant synthetic GQH4 SB2 x");
+        let mut wide_y_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * rows]).expect("wide y");
+        matvec_i8(
+            ordinal,
+            RUNG_GQH4,
+            &wire_buf,
+            &wide_qx_buf,
+            &wide_qxs_buf,
+            &mut wide_y_buf,
+            cols,
+            rows,
+            ncols,
+            q8n,
+            cols,
+            wide_ngroups,
+            rows,
+            header.tensor_scale,
+            header.grid_code,
+        )
+        .expect("GQH4 SB2 i8 matvec");
+        let wide_got = read_f32(&wide_y_buf);
+        for column in 0..ncols {
+            for row in 0..rows {
+                let index = column * rows + row;
+                let bound = I8_DENSE_REL * row_norms[row] * col_norms[column];
+                let error = (wide_got[index] as f64 - y_ref[index] as f64).abs();
+                assert!(
+                    error <= bound,
+                    "gqh4 SB2 i8 [{column},{row}] error {error:.6} > bound {bound:.6}",
+                );
+            }
+        }
+
+        let mut pair_a =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * rows]).expect("GQH4 SB2 pair y_a");
+        let mut pair_b =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * rows]).expect("GQH4 SB2 pair y_b");
+        matvec_i8_pair(
+            ordinal,
+            RUNG_GQH4,
+            &wire_buf,
+            &wire_buf,
+            &wide_qx_buf,
+            &wide_qxs_buf,
+            &mut pair_a,
+            &mut pair_b,
+            cols,
+            rows,
+            ncols,
+            q8n,
+            q8n,
+            cols,
+            wide_ngroups,
+            rows,
+            rows,
+            header.tensor_scale,
+            header.tensor_scale,
+            header.grid_code,
+            header.grid_code,
+        )
+        .expect("GQH4 SB2 pair matvec");
+        assert_eq!(read_f32(&pair_a), wide_got, "GQH4 pair half A");
+        assert_eq!(read_f32(&pair_b), wide_got, "GQH4 pair half B");
+
+        let mut dispatch_y =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[ncols * rows]).expect("dispatch y");
+        let ran = crate::prefill_ffi::try_matmul_gqh_i8_dot(
+            ordinal,
+            ncols,
+            rows,
+            cols,
+            &x_buf,
+            &wire_buf,
+            header.tensor_scale,
+            header.grid_code,
+            RUNG_GQH4,
+            &mut dispatch_y,
+        )
+        .expect("GQH4 i8 dispatch");
+        assert!(ran, "GQH4 i8 dispatch should run for grid 2");
+        let dispatch_got = read_f32(&dispatch_y);
+        for column in 0..ncols {
+            for row in 0..rows {
+                let index = column * rows + row;
+                let bound = I8_DENSE_REL * row_norms[row] * col_norms[column];
+                let error = (dispatch_got[index] as f64 - y_ref[index] as f64).abs();
+                assert!(
+                    error <= bound,
+                    "gqh4 i8 dispatch [{column},{row}] error {error:.6} > bound {bound:.6}",
                 );
             }
         }

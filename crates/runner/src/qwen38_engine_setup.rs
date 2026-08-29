@@ -66,14 +66,8 @@ pub(crate) fn load_qwen38_engine(
             ordinal,
             context_tokens,
             text_config.hidden_size,
-        )?)
-    } else if let Some(env_path) = std::env::var_os("SUPERSONIC_DFLASH_DRAFT_GGUF") {
-        let path = std::path::PathBuf::from(env_path);
-        Some(load_dflash_decoder(
-            &path,
-            ordinal,
-            context_tokens,
-            text_config.hidden_size,
+            text_config.num_hidden_layers,
+            text_config,
         )?)
     } else {
         None
@@ -90,6 +84,8 @@ fn load_dflash_decoder(
     ordinal: usize,
     max_ctx: usize,
     hidden: usize,
+    target_layer_count: usize,
+    target_config: &qwen38::config::TextConfig,
 ) -> anyhow::Result<supersonic_runtime::dflash_spec::DflashSpecDecoder> {
     let t0 = std::time::Instant::now();
     let draft_weights = model_store::dflash::load_draft(draft_path)
@@ -108,6 +104,15 @@ fn load_dflash_decoder(
         "[dflash] draft uploaded in {:.0}ms",
         t0.elapsed().as_millis()
     );
-    supersonic_runtime::dflash_spec::DflashSpecDecoder::new(draft_gpu, ordinal, max_ctx, hidden)
-        .map_err(|e| anyhow::anyhow!("create dflash spec decoder: {e}"))
+    let decoder = supersonic_runtime::dflash_spec::DflashSpecDecoder::new(
+        draft_gpu,
+        ordinal,
+        max_ctx,
+        hidden,
+        target_layer_count,
+        target_config,
+    )
+    .map_err(|e| anyhow::anyhow!("create dflash spec decoder: {e}"))?;
+    eprintln!("[dflash] active verify block={}", decoder.block_size());
+    Ok(decoder)
 }

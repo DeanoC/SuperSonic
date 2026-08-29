@@ -886,7 +886,7 @@ __device__ inline void supersonic_qwen35_delta_recurrent_prefill_impl(
 
         if (state_trace) {
             const int trace_base =
-                ((bh * seq_len + t) * k_head_dim) * v_head_dim + v_idx;
+                ((t * batch_heads + bh) * k_head_dim) * v_head_dim + v_idx;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
                 state_trace[trace_base + k_idx * v_head_dim] =
                     supersonic_qwen35_from_float<T>(state[k_idx]);
@@ -939,6 +939,41 @@ __global__ void supersonic_qwen35_delta_recurrent_prefill_kernel(
     );
 }
 
+__global__ void supersonic_qwen35_delta_recurrent_extract_kernel(
+    int batch_heads,
+    int seq_len,
+    int k_head_dim,
+    int v_head_dim,
+    const float* __restrict__ recurrent_out,
+    float* __restrict__ recurrent_state,
+    hip_bfloat16* __restrict__ attn_output
+) {
+    const size_t state_elems =
+        static_cast<size_t>(batch_heads) * k_head_dim * v_head_dim;
+    const size_t attn_elems =
+        static_cast<size_t>(batch_heads) * seq_len * v_head_dim;
+    const size_t tid =
+        blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    if (tid < state_elems) {
+        const size_t state_stride = k_head_dim * v_head_dim;
+        const size_t head = tid / state_stride;
+        const size_t within = tid - head * state_stride;
+        const size_t src =
+            head * ((seq_len + k_head_dim) * v_head_dim) +
+            seq_len * v_head_dim + within;
+        recurrent_state[tid] = recurrent_out[src];
+    } else if (tid < state_elems + attn_elems) {
+        const size_t attn_index = tid - state_elems;
+        const size_t attn_stride = seq_len * v_head_dim;
+        const size_t head = attn_index / attn_stride;
+        const size_t within = attn_index - head * attn_stride;
+        const size_t src =
+            head * ((seq_len + k_head_dim) * v_head_dim) + within;
+        attn_output[attn_index] =
+            supersonic_qwen35_from_float<hip_bfloat16>(recurrent_out[src]);
+    }
+}
+
 // Specialized k=v=128 rec. Same product order as the generic warp
 // kernel (scale, kv_mem, delta, state+=, out) but k-per-lane is a
 // compile-time 4, so the 8070-token loop has no nk branches and no
@@ -954,7 +989,8 @@ void supersonic_qwen35_delta_recurrent_prefill_warp_k128_kernel(
     const T* __restrict__ value,
     const T* __restrict__ beta,
     const T* __restrict__ g,
-    T* __restrict__ out
+    T* __restrict__ out,
+    half* __restrict__ state_trace
 ) {
     constexpr int K = 128;
     constexpr int V = 128;
@@ -1083,6 +1119,21 @@ void supersonic_qwen35_delta_recurrent_prefill_warp_k128_kernel(
         o1 = __shfl(supersonic_qwen35_wave_sum(o1), 0);
         o2 = __shfl(supersonic_qwen35_wave_sum(o2), 0);
         o3 = __shfl(supersonic_qwen35_wave_sum(o3), 0);
+        if (state_trace != nullptr) {
+            const int trace_base = ((t * batch_heads + bh) * K) * V;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int trace_row = trace_base + k_ids[r] * V;
+                state_trace[trace_row + v0] =
+                    supersonic_qwen35_from_float<half>(state0[r]);
+                state_trace[trace_row + v1] =
+                    supersonic_qwen35_from_float<half>(state1[r]);
+                state_trace[trace_row + v2] =
+                    supersonic_qwen35_from_float<half>(state2[r]);
+                state_trace[trace_row + v3] =
+                    supersonic_qwen35_from_float<half>(state3[r]);
+            }
+        }
         if (lane == 0) {
             out[out_base + t * V + v0] = supersonic_qwen35_from_float<T>(o0);
             out[out_base + t * V + v1] = supersonic_qwen35_from_float<T>(o1);

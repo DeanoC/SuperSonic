@@ -3,6 +3,7 @@ use std::time::Instant;
 use anyhow::Result;
 
 use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
+use crate::profiling::DflashProfileScope;
 use crate::qwen38_decode_report::{emit_qwen38_decode_report, Qwen38DecodeReport};
 use crate::qwen38_engine_setup::load_qwen38_engine;
 use crate::qwen38_prefill::run_qwen38_prefill;
@@ -25,12 +26,12 @@ pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
     let mut generated_ids = Vec::new();
     let mut timings = DecodeStageTimings::default();
     let mut timing_steps = 0usize;
-    let decode_start = Instant::now();
     let eos_ids = qwen_eos_ids(&startup.text_config, &startup.tokenizer, cli.chat);
+    let decode_ms;
 
     if let Some(dflash) = setup.dflash.as_mut() {
         // DFlash2 handles its own prefill (with hidden-state capture).
-        run_qwen38_dflash(
+        decode_ms = run_qwen38_dflash(
             cli,
             &mut setup.engine,
             dflash,
@@ -41,6 +42,7 @@ pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
     } else {
         let prefill = run_qwen38_prefill(cli, &mut setup.engine, &startup.prompt_ids)?;
         setup.engine.prepare_hip_gqh_decode()?;
+        let decode_start = Instant::now();
         let mut next_token = prefill.next_token;
 
         if setup.engine.mtp_spec_enabled() {
@@ -106,6 +108,7 @@ pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
                 next_token = sampled;
             }
         }
+        decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
     }
 
     emit_qwen38_decode_report(Qwen38DecodeReport {
@@ -113,7 +116,7 @@ pub(crate) fn run_qwen38(cli: &Cli, entry: &RegistryEntry, ordinal: usize) -> Re
         prompt_ids: &startup.prompt_ids,
         generated_ids: &generated_ids,
         emit_generated_json: cli.emit_generated_json,
-        decode_ms: decode_start.elapsed().as_secs_f64() * 1000.0,
+        decode_ms,
         emit_stage_timings: cli.emit_stage_timings,
         native_decode_timings: &timings,
         native_decode_timing_steps: timing_steps,
@@ -127,7 +130,7 @@ fn run_qwen38_dflash(
     prompt_ids: &[u32],
     eos_ids: &[u32],
     generated_ids: &mut Vec<u32>,
-) -> Result<()> {
+) -> Result<f64> {
     let prompt_len = prompt_ids.len();
 
     // Prefill with capture: record target hidden states at the 5 draft
@@ -145,34 +148,38 @@ fn run_qwen38_dflash(
 
     let mut committed = prompt_len;
     let mut last_tok = first_token;
-    generated_ids.push(first_token);
+    let profile_scope =
+        DflashProfileScope::new(cli.profile_prefill || cli.profile_prefill_json.is_some());
+    let decode_start = Instant::now();
 
     while generated_ids.len() < cli.max_new_tokens {
-        if !cli.ignore_eos && eos_ids.contains(&last_tok) {
-            break;
-        }
         let remaining = cli.max_new_tokens - generated_ids.len();
+        let round_start = Instant::now();
         let round = dflash.run_round(engine, last_tok, committed, remaining)?;
+        let round_ms = round_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
-            "[dflash] pos={} drafted={} accepted={} emitted={}",
+            "[dflash] pos={} drafted={} accepted={} emitted={} round_ms={round_ms:.1}",
             committed,
             round.n_drafted,
             round.n_accepted,
             round.emitted.len()
         );
+        let mut hit_eos = false;
         for token in &round.emitted {
             generated_ids.push(*token);
             committed += 1;
-            last_tok = *token;
-            if generated_ids.len() >= cli.max_new_tokens
-                || (!cli.ignore_eos && eos_ids.contains(token))
-            {
+            if !cli.ignore_eos && eos_ids.contains(token) {
+                hit_eos = true;
+                break;
+            }
+            if generated_ids.len() >= cli.max_new_tokens {
                 break;
             }
         }
-        if generated_ids.len() >= cli.max_new_tokens {
+        if hit_eos || generated_ids.len() >= cli.max_new_tokens {
             break;
         }
+        last_tok = round.next_token;
     }
 
     let summary = dflash.summary();
@@ -187,7 +194,9 @@ fn run_qwen38_dflash(
         },
         summary.n_rounds,
     );
-    Ok(())
+    let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+    profile_scope.finish();
+    Ok(decode_ms)
 }
 
 fn qwen_eos_ids(

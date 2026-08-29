@@ -194,7 +194,7 @@ class BenchmarkRenderTests(unittest.TestCase):
 
         page = self.render.render_run(record)
 
-        for value in ("30.0", "28.0", "32.0", "2.0", "3", "2400", "1249"):
+        for value in ("30.0", "1066.6666666667", "1", "2400", "1249"):
             self.assertIn(value, page)
         for value in (
             "locked",
