@@ -3,7 +3,9 @@
 The benchmark harness measures the supported Qwen3.8-27B GQH path without
 expanding the runner contract. A result is a reviewable candidate first; it
 becomes a public number only after validation, correctness, and evidence review.
-No measured throughput number is published in this repository yet.
+The committed clean-tree quick baseline is documented in
+[Performance](performance.md#current-quick-baseline). No full-suite or peer
+throughput number is published in this repository yet.
 
 ## Tiers and time budgets
 
