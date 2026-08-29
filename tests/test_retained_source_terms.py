@@ -379,6 +379,45 @@ class RetainedSourceTermsTests(unittest.TestCase):
             self.assertIn(legacy, terms, legacy)
         self.assertEqual(len(violations), 4, violations)
 
+    def test_allows_retained_dflash2_rollback_and_commit_contracts(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crates" / "runtime" / "src"
+            runtime.mkdir(parents=True)
+            (runtime / "dflash_spec.rs").write_text(
+                "use crate::prefill_engine::DflashRollbackCapture;\n"
+                "pub enum DflashVerifyPath { Component }\n"
+                "struct DflashCommitPlan;\n"
+                "pub fn verify_block_dflash_with_rollback() {}\n"
+                "pub fn rollback_dflash_prefix() {}\n"
+                "pub fn replay_committed_prefix_dflash() {}\n"
+                "fn dflash_commit_plan() {}\n"
+                "fn dflash_fast_rollback_plan() {}\n"
+                "fn dflash_tokens_from_selector() {}\n"
+                "fn dflash_next_token() {}\n"
+                "fn trace() -> Option<usize> {\n"
+                "    std::env::var(\"SUPERSONIC_DFLASH_TRACE_CTX\").ok()?\n"
+                "        .parse::<usize>().ok()\n"
+                "}\n"
+                "mod dflash_commit_tests {}\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        terms = {term for _, _, term, _ in violations}
+        for allowed in (
+            "DflashRollbackCapture", "DflashVerifyPath", "DflashCommitPlan",
+            "verify_block_dflash_with_rollback", "rollback_dflash_prefix",
+            "replay_committed_prefix_dflash", "dflash_commit_plan",
+            "dflash_fast_rollback_plan", "dflash_tokens_from_selector",
+            "dflash_next_token", "dflash_commit_tests",
+            "SUPERSONIC_DFLASH_TRACE_CTX",
+        ):
+            self.assertNotIn(allowed, terms, allowed)
+        self.assertEqual(violations, [])
+
 
 if __name__ == "__main__":
     unittest.main()

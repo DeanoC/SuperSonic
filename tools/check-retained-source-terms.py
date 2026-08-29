@@ -53,14 +53,25 @@ ALLOWED_DFLASH2_TERMS = frozenset({
     "DflashSpecRound",
     "DflashSpecSummary",
     "DflashTargetCapture",
+    "DflashRollbackCapture",
+    "DflashVerifyPath",
+    "DflashCommitPlan",
     "capture_block_dflash",
     "dflash",
     "dflash_capture",
+    "dflash_commit_plan",
+    "dflash_commit_tests",
     "dflash_dyn_conv",
+    "dflash_fast_rollback_plan",
+    "dflash_next_token",
     "dflash_scatter_cols_raw",
     "dflash_spec",
+    "dflash_tokens_from_selector",
     "prefill_with_dflash_capture",
+    "replay_committed_prefix_dflash",
+    "rollback_dflash_prefix",
     "verify_block_dflash",
+    "verify_block_dflash_with_rollback",
 })
 
 # Rust environment controls are conventionally uppercase, but the boundary
@@ -75,7 +86,9 @@ FORBIDDEN_MTP_ENV_RE = re.compile(
 # The DFlash2 profiling telemetry control.  Allowlisted as an exact,
 # case-sensitive spelling so other SUPERSONIC_DFLASH* controls (including
 # lowercase evasions) stay rejected (e.g. SUPERSONIC_DFLASH_PROFILE_VERIFY).
-ALLOWED_DFLASH2_ENV = frozenset({"SUPERSONIC_DFLASH_PROFILE"})
+ALLOWED_DFLASH2_ENV = frozenset(
+    {"SUPERSONIC_DFLASH_PROFILE", "SUPERSONIC_DFLASH_TRACE_CTX"}
+)
 FORBIDDEN_KERNEL_PRODUCT_RE = re.compile(r"qwen\s*3[.]5", re.IGNORECASE)
 STALE_KERNEL_GEOMETRY_RE = re.compile(
     r"(?:\b(?!64\b)\d+\s+total\b[^\n]*(?:decoder\s+layer|qwen3[.]8)|"

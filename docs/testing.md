@@ -19,6 +19,7 @@ HIP_ARCH=gfx1201 cargo check --workspace --all-targets
 python3 tools/check-support-matrix.py
 python3 tools/check-kernel-groups.py
 python3 tools/check-tool-inventory.py
+python3 tools/check-retained-source-terms.py
 python3 tools/check-active-docs.py
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
