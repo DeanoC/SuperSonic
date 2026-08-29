@@ -77,3 +77,13 @@ If the GQH file contains the complete Qwen3.8 NextN block, pass
 `--speculative-decode`. The runtime validates the block before launch and
 keeps the generated token sequence equivalent to ordinary greedy generation.
 The [testing](testing.md) page describes the serial equivalence gate.
+
+## Optional DFlash2 draft-model generation
+
+Pass `--draft-gguf-file` with the canonical
+`qwen38-dflash2-q8_0-canonical.gguf` drafter to enable DFlash2 speculative
+generation instead of NextN/MTP. The runner validates the draft architecture and
+target-hidden-state contract before launch. DFlash2 runs its active verify
+block at width 16; the drafter's metadata width is provenance, not a public
+compatibility mode. DFlash2 uses the int8 serving policy and is accepted by
+semantic benchmark quality cases, not ordinary-token equality.

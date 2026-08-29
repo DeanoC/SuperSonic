@@ -3,19 +3,22 @@
 The benchmark harness measures the supported Qwen3.8-27B GQH path without
 expanding the runner contract. A result is a reviewable candidate first; it
 becomes a public number only after validation, correctness, and evidence review.
-No measured throughput number is published in this repository yet.
+The committed clean-tree quick baseline is documented in
+[Performance](performance.md#current-quick-baseline). No full-suite or peer
+throughput number is published in this repository yet.
 
 ## Tiers and time budgets
 
 The suite manifests own the measurement budgets:
 
 - `quick` has a 600-second hard budget (10 minutes). It is the development and GPU
-  smoke candidate, with the representative quality and performance cases.
+  smoke candidate, with ordinary and DFlash2 short performance arms plus the
+  representative quality cases.
 - `full` runs for about six hours: it has a 20,700-second minimum inside a
   21,600-second hard budget. It is
   manually triggered after quick review or for an overnight run, and includes
-  the complete quality corpus, the verified cold-load series, MTP cases, and
-  the configured peer engine. The seeded case/engine order runs in
+  the complete quality corpus, the verified cold-load series, MTP and DFlash2
+  cases, and the configured peer engine. The seeded case/engine order runs in
   balanced rounds until the minimum is reached; the reserved 900 seconds bound the final
   round and manifest finalization.
 
@@ -82,7 +85,11 @@ development profile implicitly.
 
 The following is the implemented CLI shape used by the quick workflow. All
 paths and clock values are explicit inputs; the static JSON is required by the
-CLI and is the authoritative provenance source.
+CLI and is the authoritative provenance source. The DFlash2 arm requires the
+canonical `qwen38-dflash2-q8_0-canonical.gguf` drafter; do not substitute the
+similarly named vendor or converted drafters. DFlash2 results record the
+active width-16 verify block and are not comparable with obsolete width-8
+evidence.
 
 ```bash
 set -euo pipefail
@@ -92,6 +99,9 @@ RUST_TEST_THREADS=1 timeout --foreground 660s \
   --suite quick \
   --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
   --artifact "$SUPERSONIC_GQH_GGUF" \
+  --draft-artifact "$SUPERSONIC_DFLASH_DRAFT_GGUF" \
+  --draft-artifact-semantic-id qwen3.8-27b-dflash2-q8-canonical \
+  --draft-artifact-quantization Q8_0 \
   --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
   --artifact-quantization GQH-Q3KXL \
   --tokenizer-sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 \
@@ -173,6 +183,9 @@ RUST_TEST_THREADS=1 timeout --foreground 21660s \
   --suite full \
   --model-dir "$SUPERSONIC_QWEN38_MODEL_DIR" \
   --artifact "$SUPERSONIC_GQH_GGUF" \
+  --draft-artifact "$SUPERSONIC_DFLASH_DRAFT_GGUF" \
+  --draft-artifact-semantic-id qwen3.8-27b-dflash2-q8-canonical \
+  --draft-artifact-quantization Q8_0 \
   --peer-artifact "$SUPERSONIC_LLAMA_CPP_ARTIFACT" \
   --artifact-semantic-id qwen3.8-27b-gqh-q3kxl-hf-91bc7e33 \
   --artifact-quantization GQH-Q3KXL \
@@ -257,8 +270,10 @@ diagnosis but are excluded from headline performance and peer speedup claims.
 
 Every candidate record retains the commit and dirty state, engine/version,
 ROCm/HIP versions, static physical GPU provenance, logical mapping, artifact
-identity and digest, prompt/workload, cache/process state, clock evidence,
-correctness and ordinary-versus-MTP equality, and raw measured samples in
+identity and digest, DFlash2 drafter identity and digest for DFlash2 records,
+prompt/workload, cache/process state, clock evidence,
+correctness, ordinary-versus-MTP equality, DFlash2 semantic quality, and raw
+measured samples in
 measurement order. The validator validates raw sample values, the suite-required
 or balanced-round sample count, and bundle completeness. The renderer deterministically derives sample
 count, median, minimum, maximum, and median absolute deviation (MAD) from

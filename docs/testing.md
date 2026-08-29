@@ -1,7 +1,8 @@
 # Testing
 
 The testing contract protects the direct Qwen3.8-27B GQH path, deterministic
-greedy generation, and optional NextN/MTP token equivalence. CPU-safe checks do
+greedy generation, optional NextN/MTP token equivalence, and DFlash2 semantic
+quality. CPU-safe checks do
 not require an accelerator. Artifact-dependent checks accept explicit paths
 locally; the configured self-hosted workflow fails during preflight instead of
 turning a missing artifact into a pass.
@@ -18,6 +19,7 @@ HIP_ARCH=gfx1201 cargo check --workspace --all-targets
 python3 tools/check-support-matrix.py
 python3 tools/check-kernel-groups.py
 python3 tools/check-tool-inventory.py
+python3 tools/check-retained-source-terms.py
 python3 tools/check-active-docs.py
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
@@ -39,7 +41,7 @@ set -euo pipefail
 export HIP_ARCH=gfx1201
 export RUST_TEST_THREADS=1
 export SUPERSONIC_REQUIRE_GQH_ARTIFACTS=1
-export SUPERSONIC_GQH_GGUF="${SUPERSONIC_GQH_GGUF:-/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq.gguf}"
+export SUPERSONIC_GQH_GGUF="${SUPERSONIC_GQH_GGUF:-/home/deano/models/qwen38-gqh-shaped.gguf}"
 export SUPERSONIC_QWEN38_MODEL_DIR="${SUPERSONIC_QWEN38_MODEL_DIR:-/data/models/Qwen3.8-27B}"
 export SUPERSONIC_GQH_8192_GGUF="${SUPERSONIC_GQH_8192_GGUF:-/home/deano/gqh-artifacts/qwen38-gqh-q2kxl-gptq-8192.gguf}"
 python3 tools/check-qwen38-artifacts.py --require-8192
@@ -53,6 +55,8 @@ RUST_TEST_THREADS=1 cargo test --release -p supersonic-runtime \
 
 The gate covers official GQH vectors, tensor geometry, deterministic component
 decode, chat-template generation, and the ordinary-versus-MTP token sequence.
+DFlash2 artifact tests additionally compare the draft-forward, target-capture,
+rollback, and generation-limit state paths.
 Keep `--include-ignored` and `--test-threads=1`: the canonical artifact is
 large and these cases are deliberately serialized.
 

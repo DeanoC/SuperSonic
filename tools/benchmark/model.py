@@ -52,6 +52,7 @@ class PerformanceCase:
     cache_state: str
     timeout_seconds: int
     decoding_policy: str
+    stop_policy: str
     engines: tuple[str, ...]
 
 

@@ -2,7 +2,7 @@ use std::ffi::{c_int, c_void};
 
 /// Maximum batch size supported by the batched decode kernel.
 /// Struct arrays in BatchSeqDesc are fixed to this size.
-pub const MAX_BATCH_SIZE: usize = 8;
+pub const MAX_BATCH_SIZE: usize = 16;
 
 /// Rust mirror of the historical `Qwen35DecodeLayerDesc` bridge layout.
 /// The C++ field spelling is an external ABI detail; the product is Qwen3.8.
@@ -227,6 +227,9 @@ pub struct BatchSeqDesc {
     // capability and these remain null.
     kv_scale_k: [*mut c_void; MAX_BATCH_SIZE],
     kv_scale_v: [*mut c_void; MAX_BATCH_SIZE],
+    pub dflash_target_hidden: [*mut c_void; MAX_BATCH_SIZE],
+    pub dflash_recurrent: [*mut c_void; MAX_BATCH_SIZE],
+    pub dflash_qkv: [*mut c_void; MAX_BATCH_SIZE],
 }
 
 unsafe impl Send for BatchSeqDesc {}
@@ -240,7 +243,7 @@ impl Default for BatchSeqDesc {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::INT4ScaleDesc;
+    use super::{BatchSeqDesc, INT4ScaleDesc, MAX_BATCH_SIZE};
     use std::ffi::{c_int, c_void};
     use std::mem::{align_of, offset_of, size_of};
 
@@ -261,5 +264,28 @@ mod layout_tests {
         );
         assert_eq!(size_of::<INT4ScaleDesc>(), expected_size);
         assert_eq!(align_of::<INT4ScaleDesc>(), alignment);
+    }
+
+    #[test]
+    fn dflash_capture_descriptor_matches_cpp_wire_layout() {
+        let pointer_bytes = size_of::<*mut c_void>();
+        let array_bytes = MAX_BATCH_SIZE * size_of::<c_int>();
+
+        assert_eq!(
+            offset_of!(BatchSeqDesc, dflash_target_hidden),
+            4 * array_bytes + 8 * MAX_BATCH_SIZE * pointer_bytes
+        );
+        assert_eq!(
+            offset_of!(BatchSeqDesc, dflash_recurrent),
+            offset_of!(BatchSeqDesc, dflash_target_hidden) + MAX_BATCH_SIZE * pointer_bytes
+        );
+        assert_eq!(
+            offset_of!(BatchSeqDesc, dflash_qkv),
+            offset_of!(BatchSeqDesc, dflash_recurrent) + MAX_BATCH_SIZE * pointer_bytes
+        );
+        assert_eq!(
+            size_of::<BatchSeqDesc>(),
+            offset_of!(BatchSeqDesc, dflash_qkv) + MAX_BATCH_SIZE * pointer_bytes
+        );
     }
 }

@@ -76,6 +76,8 @@ class BenchmarkExecutionTests(unittest.TestCase):
             (self.model_dir / name).write_text("{}", encoding="utf-8")
         self.artifact = self.root / "qwen38.gqh.gguf"
         self.artifact.write_bytes(b"artifact")
+        self.draft_artifact = self.root / "qwen38-dflash2-q8_0-canonical.gguf"
+        self.draft_artifact.write_bytes(b"dflash2-draft")
         self.peer_artifact = self.root / "peer.gguf"
         self.peer_artifact.write_bytes(b"peer")
         self.static_json = self.root / "amd-smi-static.json"
@@ -124,6 +126,9 @@ class BenchmarkExecutionTests(unittest.TestCase):
             suite=suite,
             model_dir=self.model_dir,
             artifact=self.artifact,
+            draft_artifact=self.draft_artifact,
+            draft_artifact_semantic_id="qwen3.8-27b-dflash2-q8-canonical",
+            draft_artifact_quantization="Q8_0",
             peer_artifact=self.peer_artifact if include_peer else None,
             physical_gpu="0",
             gpu_arch="gfx1201",
@@ -187,7 +192,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
     def test_locked_real_run_records_live_process_telemetry(self):
         self.binary.write_text(
             "#!/bin/sh\n"
-            "sleep 0.3\n"
+            "sleep 0.6\n"
             "printf '[generated_json] \"ok\"\\n'\n"
             "printf '[tokens] 1\\n'\n"
             "printf '[result] prompt_tokens=2 generated_tokens=1 decode_ms=1.0 ms_per_tok=1.0\\n'\n",
@@ -229,6 +234,88 @@ class BenchmarkExecutionTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field.replace("_", ".*")):
                 self.execution.preflight(config)
 
+    def test_dflash_suite_requires_and_records_explicit_draft_artifact(self):
+        draft_artifact = self.root / "qwen38-dflash2-q8_0-canonical.gguf"
+        draft_artifact.write_bytes(b"dflash2-draft")
+        quick = self.execution.manifest.load_suite("quick")
+        dflash_case = next(
+            case for case in quick.performance_cases
+            if case.mode == "dflash" and case.id.endswith("has-close-elements-dflash")
+        )
+        suite = replace(quick, performance_cases=(dflash_case,))
+        config = self.execution.replace_config(self.config(run_quality=False), suite=suite)
+        config = self.execution.replace_config(
+            config,
+            draft_artifact=None,
+            draft_artifact_semantic_id=None,
+            draft_artifact_quantization=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "draft[_ ]artifact"):
+            self.execution.preflight(config)
+
+        config = self.execution.replace_config(
+            config,
+            draft_artifact=draft_artifact,
+            draft_artifact_semantic_id="qwen3.8-27b-dflash2-q8-canonical",
+            draft_artifact_quantization="Q8_0",
+        )
+        status = self.execution.run_suite(config, FakeClock([0, 1]), FakeRunner())
+
+        self.assertEqual(status.errors, ("quality_failed",))
+        self.assertEqual(len(status.records), 1)
+        runner = FakeRunner()
+        self.execution.run_suite(
+            self.execution.replace_config(
+                config,
+                output_dir=self.root / "candidate-record",
+            ),
+            FakeClock([0, 1]),
+            runner,
+        )
+        self.assertIn("--draft-gguf-file", runner.calls[0][0])
+        record = json.loads(status.records[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["workload"]["mode"], "dflash")
+        self.assertEqual(record["workload"]["dflash_block_size"], 16)
+        self.assertEqual(
+            record["draft_artifact"]["sha256"],
+            hashlib.sha256(draft_artifact.read_bytes()).hexdigest(),
+        )
+
+    def test_dflash_quality_runs_semantic_dflash_output(self):
+        draft_artifact = self.root / "qwen38-dflash2-q8_0-canonical.gguf"
+        draft_artifact.write_bytes(b"dflash2-draft")
+        quality_case = next(
+            case
+            for case in self.execution.manifest.load_quality("v2")
+            if case.category == "dflash-quality"
+        )
+        quick = self.execution.manifest.load_suite("quick")
+        suite = replace(
+            quick,
+            quality_case_ids=(quality_case.id,),
+            performance_cases=(),
+        )
+        config = self.execution.replace_config(
+            self.config(run_quality=True),
+            suite=suite,
+            draft_artifact=draft_artifact,
+            draft_artifact_semantic_id="qwen3.8-27b-dflash2-q8-canonical",
+            draft_artifact_quantization="Q8_0",
+        )
+
+        runner = FakeRunner(
+            '[generated_json] "ready"\n'
+            "[tokens] 1\n"
+            "[result] prompt_tokens=2 generated_tokens=1 decode_ms=1.0 ms_per_tok=1.0\n"
+        )
+        status = self.execution.run_suite(config, FakeClock([0, 1, 2]), runner)
+
+        self.assertEqual(status.state, "complete")
+        self.assertEqual(status.errors, ())
+        self.assertIn("--draft-gguf-file", runner.calls[0][0])
+        self.assertNotIn("--speculative-decode", runner.calls[0][0])
+
     def test_chat_template_identity_hashes_the_template_not_its_container_file(self):
         template = "{% if messages %}{{ messages[0].content }}{% endif %}"
         config_file = self.model_dir / "tokenizer_config.json"
@@ -263,7 +350,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
         status = self.execution.run_suite(config, FakeClock([0, 599, 599.5, 601]), runner)
         self.assertEqual(status.state, "incomplete")
         self.assertIn("budget_exhausted", status.errors)
-        self.assertEqual(set(runner.started_case_ids), {"quick-short-cold-ordinary"})
+        self.assertEqual(set(runner.started_case_ids), {"quick-geo-humaneval-has-close-elements-ordinary"})
 
     def test_case_timeout_is_bounded_and_preserves_incomplete_evidence(self):
         config = self.config(run_quality=False)
@@ -293,7 +380,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
     def test_invalid_record_is_never_atomically_promoted(self):
         config = self.config(run_quality=False)
         status = self.execution.run_suite(config, FakeClock([0, 1, 2, 3, 4, 5]), CorruptRunner())
-        self.assertFalse((status.bundle / "records" / "quick-short-cold-ordinary-supersonic.json").exists())
+        self.assertFalse((status.bundle / "records" / "quick-geo-humaneval-has-close-elements-ordinary-supersonic.json").exists())
         self.assertFalse(any(path.name.endswith(".tmp") for path in (status.bundle / "records").glob("*")))
 
     def test_raw_streams_are_captured_locally_and_measured_processes_are_fresh(self):
@@ -452,17 +539,83 @@ class BenchmarkExecutionTests(unittest.TestCase):
         self.assertGreaterEqual(manifest["status"]["elapsed_seconds"], 5.0)
 
     def test_mtp_quality_integration_rejects_non_manifest_token_cases(self):
-        quality_cases = self.execution.manifest.load_quality("v1")
+        quality_cases = self.execution.manifest.load_quality("v2")
         non_mtp = next(case for case in quality_cases if case.scorer != "exact_tokens")
         with self.assertRaisesRegex(ValueError, "MTP|exact_tokens|manifest"):
             self.execution._validate_mtp_quality_case(non_mtp)
 
     def test_quality_timeout_allows_bounded_fresh_process_model_load(self):
-        quality_case = self.execution.manifest.load_quality("v1")[0]
+        quality_case = self.execution.manifest.load_quality("v2")[0]
 
         timeout = self.execution._quality_timeout(quality_case, 600.0, FakeClock([0.0]))
 
         self.assertEqual(timeout, 180.0)
+
+    def test_process_environment_is_explicit_and_does_not_inherit_unrecorded_inputs(self):
+        config = self.execution.replace_config(
+            self.config(suite="quick", run_quality=False),
+            physical_gpu="1",
+        )
+
+        with mock.patch.dict(
+            self.execution.os.environ,
+            {
+                "SUPERSONIC_DFLASH_DRAFT_GGUF": "/unrecorded/drafter.gguf",
+                "ROCM_PATH": "/opt/rocm",
+                "GGML_GQH_I8DOT": "0",
+            },
+        ):
+            env = self.execution._process_environment(config)
+
+        self.assertEqual(env["HIP_ARCH"], "gfx1201")
+        self.assertEqual(env["HIP_VISIBLE_DEVICES"], "1")
+        self.assertEqual(env["SUPERSONIC_DEVICE"], "0")
+        self.assertEqual(env["ROCM_PATH"], "/opt/rocm")
+        self.assertEqual(env["GGML_GQH_I8DOT"], "0")
+        self.assertNotIn("SUPERSONIC_DFLASH_DRAFT_GGUF", env)
+
+        conflicting = self.execution.replace_config(
+            config,
+            environment={"HIP_VISIBLE_DEVICES": "0"},
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts with the selected GPU mapping"):
+            self.execution._process_environment(conflicting)
+
+    def test_quality_process_uses_explicit_gpu_environment(self):
+        class EnvironmentRunner(FakeRunner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.environment: dict[str, str] | None = None
+
+            def __call__(self, argv, timeout=None, case_id=None, engine_name=None, env=None):
+                self.environment = dict(env) if env is not None else None
+                return super().__call__(argv, timeout=timeout, case_id=case_id, engine_name=engine_name)
+
+        config = self.execution.replace_config(
+            self.config(run_quality=True),
+            physical_gpu="0",
+            logical_gpu="0",
+            output_dir=self.root / "quality-environment",
+        )
+        run_manifest = self.execution.preflight(config)
+        quality_case = run_manifest.quality_cases[0]
+        engine = run_manifest.engines[0]
+        runner = EnvironmentRunner()
+
+        self.execution._quality_process(
+            run_manifest,
+            quality_case,
+            engine,
+            ("supersonic",),
+            timeout=1.0,
+            command_runner=runner,
+            suffix="ordinary",
+        )
+
+        self.assertIsNotNone(runner.environment)
+        self.assertEqual(runner.environment["HIP_ARCH"], "gfx1201")
+        self.assertEqual(runner.environment["HIP_VISIBLE_DEVICES"], "0")
+        self.assertEqual(runner.environment["SUPERSONIC_DEVICE"], "0")
 
     def test_peer_artifact_identity_is_not_copied_from_supersonic(self):
         config = self.config(suite="full", include_peer=True, run_quality=False)
@@ -593,6 +746,7 @@ class BenchmarkExecutionTests(unittest.TestCase):
             cache_state="prefix-cache-empty",
             timeout_seconds=1,
             decoding_policy="greedy",
+            stop_policy="ignore-eos",
             engines=("supersonic",),
         )
         custom_suite = replace(suite, performance_cases=(prefix_case,))

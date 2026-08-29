@@ -3,7 +3,33 @@
 SuperSonic is tuned for maximum measured inference performance on the
 Qwen3.8-27B custom GQH GGUF path. Public performance means a reproducible,
 correctness-passing record with enough evidence for another contributor to
-re-run the same case. No measured performance number is published here yet.
+re-run the same case. The first committed clean-tree quick baseline is below.
+It is a development quick gate, not a full-suite or peer comparison.
+
+## Current quick baseline
+
+Engine: supersonic, version: source-b0b3a6b274707200b5017d1ebcd3a310f8e6e7b7,
+commit: b0b3a6b274707200b5017d1ebcd3a310f8e6e7b7, artifact:
+qwen38-gqh-shaped.gguf, target: gfx1201, workload: quick Geo HumanEval
+ordinary, context-size: 32768, max-new-tokens: 256, warmups: 0, measurement:
+decode, clock policy: locked, cache_state: cold-load, process_reuse: false,
+statistic: median, sample_count: 10, quality: pass, direct run:
+benchmarks/results/gfx1201/quick-clean-locked-1788026895/manifest.json,
+decode measurement: 20.8214 tok/s, MAD: 0.0092.
+
+Engine: supersonic, version: source-b0b3a6b274707200b5017d1ebcd3a310f8e6e7b7,
+commit: b0b3a6b274707200b5017d1ebcd3a310f8e6e7b7, artifact:
+qwen38-gqh-shaped.gguf, draft artifact: qwen38-dflash2-q8_0.gguf, target:
+gfx1201, workload: quick Geo HumanEval DFlash2 block 16, context-size: 32768,
+max-new-tokens: 256, warmups: 0, measurement: decode, clock policy: locked,
+cache_state: cold-load, process_reuse: false, statistic: median,
+sample_count: 10, quality: pass, direct run:
+benchmarks/results/gfx1201/quick-clean-locked-1788026895/manifest.json,
+decode measurement: 113.4699 tok/s, MAD: 5.2282.
+
+These records do not establish an absolute cross-project performance target.
+Absolute throughput is not portable between hosts, and a peer or cross-project
+ratio requires the comparator's full evidence and comparability checks.
 
 ## Headline evidence contract
 
@@ -14,7 +40,8 @@ record identifies all of the following:
 - verified static GPU provenance, physical-to-logical mapping, architecture,
   and the locked clock/power policy;
 - exact artifact identity and digest, including tokenizer and chat-template
-  identities when they affect the case;
+  identities when they affect the case, and DFlash2 drafter identity and digest
+  for DFlash2 cases;
 - exact prompt or stable workload/case, context and generation limits, greedy
   decoding, stop policy, and timing boundary;
 - explicit cache state and process state, with `process_reuse=false` for the
@@ -22,7 +49,8 @@ record identifies all of the following:
 - raw measured samples; the validator validates their values, suite-required
   count or balanced-round count, and bundle completeness, while the renderer derives sample count, statistic,
   and dispersion from validated raw samples; and
-- correctness, including ordinary-versus-MTP token equality where applicable.
+- correctness, including ordinary-versus-MTP token equality and DFlash2
+  semantic quality where applicable.
 
 The representative statistic is the median. Raw samples in measured order are
 the source of truth. The validator checks their values, required count, and bundle
@@ -47,6 +75,7 @@ quick hard budget and the full 20,700-second minimum within its
 Comparability is decided by the validator, not by a page template or by a
 reviewer who sees similar names. Two records must match physical hardware,
 architecture, clock and power policy, artifact semantics and digest,
+DFlash2 drafter semantics and digest for DFlash2 records,
 tokenizer/template identity, exact workload and limits, greedy stop behavior,
 cache state, warmup policy, process state, measurement boundary, correctness,
 and engine/version evidence before a peer ratio is eligible.

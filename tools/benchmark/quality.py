@@ -8,6 +8,7 @@ from .model import QualityCase, canonical_json, parse_strict_json
 
 
 MTP_CATEGORY = "ordinary-vs-mtp-token-equality"
+DFLASH_CATEGORY = "dflash-quality"
 MAX_VALUE_PREVIEW = 160
 _USE_CASE_EXPECTED = object()
 
@@ -30,6 +31,12 @@ def score_case(case: QualityCase, output: ParsedOutput) -> QualityResult:
         actual = output.generated_text
         passed = actual == case.expected
         failure = None if passed else "generated text did not exactly match expected text"
+        return _result(case, actual=actual, passed=passed, failure=failure)
+
+    if case.scorer == "semantic_text":
+        actual = output.generated_text.strip()
+        passed = actual == case.expected.strip()
+        failure = None if passed else "generated text did not semantically match expected text"
         return _result(case, actual=actual, passed=passed, failure=failure)
 
     if case.scorer == "exact_tokens":
@@ -65,26 +72,45 @@ def score_mtp_pair(
     case_id: str | None = None,
     category: str | None = None,
 ) -> QualityResult:
-    mtp_case = _resolve_mtp_case(
+    return _score_speculative_pair(
+        ordinary,
+        mtp,
+        case=case,
+        case_id=case_id,
+        category=category,
+        label="MTP",
+    )
+
+
+def _score_speculative_pair(
+    ordinary: ParsedOutput,
+    speculative: ParsedOutput,
+    *,
+    case: QualityCase | None,
+    case_id: str | None,
+    category: str | None,
+    label: str,
+) -> QualityResult:
+    pair_case = _resolve_pair_case(
         case=case,
         case_id=case_id,
         category=category,
         ordinary=ordinary,
-        mtp=mtp,
+        speculative=speculative,
     )
-    if ordinary.token_ids is None or mtp.token_ids is None:
+    if ordinary.token_ids is None or speculative.token_ids is None:
         return _result(
-            mtp_case,
+            pair_case,
             expected=list(ordinary.token_ids) if ordinary.token_ids is not None else None,
-            actual=list(mtp.token_ids) if mtp.token_ids is not None else None,
+            actual=list(speculative.token_ids) if speculative.token_ids is not None else None,
             passed=False,
-            failure="ordinary/MTP token ids unavailable for exact comparison",
+            failure=f"ordinary/{label} token ids unavailable for exact comparison",
         )
-    actual = list(mtp.token_ids)
-    passed = tuple(ordinary.token_ids) == tuple(mtp.token_ids)
-    failure = None if passed else "ordinary/MTP token ids did not exactly match"
+    actual = list(speculative.token_ids)
+    passed = tuple(ordinary.token_ids) == tuple(speculative.token_ids)
+    failure = None if passed else f"ordinary/{label} token ids did not exactly match"
     return _result(
-        mtp_case,
+        pair_case,
         expected=list(ordinary.token_ids),
         actual=actual,
         passed=passed,
@@ -214,13 +240,13 @@ def _result_dict(result: QualityResult) -> dict[str, object]:
     }
 
 
-def _resolve_mtp_case(
+def _resolve_pair_case(
     *,
     case: QualityCase | None,
     case_id: str | None,
     category: str | None,
     ordinary: ParsedOutput,
-    mtp: ParsedOutput,
+    speculative: ParsedOutput,
 ) -> QualityCase:
     if case is not None:
         if case_id is not None or category is not None:
@@ -234,7 +260,7 @@ def _resolve_mtp_case(
         id=case_id,
         category=category,
         prompt="",
-        max_new_tokens=max(ordinary.generated_tokens, mtp.generated_tokens, 1),
+        max_new_tokens=max(ordinary.generated_tokens, speculative.generated_tokens, 1),
         scorer="exact_tokens",
         expected=list(ordinary.token_ids) if ordinary.token_ids is not None else None,
         decoding_policy="greedy",

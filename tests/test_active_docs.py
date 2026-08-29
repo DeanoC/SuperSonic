@@ -657,7 +657,7 @@ printf 'cargo|%s|GQH=%s|MODEL=%s|8192=%s|REQ=%s\\n' "$*" \
         cargo_lines = [line for line in lines if line.startswith("cargo|")]
         self.assertEqual(len(cargo_lines), 3)
         for line in lines:
-            self.assertIn("GQH=/home/deano/gqh-artifacts/", line)
+            self.assertIn("GQH=/home/deano/models/qwen38-gqh-shaped.gguf", line)
             self.assertIn("MODEL=/data/models/Qwen3.8-27B", line)
             self.assertIn("8192=/home/deano/gqh-artifacts/", line)
             self.assertIn("REQ=1", line)

@@ -364,8 +364,22 @@ def _validate_record_consistency(record: dict[str, object]) -> None:
         raise ValueError("workload warmups does not match suite manifest")
     if workload["mode"] != case.mode:
         raise ValueError("workload mode does not match suite manifest")
+    if workload["mode"] == "dflash":
+        if workload.get("dflash_block_size") != 16:
+            raise ValueError("DFlash2 workload records must use active block width 16")
+        draft = record.get("draft_artifact")
+        if not isinstance(draft, Mapping):
+            raise ValueError("DFlash2 workload records must include draft_artifact identity")
+        for field in ("semantic_id", "quantization", "sha256"):
+            value = draft.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"draft_artifact.{field} must be a non-empty string")
+        if re.fullmatch(r"[0-9a-f]{64}", str(draft["sha256"])) is None:
+            raise ValueError("draft_artifact.sha256 must be a SHA-256 digest")
     if workload["cache_state"] != case.cache_state:
         raise ValueError("workload cache_state does not match suite manifest")
+    if workload["stop_policy"] != case.stop_policy:
+        raise ValueError("workload stop_policy does not match suite manifest")
     sample_count = len(record["samples"])
     if suite.minimum_duration_seconds > 0:
         if sample_count < case.repetitions:
@@ -412,7 +426,7 @@ def _validate_quality_summary(quality: dict[str, object], required_case_ids: tup
             and case["passed"]
             and case["expected_hash"] != case["actual_hash"]
         ):
-            raise ValueError("passed MTP equality case must have matching evidence hashes")
+            raise ValueError("passed speculative equality case must have matching evidence hashes")
         bucket = category_counts.setdefault(str(case["category"]), {"passed": 0, "failed": 0, "total": 0})
         bucket["total"] += 1
         if case["passed"]:

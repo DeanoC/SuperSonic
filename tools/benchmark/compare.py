@@ -36,12 +36,29 @@ COMPARABILITY_FIELDS = (
     "environment.requested.power_cap_watts",
     "environment.requested.performance_level",
     "environment.process_reuse",
+    "environment.allowlisted_environment.GGML_GQH_I8DOT",
 )
+DRAFT_ARTIFACT_FIELDS = (
+    "draft_artifact.semantic_id",
+    "draft_artifact.quantization",
+    "draft_artifact.sha256",
+)
+DFLASH_WORKLOAD_FIELDS = ("workload.dflash_block_size",)
+OPTIONAL_FIELD_DEFAULTS = {
+    "environment.allowlisted_environment.GGML_GQH_I8DOT": "1",
+}
+_MISSING = object()
 
 # Engine identity distinguishes the two sides of a peer comparison and keeps
 # independent engine series apart, but it is not a shared-input requirement:
 # the comparator is specifically used to compare different engines.
-SERIES_IDENTITY_FIELDS = ("engine.name", "engine.version", *COMPARABILITY_FIELDS)
+SERIES_IDENTITY_FIELDS = (
+    "engine.name",
+    "engine.version",
+    *DRAFT_ARTIFACT_FIELDS,
+    *DFLASH_WORKLOAD_FIELDS,
+    *COMPARABILITY_FIELDS,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +97,14 @@ def summarize_samples(values: list[float] | tuple[float, ...]) -> SampleSummary:
 
 
 def series_key(record: dict[str, object]) -> tuple[str, ...]:
-    return tuple(f"{field}={_field_value(record, field)}" for field in SERIES_IDENTITY_FIELDS)
+    fields = SERIES_IDENTITY_FIELDS
+    if record["workload"]["mode"] != "dflash":
+        fields = tuple(
+            field
+            for field in fields
+            if field not in DRAFT_ARTIFACT_FIELDS and field not in DFLASH_WORKLOAD_FIELDS
+        )
+    return tuple(f"{field}={_field_value(record, field)}" for field in fields)
 
 
 def compare_records(left: dict[str, object], right: dict[str, object]) -> Comparison:
@@ -88,6 +112,10 @@ def compare_records(left: dict[str, object], right: dict[str, object]) -> Compar
     for field in COMPARABILITY_FIELDS:
         if _field_value(left, field) != _field_value(right, field):
             _append_reason(reasons, _reason_name(field))
+    if left["workload"]["mode"] == "dflash" and right["workload"]["mode"] == "dflash":
+        for field in (*DRAFT_ARTIFACT_FIELDS, *DFLASH_WORKLOAD_FIELDS):
+            if _field_value(left, field) != _field_value(right, field):
+                _append_reason(reasons, field.replace(".", "_"))
 
     for label, record in (("left", left), ("right", right)):
         try:
@@ -137,7 +165,14 @@ def _median(values: tuple[float, ...]) -> float:
 
 def _field_value(record: dict[str, object], field: str) -> object:
     value: Any = record
-    for part in field.split("."):
+    parts = field.split(".")
+    for index, part in enumerate(parts):
+        if (
+            index == len(parts) - 1
+            and part not in value
+            and field in OPTIONAL_FIELD_DEFAULTS
+        ):
+            return OPTIONAL_FIELD_DEFAULTS[field]
         value = value[part]
     return value
 

@@ -436,6 +436,105 @@ static __device__ __forceinline__ float gqh_warp_shfl_down(float v, int off) {
 #endif
 }
 
+static __device__ __forceinline__ float gqh_warp_shfl_xor(float v, int lane_mask) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __shfl_xor(v, lane_mask, GQH_WARP);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, lane_mask, GQH_WARP);
+#endif
+}
+
+static __device__ __forceinline__ float gqh_permlanex16(float v) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __int_as_float(__builtin_amdgcn_permlanex16(
+        0, __float_as_int(v), 0x76543210u, 0xfedcba98u, false, true));
+#else
+    return gqh_warp_shfl_xor(v, GQH_WARP / 2);
+#endif
+}
+
+template <int OFF>
+static __device__ __forceinline__ float gqh_dpp_xor(float v) {
+    static_assert(OFF > 0 && OFF < 16, "ROW_XMASK cannot cross a DPP row");
+#if defined(__HIP_PLATFORM_AMD__)
+    return __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x160 | OFF, 0xf, 0xf, false));
+#else
+    return gqh_warp_shfl_xor(v, OFF);
+#endif
+}
+
+template <int OFF>
+static __device__ __forceinline__ float gqh_rs_xor(float v) {
+    if constexpr (OFF == GQH_WARP / 2) {
+        return gqh_permlanex16(v);
+    } else {
+        return gqh_dpp_xor<OFF>(v);
+    }
+}
+
+static __device__ __forceinline__ int gqh_lane_id() {
+#if defined(__HIP_PLATFORM_AMD__)
+    static_assert(GQH_WARP == 32, "wave32: EXEC is one 32-bit mask");
+    return (int)__builtin_amdgcn_mbcnt_lo(~0u, 0u);
+#else
+    return (int)(threadIdx.x % GQH_WARP);
+#endif
+}
+
+template <int OFF>
+static __device__ __forceinline__ void gqh_rs_level(float (&v)[GQH_WARP], int lane) {
+    const bool hi = (lane & OFF) != 0;
+#pragma unroll
+    for (int k = 0; k < OFF; ++k) {
+        const float mine = hi ? v[k + OFF] : v[k];
+        const float other = hi ? v[k] : v[k + OFF];
+        v[k] = mine + gqh_rs_xor<OFF>(other);
+    }
+}
+
+template <bool kAcc>
+static __device__ __forceinline__ void gqh_reduce_scatter_wide16(
+    float (&acc)[4][16], int row0, int row_end, float* y, int64_t y_col_stride) {
+    constexpr int ROWS = 4;
+    constexpr int NCOLS = 16;
+    constexpr int RS_COLS = GQH_WARP / ROWS;
+    constexpr int RS_GROUPS = ROWS * NCOLS / GQH_WARP;
+    static_assert(RS_GROUPS == 2, "width-16 ROWS=4 uses two 32-value passes");
+    const int lane = gqh_lane_id();
+#pragma unroll
+    for (int group = 0; group < RS_GROUPS; ++group) {
+        float v[GQH_WARP];
+#pragma unroll
+        for (int column = 0; column < RS_COLS; ++column) {
+#pragma unroll
+            for (int row = 0; row < ROWS; ++row) {
+                v[column * ROWS + row] = acc[row][group * RS_COLS + column];
+            }
+        }
+        gqh_rs_level<GQH_WARP / 2>(v, lane);
+        gqh_rs_level<8>(v, lane);
+        gqh_rs_level<4>(v, lane);
+        gqh_rs_level<2>(v, lane);
+        gqh_rs_level<1>(v, lane);
+        const int row_out = lane & (ROWS - 1);
+        const int column_out = lane / ROWS;
+        const uint32_t y_offset =
+            ((uint32_t)(group * RS_COLS + column_out) * (uint32_t)y_col_stride +
+             (uint32_t)row_out) * 4u;
+        if (row_out == 0 || row0 + row_out < row_end) {
+            float* destination = reinterpret_cast<float*>(
+                reinterpret_cast<char*>(y + row0) + y_offset);
+            if constexpr (kAcc) {
+                *destination =
+                    gqh_bf16_round(*destination + gqh_bf16_round(v[0]));
+            } else {
+                *destination = v[0];
+            }
+        }
+    }
+}
+
 // Grids are symmetric about zero.
 // gqh3:   grid = [-m3,-m2,-m1,-m0, m0,m1,m2,m3]
 // gqh2_h: grid = [-1, -a, +a, +1]
@@ -1500,6 +1599,52 @@ __global__ void gqh_matvec_tight_kernel(
     const int j0 = lane * GQH_PER_LANE;
     const int sub = j0 >> 4;
 
+    if constexpr (kCols == 16 && kRows == 4) {
+        if (ncols != 16) {
+            return;
+        }
+        const int row_end = row_off + out;
+        const uint8_t* __restrict__ rowbase[kRows];
+#pragma unroll
+        for (int row = 0; row < kRows; ++row) {
+            const int row_index =
+                row == 0 || row0 + row < row_end ? row0 + row : row_end - 1;
+            rowbase[row] = data + (int64_t)row_index * row_pitch;
+        }
+        float acc[kRows][kCols] = {};
+        for (int sb = 0; sb < nsb; ++sb) {
+            gqh_tight_lane partial[kRows];
+            float weights[kRows][GQH_PER_LANE];
+#pragma unroll
+            for (int row = 0; row < kRows; ++row) {
+                if constexpr (kPad) {
+                    partial[row] = gqh_load_padded_lane<IS_GQH3>(
+                        rowbase[row], sb, sb_pitch, lane, sub, tensor_scale,
+                        s_ratio);
+                } else {
+                    partial[row] = gqh_load_tight_lane<IS_GQH3>(
+                        rowbase[row], sb, sb_pitch, lane, sub, tensor_scale,
+                        s_ratio);
+                }
+                gqh_lane_weights<IS_GQH3>(weights[row], partial[row], s_lvl);
+            }
+#pragma unroll
+            for (int column = 0; column < kCols; ++column) {
+                float xs[GQH_PER_LANE];
+                gqh_load_lane_xs(
+                    xs, x, col0 + column, x_col_stride, sb, j0);
+#pragma unroll
+                for (int row = 0; row < kRows; ++row) {
+                    gqh_fma_weights(acc[row][column], weights[row], xs);
+                }
+            }
+        }
+        gqh_reduce_scatter_wide16<kAcc>(
+            acc, row0, row_end, y, y_col_stride);
+        return;
+    }
+
+
     float acc0[kCols];
     float acc1[kCols];
 #pragma unroll
@@ -1959,6 +2104,54 @@ __global__ void gqh4_matvec_tight_kernel(
     const int j0 = lane * GQH_PER_LANE;
     const int sub = j0 >> 4;
 
+    if constexpr (kCols == 16 && kRows == 4) {
+        if (ncols != 16) {
+            return;
+        }
+        const int row_end = row_off + out;
+        const uint8_t* __restrict__ rowbase[kRows];
+#pragma unroll
+        for (int row = 0; row < kRows; ++row) {
+            const int row_index =
+                row == 0 || row0 + row < row_end ? row0 + row : row_end - 1;
+            rowbase[row] = data + (int64_t)row_index * row_pitch;
+        }
+        float acc[kRows][kCols] = {};
+        for (int sb = 0; sb < nsb; ++sb) {
+            const uint8_t* __restrict__ block[kRows];
+            float scale[kRows];
+            uint32_t codes[kRows];
+            float weights[kRows][GQH_PER_LANE];
+#pragma unroll
+            for (int row = 0; row < kRows; ++row) {
+                block[row] = rowbase[row] + (int64_t)sb * sb_bytes;
+                const uint8_t d = gqh_ld_sb_u8(block[row]);
+                const float d_real = gqh_e4m3_dreal(d) * tensor_scale;
+                const uint8_t ratio_byte =
+                    gqh_ld_sb_u8(block[row] + 1 + (sub >> 1));
+                scale[row] = d_real * s_ratio[(sub & 1) ? (ratio_byte >> 4) : (ratio_byte & 0x0f)];
+                memcpy(&codes[row], block[row] + 9 + lane * 4, sizeof(codes[row]));
+#pragma unroll
+                for (int weight = 0; weight < GQH_PER_LANE; ++weight) {
+                    weights[row][weight] =
+                        s_grid[(codes[row] >> (4 * weight)) & 0x0f] * scale[row];
+                }
+            }
+#pragma unroll
+            for (int column = 0; column < kCols; ++column) {
+                float xs[GQH_PER_LANE];
+                gqh_load_lane_xs(xs, x, col0 + column, x_col_stride, sb, j0);
+#pragma unroll
+                for (int row = 0; row < kRows; ++row) {
+                    gqh_fma_weights(acc[row][column], weights[row], xs);
+                }
+            }
+        }
+        gqh_reduce_scatter_wide16<kAcc>(
+            acc, row0, row_end, y, y_col_stride);
+        return;
+    }
+
     float acc0[kCols];
     float acc1[kCols];
 #pragma unroll
@@ -2411,4 +2604,912 @@ __global__ void gqh_mix_matvec_kernel(
             y[yi] = acc;
         }
     }
+}
+
+// ---- GQH i8 activation quantization pre-pass --------------------------------
+//
+// Ports PR #35's gqh_quant_x: quantize f32 activations to int8 codes with one
+// scale per 8-weight group (GQH_PER_LANE), matching GQH's 16-weight sub-block so
+// the group boundary never straddles a sub-block ratio. The stored scale folds
+// BOTH /127s (GQH_Q8_XSCALE = 1/(127*127)) so the matvec's per-row scale chain
+// stays d_real * ratio * qxs -- one v_mul per row per superblock, none per column.
+//
+// Layout: qx[ncols * in] int8 codes (column-major, stride = in) then qxs[ncols *
+// (in/8)] f32 group scales (column-major, stride = in/8). Both grown on demand
+// by the caller and never freed here.
+#define GQH_Q8_XSCALE_F (1.0f / (127.0f * 127.0f))
+
+__global__ void gqh_quant_x_i8_kernel(
+    const float* __restrict__ x,
+    int8_t* __restrict__ qx,
+    float* __restrict__ qxs,
+    int ncols,
+    int in_dim,
+    int64_t x_col_stride) {
+    // One block per (column, group-of-8). 32 threads cooperatively quantize the
+    // 8 activations of one group: each thread holds one value, the warp reduces
+    // amax via shfl, then each thread rounds its own code.
+    const int group = blockIdx.x;
+    const int col = blockIdx.y;
+    if (col >= ncols) {
+        return;
+    }
+    const int ngroups = in_dim / GQH_PER_LANE;
+    if (group >= ngroups) {
+        return;
+    }
+    const int tid = threadIdx.x;  // 0..7 are active; 8..31 idle
+    const int t = tid;
+    float v = 0.0f;
+    if (t < GQH_PER_LANE) {
+        const int j = group * GQH_PER_LANE + t;
+        v = x[(int64_t)col * x_col_stride + j];
+    }
+    float amax = fabsf(v);
+#pragma unroll
+    for (int m = 1; m < GQH_PER_LANE; m <<= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, m, GQH_WARP));
+    }
+    // amax is now uniform across lanes 0..7 (and garbage-but-unused on 8..31).
+    int8_t code = 0;
+    if (t < GQH_PER_LANE) {
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int q = __float2int_rn(v * inv);
+        if (q > 127) {
+            q = 127;
+        }
+        if (q < -127) {
+            q = -127;
+        }
+        code = static_cast<int8_t>(q);
+        qx[(int64_t)col * in_dim + group * GQH_PER_LANE + t] = code;
+    }
+    if (t == 0) {
+        qxs[(int64_t)col * ngroups + group] = amax * GQH_Q8_XSCALE_F;
+    }
+}
+
+// Geo PR #35's width-16 shared-activation pre-pass. Sixteen lanes cover one
+// 16-activation group across all columns, reduce one group max, and only lane
+// zero stores that shared scale. This is the layout the SB2 matvec consumes.
+__global__ void gqh_quant_x_i8_wide16_kernel(
+    const float* __restrict__ x,
+    int8_t* __restrict__ qx,
+    float* __restrict__ qxs,
+    int ncols,
+    int in_dim,
+    int64_t x_col_stride) {
+    const int ngroups = in_dim / 16;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int group = tid >> 4;
+    const int col = tid & 15;
+    const bool live = group < ngroups && col < ncols;
+    const int safe_group = group < ngroups ? group : 0;
+    const int safe_col = col < ncols ? col : 0;
+    const float* __restrict__ values =
+        x + (int64_t)safe_col * x_col_stride + safe_group * 16;
+
+    float amax = 0.0f;
+#pragma unroll
+    for (int offset = 0; offset < 16; offset += 4) {
+        const float4 value = *reinterpret_cast<const float4*>(values + offset);
+        amax = fmaxf(
+            amax,
+            fmaxf(
+                fmaxf(fabsf(value.x), fabsf(value.y)),
+                fmaxf(fabsf(value.z), fabsf(value.w))));
+    }
+#pragma unroll
+    for (int mask = 1; mask < 16; mask <<= 1) {
+        amax = fmaxf(amax, gqh_warp_shfl_xor(amax, mask));
+    }
+
+    if (live) {
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int packed[4] = {};
+#pragma unroll
+        for (int t = 0; t < 16; ++t) {
+            int q = __float2int_rn(values[t] * inv);
+            q = q > 127 ? 127 : (q < -127 ? -127 : q);
+            packed[t >> 2] |= (q & 0xff) << (8 * (t & 3));
+        }
+        int4 codes = make_int4(packed[0], packed[1], packed[2], packed[3]);
+        memcpy(
+            qx + (int64_t)col * in_dim + group * 16,
+            &codes,
+            sizeof(codes));
+    }
+    if (live && col == 0) {
+        qxs[group] = amax * GQH_Q8_XSCALE_F;
+    }
+}
+
+// ---- GQH i8 weight LUT bake (device-side q8_round) -------------------------
+//
+// Ports PR #35's gqh_q8_level(level, n) = __float2int_rn(level * n) clamped to
+// [-127, 127]. The matvec bakes the level grid to int8 once per block in LDS
+// (see the prologue); this standalone kernel exposes the SAME arithmetic so a
+// harness can verify the device bake matches the host denominator search
+// (model_store::gqh_q8::q8_round) bit-for-bit. The extreme-entry invariant
+// (amax == 1.0 -> q8_round(+-1.0, n) == +-n) is what makes the bake safe.
+__global__ void gqh_bake_q8_lut_kernel(
+    int8_t* __restrict__ out,
+    int rung,
+    int grid_code,
+    int q8n,
+    int nlev) {
+    const int i = threadIdx.x;
+    if (i >= nlev) {
+        return;
+    }
+    float level = 0.0f;
+    if (rung == 0) {        // GQH3
+        level = gqh_bits(GQH3_GRID[grid_code][i]);
+    } else if (rung == 3) { // GQH4
+        level = gqh_bits(GQH4_GRID[grid_code][i]);
+    } else if (rung == 1) { // GQH2_H
+        level = gqh_bits(GQH2H_GRID[grid_code][i]);
+    }
+    const int q = __float2int_rn(level * (float) q8n);
+    int clamped = q > 127 ? 127 : (q < -127 ? -127 : q);
+    out[i] = static_cast<int8_t>(clamped);
+}
+
+// 4-wide signed int8 dot product accumulating to int32 (dp4a). On RDNA3
+// (gfx1100) and RDNA4 (gfx1201) this maps to __builtin_amdgcn_sudot4, the
+// same intrinsic llama.cpp's dp4a helper uses for those archs. The result
+// is exact in int32 for |dot| <= 8 * 127 * 127 = 129032 (well inside 2^24),
+// so the float conversion in the matvec is loss-free.
+static __device__ __forceinline__ int supersonic_gqh_dp4a(int a, int b, int c) {
+#if defined(__HIP_PLATFORM_AMD__) && (defined(__GFX11__) || defined(__GFX12__))
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    const int8_t* pa = reinterpret_cast<const int8_t*>(&a);
+    const int8_t* pb = reinterpret_cast<const int8_t*>(&b);
+    return c + pa[0]*pb[0] + pa[1]*pb[1] + pa[2]*pb[2] + pa[3]*pb[3];
+#endif
+}
+
+// ---- GQH i8 multicol matvec (the fast verify arm) ---------------------------
+//
+// Ports PR #35's int8 dot arm. Takes PRE-QUANTIZED int8 activations (qx, qxs
+// from gqh_quant_x_i8_kernel) instead of f32, bakes the level grid to int8
+// once per block (s_q8, via q8n = the grid's denominator), and does a dp4a dot
+// instead of fmaf. The scale chain folds 127/q8n into tensor_scale (PR #35's
+// t_scale *= 127/q8n) and qxs already folds both /127s, so:
+//   acc += s_b * qxs[group] * (float)dot
+// matches the f32 product level * s_b_true * v. Not bit-exact (int8 rounds
+// every level), but tolerance-bounded by the weight LUT step (row_max/127).
+//
+// Reuses gqh_load_tight_lane (same wire load, same s_b, same cw); only the
+// inner dot changes. kRows=1, kCols up to 16 (DFlash2 verify block).
+template <bool IS_GQH3, bool IS_GQH4 = false, bool kAcc = false,
+          int kRows = 1, int kNsb = 0, int kCols = 1>
+__global__ void gqh_matvec_i8_tight_kernel(
+    const uint8_t* __restrict__ data,
+    const int8_t* __restrict__ qx,
+    const float* __restrict__ qxs,
+    float* __restrict__ y,
+    int in, int out,
+    float tensor_scale,
+    gqh_grid16 grid,
+    int q8n,
+    int64_t qx_col_stride,
+    int64_t qxs_col_stride,
+    int64_t y_col_stride,
+    int row_off,
+    int ncols) {
+    static_assert(!(IS_GQH3 && IS_GQH4), "one GQH rung per kernel");
+    static_assert(kRows == 1 || kRows == 2 || kRows == 4, "supported row tiles");
+    static_assert(
+        kRows != 4 || kCols == 16,
+        "the reduce-scatter row tile is width-16 only");
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int lane = threadIdx.x % GQH_WARP;
+    const int col0 = (kCols == 1) ? (int)blockIdx.y : 0;
+    const int ncol = (kCols == 1) ? 1 : (ncols < kCols ? ncols : kCols);
+    const int warp = threadIdx.x / GQH_WARP;
+    const int row0 =
+        (blockIdx.x * warps_per_block + warp) * kRows + row_off;
+    const int row_end = row_off + out;
+
+    __shared__ float s_ratio[16];
+    __shared__ int8_t s_q8[16];
+    const float4 mag = make_float4(
+        grid.v[0], grid.v[1], grid.v[2], grid.v[3]);
+    if (threadIdx.x < 16) {
+        s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+        const float level = IS_GQH4
+            ? grid.v[threadIdx.x]
+            : gqh_level<IS_GQH3>(threadIdx.x, mag);
+        int q = __float2int_rn(level * (float)q8n);
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        s_q8[threadIdx.x] = static_cast<int8_t>(q);
+    }
+    __syncthreads();
+    if (row0 >= row_end) {
+        return;
+    }
+    if (kRows == 4 && ncols != 16) {
+        return;
+    }
+
+    const float t_scale_eff = tensor_scale * (127.0f / (float)q8n);
+    const int nsb = kNsb > 0 ? kNsb : (in / GQH_SUPERBLOCK);
+    constexpr int sb_bytes = IS_GQH4
+        ? GQH4_SB_BYTES
+        : (IS_GQH3 ? GQH3_SB_BYTES : GQH2H_SB_BYTES);
+    int row_pitch;
+    if constexpr (IS_GQH4) {
+        row_pitch = nsb * sb_bytes;
+    } else {
+        int off_r, off_lo, off_hi, stride;
+        gqh_plane_offsets(nsb, IS_GQH3 ? 1 : 0, &off_r, &off_lo, &off_hi, &stride);
+        (void)off_r;
+        (void)off_lo;
+        (void)off_hi;
+        row_pitch = stride;
+    }
+    const uint8_t* __restrict__ rowbase[kRows];
+#pragma unroll
+    for (int row = 0; row < kRows; ++row) {
+        const int row_index =
+            row == 0 || row0 + row < row_end ? row0 + row : row_end - 1;
+        rowbase[row] = data + (int64_t)row_index * row_pitch;
+    }
+    const int j0 = lane * GQH_PER_LANE;
+    const int sub = j0 >> 4;
+    const int groups_per_superblock = GQH_SUPERBLOCK / GQH_PER_LANE;
+
+    float acc[kRows][kCols] = {};
+    for (int sb = 0; sb < nsb; ++sb) {
+        int wq0[kRows];
+        int wq1[kRows];
+        float row_scale[kRows];
+#pragma unroll
+        for (int row = 0; row < kRows; ++row) {
+            wq0[row] = 0;
+            wq1[row] = 0;
+            if constexpr (IS_GQH4) {
+                const uint8_t* __restrict__ block =
+                    rowbase[row] + (int64_t)sb * sb_bytes;
+                const uint8_t d = gqh_ld_sb_u8(block);
+                const float d_real = gqh_e4m3_dreal(d) * t_scale_eff;
+                const uint8_t ratio_byte =
+                    gqh_ld_sb_u8(block + 1 + (sub >> 1));
+                row_scale[row] = d_real * s_ratio[
+                    (sub & 1) ? (ratio_byte >> 4) : (ratio_byte & 0x0f)];
+                uint32_t codes;
+                memcpy(&codes, block + 9 + lane * 4, sizeof(codes));
+#pragma unroll
+                for (int t = 0; t < GQH_PER_LANE; ++t) {
+                    const int code = (codes >> (4 * t)) & 0x0f;
+                    const int8_t weight = s_q8[code];
+                    if (t < 4) {
+                        wq0[row] |= ((int)weight & 0xff) << (8 * t);
+                    } else {
+                        wq1[row] |= ((int)weight & 0xff)
+                            << (8 * (t - 4));
+                    }
+                }
+            } else {
+                const gqh_tight_lane partial = gqh_load_tight_lane<IS_GQH3>(
+                    rowbase[row], sb, sb_bytes, lane, sub, t_scale_eff,
+                    s_ratio);
+                row_scale[row] = partial.s_b;
+#pragma unroll
+                for (int t = 0; t < GQH_PER_LANE; ++t) {
+                    const int code = gqh_code_at<IS_GQH3>(partial.cw, t);
+                    const int8_t weight = s_q8[code];
+                    if (t < 4) {
+                        wq0[row] |= ((int)weight & 0xff) << (8 * t);
+                    } else {
+                        wq1[row] |= ((int)weight & 0xff)
+                            << (8 * (t - 4));
+                    }
+                }
+            }
+        }
+        const int group = sb * groups_per_superblock + lane;
+#pragma unroll
+        for (int column = 0; column < kCols; ++column) {
+            if (column >= ncol) {
+                break;
+            }
+            const int8_t* activation = qx +
+                (int64_t)(col0 + column) * qx_col_stride +
+                group * GQH_PER_LANE;
+            int xq0, xq1;
+            memcpy(&xq0, activation, 4);
+            memcpy(&xq1, activation + 4, 4);
+            const float x_scale = qxs[
+                (int64_t)(col0 + column) * qxs_col_stride + group];
+#pragma unroll
+            for (int row = 0; row < kRows; ++row) {
+                int dot = supersonic_gqh_dp4a(wq0[row], xq0, 0);
+                dot = supersonic_gqh_dp4a(wq1[row], xq1, dot);
+                acc[row][column] += row_scale[row] * x_scale * (float)dot;
+            }
+        }
+    }
+
+    if constexpr (kRows == 4 && kCols == 16) {
+        gqh_reduce_scatter_wide16<kAcc>(acc, row0, row_end, y, y_col_stride);
+        return;
+    }
+
+#pragma unroll
+    for (int row = 0; row < kRows; ++row) {
+#pragma unroll
+        for (int column = 0; column < kCols; ++column) {
+            if (column >= ncol) {
+                break;
+            }
+#pragma unroll
+            for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
+                acc[row][column] +=
+                    gqh_warp_shfl_down(acc[row][column], off);
+            }
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int row = 0; row < kRows; ++row) {
+            if (row != 0 && row0 + row >= row_end) {
+                break;
+            }
+#pragma unroll
+            for (int column = 0; column < kCols; ++column) {
+                if (column >= ncol) {
+                    break;
+                }
+                const int64_t output_index =
+                    (int64_t)(col0 + column) * y_col_stride + row0 + row;
+                if constexpr (kAcc) {
+                    y[output_index] = gqh_bf16_round(
+                        y[output_index] + gqh_bf16_round(acc[row][column]));
+                } else {
+                    y[output_index] = acc[row][column];
+                }
+            }
+        }
+    }
+}
+
+// Geo PR #35's GQH4 SB2 arm. One lane folds one whole 16-weight sub-block;
+// lanes 0..15 and 16..31 therefore cover two adjacent superblocks per trip.
+// The activation pre-pass shares one 16-element scale across all columns.
+template <bool kAcc = false, int kRows = 4, int kNsb = 0, int kCols = 16>
+__global__ void gqh_matvec_i8_sb2_gqh4_kernel(
+    const uint8_t* __restrict__ data,
+    const int8_t* __restrict__ qx,
+    const float* __restrict__ qxs,
+    float* __restrict__ y,
+    int in,
+    int out,
+    float tensor_scale,
+    gqh_grid16 grid,
+    int q8n,
+    int64_t qx_col_stride,
+    int64_t qxs_col_stride,
+    int64_t y_col_stride,
+    int row_off,
+    int ncols) {
+    static_assert(kRows == 4, "GQH4 SB2 uses the width-16 row tile");
+    static_assert(kCols == 16, "GQH4 SB2 is the exact width-16 arm");
+    (void)qxs_col_stride;
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int lane = threadIdx.x % GQH_WARP;
+    const int warp = threadIdx.x / GQH_WARP;
+    const int row0 =
+        (blockIdx.x * warps_per_block + warp) * kRows + row_off;
+    const int row_end = row_off + out;
+    if (ncols != 16 || row0 >= row_end) {
+        return;
+    }
+
+    __shared__ float s_ratio[16];
+    __shared__ int8_t s_q8[16];
+    if (threadIdx.x < 16) {
+        s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+        int q = __float2int_rn(grid.v[threadIdx.x] * (float)q8n);
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        s_q8[threadIdx.x] = static_cast<int8_t>(q);
+    }
+    __syncthreads();
+
+    const int nsb = kNsb > 0 ? kNsb : (in / GQH_SUPERBLOCK);
+    constexpr int sb_bytes = GQH4_SB_BYTES;
+    const uint8_t* __restrict__ rowbase[kRows];
+#pragma unroll
+    for (int row = 0; row < kRows; ++row) {
+        const int row_index =
+            row == 0 || row0 + row < row_end ? row0 + row : row_end - 1;
+        rowbase[row] = data + (int64_t)row_index * nsb * sb_bytes;
+    }
+
+    const int shalf = lane / 16;
+    const int slane = lane % 16;
+    const int sub = slane;
+    const int ratio_shift = (sub & 1) << 2;
+    const float t_scale_eff = tensor_scale * (127.0f / (float)q8n);
+    float acc[kRows][kCols] = {};
+
+    for (int sb = 0; sb < nsb; sb += 2) {
+        const int group = sb * 16 + lane;
+        const float x_scale = qxs[group];
+        int wq[kRows][4];
+        float row_scale[kRows];
+#pragma unroll
+        for (int row = 0; row < kRows; ++row) {
+            const uint8_t* __restrict__ block =
+                rowbase[row] + (int64_t)(sb + shalf) * sb_bytes;
+            const uint8_t d = gqh_ld_sb_u8(block);
+            const float d_real = gqh_e4m3_dreal(d) * t_scale_eff;
+            const uint8_t ratio_byte =
+                gqh_ld_sb_u8(block + 1 + (sub >> 1));
+            row_scale[row] = d_real * s_ratio[
+                (ratio_byte >> ratio_shift) & 0x0f] * x_scale;
+
+            uint32_t codes[2];
+            memcpy(
+                &codes[0],
+                block + 9 + slane * 8,
+                sizeof(codes));
+            wq[row][0] = 0;
+            wq[row][1] = 0;
+            wq[row][2] = 0;
+            wq[row][3] = 0;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const uint32_t code_word = t < 8 ? codes[0] : codes[1];
+                const int code =
+                    (int)((code_word >> (4 * (t & 7))) & 0x0f);
+                const int8_t weight = s_q8[code];
+                wq[row][t >> 2] |=
+                    ((int)weight & 0xff) << (8 * (t & 3));
+            }
+        }
+
+#pragma unroll
+        for (int column = 0; column < kCols; ++column) {
+            const int8_t* activation = qx +
+                (int64_t)column * qx_col_stride + group * 16;
+            int4 xq;
+            memcpy(&xq, activation, sizeof(xq));
+#pragma unroll
+            for (int row = 0; row < kRows; ++row) {
+                int dot = supersonic_gqh_dp4a(wq[row][0], xq.x, 0);
+                dot = supersonic_gqh_dp4a(wq[row][1], xq.y, dot);
+                dot = supersonic_gqh_dp4a(wq[row][2], xq.z, dot);
+                dot = supersonic_gqh_dp4a(wq[row][3], xq.w, dot);
+                acc[row][column] += row_scale[row] * (float)dot;
+            }
+        }
+    }
+
+    gqh_reduce_scatter_wide16<kAcc>(
+        acc, row0, row_end, y, y_col_stride);
+}
+
+// GQH3's SB2 twin. A 16-weight lane spans two adjacent packed 8-code words,
+// while the activation and shared-scale layouts match the GQH4 arm.
+template <bool kAcc = false, int kRows = 4, int kNsb = 0, int kCols = 16>
+__global__ void gqh_matvec_i8_sb2_gqh3_kernel(
+    const uint8_t* __restrict__ data,
+    const int8_t* __restrict__ qx,
+    const float* __restrict__ qxs,
+    float* __restrict__ y,
+    int in,
+    int out,
+    float tensor_scale,
+    gqh_grid16 grid,
+    int q8n,
+    int64_t qx_col_stride,
+    int64_t qxs_col_stride,
+    int64_t y_col_stride,
+    int row_off,
+    int ncols) {
+    static_assert(kRows == 4, "GQH3 SB2 uses the width-16 row tile");
+    static_assert(kCols == 16, "GQH3 SB2 is the exact width-16 arm");
+    (void)qxs_col_stride;
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int lane = threadIdx.x % GQH_WARP;
+    const int warp = threadIdx.x / GQH_WARP;
+    const int row0 =
+        (blockIdx.x * warps_per_block + warp) * kRows + row_off;
+    const int row_end = row_off + out;
+    if (ncols != 16 || row0 >= row_end) {
+        return;
+    }
+
+    __shared__ float s_ratio[16];
+    __shared__ int8_t s_q8[8];
+    if (threadIdx.x < 16) {
+        s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+    }
+    if (threadIdx.x < 8) {
+        const float4 mag = make_float4(
+            grid.v[0], grid.v[1], grid.v[2], grid.v[3]);
+        int q = __float2int_rn(
+            gqh_level<true>(threadIdx.x, mag) * (float)q8n);
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        s_q8[threadIdx.x] = static_cast<int8_t>(q);
+    }
+    __syncthreads();
+
+    const int nsb = kNsb > 0 ? kNsb : (in / GQH_SUPERBLOCK);
+    int off_r, off_lo, off_hi, stride;
+    gqh_plane_offsets(nsb, 1, &off_r, &off_lo, &off_hi, &stride);
+    (void)off_r;
+    (void)off_lo;
+    (void)off_hi;
+    constexpr int sb_bytes = GQH3_SB_BYTES;
+    const uint8_t* __restrict__ rowbase[kRows];
+#pragma unroll
+    for (int row = 0; row < kRows; ++row) {
+        const int row_index =
+            row == 0 || row0 + row < row_end ? row0 + row : row_end - 1;
+        rowbase[row] = data + (int64_t)row_index * stride;
+    }
+
+    const int shalf = lane / 16;
+    const int slane = lane % 16;
+    const int sub = slane;
+    const int ratio_shift = (sub & 1) << 2;
+    const float t_scale_eff = tensor_scale * (127.0f / (float)q8n);
+    float acc[kRows][kCols] = {};
+
+    for (int sb = 0; sb < nsb; sb += 2) {
+        const int group = sb * 16 + lane;
+        const float x_scale = qxs[group];
+        int wq[kRows][4];
+        float row_scale[kRows];
+#pragma unroll
+        for (int row = 0; row < kRows; ++row) {
+            const uint8_t* __restrict__ block =
+                rowbase[row] + (int64_t)(sb + shalf) * sb_bytes;
+            const uint8_t d = gqh_ld_sb_u8(block);
+            const float d_real = gqh_dreal_uniform(d, t_scale_eff);
+            const uint8_t ratio_byte =
+                gqh_ld_sb_u8(block + 1 + (sub >> 1));
+            row_scale[row] = d_real * s_ratio[
+                (ratio_byte >> ratio_shift) & 0x0f] * x_scale;
+
+            uint32_t codes[2];
+            codes[0] = gqh_load_codeword<true>(
+                block, 2 * slane, GQH_CODES_OFF);
+            codes[1] = gqh_load_codeword<true>(
+                block, 2 * slane + 1, GQH_CODES_OFF);
+            wq[row][0] = 0;
+            wq[row][1] = 0;
+            wq[row][2] = 0;
+            wq[row][3] = 0;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const int code = gqh_code_at<true>(
+                    codes[t >> 3], t & 7);
+                const int8_t weight = s_q8[code];
+                wq[row][t >> 2] |=
+                    ((int)weight & 0xff) << (8 * (t & 3));
+            }
+        }
+
+#pragma unroll
+        for (int column = 0; column < kCols; ++column) {
+            const int8_t* activation = qx +
+                (int64_t)column * qx_col_stride + group * 16;
+            int4 xq;
+            memcpy(&xq, activation, sizeof(xq));
+#pragma unroll
+            for (int row = 0; row < kRows; ++row) {
+                int dot = supersonic_gqh_dp4a(wq[row][0], xq.x, 0);
+                dot = supersonic_gqh_dp4a(wq[row][1], xq.y, dot);
+                dot = supersonic_gqh_dp4a(wq[row][2], xq.z, dot);
+                dot = supersonic_gqh_dp4a(wq[row][3], xq.w, dot);
+                acc[row][column] += row_scale[row] * (float)dot;
+            }
+        }
+    }
+
+    gqh_reduce_scatter_wide16<kAcc>(
+        acc, row0, row_end, y, y_col_stride);
+}
+
+// Width-16 GQH4 gate/up pair. Both tensors share the same row geometry and
+// pre-quantized activation, while retaining their own level grid, q8 denominator,
+// and tensor scale. One launch computes both projections; the caller still
+// applies SwiGLU after reading the two output columns.
+template <int kNsb = 0>
+__global__ void gqh_matvec_i8_sb2_gqh4_pair_kernel(
+    const uint8_t* __restrict__ data_a,
+    const uint8_t* __restrict__ data_b,
+    const int8_t* __restrict__ qx,
+    const float* __restrict__ qxs,
+    float* __restrict__ y_a,
+    float* __restrict__ y_b,
+    int in,
+    int out,
+    float tensor_scale_a,
+    float tensor_scale_b,
+    gqh_grid16 grid_a,
+    gqh_grid16 grid_b,
+    int q8n_a,
+    int q8n_b,
+    int64_t qx_col_stride,
+    int64_t qxs_col_stride,
+    int64_t y_col_stride_a,
+    int64_t y_col_stride_b,
+    int row_off,
+    int ncols) {
+    (void)qxs_col_stride;
+    constexpr int kRows = 4;
+    constexpr int kCols = 16;
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int lane = threadIdx.x % GQH_WARP;
+    const int warp = threadIdx.x / GQH_WARP;
+    const int row0 =
+        (blockIdx.x * warps_per_block + warp) * kRows + row_off;
+    const int row_end = row_off + out;
+    if (ncols != 16 || row0 >= row_end) {
+        return;
+    }
+
+    __shared__ float s_ratio[16];
+    __shared__ int8_t s_q8_a[16];
+    __shared__ int8_t s_q8_b[16];
+    if (threadIdx.x < 16) {
+        s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+        int qa = __float2int_rn(grid_a.v[threadIdx.x] * (float)q8n_a);
+        int qb = __float2int_rn(grid_b.v[threadIdx.x] * (float)q8n_b);
+        qa = qa > 127 ? 127 : (qa < -127 ? -127 : qa);
+        qb = qb > 127 ? 127 : (qb < -127 ? -127 : qb);
+        s_q8_a[threadIdx.x] = static_cast<int8_t>(qa);
+        s_q8_b[threadIdx.x] = static_cast<int8_t>(qb);
+    }
+    __syncthreads();
+
+    const int nsb = kNsb > 0 ? kNsb : (in / GQH_SUPERBLOCK);
+    constexpr int sb_bytes = GQH4_SB_BYTES;
+    const uint8_t* __restrict__ rowbase_a[kRows];
+    const uint8_t* __restrict__ rowbase_b[kRows];
+#pragma unroll
+    for (int row = 0; row < kRows; ++row) {
+        const int row_index =
+            row == 0 || row0 + row < row_end ? row0 + row : row_end - 1;
+        rowbase_a[row] =
+            data_a + (int64_t)row_index * nsb * sb_bytes;
+        rowbase_b[row] =
+            data_b + (int64_t)row_index * nsb * sb_bytes;
+    }
+
+    const int shalf = lane / 16;
+    const int slane = lane % 16;
+    const int sub = slane;
+    const int ratio_shift = (sub & 1) << 2;
+    const float scale_a_eff = tensor_scale_a * (127.0f / (float)q8n_a);
+    const float scale_b_eff = tensor_scale_b * (127.0f / (float)q8n_b);
+    float acc_a[kRows][kCols] = {};
+    float acc_b[kRows][kCols] = {};
+
+    for (int sb = 0; sb < nsb; sb += 2) {
+        const int group = sb * 16 + lane;
+        const float x_scale = qxs[group];
+        int wq_a[kRows][4];
+        int wq_b[kRows][4];
+        float row_scale_a[kRows];
+        float row_scale_b[kRows];
+#pragma unroll
+        for (int row = 0; row < kRows; ++row) {
+            const uint8_t* __restrict__ block_a =
+                rowbase_a[row] + (int64_t)(sb + shalf) * sb_bytes;
+            const uint8_t* __restrict__ block_b =
+                rowbase_b[row] + (int64_t)(sb + shalf) * sb_bytes;
+
+            const uint8_t da = gqh_ld_sb_u8(block_a);
+            const uint8_t db = gqh_ld_sb_u8(block_b);
+            const float da_real = gqh_e4m3_dreal(da) * scale_a_eff;
+            const float db_real = gqh_e4m3_dreal(db) * scale_b_eff;
+            const uint8_t ratio_a =
+                gqh_ld_sb_u8(block_a + 1 + (sub >> 1));
+            const uint8_t ratio_b =
+                gqh_ld_sb_u8(block_b + 1 + (sub >> 1));
+            row_scale_a[row] = da_real * s_ratio[
+                (ratio_a >> ratio_shift) & 0x0f] * x_scale;
+            row_scale_b[row] = db_real * s_ratio[
+                (ratio_b >> ratio_shift) & 0x0f] * x_scale;
+
+            uint32_t codes_a[2];
+            uint32_t codes_b[2];
+            memcpy(&codes_a[0], block_a + 9 + slane * 8, sizeof(codes_a));
+            memcpy(&codes_b[0], block_b + 9 + slane * 8, sizeof(codes_b));
+            wq_a[row][0] = 0;
+            wq_a[row][1] = 0;
+            wq_a[row][2] = 0;
+            wq_a[row][3] = 0;
+            wq_b[row][0] = 0;
+            wq_b[row][1] = 0;
+            wq_b[row][2] = 0;
+            wq_b[row][3] = 0;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const uint32_t code_word_a =
+                    t < 8 ? codes_a[0] : codes_a[1];
+                const uint32_t code_word_b =
+                    t < 8 ? codes_b[0] : codes_b[1];
+                const int code_a =
+                    (int)((code_word_a >> (4 * (t & 7))) & 0x0f);
+                const int code_b =
+                    (int)((code_word_b >> (4 * (t & 7))) & 0x0f);
+                const int8_t weight_a = s_q8_a[code_a];
+                const int8_t weight_b = s_q8_b[code_b];
+                wq_a[row][t >> 2] |=
+                    ((int)weight_a & 0xff) << (8 * (t & 3));
+                wq_b[row][t >> 2] |=
+                    ((int)weight_b & 0xff) << (8 * (t & 3));
+            }
+        }
+
+#pragma unroll
+        for (int column = 0; column < kCols; ++column) {
+            const int8_t* __restrict__ activation = qx +
+                (int64_t)column * qx_col_stride + group * 16;
+            int4 xq;
+            memcpy(&xq, activation, sizeof(xq));
+#pragma unroll
+            for (int row = 0; row < kRows; ++row) {
+                int dot_a = supersonic_gqh_dp4a(wq_a[row][0], xq.x, 0);
+                int dot_b = supersonic_gqh_dp4a(wq_b[row][0], xq.x, 0);
+                dot_a = supersonic_gqh_dp4a(wq_a[row][1], xq.y, dot_a);
+                dot_b = supersonic_gqh_dp4a(wq_b[row][1], xq.y, dot_b);
+                dot_a = supersonic_gqh_dp4a(wq_a[row][2], xq.z, dot_a);
+                dot_b = supersonic_gqh_dp4a(wq_b[row][2], xq.z, dot_b);
+                dot_a = supersonic_gqh_dp4a(wq_a[row][3], xq.w, dot_a);
+                dot_b = supersonic_gqh_dp4a(wq_b[row][3], xq.w, dot_b);
+                acc_a[row][column] += row_scale_a[row] * (float)dot_a;
+                acc_b[row][column] += row_scale_b[row] * (float)dot_b;
+            }
+        }
+    }
+
+    gqh_reduce_scatter_wide16<false>(
+        acc_a, row0, row_end, y_a, y_col_stride_a);
+    gqh_reduce_scatter_wide16<false>(
+        acc_b, row0, row_end, y_b, y_col_stride_b);
+}
+
+// Width-16 GQH3 gate/up pair, using the same shared activation layout as the
+// single-tensor SB2 arm. Each 16-weight lane expands two independently baked
+// level LUTs and computes both dp4a reductions with one activation load.
+template <int kNsb = 0>
+__global__ void gqh_matvec_i8_sb2_gqh3_pair_kernel(
+    const uint8_t* __restrict__ data_a,
+    const uint8_t* __restrict__ data_b,
+    const int8_t* __restrict__ qx,
+    const float* __restrict__ qxs,
+    float* __restrict__ y_a,
+    float* __restrict__ y_b,
+    int in,
+    int out,
+    float tensor_scale_a,
+    float tensor_scale_b,
+    gqh_grid16 grid_a,
+    gqh_grid16 grid_b,
+    int q8n_a,
+    int q8n_b,
+    int64_t qx_col_stride,
+    int64_t qxs_col_stride,
+    int64_t y_col_stride_a,
+    int64_t y_col_stride_b,
+    int row_off,
+    int ncols) {
+    (void)qxs_col_stride;
+    constexpr int kRows = 4;
+    constexpr int kCols = 16;
+    const int warps_per_block = blockDim.x / GQH_WARP;
+    const int lane = threadIdx.x % GQH_WARP;
+    const int warp = threadIdx.x / GQH_WARP;
+    const int row0 =
+        (blockIdx.x * warps_per_block + warp) * kRows + row_off;
+    const int row_end = row_off + out;
+    if (ncols != 16 || row0 >= row_end) {
+        return;
+    }
+    const bool is_half_b = blockIdx.y != 0;
+    const uint8_t* __restrict__ data = is_half_b ? data_b : data_a;
+    float* __restrict__ y = is_half_b ? y_b : y_a;
+    const int64_t y_col_stride =
+        is_half_b ? y_col_stride_b : y_col_stride_a;
+    const float tensor_scale =
+        is_half_b ? tensor_scale_b : tensor_scale_a;
+    const gqh_grid16 grid = is_half_b ? grid_b : grid_a;
+    const int q8n = is_half_b ? q8n_b : q8n_a;
+
+    __shared__ float s_ratio[16];
+    __shared__ int8_t s_q8[8];
+    if (threadIdx.x < 16) {
+        s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+    }
+    if (threadIdx.x < 8) {
+        const float4 mag = make_float4(
+            grid.v[0], grid.v[1], grid.v[2], grid.v[3]);
+        int q = __float2int_rn(gqh_level<true>(threadIdx.x, mag) * (float)q8n);
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        s_q8[threadIdx.x] = static_cast<int8_t>(q);
+    }
+    __syncthreads();
+
+    const int nsb = kNsb > 0 ? kNsb : (in / GQH_SUPERBLOCK);
+    int off_r, off_lo, off_hi, stride;
+    gqh_plane_offsets(nsb, 1, &off_r, &off_lo, &off_hi, &stride);
+    (void)off_r;
+    (void)off_lo;
+    (void)off_hi;
+    constexpr int sb_bytes = GQH3_SB_BYTES;
+    const uint8_t* __restrict__ rowbase[kRows];
+#pragma unroll
+    for (int row = 0; row < kRows; ++row) {
+        const int row_index =
+            row == 0 || row0 + row < row_end ? row0 + row : row_end - 1;
+        rowbase[row] = data + (int64_t)row_index * stride;
+    }
+
+    const int shalf = lane / 16;
+    const int slane = lane % 16;
+    const int sub = slane;
+    const int ratio_shift = (sub & 1) << 2;
+    const float scale_eff = tensor_scale * (127.0f / (float)q8n);
+    float acc[kRows][kCols] = {};
+
+    for (int sb = 0; sb < nsb; sb += 2) {
+        const int group = sb * 16 + lane;
+        const float x_scale = qxs[group];
+        int wq[kRows][4];
+        float row_scale[kRows];
+#pragma unroll
+        for (int row = 0; row < kRows; ++row) {
+            const uint8_t* __restrict__ block =
+                rowbase[row] + (int64_t)(sb + shalf) * sb_bytes;
+            const uint8_t d = gqh_ld_sb_u8(block);
+            const float d_real = gqh_dreal_uniform(d, scale_eff);
+            const uint8_t ratio = gqh_ld_sb_u8(block + 1 + (sub >> 1));
+            row_scale[row] = d_real * s_ratio[
+                (ratio >> ratio_shift) & 0x0f] * x_scale;
+
+            uint32_t codes[2];
+            codes[0] = gqh_load_codeword<true>(
+                block, 2 * slane, GQH_CODES_OFF);
+            codes[1] = gqh_load_codeword<true>(
+                block, 2 * slane + 1, GQH_CODES_OFF);
+            wq[row][0] = 0;
+            wq[row][1] = 0;
+            wq[row][2] = 0;
+            wq[row][3] = 0;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const int code = gqh_code_at<true>(codes[t >> 3], t & 7);
+                const int8_t weight = s_q8[code];
+                wq[row][t >> 2] |=
+                    ((int)weight & 0xff) << (8 * (t & 3));
+            }
+        }
+
+#pragma unroll
+        for (int column = 0; column < kCols; ++column) {
+            const int8_t* __restrict__ activation = qx +
+                (int64_t)column * qx_col_stride + group * 16;
+            int4 xq;
+            memcpy(&xq, activation, sizeof(xq));
+#pragma unroll
+            for (int row = 0; row < kRows; ++row) {
+                int dot = supersonic_gqh_dp4a(wq[row][0], xq.x, 0);
+                dot = supersonic_gqh_dp4a(wq[row][1], xq.y, dot);
+                dot = supersonic_gqh_dp4a(wq[row][2], xq.z, dot);
+                dot = supersonic_gqh_dp4a(wq[row][3], xq.w, dot);
+                acc[row][column] += row_scale[row] * (float)dot;
+            }
+        }
+    }
+
+    gqh_reduce_scatter_wide16<false>(acc, row0, row_end, y, y_col_stride);
 }
