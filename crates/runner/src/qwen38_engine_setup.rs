@@ -7,6 +7,7 @@ use crate::Cli;
 
 pub(crate) struct Qwen38EngineSetup {
     pub(crate) engine: DecodeEngine,
+    pub(crate) dflash: Option<supersonic_runtime::dflash_spec::DflashSpecDecoder>,
 }
 
 pub(crate) fn load_qwen38_engine(
@@ -58,5 +59,60 @@ pub(crate) fn load_qwen38_engine(
         eprintln!("[qwen38-mtp] loaded NextN blk.64 (pass --speculative-decode to enable)");
     }
 
-    Ok(Qwen38EngineSetup { engine })
+    // DFlash2 draft model: load + upload + create spec decoder.
+    let dflash = if let Some(draft_path) = cli.draft_gguf_file.as_deref() {
+        Some(load_dflash_decoder(
+            draft_path,
+            ordinal,
+            context_tokens,
+            text_config.hidden_size,
+            text_config.num_hidden_layers,
+            text_config,
+        )?)
+    } else {
+        None
+    };
+    if dflash.is_some() {
+        eprintln!("[dflash] draft model loaded; speculative decode enabled");
+    }
+
+    Ok(Qwen38EngineSetup { engine, dflash })
+}
+
+fn load_dflash_decoder(
+    draft_path: &std::path::Path,
+    ordinal: usize,
+    max_ctx: usize,
+    hidden: usize,
+    target_layer_count: usize,
+    target_config: &qwen38::config::TextConfig,
+) -> anyhow::Result<supersonic_runtime::dflash_spec::DflashSpecDecoder> {
+    let t0 = std::time::Instant::now();
+    let draft_weights = model_store::dflash::load_draft(draft_path)
+        .map_err(|e| anyhow::anyhow!("load draft GGUF {draft_path:?}: {e}"))?;
+    eprintln!(
+        "[dflash] draft config: hidden={} layers={} block={} mask_token={}",
+        draft_weights.config.hidden,
+        draft_weights.config.n_layers,
+        draft_weights.config.block_size,
+        draft_weights.config.mask_token_id,
+    );
+    let draft_gpu = draft_weights
+        .upload(ordinal)
+        .map_err(|e| anyhow::anyhow!("upload draft to GPU: {e}"))?;
+    eprintln!(
+        "[dflash] draft uploaded in {:.0}ms",
+        t0.elapsed().as_millis()
+    );
+    let decoder = supersonic_runtime::dflash_spec::DflashSpecDecoder::new(
+        draft_gpu,
+        ordinal,
+        max_ctx,
+        hidden,
+        target_layer_count,
+        target_config,
+    )
+    .map_err(|e| anyhow::anyhow!("create dflash spec decoder: {e}"))?;
+    eprintln!("[dflash] active verify block={}", decoder.block_size());
+    Ok(decoder)
 }

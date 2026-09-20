@@ -1,282 +1,291 @@
 {
+  "artifact": {
+    "chat_template_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "quantization": "GQH-Q4",
+    "semantic_id": "qwen3.8-27b-gqh",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tokenizer_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "engine": {
+    "adapter_version": 2,
+    "name": "supersonic",
+    "version": "supersonic 0.1.0"
+  },
+  "environment": {
+    "allowlisted_environment": {
+      "HIP_ARCH": "gfx1201",
+      "HIP_PATH": "rocm/hip",
+      "HIP_VISIBLE_DEVICES": "1",
+      "GGML_GQH_I8DOT": "0",
+      "ROCM_PATH": "rocm",
+      "RUSTFLAGS": "-C target-cpu=native",
+      "SUPERSONIC_DEVICE": "0"
+    },
+    "cache_evidence": {
+      "filesystem_flush": "not-requested",
+      "process_reuse": false,
+      "process_state": "fresh-process"
+    },
+    "cache_state": "cold-load",
+    "clock_policy": "locked",
+    "cpu_governor": "performance",
+    "evidence_notes": [],
+    "headline_eligible": true,
+    "hip_version": "HIP 6.4.2",
+    "logical_gpu": "0",
+    "observed_after": {
+      "gpu_clock_mhz": 2400,
+      "gpu_utilization_percent": 0.0,
+      "memory_clock_mhz": 1249,
+      "memory_utilization_percent": 3.0,
+      "performance_level": "manual",
+      "power_cap_watts": 295,
+      "power_watts": 245.0,
+      "temperature_celsius": 67.0
+    },
+    "observed_after_at": "2026-08-24T12:00:05Z",
+    "observed_before": {
+      "gpu_clock_mhz": 2400,
+      "gpu_utilization_percent": 91.0,
+      "memory_clock_mhz": 1249,
+      "memory_utilization_percent": 88.0,
+      "performance_level": "manual",
+      "power_cap_watts": 295,
+      "power_watts": 245.0,
+      "temperature_celsius": 67.0
+    },
+    "observed_before_at": "2026-08-24T12:00:00Z",
+    "physical_gpu": "1",
+    "process_reuse": false,
+    "requested": {
+      "clock_tolerance_mhz": 20,
+      "gpu_clock_mhz": 2400,
+      "memory_clock_mhz": 1249,
+      "performance_level": "manual",
+      "power_cap_watts": 295
+    },
+    "requested_at": "2026-08-24T12:00:00Z",
+    "rocm_version": "ROCm 6.4.2",
+    "telemetry_samples": [
+      {
+        "gpu_clock_mhz": 2400,
+        "gpu_utilization_percent": 91.0,
+        "memory_clock_mhz": 1249,
+        "memory_utilization_percent": 88.0,
+        "offset_seconds": 2.5,
+        "performance_level": "manual",
+        "power_cap_watts": 295,
+        "power_watts": 245.0,
+        "temperature_celsius": 67.0
+      }
+    ],
+    "verification_errors": []
+  },
+  "errors": [],
+  "hardware": {
+    "architecture": "gfx1201",
+    "clock_policy": "locked",
+    "identity": "0000:65:00.0",
+    "identity_fields": {
+      "gfx_arch": "gfx1201",
+      "gpu": "1",
+      "identity": "0000:65:00.0",
+      "identity_kind": "pci_bdf",
+      "logical_gpu": "0",
+      "market_name": "AMD Radeon AI PRO R9700"
+    },
+    "identity_kind": "pci_bdf",
+    "identity_source_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+    "logical_gpu": "0",
+    "physical_gpu": "1"
+  },
+  "quality": {
+    "cases": [
+      {
+        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "actual_value": "expected",
+        "category": "instruction-following",
+        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "expected_value": "expected",
+        "failure": null,
+        "id": "instruction-following-1",
+        "passed": true,
+        "scorer": "exact_text"
+      },
+      {
+        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "actual_value": "{\"answer\":42}",
+        "category": "structured-extraction",
+        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "expected_value": "{\"answer\":42}",
+        "failure": null,
+        "id": "structured-extraction-1",
+        "passed": true,
+        "scorer": "structured_json"
+      },
+      {
+        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "actual_value": "42",
+        "category": "arithmetic-and-reasoning",
+        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "expected_value": "42",
+        "failure": null,
+        "id": "arithmetic-and-reasoning-1",
+        "passed": true,
+        "scorer": "exact_text"
+      },
+      {
+        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "actual_value": "code",
+        "category": "code-completion",
+        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "expected_value": "code",
+        "failure": null,
+        "id": "code-completion-1",
+        "passed": true,
+        "scorer": "exact_text"
+      },
+      {
+        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "actual_value": "needle",
+        "category": "long-context-retrieval",
+        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "expected_value": "needle",
+        "failure": null,
+        "id": "long-context-retrieval-1",
+        "passed": true,
+        "scorer": "exact_text"
+      },
+      {
+        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "actual_value": "chat",
+        "category": "chat-template-behavior",
+        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "expected_value": "chat",
+        "failure": null,
+        "id": "chat-template-behavior-1",
+        "passed": true,
+        "scorer": "exact_text"
+      },
+      {
+        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "actual_value": "[1,2,3]",
+        "category": "repeated-run-determinism",
+        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "expected_value": "[1,2,3]",
+        "failure": null,
+        "id": "repeated-run-determinism-1",
+        "passed": true,
+        "scorer": "exact_tokens"
+      },
+      {
+        "actual_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "actual_value": "[1,2,3]",
+        "category": "ordinary-vs-mtp-token-equality",
+        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "expected_value": "[1,2,3]",
+        "failure": null,
+        "id": "ordinary-vs-mtp-token-equality-1",
+        "passed": true,
+        "scorer": "exact_tokens"
+      },
+      {
+        "actual_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "actual_value": "ready",
+        "category": "dflash-quality",
+        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "expected_value": "ready",
+        "failure": null,
+        "id": "dflash-quality-1",
+        "passed": true,
+        "scorer": "semantic_text"
+      }
+    ],
+    "categories": {
+      "arithmetic-and-reasoning": {
+        "failed": 0,
+        "passed": 1,
+        "total": 1
+      },
+      "chat-template-behavior": {
+        "failed": 0,
+        "passed": 1,
+        "total": 1
+      },
+      "code-completion": {
+        "failed": 0,
+        "passed": 1,
+        "total": 1
+      },
+      "dflash-quality": {
+        "failed": 0,
+        "passed": 1,
+        "total": 1
+      },
+      "instruction-following": {
+        "failed": 0,
+        "passed": 1,
+        "total": 1
+      },
+      "long-context-retrieval": {
+        "failed": 0,
+        "passed": 1,
+        "total": 1
+      },
+      "ordinary-vs-mtp-token-equality": {
+        "failed": 0,
+        "passed": 1,
+        "total": 1
+      },
+      "repeated-run-determinism": {
+        "failed": 0,
+        "passed": 1,
+        "total": 1
+      },
+      "structured-extraction": {
+        "failed": 0,
+        "passed": 1,
+        "total": 1
+      }
+    },
+    "failed": 0,
+    "missing_case_ids": [],
+    "passed": 9,
+    "total": 9
+  },
   "run": {
-    "schema_version": 1,
-    "suite": "quick",
-    "suite_version": 1,
-    "quality_version": "v2",
-    "case_id": "quick-short-cold-ordinary",
-    "run_id": "quick-short-cold-ordinary-supersonic-0001",
-    "commit": "0123456789abcdef0123456789abcdef01234567",
-    "dirty": false,
+    "case_id": "quick-geo-humaneval-has-close-elements-ordinary",
     "command": [
       "target/release/supersonic",
       "--model",
       "qwen3.8-27b"
-    ]
-  },
-  "engine": {
-    "name": "supersonic",
-    "version": "supersonic 0.1.0",
-    "adapter_version": 2
-  },
-  "hardware": {
-    "identity": "0000:65:00.0",
-    "identity_kind": "pci_bdf",
-    "identity_source_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
-    "identity_fields": {
-      "gpu": "1",
-      "gfx_arch": "gfx1201",
-      "logical_gpu": "0",
-      "identity": "0000:65:00.0",
-      "identity_kind": "pci_bdf",
-      "market_name": "AMD Radeon AI PRO R9700"
-    },
-    "architecture": "gfx1201",
-    "physical_gpu": "1",
-    "clock_policy": "locked",
-    "logical_gpu": "0"
-  },
-  "artifact": {
-    "semantic_id": "qwen3.8-27b-gqh",
-    "quantization": "GQH-Q4",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "tokenizer_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "chat_template_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-  },
-  "workload": {
-    "case_id": "quick-short-cold-ordinary",
-    "prompt_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    "context_limit": 32768,
-    "max_new_tokens": 32,
-    "mode": "ordinary",
-    "stop_policy": "ignore-eos",
-    "cache_state": "cold-load",
-    "warmups": 0,
-    "measurement_boundary": "decode"
-  },
-  "environment": {
-    "rocm_version": "ROCm 6.4.2",
-    "hip_version": "HIP 6.4.2",
-    "clock_policy": "locked",
-    "requested": {
-      "gpu_clock_mhz": 2400,
-      "clock_tolerance_mhz": 20,
-      "memory_clock_mhz": 1249,
-      "power_cap_watts": 295,
-      "performance_level": "manual"
-    },
-    "requested_at": "2026-08-24T12:00:00Z",
-    "observed_before": {
-      "gpu_clock_mhz": 2400,
-      "memory_clock_mhz": 1249,
-      "power_cap_watts": 295,
-      "power_watts": 245.0,
-      "temperature_celsius": 67.0,
-      "gpu_utilization_percent": 91.0,
-      "memory_utilization_percent": 88.0,
-      "performance_level": "manual"
-    },
-    "observed_before_at": "2026-08-24T12:00:00Z",
-    "observed_after": {
-      "gpu_clock_mhz": 2400,
-      "memory_clock_mhz": 1249,
-      "power_cap_watts": 295,
-      "power_watts": 245.0,
-      "temperature_celsius": 67.0,
-      "gpu_utilization_percent": 0.0,
-      "memory_utilization_percent": 3.0,
-      "performance_level": "manual"
-    },
-    "observed_after_at": "2026-08-24T12:00:05Z",
-    "telemetry_samples": [
-      {
-        "offset_seconds": 2.5,
-        "gpu_clock_mhz": 2400,
-        "memory_clock_mhz": 1249,
-        "power_cap_watts": 295,
-        "power_watts": 245.0,
-        "temperature_celsius": 67.0,
-        "gpu_utilization_percent": 91.0,
-        "memory_utilization_percent": 88.0,
-        "performance_level": "manual"
-      }
     ],
-    "headline_eligible": true,
-    "physical_gpu": "1",
-    "logical_gpu": "0",
-    "cpu_governor": "performance",
-    "allowlisted_environment": {
-      "HIP_ARCH": "gfx1201",
-      "HIP_VISIBLE_DEVICES": "1",
-      "ROCM_PATH": "rocm",
-      "HIP_PATH": "rocm/hip",
-      "SUPERSONIC_DEVICE": "0",
-      "RUSTFLAGS": "-C target-cpu=native"
-    },
-    "cache_state": "cold-load",
-    "cache_evidence": {
-      "process_state": "fresh-process",
-      "process_reuse": false,
-      "filesystem_flush": "not-requested"
-    },
-    "process_reuse": false,
-    "verification_errors": [],
-    "evidence_notes": []
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "dirty": false,
+    "quality_version": "v2",
+    "run_id": "quick-geo-humaneval-has-close-elements-ordinary-supersonic-0001",
+    "schema_version": 1,
+    "suite": "quick",
+    "suite_version": 1
   },
   "samples": [
     {
       "decode_ms": 30.0,
       "tokens_per_second": 1066.6666666667
-    },
-    {
-      "decode_ms": 28.0,
-      "tokens_per_second": 1142.8571428571
-    },
-    {
-      "decode_ms": 32.0,
-      "tokens_per_second": 1000.0
     }
   ],
-  "quality": {
-    "passed": 8,
-    "failed": 0,
-    "total": 8,
-    "categories": {
-      "instruction-following": {
-        "passed": 1,
-        "failed": 0,
-        "total": 1
-      },
-      "structured-extraction": {
-        "passed": 1,
-        "failed": 0,
-        "total": 1
-      },
-      "arithmetic-and-reasoning": {
-        "passed": 1,
-        "failed": 0,
-        "total": 1
-      },
-      "code-completion": {
-        "passed": 1,
-        "failed": 0,
-        "total": 1
-      },
-      "long-context-retrieval": {
-        "passed": 1,
-        "failed": 0,
-        "total": 1
-      },
-      "chat-template-behavior": {
-        "passed": 1,
-        "failed": 0,
-        "total": 1
-      },
-      "repeated-run-determinism": {
-        "passed": 1,
-        "failed": 0,
-        "total": 1
-      },
-      "ordinary-vs-mtp-token-equality": {
-        "passed": 1,
-        "failed": 0,
-        "total": 1
-      }
-    },
-    "cases": [
-      {
-        "id": "instruction-following-1",
-        "category": "instruction-following",
-        "scorer": "exact_text",
-        "passed": true,
-        "failure": null,
-        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "expected_value": "expected",
-        "actual_value": "expected"
-      },
-      {
-        "id": "structured-extraction-1",
-        "category": "structured-extraction",
-        "scorer": "structured_json",
-        "passed": true,
-        "failure": null,
-        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "expected_value": "{\"answer\":42}",
-        "actual_value": "{\"answer\":42}"
-      },
-      {
-        "id": "arithmetic-and-reasoning-1",
-        "category": "arithmetic-and-reasoning",
-        "scorer": "exact_text",
-        "passed": true,
-        "failure": null,
-        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "expected_value": "42",
-        "actual_value": "42"
-      },
-      {
-        "id": "code-completion-1",
-        "category": "code-completion",
-        "scorer": "exact_text",
-        "passed": true,
-        "failure": null,
-        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "expected_value": "code",
-        "actual_value": "code"
-      },
-      {
-        "id": "long-context-retrieval-1",
-        "category": "long-context-retrieval",
-        "scorer": "exact_text",
-        "passed": true,
-        "failure": null,
-        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "expected_value": "needle",
-        "actual_value": "needle"
-      },
-      {
-        "id": "chat-template-behavior-1",
-        "category": "chat-template-behavior",
-        "scorer": "exact_text",
-        "passed": true,
-        "failure": null,
-        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "expected_value": "chat",
-        "actual_value": "chat"
-      },
-      {
-        "id": "repeated-run-determinism-1",
-        "category": "repeated-run-determinism",
-        "scorer": "exact_tokens",
-        "passed": true,
-        "failure": null,
-        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "actual_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "expected_value": "[1,2,3]",
-        "actual_value": "[1,2,3]"
-      },
-      {
-        "id": "ordinary-vs-mtp-token-equality-1",
-        "category": "ordinary-vs-mtp-token-equality",
-        "scorer": "exact_tokens",
-        "passed": true,
-        "failure": null,
-        "expected_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "actual_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "expected_value": "[1,2,3]",
-        "actual_value": "[1,2,3]"
-      }
-    ],
-    "missing_case_ids": []
-  },
   "status": {
     "state": "complete"
   },
-  "errors": []
+  "workload": {
+    "cache_state": "cold-load",
+    "case_id": "quick-geo-humaneval-has-close-elements-ordinary",
+    "context_limit": 32768,
+    "max_new_tokens": 256,
+    "measurement_boundary": "decode",
+    "mode": "ordinary",
+    "prompt_sha256": "eb8ed1bcb5e9bee3d4e0359c703d1dfb6dba7c665432908cf89af91095a74997",
+    "stop_policy": "honor-eos",
+    "warmups": 0
+  }
 }

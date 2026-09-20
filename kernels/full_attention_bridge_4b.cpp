@@ -35,6 +35,66 @@ extern "C" int supersonic_gqh_hip_restore_planar(
     void* wire,
     int in_dim,
     int out_dim);
+extern "C" int supersonic_gqh_hip_quant_x_i8(
+    int device_ordinal,
+    const void* x,
+    void* qx,
+    void* qxs,
+    int ncols,
+    int in_dim,
+    int64_t x_col_stride,
+    hipStream_t stream);
+extern "C" int supersonic_gqh_hip_quant_x_i8_wide16(
+    int device_ordinal,
+    const void* x,
+    void* qx,
+    void* qxs,
+    int ncols,
+    int in_dim,
+    int64_t x_col_stride,
+    hipStream_t stream);
+extern "C" int supersonic_gqh_hip_matvec_i8(
+    int device_ordinal,
+    int rung,
+    const void* wire,
+    const void* qx,
+    const void* qxs,
+    void* y,
+    int in_dim,
+    int out_dim,
+    int ncols,
+    int q8n,
+    int64_t qx_col_stride,
+    int64_t qxs_col_stride,
+    int64_t y_col_stride,
+    float tensor_scale,
+    int grid_code,
+    int accumulate,
+    hipStream_t stream);
+extern "C" int supersonic_gqh_hip_matvec_i8_pair(
+    int device_ordinal,
+    int rung_a,
+    int rung_b,
+    const void* wire_a,
+    const void* wire_b,
+    const void* qx,
+    const void* qxs,
+    void* y_a,
+    void* y_b,
+    int in_dim,
+    int out_dim,
+    int ncols,
+    int q8n_a,
+    int q8n_b,
+    int64_t qx_col_stride,
+    int64_t qxs_col_stride,
+    int64_t y_col_stride_a,
+    int64_t y_col_stride_b,
+    float tensor_scale_a,
+    float tensor_scale_b,
+    int grid_code_a,
+    int grid_code_b,
+    hipStream_t stream);
 extern "C" int supersonic_qwen35_4b_hip_invalidate_decode_cache(
     int device_ordinal,
     const void* layers,
@@ -73,6 +133,7 @@ extern "C" void supersonic_qwen35_4b_hip_set_gqh_prepare_only(int on) {
     g_hip_gqh_prepare_only = on != 0;
     supersonic_gqh_hip_unlock();
 }
+
 
 extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
     int dtype,
@@ -305,6 +366,110 @@ int gqh_rung_from_qtype(int qtype) {
     return -1;
 }
 
+namespace {
+int gqh_q8_round(float level, int denominator) {
+    int value = static_cast<int>(std::nearbyintf(
+        level * static_cast<float>(denominator)));
+    if (value > 127) {
+        value = 127;
+    }
+    if (value < -127) {
+        value = -127;
+    }
+    return value;
+}
+
+bool gqh_i8_dot_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("GGML_GQH_I8DOT");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+int gqh_q8_denom(int rung, int grid_code) {
+    const uint32_t* grid = nullptr;
+    int level_count = 0;
+    if (rung == 0) {
+        grid = GQH3_GRID[grid_code];
+        level_count = 8;
+    } else if (rung == 1) {
+        grid = GQH2H_GRID[grid_code];
+        level_count = 4;
+    } else if (rung == 3) {
+        grid = GQH4_GRID[grid_code];
+        level_count = 16;
+    } else {
+        return 0;
+    }
+    int best = 127;
+    double best_rms = -1.0;
+    for (int denominator = 1; denominator <= 127; ++denominator) {
+        double squared_error = 0.0;
+        for (int level_index = 0; level_index < level_count; ++level_index) {
+            float bits = 0.0f;
+            std::memcpy(&bits, &grid[level_index], sizeof(bits));
+            const double error =
+                static_cast<double>(gqh_q8_round(bits, denominator)) /
+                    static_cast<double>(denominator) -
+                static_cast<double>(bits);
+            squared_error += error * error;
+        }
+        const double rms = std::sqrt(squared_error / level_count);
+        if (best_rms < 0.0 || rms <= best_rms) {
+            best_rms = rms;
+            best = denominator;
+        }
+    }
+    return best;
+}
+
+int gqh_q8_denom_eff(int rung, int grid_code) {
+    const char* value = std::getenv("GGML_GQH_Q8N");
+    if (value == nullptr || *value == '\0') {
+        return 127;
+    }
+    if (std::strcmp(value, "opt") == 0 || std::strcmp(value, "derived") == 0 ||
+        std::strcmp(value, "auto") == 0) {
+        return gqh_q8_denom(rung, grid_code);
+    }
+    const int forced = std::atoi(value);
+    if (forced >= 1 && forced <= 127) {
+        return forced;
+    }
+    return gqh_q8_denom(rung, grid_code);
+}
+
+bool gqh_q8_grid_representable(int rung, int grid_code, int denominator) {
+    if (denominator < 1 || denominator > 127) {
+        return false;
+    }
+    const uint32_t* grid = nullptr;
+    int level_count = 0;
+    if (rung == 0) {
+        grid = GQH3_GRID[grid_code];
+        level_count = 8;
+    } else if (rung == 1) {
+        grid = GQH2H_GRID[grid_code];
+        level_count = 4;
+    } else if (rung == 3) {
+        grid = GQH4_GRID[grid_code];
+        level_count = 16;
+    } else {
+        return false;
+    }
+    for (int level_index = 0; level_index < level_count; ++level_index) {
+        float level = 0.0f;
+        std::memcpy(&level, &grid[level_index], sizeof(level));
+        if (level != 0.0f && gqh_q8_round(level, denominator) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 struct GqhProjHdr {
     const void* wire = nullptr;
     float scale = 0.0f;
@@ -315,6 +480,22 @@ struct GqhProjHdr {
     int mix_k = 0;
     float mix_lut[16] = {};
 };
+
+bool gqh_mlp_i8_supported(
+    const GqhProjHdr& header,
+    int ncols,
+    int in_dim) {
+    if (!gqh_i8_dot_enabled() || ncols <= 1 || ncols > 16 ||
+        in_dim == 0 || in_dim % 256 != 0 || header.wire == nullptr) {
+        return false;
+    }
+    if (header.rung != 0 && header.rung != 1 && header.rung != 3) {
+        return false;
+    }
+    const int denominator = gqh_q8_denom_eff(header.rung, header.grid);
+    return denominator >= 1 && denominator <= 127 &&
+        gqh_q8_grid_representable(header.rung, header.grid, denominator);
+}
 
 bool ggml_k_qtype(int qtype) {
     return qtype == 8 || qtype == 12 || qtype == 13 || qtype == 14;
@@ -1139,6 +1320,138 @@ hipError_t launch_gqh_gemv_acc(
     return st == 0 ? hipSuccess : hipErrorInvalidValue;
 }
 
+hipError_t launch_gqh_matvec_i8(
+    int ordinal,
+    const GqhProjHdr& header,
+    const float* x,
+    float* y,
+    int in_dim,
+    int out_dim,
+    hipStream_t stream,
+    int ncols,
+    int64_t x_col_stride,
+    int64_t y_col_stride,
+    uint8_t* scratch,
+    bool accumulate) {
+    if (!gqh_mlp_i8_supported(header, ncols, in_dim)) {
+        return hipErrorInvalidValue;
+    }
+    auto* qx = reinterpret_cast<int8_t*>(scratch);
+    auto* qxs = reinterpret_cast<float*>(
+        scratch + static_cast<int64_t>(ncols) * in_dim);
+    const int q8n = gqh_q8_denom_eff(header.rung, header.grid);
+    const bool wide16 = ncols == 16 &&
+        (header.rung == 0 || header.rung == 3) && (in_dim % 512) == 0;
+    int status = 0;
+    if (wide16) {
+        status = supersonic_gqh_hip_quant_x_i8_wide16(
+            ordinal,
+            x,
+            qx,
+            qxs,
+            ncols,
+            in_dim,
+            x_col_stride,
+            stream);
+    } else {
+        status = supersonic_gqh_hip_quant_x_i8(
+            ordinal,
+            x,
+            qx,
+            qxs,
+            ncols,
+            in_dim,
+            x_col_stride,
+            stream);
+    }
+    if (status != 0) {
+        return hipErrorInvalidValue;
+    }
+    status = supersonic_gqh_hip_matvec_i8(
+        ordinal,
+        header.rung,
+        header.wire,
+        qx,
+        qxs,
+        y,
+        in_dim,
+        out_dim,
+        ncols,
+        q8n,
+        in_dim,
+        wide16 ? in_dim / 16 : in_dim / 8,
+        y_col_stride,
+        header.scale,
+        header.grid,
+        accumulate ? 1 : 0,
+        stream);
+    return status == 0 ? hipSuccess : hipErrorInvalidValue;
+}
+
+hipError_t launch_gqh_matvec_i8_pair(
+    int ordinal,
+    const GqhProjHdr& gate,
+    const GqhProjHdr& up,
+    const float* x,
+    float* y_gate,
+    float* y_up,
+    int in_dim,
+    int out_dim,
+    hipStream_t stream,
+    int ncols,
+    int64_t x_col_stride,
+    int64_t y_col_stride,
+    uint8_t* scratch) {
+    if (ncols != 16 || gate.rung != up.rung ||
+        (gate.rung != 0 && gate.rung != 3) || (in_dim % 512) != 0 ||
+        !gqh_mlp_i8_supported(gate, ncols, in_dim) ||
+        !gqh_mlp_i8_supported(up, ncols, in_dim)) {
+        return hipErrorInvalidValue;
+    }
+    auto* qx = reinterpret_cast<int8_t*>(scratch);
+    auto* qxs = reinterpret_cast<float*>(
+        scratch + static_cast<int64_t>(ncols) * in_dim);
+    const int q8n_gate = gqh_q8_denom_eff(gate.rung, gate.grid);
+    const int q8n_up = gqh_q8_denom_eff(up.rung, up.grid);
+    int status = supersonic_gqh_hip_quant_x_i8_wide16(
+        ordinal,
+        x,
+        qx,
+        qxs,
+        ncols,
+        in_dim,
+        x_col_stride,
+        stream);
+    if (status != 0) {
+        return hipErrorInvalidValue;
+    }
+    status = supersonic_gqh_hip_matvec_i8_pair(
+        ordinal,
+        gate.rung,
+        up.rung,
+        gate.wire,
+        up.wire,
+        qx,
+        qxs,
+        y_gate,
+        y_up,
+        in_dim,
+        out_dim,
+        ncols,
+        q8n_gate,
+        q8n_up,
+        in_dim,
+        in_dim / 16,
+        y_col_stride,
+        y_col_stride,
+        gate.scale,
+        up.scale,
+        gate.grid,
+        up.grid,
+        stream);
+    return status == 0 ? hipSuccess : hipErrorInvalidValue;
+}
+
 void launch_round_f32(
     float* y,
     int n,
@@ -1211,7 +1524,7 @@ DecodeRecScratch& decode_rec_scratch() {
 // trunk sequentially. Rec is copied after each token in the layer B-loop;
 // conv is written inside the rec-prep kernel after each col.
 struct MtpPrefixSnap {
-    static constexpr int kMaxB = 8;
+    static constexpr int kMaxB = 16;
     static constexpr int kMaxLayers = 80;
     float* rec[kMaxB][kMaxLayers]{};
     hip_bfloat16* conv[kMaxB][kMaxLayers]{};
@@ -1735,6 +2048,96 @@ void launch_decode_extract_rec_gated(
         compact);
 }
 
+hipError_t launch_decode_rec_k128_fused_batch(
+    int ordinal,
+    int nv,
+    int nk,
+    int seq_len,
+    float* rec_state,
+    const float* q_unique,
+    const float* k_unique,
+    const float* value,
+    const float* b,
+    const float* a,
+    const hip_bfloat16* dt_bias,
+    const hip_bfloat16* a_log_exp,
+    float* out,
+    __half* state_trace,
+    int64_t qkv_stride,
+    int64_t ba_stride,
+    int64_t out_stride,
+    hipStream_t stream) {
+    if (nv <= 0 || nk <= 0 || seq_len <= 0 || rec_state == nullptr ||
+        q_unique == nullptr || k_unique == nullptr || value == nullptr ||
+        b == nullptr || a == nullptr || out == nullptr) {
+        return hipErrorInvalidValue;
+    }
+    constexpr int warps_per_block = 4;
+    const size_t total_warps =
+        static_cast<size_t>(nv) * static_cast<size_t>(128 / 4);
+    const unsigned int grid = static_cast<unsigned int>(
+        (total_warps + static_cast<size_t>(warps_per_block) - 1) /
+        static_cast<size_t>(warps_per_block));
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_decode_rec_k128_fused_batch_kernel),
+        dim3(grid > 0 ? grid : 1u),
+        dim3(32, warps_per_block),
+        0,
+        stream,
+        nv,
+        nk,
+        seq_len,
+        rec_state,
+        q_unique,
+        k_unique,
+        value,
+        b,
+        a,
+        dt_bias,
+        a_log_exp,
+        out,
+        state_trace,
+        qkv_stride,
+        ba_stride,
+        out_stride);
+    return hipGetLastError();
+}
+
+hipError_t launch_decode_extract_rec_gated_batch(
+    int nv,
+    int vhd,
+    float eps,
+    const float* rec_out,
+    const float* z,
+    const float* norm_w,
+    float* attn_out,
+    int seq_len,
+    int64_t out_stride,
+    int64_t z_stride,
+    hipStream_t stream) {
+    if (nv <= 0 || vhd <= 0 || seq_len <= 0 || rec_out == nullptr ||
+        z == nullptr || attn_out == nullptr) {
+        return hipErrorInvalidValue;
+    }
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_decode_extract_rec_gated_batch_kernel),
+        dim3(static_cast<unsigned int>(nv), static_cast<unsigned int>(seq_len)),
+        dim3(128),
+        0,
+        stream,
+        nv,
+        vhd,
+        eps,
+        rec_out,
+        z,
+        norm_w,
+        attn_out,
+        seq_len,
+        out_stride,
+        z_stride);
+    return hipGetLastError();
+}
+
 struct DecodeFullAttnScratch {
     hip_bfloat16* q = nullptr;
     hip_bfloat16* k = nullptr;
@@ -2150,6 +2553,25 @@ hipError_t launch_hidden_store_bf16(
     return hipGetLastError();
 }
 
+hipError_t launch_dflash_recurrent_capture(
+    const float* recurrent_f32,
+    __half* recurrent_f16,
+    int n,
+    hipStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = (n + block_size - 1) / block_size;
+    hipLaunchKernelGGL(
+        supersonic_qwen35_pack_f32_to_half_kernel,
+        dim3(static_cast<unsigned int>(grid_size)),
+        dim3(block_size),
+        0,
+        stream,
+        recurrent_f32,
+        recurrent_f16,
+        n);
+    return hipGetLastError();
+}
+
 namespace {
 hip_bfloat16* g_ggml_x_bf = nullptr;
 hip_bfloat16* g_ggml_y_bf = nullptr;
@@ -2288,6 +2710,9 @@ hipError_t launch_ggml_k_gemv_impl(
     if (ncols <= 0) {
         ncols = 1;
     }
+    if (ncols > 16) {
+        return hipErrorInvalidValue;
+    }
     if (x_col_stride <= 0) {
         x_col_stride = in_dim;
     }
@@ -2304,8 +2729,10 @@ hipError_t launch_ggml_k_gemv_impl(
         (out_dim + rows_per_block - 1) / rows_per_block));
     const dim3 threads(kThreads);
     auto* packed = static_cast<const uint8_t*>(h.wire);
-    const bool skinny = ncols > 1 && ncols <= 4;
-    const int kC = skinny ? (ncols <= 3 ? 3 : 4) : 1;
+    const bool skinny = ncols > 1;
+    const int kC = skinny
+        ? (ncols <= 3 ? 3 : (ncols <= 4 ? 4 : (ncols <= 8 ? 8 : 16)))
+        : 1;
     auto launch = [&](auto kernel) {
         hipLaunchKernelGGL(
             kernel, blocks, threads, 0, stream, packed, x, y, in_dim, out_dim,
@@ -2313,18 +2740,34 @@ hipError_t launch_ggml_k_gemv_impl(
     };
     switch (h.qtype) {
         case 8:
-            if (skinny && dual && kC == 3) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 3>)));
-            } else if (skinny && dual) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 4>)));
-            } else if (skinny && kC == 3) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1, 3>)));
+            if (skinny && dual) {
+                if (kC == 3) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 3>)));
+                } else if (kC == 4) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 4>)));
+                } else if (kC == 16) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 16>)));
+                } else {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 8>)));
+                }
             } else if (skinny) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1, 4>)));
+                if (kC == 3) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1, 3>)));
+                } else if (kC == 4) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1, 4>)));
+                } else if (kC == 16) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1, 16>)));
+                } else {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 1, 8>)));
+                }
             } else if (dual) {
                 launch(HIP_KERNEL_NAME(
                     (supersonic_qwen35_ggml_k_matvec_kernel<8, kAcc, 2, 1>)));
@@ -2335,11 +2778,27 @@ hipError_t launch_ggml_k_gemv_impl(
             break;
         case 12:
             if (skinny && dual) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 2, 4>)));
+                if (kC == 16) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 2, 16>)));
+                } else if (kC == 8) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 2, 8>)));
+                } else {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 2, 4>)));
+                }
             } else if (skinny) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 1, 4>)));
+                if (kC == 16) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 1, 16>)));
+                } else if (kC == 8) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 1, 8>)));
+                } else {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 1, 4>)));
+                }
             } else if (dual) {
                 launch(HIP_KERNEL_NAME(
                     (supersonic_qwen35_ggml_k_matvec_kernel<12, kAcc, 2, 1>)));
@@ -2350,11 +2809,27 @@ hipError_t launch_ggml_k_gemv_impl(
             break;
         case 13:
             if (skinny && dual) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 2, 4>)));
+                if (kC == 16) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 2, 16>)));
+                } else if (kC == 8) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 2, 8>)));
+                } else {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 2, 4>)));
+                }
             } else if (skinny) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 1, 4>)));
+                if (kC == 16) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 1, 16>)));
+                } else if (kC == 8) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 1, 8>)));
+                } else {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 1, 4>)));
+                }
             } else if (dual) {
                 launch(HIP_KERNEL_NAME(
                     (supersonic_qwen35_ggml_k_matvec_kernel<13, kAcc, 2, 1>)));
@@ -2365,11 +2840,27 @@ hipError_t launch_ggml_k_gemv_impl(
             break;
         case 14:
             if (skinny && dual) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 2, 4>)));
+                if (kC == 16) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 2, 16>)));
+                } else if (kC == 8) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 2, 8>)));
+                } else {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 2, 4>)));
+                }
             } else if (skinny) {
-                launch(HIP_KERNEL_NAME(
-                    (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 1, 4>)));
+                if (kC == 16) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 1, 16>)));
+                } else if (kC == 8) {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 1, 8>)));
+                } else {
+                    launch(HIP_KERNEL_NAME(
+                        (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 1, 4>)));
+                }
             } else if (dual) {
                 launch(HIP_KERNEL_NAME(
                     (supersonic_qwen35_ggml_k_matvec_kernel<14, kAcc, 2, 1>)));
@@ -2422,7 +2913,8 @@ hipError_t launch_mixer_proj_acc(
     hipStream_t stream,
     int ncols = 1,
     int64_t x_col_stride = 0,
-    int64_t y_col_stride = 0) {
+    int64_t y_col_stride = 0,
+    uint8_t* i8_scratch = nullptr) {
     if (out_dim <= 0 || h.wire == nullptr) {
         return hipSuccess;
     }
@@ -2436,6 +2928,22 @@ hipError_t launch_mixer_proj_acc(
         y_col_stride = out_dim;
     }
     if (h.rung >= 0) {
+        if (i8_scratch != nullptr &&
+            gqh_mlp_i8_supported(h, ncols, in_dim)) {
+            return launch_gqh_matvec_i8(
+                ordinal,
+                h,
+                x,
+                y,
+                in_dim,
+                out_dim,
+                stream,
+                ncols,
+                x_col_stride,
+                y_col_stride,
+                i8_scratch,
+                true);
+        }
         return launch_gqh_gemv_acc(
             ordinal, h, x, y, in_dim, out_dim, stream, ncols, x_col_stride,
             y_col_stride);
@@ -2480,7 +2988,8 @@ hipError_t launch_mixer_proj(
     bool do_round = true,
     int ncols = 1,
     int64_t x_col_stride = 0,
-    int64_t y_col_stride = 0) {
+    int64_t y_col_stride = 0,
+    uint8_t* i8_scratch = nullptr) {
     if (out_dim <= 0 || h.wire == nullptr) {
         return hipSuccess;
     }
@@ -2495,9 +3004,26 @@ hipError_t launch_mixer_proj(
     }
     hipError_t err = hipSuccess;
     if (h.rung >= 0) {
-        err = launch_gqh_gemv(
-            ordinal, h, x, y, in_dim, out_dim, stream, ncols, x_col_stride,
-            y_col_stride);
+        if (i8_scratch != nullptr &&
+            gqh_mlp_i8_supported(h, ncols, in_dim)) {
+            err = launch_gqh_matvec_i8(
+                ordinal,
+                h,
+                x,
+                y,
+                in_dim,
+                out_dim,
+                stream,
+                ncols,
+                x_col_stride,
+                y_col_stride,
+                i8_scratch,
+                false);
+        } else {
+            err = launch_gqh_gemv(
+                ordinal, h, x, y, in_dim, out_dim, stream, ncols, x_col_stride,
+                y_col_stride);
+        }
     } else if (ggml_k_qtype(h.qtype)) {
         err = launch_ggml_k_gemv(
             h, x, y, in_dim, out_dim, stream, ncols, x_col_stride,
@@ -7609,6 +8135,7 @@ static int matmul_ggml_pair_swiglu_wmma_bf16_device(
     return 0;
 }
 
+template <typename T>
 static int quantize_mmq_q8_1_device(
     int device_ordinal,
     size_t batch_elems,
@@ -7631,7 +8158,7 @@ static int quantize_mmq_q8_1_device(
 
     const int blocks_per_row = (k + 127) / 128;
     hipLaunchKernelGGL(
-        supersonic_qwen35_quantize_mmq_q8_1_kernel,
+        supersonic_qwen35_quantize_mmq_q8_1_kernel<T>,
         dim3(blocks_per_row, m, static_cast<unsigned int>(batch_elems)),
         dim3(32),
         0,
@@ -7639,7 +8166,7 @@ static int quantize_mmq_q8_1_device(
         batch_elems,
         m,
         k,
-        static_cast<const hip_bfloat16*>(lhs),
+        static_cast<const T*>(lhs),
         quant_type,
         static_cast<uint8_t*>(out));
     hipError_t launch_err = hipGetLastError();
@@ -7931,6 +8458,18 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
     }
 
     switch (dtype) {
+    case 1: {
+        // F32 output for the DFlash2 draft forward. The scalar kernel
+        // dequantizes Q8_0 to F32, reads an F32 lhs, accumulates in F32, and
+        // stores F32 — matching the upstream ggml F32 compute type so draft
+        // activations never pass through a BF16 truncation. The WMMA path
+        // stores BF16 only, so F32 output uses the scalar kernel. The caller
+        // must supply an F32 lhs (the scalar kernel reads `lhs` as
+        // `const float*`); a BF16 lhs would be reinterpreted as garbage.
+        return matmul_int4_dequant_device<float>(
+            static_cast<int>(device_ordinal), batch_elems, m, n, k,
+            lhs, rhs_int4, scale, zero, awq_inv_scale, group_size, quant_type, out);
+    }
     case 2: {
         // The tiled WMMA kernel fetches one (scale, zero) pair per BK-wide
         // K slab per row, so it's only correct when every BK-aligned slab
@@ -8031,8 +8570,11 @@ extern "C" int supersonic_qwen35_4b_hip_quantize_mmq_q8_1(
     int quant_type,
     void* out) {
     switch (dtype) {
+    case 1:
+        return quantize_mmq_q8_1_device<float>(
+            static_cast<int>(device_ordinal), batch_elems, m, k, lhs, quant_type, out);
     case 2:
-        return quantize_mmq_q8_1_device(
+        return quantize_mmq_q8_1_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, k, lhs, quant_type, out);
     default:
         return 304;
@@ -9310,6 +9852,8 @@ int persistent_decode_device(
     if (use_gqh_split) {
         const Qwen35DecodeLayerDesc* layers_base =
             static_cast<const Qwen35DecodeLayerDesc*>(layers);
+        const BatchSeqDesc* dflash_batch =
+            static_cast<const BatchSeqDesc*>(batch_descs);
         const Qwen35INT4ScaleDesc* int4_base =
             static_cast<const Qwen35INT4ScaleDesc*>(int4_scales);
         auto phase_grid = [&](int vgpr, size_t scratch, int api_occ, int cap) -> int {
@@ -9897,6 +10441,16 @@ int persistent_decode_device(
                     dump_ws_f32_n("l5_in", ws_hidden, hidden_dim);
                     dump_ws_f32_n("l5_normed", ws_normed, hidden_dim);
                 }
+                constexpr int64_t mixer_i8_region_bytes = 256 * 1024;
+                const int64_t mixer_i8_available_bytes =
+                    static_cast<int64_t>(attn_scratch_floats) *
+                    static_cast<int64_t>(sizeof(float));
+                const bool mixer_i8_available =
+                    mixer_i8_available_bytes >= 2 * mixer_i8_region_bytes;
+                uint8_t* mixer_i8_main =
+                    reinterpret_cast<uint8_t*>(ws_attn);
+                uint8_t* mixer_i8_side =
+                    mixer_i8_main + mixer_i8_region_bytes;
                 if (use_gqh_gemv) {
                     const GqhMixerLayer& mx = mlp_hdrs.mix[layer];
                     const double t_in0 = dec_prof ? (sync_now(), now_ms()) : 0;
@@ -9919,20 +10473,23 @@ int persistent_decode_device(
                         err = launch_mixer_proj(
                             device_ordinal, mx.q, ws_normed, ws_proj,
                             hidden_dim, mx.q_out, stream, false, gemv_ncols,
-                            hidden_stride, proj_stride);
+                            hidden_stride, proj_stride,
+                            mixer_i8_available ? mixer_i8_main : nullptr);
                         if (err == hipSuccess) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.k, ws_normed,
                                 ws_proj + mx.q_out,
                                 hidden_dim, mx.k_out, kv_stream, false,
-                                gemv_ncols, hidden_stride, proj_stride);
+                                gemv_ncols, hidden_stride, proj_stride,
+                                mixer_i8_available ? mixer_i8_side : nullptr);
                         }
                         if (err == hipSuccess) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.v, ws_normed,
                                 ws_proj + mx.q_out + mx.k_out,
                                 hidden_dim, mx.k_out, kv_stream, false,
-                                gemv_ncols, hidden_stride, proj_stride);
+                                gemv_ncols, hidden_stride, proj_stride,
+                                mixer_i8_available ? mixer_i8_side : nullptr);
                         }
                         if (kv_stream != stream) {
                             err = decode_join_side(device_ordinal, stream, kv_stream);
@@ -9960,13 +10517,15 @@ int persistent_decode_device(
                         err = launch_mixer_proj(
                             device_ordinal, mx.qkv, ws_normed, ws_proj,
                             hidden_dim, mx.qkv_out, stream, false, gemv_ncols,
-                            hidden_stride, proj_stride);
+                            hidden_stride, proj_stride,
+                            mixer_i8_available ? mixer_i8_main : nullptr);
                         if (err == hipSuccess) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.z, ws_normed,
                                 ws_proj + mx.qkv_out,
                                 hidden_dim, mx.z_out, z_stream, false,
-                                gemv_ncols, hidden_stride, proj_stride);
+                                gemv_ncols, hidden_stride, proj_stride,
+                                mixer_i8_available ? mixer_i8_side : nullptr);
                         }
                         // Join z after rec-prep: rec-prep only reads qkv, so
                         // it can overlap the z GEMV. Rec fused still needs z.
@@ -9978,14 +10537,16 @@ int persistent_decode_device(
                                 device_ordinal, mx.b, ws_normed,
                                 ws_proj + mx.qkv_out + mx.z_out,
                                 hidden_dim, mx.nv, stream, false, gemv_ncols,
-                                hidden_stride, proj_stride);
+                                hidden_stride, proj_stride,
+                                mixer_i8_available ? mixer_i8_main : nullptr);
                         }
                         if (err == hipSuccess && mx.a.qtype != 8) {
                             err = launch_mixer_proj(
                                 device_ordinal, mx.a, ws_normed,
                                 ws_proj + mx.qkv_out + mx.z_out + mx.nv,
                                 hidden_dim, mx.nv, stream, false, gemv_ncols,
-                                hidden_stride, proj_stride);
+                                hidden_stride, proj_stride,
+                                mixer_i8_available ? mixer_i8_main : nullptr);
                         }
                     }
 
@@ -10000,6 +10561,23 @@ int persistent_decode_device(
                             layer,
                             hipGetErrorString(err));
                         return err;
+                    }
+                    if (dflash_batch != nullptr && mx.layer_type == 0) {
+                        for (int b = 0; b < batch_size; ++b) {
+                            void* qkv_capture =
+                                dflash_batch[layer].dflash_qkv[b];
+                            if (qkv_capture == nullptr) {
+                                continue;
+                            }
+                            err = launch_hidden_store_bf16(
+                                ws_proj + static_cast<int64_t>(b) * proj_stride,
+                                static_cast<hip_bfloat16*>(qkv_capture),
+                                mx.qkv_out,
+                                stream);
+                            if (err != hipSuccess) {
+                                return err;
+                            }
+                        }
                     }
                     if (layer == dump_lin) {
                         if (z_pending.active()) {
@@ -10113,7 +10691,8 @@ int persistent_decode_device(
                         MtpPrefixSnap& psnap = mtp_prefix_snap();
                         hip_bfloat16* conv_snaps = nullptr;
                         int64_t snap_stride = 0;
-                        if (psnap.ready && psnap.conv[0][layer] != nullptr &&
+                        if (psnap.ready &&
+                            psnap.conv[0][layer] != nullptr &&
                             psnap.conv_bytes[layer] > 0) {
                             conv_snaps = psnap.conv[0][layer];
                             snap_stride = static_cast<int64_t>(
@@ -10199,96 +10778,167 @@ int persistent_decode_device(
                     const int key_dim = nk * hkd;
                     DecodeRecScratch& sc = decode_rec_scratch();
                     const double t_r0 = dec_prof ? (sync_now(), now_ms()) : 0;
-                    for (int b = 0; b < gemv_ncols; ++b) {
-                        float* conv_b =
-                            ws_gate + static_cast<int64_t>(b) * mlp_stride;
-                        float* proj_b =
-                            ws_proj + static_cast<int64_t>(b) * proj_stride;
-                        float* attn_b =
-                            ws_attn + static_cast<int64_t>(b) * attn_stride;
-                        const float* q_u = conv_b + mxr.qkv_out;
-                        const float* k_u = conv_b + mxr.qkv_out + key_dim;
-                        const float* v_ptr = conv_b + 2 * key_dim;
+                    const bool use_dflash_rec_batch =
+                        dflash_batch != nullptr && gemv_ncols > 1 &&
+                        hkd == 128 && hvd == 128 &&
+                        dflash_batch[layer].dflash_recurrent[0] != nullptr;
+                    if (use_dflash_rec_batch) {
+                        const float* q_u = ws_gate + mxr.qkv_out;
+                        const float* k_u = ws_gate + mxr.qkv_out + key_dim;
+                        const float* v_ptr = ws_gate + 2 * key_dim;
                         const float* b_ptr =
-                            proj_b + mxr.qkv_out + mxr.z_out;
+                            ws_proj + mxr.qkv_out + mxr.z_out;
                         const float* a_ptr = b_ptr + nv;
-                        const float* z_ptr = proj_b + mxr.qkv_out;
-                        if (hkd == 128 && hvd == 128) {
-                            const int st =
-                                supersonic_qwen35_hip_decode_rec_k128_fused(
-                                    device_ordinal,
+                        const float* z_ptr = ws_proj + mxr.qkv_out;
+                        err = launch_decode_rec_k128_fused_batch(
+                            device_ordinal,
+                            nv,
+                            nk,
+                            gemv_ncols,
+                            static_cast<float*>(mxr.recurrent_state),
+                            q_u,
+                            k_u,
+                            v_ptr,
+                            b_ptr,
+                            a_ptr,
+                            static_cast<const hip_bfloat16*>(mxr.dt_bias_w),
+                            static_cast<const hip_bfloat16*>(mxr.a_log_exp_w),
+                            ws_attn,
+                            static_cast<__half*>(
+                                dflash_batch[layer].dflash_recurrent[0]),
+                            mlp_stride,
+                            proj_stride,
+                            attn_stride,
+                            stream);
+                        if (err != hipSuccess) return err;
+                        err = launch_decode_extract_rec_gated_batch(
+                            nv,
+                            hvd,
+                            mxr.linear_norm_eps,
+                            ws_attn,
+                            z_ptr,
+                            static_cast<const float*>(mxr.linear_norm_w),
+                            ws_attn,
+                            gemv_ncols,
+                            attn_stride,
+                            proj_stride,
+                            stream);
+                        if (err != hipSuccess) return err;
+                    } else {
+                        for (int b = 0; b < gemv_ncols; ++b) {
+                            float* conv_b =
+                                ws_gate + static_cast<int64_t>(b) * mlp_stride;
+                            float* proj_b =
+                                ws_proj + static_cast<int64_t>(b) * proj_stride;
+                            float* attn_b =
+                                ws_attn + static_cast<int64_t>(b) * attn_stride;
+                            const float* q_u = conv_b + mxr.qkv_out;
+                            const float* k_u = conv_b + mxr.qkv_out + key_dim;
+                            const float* v_ptr = conv_b + 2 * key_dim;
+                            const float* b_ptr =
+                                proj_b + mxr.qkv_out + mxr.z_out;
+                            const float* a_ptr = b_ptr + nv;
+                            const float* z_ptr = proj_b + mxr.qkv_out;
+                            if (hkd == 128 && hvd == 128) {
+                                const int st =
+                                    supersonic_qwen35_hip_decode_rec_k128_fused(
+                                        device_ordinal,
+                                        nv,
+                                        nk,
+                                        static_cast<float*>(mxr.recurrent_state),
+                                        q_u,
+                                        k_u,
+                                        v_ptr,
+                                        b_ptr,
+                                        a_ptr,
+                                        static_cast<const hip_bfloat16*>(
+                                            mxr.dt_bias_w),
+                                        static_cast<const hip_bfloat16*>(
+                                            mxr.a_log_exp_w),
+                                        sc.out,
+                                        stream);
+                                err = st == 0 ? hipSuccess : hipErrorInvalidValue;
+                            } else {
+                                launch_decode_pack_rec_inputs(
                                     nv,
                                     nk,
-                                    static_cast<float*>(mxr.recurrent_state),
+                                    hkd,
                                     q_u,
                                     k_u,
-                                    v_ptr,
                                     b_ptr,
                                     a_ptr,
                                     static_cast<const hip_bfloat16*>(
                                         mxr.dt_bias_w),
                                     static_cast<const hip_bfloat16*>(
                                         mxr.a_log_exp_w),
+                                    sc.q,
+                                    sc.k,
+                                    sc.beta,
+                                    sc.g,
+                                    stream);
+                                err = launch_delta_recurrent_prefill_f32(
+                                    device_ordinal,
+                                    nv,
+                                    hkd,
+                                    hvd,
+                                    static_cast<const float*>(
+                                        mxr.recurrent_state),
+                                    sc.q,
+                                    sc.k,
+                                    v_ptr,
+                                    sc.beta,
+                                    sc.g,
                                     sc.out,
                                     stream);
-                            err = st == 0 ? hipSuccess : hipErrorInvalidValue;
-                        } else {
-                            launch_decode_pack_rec_inputs(
-                                nv,
-                                nk,
-                                hkd,
-                                q_u,
-                                k_u,
-                                b_ptr,
-                                a_ptr,
-                                static_cast<const hip_bfloat16*>(mxr.dt_bias_w),
-                                static_cast<const hip_bfloat16*>(
-                                    mxr.a_log_exp_w),
-                                sc.q,
-                                sc.k,
-                                sc.beta,
-                                sc.g,
-                                stream);
-                            err = launch_delta_recurrent_prefill_f32(
-                                device_ordinal,
+                            }
+                            if (err != hipSuccess) return err;
+                            launch_decode_extract_rec_gated(
                                 nv,
                                 hkd,
                                 hvd,
-                                static_cast<const float*>(mxr.recurrent_state),
-                                sc.q,
-                                sc.k,
-                                v_ptr,
-                                sc.beta,
-                                sc.g,
+                                mxr.linear_norm_eps,
                                 sc.out,
-                                stream);
+                                z_ptr,
+                                static_cast<const float*>(mxr.linear_norm_w),
+                                (hkd == 128 && hvd == 128)
+                                    ? nullptr
+                                    : static_cast<float*>(mxr.recurrent_state),
+                                attn_b,
+                                stream,
+                                (hkd == 128 && hvd == 128) ? 1 : 0);
+                            MtpPrefixSnap& psnap = mtp_prefix_snap();
+                            if (psnap.ready && b < gemv_ncols &&
+                                psnap.rec[b][layer] != nullptr &&
+                                psnap.rec_bytes[layer] > 0 &&
+                                mxr.recurrent_state != nullptr) {
+                                (void)hipMemcpyAsync(
+                                    psnap.rec[b][layer],
+                                    mxr.recurrent_state,
+                                    psnap.rec_bytes[layer],
+                                    hipMemcpyDeviceToDevice,
+                                    stream);
+                            }
                         }
-                        if (err != hipSuccess) return err;
-                        launch_decode_extract_rec_gated(
-                            nv,
-                            hkd,
-                            hvd,
-                            mxr.linear_norm_eps,
-                            sc.out,
-                            z_ptr,
-                            static_cast<const float*>(mxr.linear_norm_w),
-                            (hkd == 128 && hvd == 128)
-                                ? nullptr
-                                : static_cast<float*>(mxr.recurrent_state),
-                            attn_b,
-                            stream,
-                            (hkd == 128 && hvd == 128) ? 1 : 0);
-                        MtpPrefixSnap& psnap = mtp_prefix_snap();
-                        if (psnap.ready && b < gemv_ncols &&
-                            psnap.rec[b][layer] != nullptr &&
-                            psnap.rec_bytes[layer] > 0 &&
-                            mxr.recurrent_state != nullptr) {
-                            (void)hipMemcpyAsync(
-                                psnap.rec[b][layer],
-                                mxr.recurrent_state,
-                                psnap.rec_bytes[layer],
-                                hipMemcpyDeviceToDevice,
-                                stream);
+                        if (dflash_batch != nullptr) {
+                            MtpPrefixSnap& dflash_psnap = mtp_prefix_snap();
+                            for (int b = 0; b < batch_size; ++b) {
+                                void* recurrent_capture =
+                                    dflash_batch[layer].dflash_recurrent[b];
+                                if (recurrent_capture == nullptr ||
+                                    dflash_psnap.rec[b][layer] == nullptr) {
+                                    continue;
+                                }
+                                const int recurrent_elems =
+                                    mxr.nv * mxr.hkd * mxr.hvd;
+                                err = launch_dflash_recurrent_capture(
+                                    dflash_psnap.rec[b][layer],
+                                    static_cast<__half*>(recurrent_capture),
+                                    recurrent_elems,
+                                    stream);
+                                if (err != hipSuccess) {
+                                    return err;
+                                }
+                            }
                         }
                     }
                     if (dec_prof) {
@@ -10342,15 +10992,6 @@ int persistent_decode_device(
                             }
                         }
                     }
-                    dump_ws_f32_n("l5_conv", ws_gate, mxd.qkv_out);
-                    dump_ws_f32_n(
-                        "l5_b",
-                        ws_proj + mxd.qkv_out + mxd.z_out,
-                        mxd.nv);
-                    dump_ws_f32_n(
-                        "l5_a",
-                        ws_proj + mxd.qkv_out + mxd.z_out + mxd.nv,
-                        mxd.nv);
                     dump_ws_f32_n("l5_qnorm", ws_gate + mxd.qkv_out, mxd.qkv_out / 5);
                     dump_ws_f32_n(
                         "l5_knorm",
@@ -10395,7 +11036,6 @@ int persistent_decode_device(
                             ws_gate + mxd.qkv_out + 2 * (mxd.qkv_out / 5),
                             mxd.val_dim);
                     }
-                    dump_ws_f32_n("l5_gated", ws_attn, mxd.val_dim);
                     dump_ws_f32_n("l5_mid_hidden", ws_hidden, hidden_dim);
                 }
                 int out_flags = 0;
@@ -10410,7 +11050,8 @@ int persistent_decode_device(
                         err = launch_mixer_proj_acc(
                             device_ordinal, mx.o, ws_proj, ws_hidden,
                             mx.attn_size, hidden_dim, stream, gemv_ncols,
-                            proj_stride, hidden_stride);
+                            proj_stride, hidden_stride,
+                            mixer_i8_available ? mixer_i8_main : nullptr);
                     } else if (do_lin) {
                         // extract_rec_gated already BF16-rounds attn_out,
                         // so a second round_f32 is a no-op. Acc GEMV is
@@ -10419,7 +11060,8 @@ int persistent_decode_device(
                         err = launch_mixer_proj_acc(
                             device_ordinal, mx.lin_out, ws_attn, ws_hidden,
                             mx.val_dim, hidden_dim, stream, gemv_ncols,
-                            attn_stride, hidden_stride);
+                            attn_stride, hidden_stride,
+                            reinterpret_cast<uint8_t*>(ws_proj));
                     }
                     if (dec_prof) {
                         sync_now();
@@ -10563,8 +11205,80 @@ int persistent_decode_device(
                     const double t_m0 = dec_prof ? (sync_now(), now_ms()) : 0;
                     const GqhProjHdr& gate_h = mlp_hdrs.gate[layer];
                     const GqhProjHdr& up_h = mlp_hdrs.up[layer];
-                    if (gate_h.rung >= 0 && up_h.rung >= 0 &&
-                        gate_h.rung == up_h.rung) {
+                    const GqhProjHdr& down_h = mlp_hdrs.down[layer];
+                    const bool use_i8_mlp = gemv_ncols > 1 &&
+                        gqh_mlp_i8_supported(gate_h, gemv_ncols, hidden_dim) &&
+                        gqh_mlp_i8_supported(up_h, gemv_ncols, hidden_dim) &&
+                        gqh_mlp_i8_supported(down_h, gemv_ncols, intermediate_size);
+                    uint8_t* i8_scratch = reinterpret_cast<uint8_t*>(ws_proj);
+                    if (use_i8_mlp) {
+                        const int64_t needed_bytes =
+                            (static_cast<int64_t>(gemv_ncols) *
+                             intermediate_size * 3) / 2;
+                        const int64_t available_bytes =
+                            static_cast<int64_t>(batch_size) *
+                            proj_buf_floats * static_cast<int64_t>(sizeof(float));
+                        if (needed_bytes > available_bytes) {
+                            std::fprintf(
+                                stderr,
+                                "[decode] fused i8 MLP scratch exhausted: need=%lld available=%lld\n",
+                                static_cast<long long>(needed_bytes),
+                                static_cast<long long>(available_bytes));
+                            return hipErrorInvalidValue;
+                        }
+                        if (gate_h.rung == up_h.rung &&
+                            (gate_h.rung == 0 || gate_h.rung == 3)) {
+                            err = launch_gqh_matvec_i8_pair(
+                                device_ordinal,
+                                gate_h,
+                                up_h,
+                                ws_normed,
+                                ws_gate,
+                                ws_up,
+                                hidden_dim,
+                                intermediate_size,
+                                stream,
+                                gemv_ncols,
+                                hidden_stride,
+                                mlp_stride,
+                                i8_scratch);
+                        } else {
+                            err = launch_gqh_matvec_i8(
+                                device_ordinal,
+                                gate_h,
+                                ws_normed,
+                                ws_gate,
+                                hidden_dim,
+                                intermediate_size,
+                                stream,
+                                gemv_ncols,
+                                hidden_stride,
+                                mlp_stride,
+                                i8_scratch,
+                                false);
+                            if (err == hipSuccess) {
+                                err = launch_gqh_matvec_i8(
+                                    device_ordinal,
+                                    up_h,
+                                    ws_normed,
+                                    ws_up,
+                                    hidden_dim,
+                                    intermediate_size,
+                                    stream,
+                                    gemv_ncols,
+                                    hidden_stride,
+                                    mlp_stride,
+                                    i8_scratch,
+                                    false);
+                            }
+                        }
+                        if (err == hipSuccess) {
+                            launch_swiglu_f32(
+                                ws_gate, ws_up, intermediate_size, stream,
+                                gemv_ncols, mlp_stride);
+                        }
+                    } else if (gate_h.rung >= 0 && up_h.rung >= 0 &&
+                               gate_h.rung == up_h.rung) {
                         err = launch_gqh_gemv_pair(
                             device_ordinal,
                             gate_h,
@@ -10626,7 +11340,21 @@ int persistent_decode_device(
                     if (dec_prof) {
                         ms_pair += t_d0 - t_m0;
                     }
-                    if (mlp_hdrs.down[layer].rung >= 0) {
+                    if (use_i8_mlp) {
+                        err = launch_gqh_matvec_i8(
+                            device_ordinal,
+                            down_h,
+                            ws_gate,
+                            ws_hidden,
+                            intermediate_size,
+                            hidden_dim,
+                            stream,
+                            gemv_ncols,
+                            mlp_stride,
+                            hidden_stride,
+                            i8_scratch,
+                            true);
+                    } else if (mlp_hdrs.down[layer].rung >= 0) {
                         err = launch_gqh_gemv_acc(
                             device_ordinal,
                             mlp_hdrs.down[layer],
@@ -10649,7 +11377,8 @@ int persistent_decode_device(
                             stream,
                             gemv_ncols,
                             mlp_stride,
-                            hidden_stride);
+                            hidden_stride,
+                            reinterpret_cast<uint8_t*>(ws_proj));
                     }
                     if (err != hipSuccess) {
                         std::fprintf(
@@ -10672,6 +11401,21 @@ int persistent_decode_device(
                             batch_size * hidden_dim,
                             stream);
                         if (err != hipSuccess) return err;
+                    }
+                    if (dflash_batch != nullptr) {
+                        for (int b = 0; b < batch_size; ++b) {
+                            void* hidden_capture =
+                                dflash_batch[layer].dflash_target_hidden[b];
+                            if (hidden_capture == nullptr) {
+                                continue;
+                            }
+                            err = launch_hidden_store_bf16(
+                                ws_hidden + static_cast<int64_t>(b) * hidden_dim,
+                                static_cast<hip_bfloat16*>(hidden_capture),
+                                hidden_dim,
+                                stream);
+                            if (err != hipSuccess) return err;
+                        }
                     }
                 } else {
                     err = launch_split(6, layer, 0, grid_up, stream);

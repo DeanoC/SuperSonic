@@ -39,6 +39,7 @@ FULL_BUDGET_SECONDS = EXPECTED_BUDGETS["full"]
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 SUPPORTED_GPU_ARCHES = frozenset(("gfx1100", "gfx1201"))
 MTP_CATEGORY = quality.MTP_CATEGORY
+DFLASH_CATEGORY = quality.DFLASH_CATEGORY
 VERSION_FILE_MAX_BYTES = 4096
 VERSION_VALUE_MAX_LENGTH = 128
 _VERSION_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:+()-]{0,127}$")
@@ -66,6 +67,9 @@ class RunConfig:
     logical_gpu: str | None = None
     output_dir: Path = Path("target/benchmarks/candidate")
     peer_artifact: Path | None = None
+    draft_artifact: Path | None = None
+    draft_artifact_semantic_id: str | None = None
+    draft_artifact_quantization: str | None = None
     device: int = 0
     context_size: int | None = 32768
     chat: bool = False
@@ -181,6 +185,17 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
     model_dir = _required_path(resolved.model_dir, "model_dir", directory=True)
     _validate_model_files(model_dir, chat=bool(resolved.chat))
     artifact = _required_path(resolved.artifact, "artifact", directory=False, nonempty=True)
+    dflash_case_ids = [case.id for case in suite.performance_cases if case.mode == "dflash"]
+    draft_artifact = None
+    if dflash_case_ids or resolved.draft_artifact is not None:
+        draft_artifact = _required_path(
+            resolved.draft_artifact, "draft_artifact", directory=False, nonempty=True
+        )
+        if dflash_case_ids:
+            if not resolved.draft_artifact_semantic_id or not resolved.draft_artifact_quantization:
+                raise ValueError(
+                    "DFlash2 cases require draft_artifact_semantic_id and draft_artifact_quantization"
+                )
     _validate_model_digests(model_dir, resolved)
     physical_gpu = _required_text(resolved.physical_gpu, "physical_gpu")
     if not physical_gpu.isdigit():
@@ -247,6 +262,9 @@ def preflight(config: RunConfig | Mapping[str, object] | object) -> RunManifest:
         resolved,
         model_dir=model_dir,
         artifact=artifact,
+        draft_artifact=draft_artifact,
+        draft_artifact_semantic_id=resolved.draft_artifact_semantic_id,
+        draft_artifact_quantization=resolved.draft_artifact_quantization,
         physical_gpu=physical_gpu,
         gpu_arch=gpu_arch,
         gpu_static_json=static_json,
@@ -751,6 +769,7 @@ def _execute_case(
         model_dir=Path(run_manifest.config.model_dir),
         artifact=Path(run_manifest.config.artifact),
         peer_artifact=Path(run_manifest.config.peer_artifact) if run_manifest.config.peer_artifact else None,
+        draft_artifact=Path(run_manifest.config.draft_artifact) if run_manifest.config.draft_artifact else None,
         chat=bool(run_manifest.config.chat),
         device=int(run_manifest.config.device),
         context_size=run_manifest.config.context_size,
@@ -894,6 +913,7 @@ def _run_quality(
         model_dir=Path(run_manifest.config.model_dir),
         artifact=Path(run_manifest.config.artifact),
         peer_artifact=Path(run_manifest.config.peer_artifact) if run_manifest.config.peer_artifact else None,
+        draft_artifact=Path(run_manifest.config.draft_artifact) if run_manifest.config.draft_artifact else None,
         chat=bool(run_manifest.config.chat),
         device=int(run_manifest.config.device),
         context_size=run_manifest.config.context_size,
@@ -921,18 +941,32 @@ def _run_quality(
                     command_runner=command_runner,
                     suffix="ordinary",
                 )
-                mtp = _quality_output(
+                speculative_mode = "mtp"
+                speculative = _quality_output(
                     run_manifest,
                     case,
-                    mode="mtp",
+                    mode=speculative_mode,
                     inputs=inputs,
                     timeout=_quality_timeout(case, deadline, clock),
                     suite_deadline=deadline,
                     clock=clock,
                     command_runner=command_runner,
-                    suffix="mtp",
+                    suffix=speculative_mode,
                 )
-                results.append(quality.score_mtp_pair(ordinary, mtp, case=case))
+                results.append(quality.score_mtp_pair(ordinary, speculative, case=case))
+            elif case.category == DFLASH_CATEGORY:
+                dflash = _quality_output(
+                    run_manifest,
+                    case,
+                    mode="dflash",
+                    inputs=inputs,
+                    timeout=_quality_timeout(case, deadline, clock),
+                    suite_deadline=deadline,
+                    clock=clock,
+                    command_runner=command_runner,
+                    suffix="dflash",
+                )
+                results.append(quality.score_case(case, dflash))
             else:
                 quality_case = _quality_performance_case(case, mode="ordinary", engine=primary)
                 argv = adapters.build_command(primary, quality_case, inputs)
@@ -976,7 +1010,7 @@ def _run_quality(
             continue
         peer_results: list[quality.QualityResult] = []
         for case in run_manifest.quality_cases:
-            if case.category == MTP_CATEGORY:
+            if case.category in {MTP_CATEGORY, DFLASH_CATEGORY}:
                 result = primary_results.get(case.id)
                 if result is not None:
                     peer_results.append(result)
@@ -1076,6 +1110,7 @@ def _quality_process(
         timeout=active_timeout,
         case_id=f"quality-{quality_case.id}-{suffix}",
         engine_name=engine.name,
+        env=_process_environment(run_manifest.config),
     )
     _write_quality_streams(run_manifest.bundle, quality_case, suffix, result.stdout, result.stderr)
     if result.interrupted:
@@ -1110,6 +1145,7 @@ def _quality_performance_case(case: QualityCase, *, mode: str, engine: EngineMan
         cache_state="cold-load",
         timeout_seconds=max(1, case.max_new_tokens),
         decoding_policy=case.decoding_policy,
+        stop_policy="honor-eos",
         engines=(engine.name,),
     )
 
@@ -1120,6 +1156,9 @@ def _validate_quality_case(case: QualityCase) -> None:
             raise ValueError("MTP quality cases must use exact_tokens scorer")
         if not isinstance(case.expected, list) or any(isinstance(value, bool) or not isinstance(value, int) for value in case.expected):
             raise ValueError("MTP exact_tokens quality case must have manifest integer token expectations")
+    elif case.category == DFLASH_CATEGORY:
+        if case.scorer not in {"semantic_text", "structured_json"}:
+            raise ValueError("DFlash2 quality cases must use a semantic scorer, not token equality")
     elif case.scorer == "exact_tokens":
         raise ValueError("score_mtp_pair is reserved for manifest MTP exact-token cases")
 
@@ -1161,6 +1200,7 @@ def _build_record(
     config = run_manifest.config
     snapshot = _environment_record(config, case, environment_snapshot=environment_snapshot)
     artifact_info = _artifact_identity(config, engine)
+    draft_artifact_info = _draft_artifact_identity(config) if case.mode == "dflash" else None
     return {
         "run": {
             "schema_version": 1,
@@ -1189,13 +1229,15 @@ def _build_record(
             "clock_policy": snapshot["clock_policy"],
         },
         "artifact": artifact_info,
+        **({"draft_artifact": draft_artifact_info} if draft_artifact_info is not None else {}),
         "workload": {
             "case_id": case.id,
             "prompt_sha256": hashlib.sha256(case.prompt.encode("utf-8")).hexdigest(),
             "context_limit": int(config.context_size or 32768),
             "max_new_tokens": case.max_new_tokens,
             "mode": case.mode,
-            "stop_policy": "ignore-eos",
+            **({"dflash_block_size": 16} if case.mode == "dflash" else {}),
+            "stop_policy": case.stop_policy,
             "cache_state": case.cache_state,
             "warmups": case.warmups,
             "measurement_boundary": "decode",
@@ -1384,6 +1426,12 @@ def _persist_bundle_manifest(
             "sha256": digest,
             "semantic_id": _artifact_identity(config, engine)["semantic_id"],
         }
+    if config.draft_artifact is not None:
+        artifact_entries["supersonic-dflash2-draft"] = {
+            "name": Path(config.draft_artifact).name,
+            "sha256": _digest_file(Path(config.draft_artifact)),
+            "semantic_id": _draft_artifact_identity(config)["semantic_id"],
+        }
     model_files = {
         name: _digest_file(Path(config.model_dir) / name)
         for name in ("config.json", "tokenizer.json", "tokenizer_config.json")
@@ -1509,6 +1557,7 @@ def _invoke_process(
     timeout: float,
     case_id: str,
     engine_name: str,
+    env: Mapping[str, str] | None = None,
 ) -> ProcessResult:
     vector = tuple(str(item) for item in argv)
     try:
@@ -1520,6 +1569,11 @@ def _invoke_process(
                 kwargs["case_id"] = case_id
             if "engine_name" in parameters:
                 kwargs["engine_name"] = engine_name
+            if env is not None and (
+                "env" in parameters
+                or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+            ):
+                kwargs["env"] = env
             if "timeout_seconds" in parameters and "timeout" not in parameters:
                 kwargs["timeout_seconds"] = timeout
                 kwargs.pop("timeout", None)
@@ -1884,9 +1938,25 @@ def _default_environment_probe_runner(argv: tuple[str, ...]) -> str:
 
 
 def _process_environment(config: RunConfig) -> dict[str, str]:
-    result = dict(os.environ)
+    result = {
+        key: os.environ[key]
+        for key in ("PATH", *environment.ALLOWLISTED_ENVIRONMENT)
+        if key in os.environ
+    }
+    required = {
+        "HIP_ARCH": str(config.gpu_arch),
+        "HIP_VISIBLE_DEVICES": str(config.physical_gpu),
+        "SUPERSONIC_DEVICE": str(config.device),
+    }
     if config.environment is not None:
-        result.update({str(key): str(value) for key, value in config.environment.items()})
+        unknown = sorted(set(config.environment) - set(environment.ALLOWLISTED_ENVIRONMENT))
+        if unknown:
+            raise ValueError(f"benchmark environment contains unsupported keys: {unknown}")
+        for key, value in config.environment.items():
+            if key in required and str(value) != required[key]:
+                raise ValueError(f"benchmark environment {key} conflicts with the selected GPU mapping")
+            result[str(key)] = str(value)
+    result.update(required)
     return result
 
 
@@ -2099,6 +2169,18 @@ def _artifact_identity(config: RunConfig, engine: EngineManifest) -> dict[str, s
         "sha256": digest,
         "tokenizer_sha256": tokenizer_digest,
         "chat_template_sha256": chat_digest,
+    }
+
+
+def _draft_artifact_identity(config: RunConfig) -> dict[str, str]:
+    if config.draft_artifact is None:
+        raise ValueError("DFlash2 draft artifact is required for draft artifact identity")
+    if not config.draft_artifact_semantic_id or not config.draft_artifact_quantization:
+        raise ValueError("DFlash2 draft artifact semantic identity and quantization are required")
+    return {
+        "semantic_id": config.draft_artifact_semantic_id,
+        "quantization": config.draft_artifact_quantization,
+        "sha256": _digest_file(Path(config.draft_artifact)),
     }
 
 

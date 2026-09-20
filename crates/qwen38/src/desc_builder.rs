@@ -312,13 +312,13 @@ pub fn build_int4_scale_descs(weights: &Qwen38Weights) -> Option<Vec<INT4ScaleDe
     Some(descs)
 }
 
-/// Build the internal B-slot descriptors used by Qwen3.8 MTP verification.
+/// Build the internal B-slot descriptors used by Qwen3.8 MTP and DFlash verification.
 pub fn build_batch_seq_descs(
     states: &[&ModelState],
     seqlen_offsets: &[usize],
 ) -> Option<Vec<BatchSeqDesc>> {
     let batch_size = states.len();
-    if batch_size <= 1 {
+    if batch_size == 0 {
         return None;
     }
     assert!(

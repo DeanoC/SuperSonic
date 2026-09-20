@@ -63,6 +63,8 @@ class BenchmarkQualityTests(unittest.TestCase):
         benchmark = load_benchmark_api()
         if case.scorer == "exact_text":
             return self.output(case.expected)
+        if case.scorer == "semantic_text":
+            return self.output(case.expected)
         if case.scorer == "exact_tokens":
             return self.output("unused", token_ids=tuple(case.expected))
         if case.scorer == "structured_json":
@@ -161,6 +163,43 @@ class BenchmarkQualityTests(unittest.TestCase):
         self.assertEqual(result.actual_value, "[40,4021,3300]")
         self.assertEqual(result.expected_hash, result.actual_hash)
 
+    def test_dflash_quality_uses_semantic_text_not_token_equality(self):
+        quality = load_quality_module()
+        case = self.case(
+            "ready",
+            scorer="semantic_text",
+            case_id="dflash-evidence",
+            category="dflash-quality",
+        )
+
+        passed = quality.score_case(case, self.output("ready", token_ids=(7, 8, 9)))
+        failed = quality.score_case(case, self.output("not ready", token_ids=(7, 8, 10)))
+
+        self.assertTrue(passed.passed)
+        self.assertEqual(passed.expected_value, "ready")
+        self.assertEqual(passed.actual_value, "ready")
+        self.assertFalse(failed.passed)
+        self.assertIn("generated text did not semantically match expected text", failed.failure)
+
+    def test_semantic_text_ignores_only_surrounding_whitespace(self):
+        quality = load_quality_module()
+        case = self.case("ready", scorer="semantic_text")
+
+        passed = quality.score_case(case, self.output("  \n\nready\n\n  "))
+        failed = quality.score_case(case, self.output("ready now"))
+
+        self.assertTrue(passed.passed)
+        self.assertEqual(passed.actual_value, "ready")
+        self.assertFalse(failed.passed)
+
+    def test_exact_text_expectations_match_generated_json_boundary(self):
+        manifest = importlib.import_module("tools.benchmark.manifest")
+        exact_cases = [case for case in manifest.load_quality("v2") if case.scorer == "exact_text"]
+
+        self.assertTrue(exact_cases)
+        for case in exact_cases:
+            self.assertEqual(case.expected, case.expected.strip(), msg=case.id)
+
     def test_mtp_fails_clearly_when_tokens_are_unavailable(self):
         quality = load_quality_module()
 
@@ -186,7 +225,7 @@ class BenchmarkQualityTests(unittest.TestCase):
         quality = load_quality_module()
 
         mtp_cases = tuple(
-            case for case in manifest.load_quality("v1") if case.category == "ordinary-vs-mtp-token-equality"
+            case for case in manifest.load_quality("v2") if case.category == "ordinary-vs-mtp-token-equality"
         )
         self.assertEqual(len(mtp_cases), 2)
 
@@ -233,14 +272,14 @@ class BenchmarkQualityTests(unittest.TestCase):
         manifest = importlib.import_module("tools.benchmark.manifest")
         quality = load_quality_module()
 
-        cases = manifest.load_quality("v1")
+        cases = manifest.load_quality("v2")
         results = tuple(quality.score_case(case, self.matching_output_for_case(case)) for case in cases)
         summary = quality.summarize_quality(results, required_cases=cases)
 
         self.assertEqual(summary["passed"], len(cases))
         self.assertEqual(summary["failed"], 0)
         self.assertEqual(summary["total"], len(cases))
-        self.assertEqual(set(summary["categories"]), manifest.APPROVED_CATEGORIES)
+        self.assertEqual(set(summary["categories"]), {case.category for case in cases})
         self.assertEqual(summary["categories"]["repeated-run-determinism"], {"passed": 2, "failed": 0, "total": 2})
         self.assertEqual(summary["categories"]["ordinary-vs-mtp-token-equality"], {"passed": 2, "failed": 0, "total": 2})
         self.assertEqual(summary["missing_case_ids"], [])
@@ -264,7 +303,7 @@ class BenchmarkQualityTests(unittest.TestCase):
         manifest = importlib.import_module("tools.benchmark.manifest")
         quality = load_quality_module()
 
-        cases = manifest.load_quality("v1")
+        cases = manifest.load_quality("v2")
         available_cases = cases[:-1]
         results = tuple(quality.score_case(case, self.matching_output_for_case(case)) for case in available_cases)
 
@@ -281,7 +320,7 @@ class BenchmarkQualityTests(unittest.TestCase):
         manifest = importlib.import_module("tools.benchmark.manifest")
         quality = load_quality_module()
 
-        cases = manifest.load_quality("v1")
+        cases = manifest.load_quality("v2")
         failed_case_id = "repeated-run-determinism-2"
         results = []
         for case in cases:

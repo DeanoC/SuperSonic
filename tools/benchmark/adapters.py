@@ -34,6 +34,7 @@ class AdapterInputs:
     model_dir: Path
     artifact: Path
     peer_artifact: Path | None = None
+    draft_artifact: Path | None = None
     chat: bool = False
     device: int = DEFAULT_DEVICE
     context_size: int | None = None
@@ -113,7 +114,7 @@ def _build_supersonic_command(
         "--sampling-seed",
         str(_require_non_negative_int(inputs.sampling_seed, "sampling_seed")),
     ]
-    if inputs.fixed_token_count:
+    if inputs.fixed_token_count and case.stop_policy == "ignore-eos":
         args.append("--ignore-eos")
     if inputs.chat:
         args.append("--chat")
@@ -121,6 +122,10 @@ def _build_supersonic_command(
         args.extend(["--context-size", str(_require_positive_int(inputs.context_size, "context_size"))])
     if case.mode == "mtp":
         args.append("--speculative-decode")
+    elif case.mode == "dflash":
+        if inputs.draft_artifact is None:
+            raise ValueError("DFlash2 benchmark cases require a draft artifact")
+        args.extend(["--draft-gguf-file", str(inputs.draft_artifact)])
     return tuple(args)
 
 
@@ -147,7 +152,7 @@ def _build_llama_cpp_command(
     ]
     if inputs.chat:
         args.append("--chat")
-    if not inputs.fixed_token_count:
+    if not inputs.fixed_token_count or case.stop_policy == "honor-eos":
         args.append("--honor-eos")
     if inputs.context_size is not None:
         args.extend(["--context-size", str(_require_positive_int(inputs.context_size, "context_size"))])

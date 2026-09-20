@@ -129,11 +129,11 @@ class RetainedSourceTermsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (runtime / "lexer_cases.rs").write_text(
-                "/* outer dflash /* nested SUPERSONIC_DFLASH_PROFILE */ still comment */\n"
+                "/* outer dflash /* nested SUPERSONIC_DFLASH_LEGACY */ still comment */\n"
                 "fn char_dflash_after_quote() { let quote = '\"'; }\n"
                 "let lower = \"supersonic_dflash_profile\";\n"
-                "let escaped = \"SUPERSONIC_\\x44FLASH_PROFILE\";\n"
-                "let unicode = \"SUPERSONIC_\\u{44}FLASH_PROFILE\";\n"
+                "let escaped = \"SUPERSONIC_\\x44FLASH_LEGACY\";\n"
+                "let unicode = \"SUPERSONIC_\\u{44}FLASH_LEGACY\";\n"
                 "let byte = b\"SUPERSONIC_METALV2_PROFILE\";\n"
                 "let raw = br###\"SUPERSONIC_qwen35_draft_mtp_greedy\"###;\n",
                 encoding="utf-8",
@@ -154,7 +154,7 @@ class RetainedSourceTermsTests(unittest.TestCase):
             "standalone_certified_kv",
             "dflash_after_quote",
             "supersonic_dflash_profile",
-            "SUPERSONIC_DFLASH_PROFILE",
+            "SUPERSONIC_DFLASH_LEGACY",
             "SUPERSONIC_METALV2_PROFILE",
             "SUPERSONIC_qwen35_draft_mtp_greedy",
         ):
@@ -185,12 +185,12 @@ class RetainedSourceTermsTests(unittest.TestCase):
                 "fn lifetime_only<'dflash, 'mtp>() {}\n"
                 "fn lifetime_label() { 'dflash: loop { break 'dflash; } }\n"
                 "fn actual_dflash_after_lifetime() {}\n"
-                "let escaped = \"SUPERSONIC_\\u{4_4}FLASH_PROFILE\";\n"
+                "let escaped = \"SUPERSONIC_\\u{4_4}FLASH_LEGACY\";\n"
                 "let concat_qwen = concat!(\n"
                 "    \"SUPERSONIC_\", /* split legacy control */\n"
                 "    \"qwen35\", \"mtp_PROFILE\",\n"
                 ");\n"
-                "let assembled_control = concat!(\"SUPERSONIC_\", \"D\", \"FLASH_PROFILE\",);\n"
+                "let assembled_control = concat!(\"SUPERSONIC_\", \"D\", \"FLASH_LEGACY\",);\n"
                 "let no_separator = \"superSONIC_qwen35mtp_profile\";\n"
                 "let raw_no_separator = r#\"SUPERSONIC_QWEN35MTP_PROFILE\"#;\n"
                 "// 'dflash 'mtp SUPERSONIC_DFLASH are historical prose only.\n",
@@ -204,9 +204,9 @@ class RetainedSourceTermsTests(unittest.TestCase):
         for term in (
             "dflash2_cache",
             "DFlash2Cache",
-            "SUPERSONIC_DFLASH_PROFILE",
+            "SUPERSONIC_DFLASH_LEGACY",
             "SUPERSONIC_qwen35mtp_PROFILE",
-            "SUPERSONIC_DFLASH_PROFILE",
+            "SUPERSONIC_DFLASH_LEGACY",
             "superSONIC_qwen35mtp_profile",
             "SUPERSONIC_QWEN35MTP_PROFILE",
             "actual_dflash_after_lifetime",
@@ -329,6 +329,94 @@ class RetainedSourceTermsTests(unittest.TestCase):
         self.assertEqual(len(prefix_terms), 5, violations)
         self.assertTrue(all("SUPERSONIC_" in term.upper() for term in prefix_terms))
         self.assertNotIn("hello", "\n".join(terms))
+
+    def test_allows_retained_dflash2_spec_decode_but_rejects_other_dflash(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crates" / "runtime" / "src"
+            runtime.mkdir(parents=True)
+            (runtime / "dflash_spec.rs").write_text(
+                "use model_store::dflash::{DraftConfig, DraftGpuWeights};\n"
+                "use crate::prefill_engine::{self, DflashTargetCapture};\n"
+                "pub struct DflashSpecDecoder { capture: DflashTargetCapture }\n"
+                "pub struct DflashSpecRound;\n"
+                "pub struct DflashSpecSummary;\n"
+                "pub fn dflash_spec() {}\n"
+                "pub fn verify_block_dflash() {}\n"
+                "pub fn capture_block_dflash() {}\n"
+                "pub fn prefill_with_dflash_capture() {}\n"
+                "pub fn dflash_capture() {}\n"
+                "pub fn dflash_dyn_conv() {}\n"
+                "pub fn dflash_scatter_cols_raw() {}\n"
+                "fn profile() -> bool {\n"
+                "    std::env::var_os(\"SUPERSONIC_DFLASH_PROFILE\").is_some()\n"
+                "}\n"
+                "fn dflash_fused_verify_cache() {}\n"
+                "fn DFlashFusedVerifyCache() {}\n"
+                "fn dflash_mtp_cache() {}\n"
+                "fn lower_evasion() -> bool {\n"
+                "    std::env::var_os(\"supersonic_dflash_profile\").is_some()\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        terms = {term for _, _, term, _ in violations}
+        for allowed in (
+            "dflash", "dflash_spec", "DflashSpecDecoder", "DflashSpecRound",
+            "DflashSpecSummary", "DflashTargetCapture", "dflash_capture",
+            "dflash_dyn_conv", "dflash_scatter_cols_raw", "verify_block_dflash",
+            "capture_block_dflash", "prefill_with_dflash_capture",
+            "SUPERSONIC_DFLASH_PROFILE",
+        ):
+            self.assertNotIn(allowed, terms, allowed)
+        for legacy in (
+            "dflash_fused_verify_cache", "DFlashFusedVerifyCache",
+            "dflash_mtp_cache", "supersonic_dflash_profile",
+        ):
+            self.assertIn(legacy, terms, legacy)
+        self.assertEqual(len(violations), 4, violations)
+
+    def test_allows_retained_dflash2_rollback_and_commit_contracts(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crates" / "runtime" / "src"
+            runtime.mkdir(parents=True)
+            (runtime / "dflash_spec.rs").write_text(
+                "use crate::prefill_engine::DflashRollbackCapture;\n"
+                "pub enum DflashVerifyPath { Component }\n"
+                "struct DflashCommitPlan;\n"
+                "pub fn verify_block_dflash_with_rollback() {}\n"
+                "pub fn rollback_dflash_prefix() {}\n"
+                "pub fn replay_committed_prefix_dflash() {}\n"
+                "fn dflash_commit_plan() {}\n"
+                "fn dflash_fast_rollback_plan() {}\n"
+                "fn dflash_tokens_from_selector() {}\n"
+                "fn dflash_next_token() {}\n"
+                "fn trace() -> Option<usize> {\n"
+                "    std::env::var(\"SUPERSONIC_DFLASH_TRACE_CTX\").ok()?\n"
+                "        .parse::<usize>().ok()\n"
+                "}\n"
+                "mod dflash_commit_tests {}\n",
+                encoding="utf-8",
+            )
+
+            violations = checker.find_violations(root)
+
+        terms = {term for _, _, term, _ in violations}
+        for allowed in (
+            "DflashRollbackCapture", "DflashVerifyPath", "DflashCommitPlan",
+            "verify_block_dflash_with_rollback", "rollback_dflash_prefix",
+            "replay_committed_prefix_dflash", "dflash_commit_plan",
+            "dflash_fast_rollback_plan", "dflash_tokens_from_selector",
+            "dflash_next_token", "dflash_commit_tests",
+            "SUPERSONIC_DFLASH_TRACE_CTX",
+        ):
+            self.assertNotIn(allowed, terms, allowed)
+        self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import importlib
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -19,6 +20,7 @@ APPROVED_CATEGORIES = {
     "chat-template-behavior",
     "repeated-run-determinism",
     "ordinary-vs-mtp-token-equality",
+    "dflash-quality",
 }
 CACHE_STATES = {
     "cold-load",
@@ -60,6 +62,8 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(quick.minimum_duration_seconds, 0)
         self.assertEqual(full.minimum_duration_seconds, 20700)
         self.assertLess(set(quick.quality_case_ids), set(full.quality_case_ids))
+        self.assertIn("dflash-quality-1", quick.quality_case_ids)
+        self.assertIn("dflash-quality-2", full.quality_case_ids)
         self.assertEqual(set(full.quality_case_ids), {case.id for case in quality_cases})
         self.assertEqual(tuple(quick.engines), ("supersonic",))
         self.assertEqual(tuple(full.engines), ("supersonic", "llama-cpp"))
@@ -77,10 +81,12 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertFalse(any("warm" in case_id for case_id in case_ids))
         self.assertTrue(any("ordinary" in case_id for case_id in case_ids))
         self.assertTrue(any("mtp" in case_id for case_id in case_ids))
+        quick = manifest.load_suite("quick")
+        self.assertTrue(any(case.mode == "dflash" for case in quick.performance_cases))
 
         engines = {engine.name: engine for engine in map(manifest.load_engine, full.engines)}
         suite_modes = {case.mode for case in full.performance_cases}
-        self.assertEqual(suite_modes, {"ordinary", "mtp"})
+        self.assertEqual(suite_modes, {"ordinary", "mtp", "dflash"})
         active_cache_states = {case.cache_state for case in full.performance_cases}
         self.assertTrue(CACHE_STATES.issubset(active_cache_states))
         self.assertFalse(active_cache_states & (SUPPORTED_CACHE_STATES - CACHE_STATES))
@@ -102,11 +108,68 @@ class BenchmarkManifestTests(unittest.TestCase):
                 self.assertEqual(case.engines, ("supersonic",))
             self.assertEqual(case.timeout_seconds, 60)
 
-        quick = manifest.load_suite("quick")
         self.assertTrue(all(case.warmups == 0 for case in quick.performance_cases))
-        self.assertTrue(all(case.repetitions == 3 for case in quick.performance_cases))
-        self.assertTrue(all(case.mode == "ordinary" for case in quick.performance_cases))
+        self.assertTrue(all(
+            case.repetitions == (1 if case.id.startswith("quick-geo-humaneval-") else 3)
+            for case in quick.performance_cases
+        ))
+        self.assertTrue(all(case.mode in {"ordinary", "dflash"} for case in quick.performance_cases))
         self.assertTrue(all(case.engines == ("supersonic",) for case in quick.performance_cases))
+        self.assertEqual({case.stop_policy for case in full.performance_cases}, {"ignore-eos"})
+
+    def test_quick_performance_owns_only_geo_comparable_workload(self):
+        manifest = load_manifest_module()
+        quick = manifest.load_suite("quick")
+        case_ids = [case.id for case in quick.performance_cases]
+
+        self.assertEqual(len(case_ids), 20)
+        self.assertTrue(all(case_id.startswith("quick-geo-humaneval-") for case_id in case_ids))
+
+    def test_quick_includes_geo_comparable_humaneval_workload(self):
+        manifest = load_manifest_module()
+        quick = manifest.load_suite("quick")
+        cases = {case.id: case for case in quick.performance_cases}
+
+        prompt_names = [
+            "has-close-elements",
+            "separate-paren-groups",
+            "truncate-number",
+            "below-zero",
+            "mean-absolute-deviation",
+            "intersperse",
+            "parse-nested-parens",
+            "filter-by-substring",
+            "sum-product",
+            "rolling-max",
+        ]
+        prompt_hashes = {
+            "has-close-elements": "eb8ed1bcb5e9bee3d4e0359c703d1dfb6dba7c665432908cf89af91095a74997",
+            "separate-paren-groups": "22d37f12dea840dc7fcf35de40d35ea50ba0cd15c9df5d79763518ec1cefe8e7",
+            "truncate-number": "4d6228ef4422d00142bf9d4f7e5aad2877b7a7b6f8b2e22aac2ffbeb765e3ffe",
+            "below-zero": "0dd6eb42233302e5c785f182b4d88c903b3ea8766dc93c2463081e67e466f919",
+            "mean-absolute-deviation": "9545160985c29e1e37d88a1316c1aaaced440fca1074d0c3014d0b4d54198131",
+            "intersperse": "9cd0d5c9209ebdae02589e78c0c424188b36e557c48bb120c877afa8bcc3115a",
+            "parse-nested-parens": "de6daaf9efa2d062e8b3c330d60b923b1a23a7f5233deef0d111c4a24e1399c7",
+            "filter-by-substring": "2fd38d40d559643fa64a73ad1b564a5cad18bef34fde8c47902237aca409ca0e",
+            "sum-product": "221fe1e9b5b64f7989fffd79a31bcea1baa9b2b1a2388f9f95565fa808c437ea",
+            "rolling-max": "641a22ee5177fd0ad5a53c761b0360b6a537d78dc2f8cd2487627d2542976fa6",
+        }
+
+        for prompt_name in prompt_names:
+            for mode in ("ordinary", "dflash"):
+                case_id = f"quick-geo-humaneval-{prompt_name}-{mode}"
+                self.assertIn(case_id, cases)
+                case = cases[case_id]
+                self.assertEqual(case.max_new_tokens, 256)
+                self.assertEqual(case.warmups, 0)
+                self.assertEqual(case.repetitions, 1)
+                self.assertEqual(case.mode, mode)
+                self.assertEqual(case.cache_state, "cold-load")
+                self.assertEqual(case.decoding_policy, "greedy")
+                self.assertEqual(case.engines, ("supersonic",))
+                self.assertEqual(case.timeout_seconds, 60)
+                self.assertEqual(case.stop_policy, "honor-eos")
+                self.assertEqual(hashlib.sha256(case.prompt.encode()).hexdigest(), prompt_hashes[prompt_name])
 
     def test_scoped_engine_case_matrix_rejects_unsupported_combinations(self):
         manifest = load_manifest_module()
@@ -120,7 +183,7 @@ version = 1
 name = "bad"
 budget_seconds = 600
 minimum_duration_seconds = 0
-quality_version = "v1"
+quality_version = "v2"
 quality_case_ids = ["instruction-following-1"]
 engines = ["supersonic", "llama-cpp"]
 decoding_policy = "greedy"
@@ -135,6 +198,7 @@ mode = "mtp"
 cache_state = "warm-resident"
 timeout_seconds = 30
 decoding_policy = "greedy"
+stop_policy = "ignore-eos"
 engines = ["llama-cpp"]
 """.strip()
                 + "\n",
@@ -155,7 +219,7 @@ version = 1
 name = "bad-duration"
 budget_seconds = 600
 minimum_duration_seconds = 601
-quality_version = "v1"
+quality_version = "v2"
 quality_case_ids = ["instruction-following-1"]
 engines = ["supersonic"]
 decoding_policy = "greedy"
@@ -190,10 +254,24 @@ engines = ["supersonic"]
         self.assertEqual(set(category_counts), APPROVED_CATEGORIES)
         for category in APPROVED_CATEGORIES:
             self.assertGreaterEqual(category_counts[category], 2, msg=category)
+        self.assertEqual(
+            category_counts["dflash-quality"],
+            2,
+        )
         for case in quality_cases:
             self.assertEqual(case.decoding_policy, "greedy")
             self.assertGreater(case.max_new_tokens, 0)
-            self.assertIn(case.scorer, {"exact_text", "exact_tokens", "structured_json"})
+            self.assertIn(
+                case.scorer,
+                {"exact_text", "semantic_text", "exact_tokens", "structured_json"},
+            )
+
+    def test_quality_loader_accepts_current_version_only(self):
+        manifest = load_manifest_module()
+
+        self.assertEqual(manifest.CURRENT_QUALITY_VERSION, "v2")
+        with self.assertRaisesRegex(ValueError, "quality version must be 'v2'"):
+            manifest.load_quality("v1")
 
     def test_json_loader_rejects_duplicate_keys_and_non_finite_numbers(self):
         manifest = load_manifest_module()
@@ -217,7 +295,7 @@ engines = ["supersonic"]
 
         self.assertEqual(supersonic.version, 1)
         self.assertEqual(llama_cpp.version, 1)
-        self.assertEqual(tuple(supersonic.supported_modes), ("ordinary", "mtp"))
+        self.assertEqual(tuple(supersonic.supported_modes), ("ordinary", "mtp", "dflash"))
         self.assertEqual(tuple(llama_cpp.supported_modes), ("ordinary",))
         self.assertIsNone(supersonic.version_pin_file)
         self.assertEqual(llama_cpp.version_pin_file, "tools/external/llama-cpp-version.txt")
@@ -268,7 +346,7 @@ engines = ["supersonic"]
                 "errors",
             },
         )
-        self.assertEqual(set(schema["properties"]), set(schema["required"]))
+        self.assertEqual(set(schema["properties"]), set(schema["required"]) | {"draft_artifact"})
         self.assertEqual(schema["properties"]["run"]["properties"]["schema_version"]["const"], 1)
         self.assertEqual(
             schema["properties"]["workload"]["properties"]["cache_state"]["enum"],
@@ -279,6 +357,14 @@ engines = ["supersonic"]
                 "prefix-cache-populated",
                 "prefix-cache-reset",
             ],
+        )
+        self.assertEqual(
+            schema["properties"]["workload"]["properties"]["mode"]["enum"],
+            ["ordinary", "mtp", "dflash"],
+        )
+        self.assertIn(
+            "dflash-quality",
+            schema["properties"]["quality"]["properties"]["categories"]["properties"],
         )
         self.assertEqual(
             set(schema["properties"]["environment"]["required"]),
@@ -375,7 +461,7 @@ version = 1
 name = "bad"
 budget_seconds = 600
 minimum_duration_seconds = 0
-quality_version = "v1"
+quality_version = "v2"
 quality_case_ids = ["instruction-following-1"]
 engines = ["supersonic"]
 decoding_policy = "greedy"
@@ -403,7 +489,7 @@ engines = ["supersonic"]
     def test_manifest_files_have_exact_allowed_keys(self):
         quick = tomllib.loads((BENCHMARKS / "suites" / "quick.toml").read_text(encoding="utf-8"))
         full = tomllib.loads((BENCHMARKS / "suites" / "full.toml").read_text(encoding="utf-8"))
-        quality = json.loads((BENCHMARKS / "quality" / "v1.json").read_text(encoding="utf-8"))
+        quality = json.loads((BENCHMARKS / "quality" / "v2.json").read_text(encoding="utf-8"))
 
         expected_suite_keys = {
             "version",
@@ -426,6 +512,7 @@ engines = ["supersonic"]
             "cache_state",
             "timeout_seconds",
             "decoding_policy",
+            "stop_policy",
             "engines",
         }
 

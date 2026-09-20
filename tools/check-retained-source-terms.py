@@ -8,6 +8,10 @@ this narrow boundary alone.  The retained full-attention HIP sources are also
 checked for product-facing Qwen3.5 comments and stale model-geometry counts;
 their qwen35 spellings are ABI/compiler identifiers and are intentionally
 outside this product check.
+
+The retained DFlash2 draft-model speculative decoder is an intentional
+feature whose identifiers and profiling control are allowlisted below;
+every other dflash spelling stays rejected.
 """
 
 from __future__ import annotations
@@ -39,6 +43,37 @@ FORBIDDEN_MTP_TERMS = (
     "qwen35_mtp_draft_greedy",
 )
 
+# The DFlash2 draft-model speculative decoder is an intentionally retained
+# feature, not a legacy MTP path.  These exact spellings are allowlisted so
+# the boundary check keeps rejecting every other dflash identifier (e.g.
+# dflash_fused_verify_cache, dflash_mtp_cache) while permitting the live
+# DFlash2 names.  Add a new term only for a deliberate DFlash2 extension.
+ALLOWED_DFLASH2_TERMS = frozenset({
+    "DflashSpecDecoder",
+    "DflashSpecRound",
+    "DflashSpecSummary",
+    "DflashTargetCapture",
+    "DflashRollbackCapture",
+    "DflashVerifyPath",
+    "DflashCommitPlan",
+    "capture_block_dflash",
+    "dflash",
+    "dflash_capture",
+    "dflash_commit_plan",
+    "dflash_commit_tests",
+    "dflash_dyn_conv",
+    "dflash_fast_rollback_plan",
+    "dflash_next_token",
+    "dflash_scatter_cols_raw",
+    "dflash_spec",
+    "dflash_tokens_from_selector",
+    "prefill_with_dflash_capture",
+    "replay_committed_prefix_dflash",
+    "rollback_dflash_prefix",
+    "verify_block_dflash",
+    "verify_block_dflash_with_rollback",
+})
+
 # Rust environment controls are conventionally uppercase, but the boundary
 # check is deliberately case-insensitive so a lowercase or escaped spelling
 # cannot evade it.  These are inspected only in decoded Rust string literals;
@@ -47,6 +82,12 @@ FORBIDDEN_MTP_ENV_RE = re.compile(
     r"\bSUPERSONIC_(?:DFLASH[A-Z0-9_]*|METALV2[A-Z0-9_]*|"
     r"METAL_V2[A-Z0-9_]*|QWEN35_?[A-Z0-9_]*MTP[A-Z0-9_]*)\b",
     re.IGNORECASE,
+)
+# The DFlash2 profiling telemetry control.  Allowlisted as an exact,
+# case-sensitive spelling so other SUPERSONIC_DFLASH* controls (including
+# lowercase evasions) stay rejected (e.g. SUPERSONIC_DFLASH_PROFILE_VERIFY).
+ALLOWED_DFLASH2_ENV = frozenset(
+    {"SUPERSONIC_DFLASH_PROFILE", "SUPERSONIC_DFLASH_TRACE_CTX"}
 )
 FORBIDDEN_KERNEL_PRODUCT_RE = re.compile(r"qwen\s*3[.]5", re.IGNORECASE)
 STALE_KERNEL_GEOMETRY_RE = re.compile(
@@ -714,6 +755,8 @@ def _has_compound(parts: list[str], compound: tuple[str, ...]) -> bool:
 
 
 def _legacy_identifier_reason(identifier: str) -> str | None:
+    if identifier in ALLOWED_DFLASH2_TERMS:
+        return None
     parts = _identifier_parts(identifier)
     normalized = "".join(parts)
     has_qwen35 = "qwen35" in normalized
@@ -761,8 +804,9 @@ def _legacy_mtp_violations(
             term = match.group(0) if match else lexeme.value
             violations.append((relative, line_number, term, line))
             continue
-        match = FORBIDDEN_MTP_ENV_RE.search(lexeme.value)
-        if match:
+        for match in FORBIDDEN_MTP_ENV_RE.finditer(lexeme.value):
+            if match.group(0) in ALLOWED_DFLASH2_ENV:
+                continue
             violations.append((relative, line_number, match.group(0), line))
 
     return violations

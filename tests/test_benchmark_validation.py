@@ -46,6 +46,30 @@ class BenchmarkValidationTests(unittest.TestCase):
     def test_valid_fixture_passes(self):
         self.validation.validate_record(self.valid_record)
 
+    def test_dflash_records_require_active_width_16(self):
+        record = copy.deepcopy(self.valid_record)
+        record["workload"]["case_id"] = "quick-geo-humaneval-has-close-elements-dflash"
+        record["workload"]["mode"] = "dflash"
+        record["run"]["case_id"] = "quick-geo-humaneval-has-close-elements-dflash"
+        record["draft_artifact"] = {
+            "semantic_id": "qwen3.8-27b-dflash2-q8-canonical",
+            "quantization": "Q8_0",
+            "sha256": "a" * 64,
+        }
+        record["workload"]["dflash_block_size"] = 16
+        self.validation.validate_record(record)
+
+        del record["workload"]["dflash_block_size"]
+        self.assert_record_invalid(record, "active block width 16")
+
+    def test_stop_policy_is_an_explicit_schema_enum(self):
+        record = copy.deepcopy(self.valid_record)
+        record["workload"]["stop_policy"] = "honor-eos"
+        self.validation.validate_record(record)
+
+        record["workload"]["stop_policy"] = "force-token-cap"
+        self.assert_record_invalid(record, "stop_policy")
+
     def test_structured_toolchain_versions_are_required_and_safe(self):
         self.assertRegex(self.valid_record["environment"]["rocm_version"], r"^ROCm ")
         self.assertRegex(self.valid_record["environment"]["hip_version"], r"^HIP ")
@@ -118,7 +142,7 @@ class BenchmarkValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "balanced|round"):
                 self.validation.validate_bundle(self.bundle, require_complete=True)
 
-            manifest["status"]["completed_rounds"] = 3
+            manifest["status"]["completed_rounds"] = 1
             (self.bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             self.validation.validate_bundle(self.bundle, require_complete=True)
 
@@ -137,7 +161,7 @@ class BenchmarkValidationTests(unittest.TestCase):
 
     def test_record_requires_exact_samples_and_quality_summary_consistency(self):
         record = copy.deepcopy(self.valid_record)
-        record["samples"].pop()
+        record["samples"] = [record["samples"][0], record["samples"][0]]
         self.assert_record_invalid(record, "sample count")
 
         record = copy.deepcopy(self.valid_record)
@@ -148,16 +172,18 @@ class BenchmarkValidationTests(unittest.TestCase):
         record["quality"]["cases"][0]["id"] = "instruction-following-2"
         self.assert_record_invalid(record, "quality")
 
-    def test_passed_mtp_equality_requires_matching_evidence_hashes(self):
-        record = copy.deepcopy(self.valid_record)
-        mtp_case = next(
-            case
-            for case in record["quality"]["cases"]
-            if case["category"] == "ordinary-vs-mtp-token-equality"
-        )
-        mtp_case["actual_hash"] = "f" * 64
+    def test_passed_speculative_equality_requires_matching_evidence_hashes(self):
+        for category in ("ordinary-vs-mtp-token-equality",):
+            with self.subTest(category=category):
+                record = copy.deepcopy(self.valid_record)
+                equality_case = next(
+                    case
+                    for case in record["quality"]["cases"]
+                    if case["category"] == category
+                )
+                equality_case["actual_hash"] = "f" * 64
 
-        self.assert_record_invalid(record, "MTP equality.*evidence hashes")
+                self.assert_record_invalid(record, "speculative equality.*evidence hashes")
 
     def test_publishable_bundle_rejects_dirty_errors_failed_quality_and_unverified_headlines(self):
         record = copy.deepcopy(self.valid_record)

@@ -142,6 +142,12 @@ class BenchmarkCliTests(unittest.TestCase):
                 "a" * 64,
                 "--chat-template-sha256",
                 "b" * 64,
+                "--draft-artifact",
+                "/draft/qwen38-dflash2-q8_0-canonical.gguf",
+                "--draft-artifact-semantic-id",
+                "qwen3.8-27b-dflash2-q8-canonical",
+                "--draft-artifact-quantization",
+                "Q8_0",
                 "--physical-gpu",
                 "0",
                 "--gpu-static-json",
@@ -159,6 +165,9 @@ class BenchmarkCliTests(unittest.TestCase):
         self.assertEqual(args.artifact_quantization, "GQH-Q3KXL")
         self.assertEqual(args.tokenizer_sha256, "a" * 64)
         self.assertEqual(args.chat_template_sha256, "b" * 64)
+        self.assertEqual(args.draft_artifact, Path("/draft/qwen38-dflash2-q8_0-canonical.gguf"))
+        self.assertEqual(args.draft_artifact_semantic_id, "qwen3.8-27b-dflash2-q8-canonical")
+        self.assertEqual(args.draft_artifact_quantization, "Q8_0")
 
     def test_repeatability_builds_a_bounded_fresh_process_soak(self):
         cli = load_cli_module()

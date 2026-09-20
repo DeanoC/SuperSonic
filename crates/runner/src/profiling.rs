@@ -147,6 +147,80 @@ impl<'a> PrefillProfileScope<'a> {
     }
 }
 
+pub(crate) struct DflashProfileScope {
+    active: bool,
+    start: std::time::Instant,
+}
+
+impl DflashProfileScope {
+    pub(crate) fn new(enabled: bool) -> Self {
+        if enabled {
+            gpu_hal::hal_profile_set_enabled(true);
+            kernel_ffi::prefill_ffi::ffi_profile_set_enabled(true);
+            gpu_hal::hal_profile_reset();
+            kernel_ffi::prefill_ffi::ffi_profile_reset();
+        }
+        Self {
+            active: enabled,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn finish(mut self) {
+        if !self.active {
+            return;
+        }
+        let wall_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        let hal = gpu_hal::hal_profile_snapshot();
+        let ffi = kernel_ffi::prefill_ffi::ffi_profile_snapshot();
+        eprintln!(
+            "[dflash-profile] wall_ms={wall_ms:.3} ffi_calls={} ffi_ms={:.3} hal_calls={} hal_ms={:.3} alloc_calls={} alloc_bytes={} h2d={} d2h={} d2d={} memset={} sync_calls={}",
+            ffi.total_calls,
+            ffi.total_ms,
+            hal.total_calls,
+            hal.total_ms,
+            hal.alloc_calls,
+            hal.alloc_bytes,
+            hal.h2d_bytes,
+            hal.d2h_bytes,
+            hal.d2d_bytes,
+            hal.memset_bytes,
+            hal.sync_calls,
+        );
+        for entry in ffi.entries.iter().take(40) {
+            eprintln!(
+                "[dflash-profile] ffi_op={} calls={} mean_ms={:.4} total_ms={:.3} max_ms={:.3}",
+                entry.op,
+                entry.calls,
+                entry.mean_ms(),
+                entry.total_ms,
+                entry.max_ms,
+            );
+        }
+        for entry in hal.entries.iter().take(25) {
+            eprintln!(
+                "[dflash-profile] op={} calls={} mean_ms={:.4} total_ms={:.3} max_ms={:.3} bytes={}",
+                entry.op,
+                entry.calls,
+                entry.mean_ms(),
+                entry.total_ms,
+                entry.max_ms,
+                entry.total_bytes,
+            );
+        }
+        disable_prefill_profiles();
+        self.active = false;
+    }
+}
+
+impl Drop for DflashProfileScope {
+    fn drop(&mut self) {
+        if self.active {
+            disable_prefill_profiles();
+        }
+    }
+}
+
 impl Drop for PrefillProfileScope<'_> {
     fn drop(&mut self) {
         if self.active {
@@ -158,4 +232,19 @@ impl Drop for PrefillProfileScope<'_> {
 fn disable_prefill_profiles() {
     kernel_ffi::prefill_ffi::ffi_profile_set_enabled(false);
     gpu_hal::hal_profile_set_enabled(false);
+}
+
+#[cfg(test)]
+mod dflash_profile_tests {
+    use super::DflashProfileScope;
+
+    #[test]
+    fn dflash_profile_scope_toggles_gpu_accumulators() {
+        let scope = DflashProfileScope::new(true);
+        assert!(kernel_ffi::prefill_ffi::ffi_profile_enabled());
+        assert!(gpu_hal::hal_profile_enabled());
+        scope.finish();
+        assert!(!kernel_ffi::prefill_ffi::ffi_profile_enabled());
+        assert!(!gpu_hal::hal_profile_enabled());
+    }
 }

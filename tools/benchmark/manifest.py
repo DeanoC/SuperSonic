@@ -34,6 +34,7 @@ PERFORMANCE_CASE_KEYS = {
     "cache_state",
     "timeout_seconds",
     "decoding_policy",
+    "stop_policy",
     "engines",
 }
 QUALITY_KEYS = {"version", "categories", "cases"}
@@ -47,7 +48,8 @@ QUALITY_CASE_KEYS = {
     "decoding_policy",
 }
 ENGINE_BASE_KEYS = {"version", "name", "binary", "version_command", "supported_modes"}
-ALLOWED_MODES = {"ordinary", "mtp"}
+ALLOWED_MODES = {"ordinary", "mtp", "dflash"}
+ALLOWED_STOP_POLICIES = {"ignore-eos", "honor-eos"}
 ALLOWED_CACHE_STATES = {
     "cold-load",
     "warm-resident",
@@ -55,7 +57,7 @@ ALLOWED_CACHE_STATES = {
     "prefix-cache-populated",
     "prefix-cache-reset",
 }
-ALLOWED_SCORERS = {"exact_text", "exact_tokens", "structured_json"}
+ALLOWED_SCORERS = {"exact_text", "semantic_text", "exact_tokens", "structured_json"}
 APPROVED_CATEGORIES = {
     "instruction-following",
     "structured-extraction",
@@ -65,7 +67,9 @@ APPROVED_CATEGORIES = {
     "chat-template-behavior",
     "repeated-run-determinism",
     "ordinary-vs-mtp-token-equality",
+    "dflash-quality",
 }
+CURRENT_QUALITY_VERSION = "v2"
 
 
 def load_suite(name: str) -> SuiteManifest:
@@ -134,6 +138,8 @@ def load_suite_path(path: Path) -> SuiteManifest:
 
 
 def load_quality(version: str) -> tuple[QualityCase, ...]:
+    if version != CURRENT_QUALITY_VERSION:
+        raise ValueError(f"quality version must be {CURRENT_QUALITY_VERSION!r}, got {version!r}")
     path = QUALITY / f"{version}.json"
     data = _load_json(path)
     _require_exact_keys(data, QUALITY_KEYS, f"quality {path.name}")
@@ -148,7 +154,7 @@ def load_quality(version: str) -> tuple[QualityCase, ...]:
     if len(category_tuple) != len(set(category_tuple)):
         raise ValueError(f"quality {path.name} categories must be unique")
     if set(category_tuple) != APPROVED_CATEGORIES:
-        raise ValueError(f"quality {path.name} categories must match the approved set")
+        raise ValueError(f"quality {path.name} categories must match its approved set")
 
     raw_cases = data["cases"]
     if not isinstance(raw_cases, list) or not raw_cases:
@@ -229,6 +235,9 @@ def _parse_performance_case(
     cache_state = _require_nonempty_str(data, "cache_state")
     if cache_state not in ALLOWED_CACHE_STATES:
         raise ValueError(f"suite {suite_name} has unknown cache_state: {cache_state!r}")
+    stop_policy = _require_nonempty_str(data, "stop_policy")
+    if stop_policy not in ALLOWED_STOP_POLICIES:
+        raise ValueError(f"suite {suite_name} has unknown stop_policy: {stop_policy!r}")
     decoding_policy = _require_greedy(
         data,
         "decoding_policy",
@@ -264,6 +273,7 @@ def _parse_performance_case(
         cache_state=cache_state,
         timeout_seconds=_require_int(data, "timeout_seconds", minimum=1),
         decoding_policy=decoding_policy,
+        stop_policy=stop_policy,
         engines=scoped_engines,
     )
 

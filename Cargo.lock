@@ -920,6 +920,7 @@ dependencies = [
  "kernel-ffi",
  "minijinja",
  "minijinja-contrib",
+ "model-store",
  "qwen38",
  "serde",
  "serde_json",

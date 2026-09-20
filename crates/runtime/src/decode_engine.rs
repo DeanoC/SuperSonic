@@ -876,6 +876,11 @@ impl DecodeEngine {
         &self.weights
     }
 
+    /// Whether the 4B fused megakernel is available for this engine.
+    pub fn use_4b_kernel(&self) -> bool {
+        self.use_4b_kernel
+    }
+
     #[cfg(feature = "scalar-head-lab")]
     pub fn set_scalar_head_lab_route(&mut self, route: ScalarHeadLabRoute) -> Result<()> {
         if route == ScalarHeadLabRoute::RawQ6Scalar {
@@ -1083,7 +1088,8 @@ impl DecodeEngine {
                 }
             }
         } else {
-            let result = self.verify_block_prefill_append_impl(&block, pos, true, None)?;
+            let result =
+                self.verify_block_prefill_append_impl(&block, pos, true, None, None, None)?;
             let verify_ms = t0.elapsed().as_secs_f64() * 1000.0;
             let greedy = result
                 .target_next
@@ -1263,6 +1269,69 @@ impl DecodeEngine {
                 ls.set_kv_filled(new_len);
             }
         }
+    }
+
+    /// Public wrapper for DFlash2 spec-decode to commit full-attention KV
+    /// after a verified block.
+    pub fn commit_fused_kv_filled_public(&mut self, new_len: usize) {
+        self.commit_fused_kv_filled(new_len);
+    }
+
+    /// DFlash2: snapshot the linear-attention state before a verify round
+    /// so it can be restored on partial acceptance.
+    pub fn snapshot_linear_for_spec(&mut self) -> Result<()> {
+        self.ensure_mtp_linear_snap()
+    }
+
+    /// DFlash2: restore the linear-attention snapshot, rewind full-attention
+    /// KV to `pos`, and replay `committed` tokens (including the seed) through
+    /// the fast greedy decode megakernel. Returns the target's greedy
+    /// prediction after the last replayed token (the bonus token).
+    pub fn replay_committed_prefix(&mut self, committed: &[u32], pos: usize) -> Result<u32> {
+        anyhow::ensure!(!committed.is_empty(), "dflash replay empty prefix");
+        let ordinal = self.ordinal;
+        let snap = self
+            .mtp_linear_snap
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("dflash replay missing linear snapshot"))?;
+        restore_linear_state(&mut self.state, snap, ordinal)?;
+        self.rewind_full_kv_filled(pos);
+
+        let mut next_token = committed[0];
+        for (i, &token) in committed.iter().enumerate() {
+            let (sampled, _) = self.decode_step_hip_fast_greedy(token, pos + i)?;
+            next_token = sampled;
+        }
+        Ok(next_token)
+    }
+
+    /// DFlash2: restore the pre-verify state, replay the complete verified block,
+    /// then roll back to the committed prefix. Keeping the full width preserves
+    /// width-dependent activation quantization and state parity.
+    pub fn replay_committed_prefix_dflash(
+        &mut self,
+        block: &[u32],
+        commit_len: usize,
+        pos: usize,
+        capture: &mut prefill_engine::DflashTargetCapture,
+        rollback: &mut prefill_engine::DflashRollbackCapture,
+    ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
+        anyhow::ensure!(!block.is_empty(), "dflash replay empty block");
+        anyhow::ensure!(
+            commit_len > 0 && commit_len <= block.len(),
+            "dflash replay commit length {commit_len} is outside block length {}",
+            block.len()
+        );
+        let ordinal = self.ordinal;
+        let snap = self
+            .mtp_linear_snap
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("dflash replay missing linear snapshot"))?;
+        restore_linear_state(&mut self.state, snap, ordinal)?;
+        self.rewind_full_kv_filled(pos);
+        let result = self.verify_block_dflash_with_rollback(block, pos, capture, rollback)?;
+        self.rollback_dflash_prefix(rollback, commit_len)?;
+        Ok(result)
     }
 
     fn mtp_replay_committed_prefix(
@@ -1543,6 +1612,7 @@ impl DecodeEngine {
             self.use_4b_kernel,
             false,
             None,
+            None,
         )?;
 
         // Reset sync counters for the decode kernel
@@ -1567,6 +1637,7 @@ impl DecodeEngine {
             self.prefill_chunk_size,
             self.use_4b_kernel,
             false,
+            None,
             None,
         )?;
         self.scratch
@@ -1848,6 +1919,8 @@ impl DecodeEngine {
         pos_offset: usize,
         greedy_only: bool,
         greedy_compare_tokens: Option<&[u32]>,
+        dflash_capture: Option<&mut prefill_engine::DflashTargetCapture>,
+        rollback_capture: Option<&mut prefill_engine::DflashRollbackCapture>,
     ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
         if tokens.is_empty() {
             anyhow::bail!("verify_block_prefill_append: tokens must be non-empty");
@@ -1883,12 +1956,167 @@ impl DecodeEngine {
             greedy_only,
             greedy_compare_tokens,
             &mut cache,
+            dflash_capture,
+            rollback_capture,
         )?;
         self.mtp_prefill_append_cache = Some(cache);
         self.scratch
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("reset sync after prefill append verify: {e}"))?;
         Ok(result)
+    }
+
+    /// DFlash2: prefill the target prompt while capturing post-MLP hidden
+    /// states at the draft target layers into `capture`.
+    pub fn prefill_with_dflash_capture(
+        &mut self,
+        prompt_ids: &[u32],
+        capture: &mut prefill_engine::DflashTargetCapture,
+    ) -> Result<prefill_engine::PrefillResult> {
+        let result = prefill_engine::prefill(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prompt_ids,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.use_4b_kernel,
+            false,
+            None,
+            Some(capture),
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after dflash prefill: {e}"))?;
+        Ok(result)
+    }
+
+    /// DFlash2: verify a draft block through the target while capturing
+    /// post-MLP hidden states at the draft target layers. Returns the
+    /// target greedy argmax for each position (`target_next`).
+    pub fn verify_block_dflash(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+        capture: &mut prefill_engine::DflashTargetCapture,
+    ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
+        self.verify_block_prefill_append_impl(tokens, pos_offset, true, None, Some(capture), None)
+    }
+
+    /// DFlash2 verify with per-token recurrent and QKV state capture.
+    pub fn verify_block_dflash_with_rollback(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+        capture: &mut prefill_engine::DflashTargetCapture,
+        rollback: &mut prefill_engine::DflashRollbackCapture,
+    ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
+        anyhow::ensure!(
+            !tokens.is_empty() && tokens.len() <= rollback.token_count(),
+            "dflash rollback verify block length {} exceeds capture capacity {}",
+            tokens.len(),
+            rollback.token_count()
+        );
+        self.verify_block_prefill_append_impl(
+            tokens,
+            pos_offset,
+            true,
+            None,
+            Some(capture),
+            Some(rollback),
+        )
+    }
+
+    /// Restore the accepted prefix captured by a DFlash verify round.
+    ///
+    /// This is the chain equivalent of geo-lucebox `rollback_to`: it promotes
+    /// per-token recurrent intermediates and the accepted convolution tail
+    /// without a second target forward pass.
+    pub fn rollback_dflash_prefix(
+        &mut self,
+        rollback: &prefill_engine::DflashRollbackCapture,
+        commit_len: usize,
+    ) -> Result<()> {
+        let config = &self.weights.config;
+        let pad = config.linear_conv_kernel_dim - 1;
+        anyhow::ensure!(
+            commit_len > 0,
+            "dflash rollback needs a positive commit length"
+        );
+        anyhow::ensure!(
+            commit_len <= rollback.token_count(),
+            "dflash rollback commit length {} exceeds capture capacity {}",
+            commit_len,
+            rollback.token_count()
+        );
+        let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let mut rollback_slot = 0usize;
+        for (layer_idx, layer) in self.state.layers.iter_mut().enumerate() {
+            if config.is_full_attention(layer_idx) {
+                continue;
+            }
+            let recurrent_src = rollback.recurrent_token_ptr(rollback_slot, commit_len - 1);
+            let recurrent_dst = layer.recurrent_state.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("dflash rollback layer {layer_idx} recurrent state")
+            })?;
+            let recurrent_elems = config.linear_num_value_heads
+                * config.linear_key_head_dim
+                * config.linear_value_head_dim;
+            kernel_ffi::prefill_ffi::cast_raw(
+                self.ordinal,
+                ScalarType::F16,
+                ScalarType::F32,
+                recurrent_elems,
+                recurrent_src,
+                recurrent_dst.as_mut_ptr(),
+            )
+            .map_err(|e| anyhow::anyhow!("dflash rollback recurrent layer {layer_idx}: {e}"))?;
+
+            let qkv_src = rollback.qkv_layer_ptr(rollback_slot);
+            let conv_dst = layer
+                .conv_state
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("dflash rollback layer {layer_idx} conv state"))?;
+            if commit_len >= pad {
+                kernel_ffi::prefill_ffi::extract_conv_state_raw(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    commit_len,
+                    qkv_dim,
+                    pad,
+                    qkv_src,
+                    conv_dst.as_mut_ptr(),
+                )
+                .map_err(|e| anyhow::anyhow!("dflash rollback conv layer {layer_idx}: {e}"))?;
+            } else {
+                let old_tail_src = rollback.conv_tail_layer_ptr(rollback_slot);
+                kernel_ffi::prefill_ffi::assemble_conv_tail_short_raw(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    qkv_dim,
+                    pad,
+                    commit_len,
+                    1,
+                    old_tail_src,
+                    qkv_src,
+                    conv_dst.as_mut_ptr(),
+                )
+                .map_err(|e| anyhow::anyhow!("dflash rollback conv layer {layer_idx}: {e}"))?;
+            }
+            rollback_slot += 1;
+        }
+
+        let base_pos = self
+            .state
+            .layers
+            .iter()
+            .find(|layer| layer.kv_filled > 0)
+            .map(|layer| layer.kv_filled)
+            .unwrap_or(0);
+        self.commit_fused_kv_filled_public(base_pos + commit_len);
+        Ok(())
     }
 
     /// Qwen3.8 MTP fused verify: single `persistent_decode_4b` megakernel
@@ -1916,32 +2144,19 @@ impl DecodeEngine {
     /// caller MUST snapshot linear state before this call and restore
     /// it after the accept decision — same snapshot/restore contract
     /// the existing verify paths already require.
-    pub fn verify_block_fused_decode(
-        &mut self,
-        tokens: &[u32],
-        pos_offset: usize,
-    ) -> Result<Vec<Vec<f32>>> {
-        Ok(self
-            .verify_block_fused_decode_ex(tokens, pos_offset, false)?
-            .0)
-    }
-
     fn verify_block_fused_decode_greedy(
         &mut self,
         tokens: &[u32],
         pos_offset: usize,
     ) -> Result<Vec<u32>> {
-        Ok(self
-            .verify_block_fused_decode_ex(tokens, pos_offset, true)?
-            .1)
+        Ok(self.verify_block_fused_decode_ex(tokens, pos_offset)?)
     }
 
     fn verify_block_fused_decode_ex(
         &mut self,
         tokens: &[u32],
         pos_offset: usize,
-        greedy_only: bool,
-    ) -> Result<(Vec<Vec<f32>>, Vec<u32>)> {
+    ) -> Result<Vec<u32>> {
         if !self.use_4b_kernel {
             anyhow::bail!("verify_block_fused_decode requires use_4b_kernel");
         }
@@ -1969,28 +2184,6 @@ impl DecodeEngine {
                 c.rms_norm_eps as f32,
             )
         };
-
-        // The 4B megakernel's shared-memory footprint per workgroup is
-        //   (block_size + max(B * hidden_dim, 2 * hidden_dim) + fp8_lut) * sizeof(f32).
-        // gfx1100/gfx115x cap LDS at 64 KiB per workgroup, or 16384 floats.
-        // Reserve 512 floats for block_size + fp8_lut, leaving 15872 floats
-        // for the input cache.
-        // If a user passes a larger MTP block, fail before HIP returns a
-        // less helpful launch error.
-        const MAX_INPUT_CACHE_FLOATS: usize = 15872;
-        let input_cache = (b * hidden_dim).max(2 * hidden_dim);
-        if input_cache > MAX_INPUT_CACHE_FLOATS {
-            let max_b = (MAX_INPUT_CACHE_FLOATS / hidden_dim.max(1)).max(1);
-            anyhow::bail!(
-                "verify_block_fused_decode: shared-memory budget exceeded \
-                 (B={b} * hidden_dim={hidden_dim} = {}, 2 * hidden_dim = {}; \
-                 cap = {MAX_INPUT_CACHE_FLOATS} floats). \
-                 Lower the speculative block size to <= {}.",
-                b * hidden_dim,
-                2 * hidden_dim,
-                max_b,
-            );
-        }
 
         let max_pos = pos_offset + b - 1;
 
@@ -2187,32 +2380,11 @@ impl DecodeEngine {
             }
             ids
         };
-        let mut logits_per_pos = Vec::new();
-        let d2h_ms;
-        if greedy_only {
-            d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
-        } else {
-            let logits_host = cache
-                .logits_buf
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("fused verify logits D2H: {e}"))?;
-            d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
-            let row_stride_bytes = vocab_size * ScalarType::BF16.size_in_bytes();
-            logits_per_pos = Vec::with_capacity(b);
-            for bi in 0..b {
-                let start = bi * row_stride_bytes;
-                let end = start + row_stride_bytes;
-                let row: Vec<f32> = logits_host[start..end]
-                    .chunks_exact(2)
-                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
-                    .collect();
-                logits_per_pos.push(row);
-            }
-        }
+        let d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
 
         if profile_verify {
             eprintln!(
-                "[qwen38-mtp-profile] fused_verify B={b} pos={pos_offset} persistent={persistent_ms:.2}ms rms={rms_ms:.2}ms lm_head={lm_head_ms:.2}ms d2h={d2h_ms:.2}ms greedy_only={greedy_only}"
+                "[qwen38-mtp-profile] fused_verify B={b} pos={pos_offset} persistent={persistent_ms:.2}ms rms={rms_ms:.2}ms lm_head={lm_head_ms:.2}ms d2h={d2h_ms:.2}ms"
             );
         }
 
@@ -2223,7 +2395,7 @@ impl DecodeEngine {
         self.fused_last_normed = Some(normed_host);
 
         self.mtp_verify_cache = Some(cache);
-        Ok((logits_per_pos, greedy))
+        Ok(greedy)
     }
 
     /// Greedy argmax over logits.
@@ -2561,6 +2733,20 @@ mod mtp_accept_tests {
 
         let descs = qwen38::desc_builder::build_batch_seq_descs(&states, &[0, 0])
             .expect("B>1 must retain internal MTP descriptors");
+
+        assert!(descs.is_empty());
+    }
+
+    #[test]
+    fn fused_verify_keeps_b1_descriptors() {
+        let state = ModelState {
+            layers: Vec::new(),
+            mtp: None,
+        };
+        let states = [&state];
+
+        let descs = qwen38::desc_builder::build_batch_seq_descs(&states, &[7])
+            .expect("fused DFlash verify must retain B=1 descriptors");
 
         assert!(descs.is_empty());
     }

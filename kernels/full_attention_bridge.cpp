@@ -491,23 +491,25 @@ int full_attention_prefill_tiled_device(
     // BM=4 left K/V tiles reused by only 4 queries. Longer prefills share
     // each tile across 8 or 16 query rows (LDS size does not depend on BM).
     const bool long_seq = q_len >= 1024;
+    constexpr int small_head_bk = sizeof(T) <= 2 ? 128 : 64;
+    constexpr int medium_head_bk = sizeof(T) <= 2 ? 64 : 32;
 
     if (head_dim <= 64) {
         if (long_seq) {
-            return launch_tiled<T, 16, 128>(batch_size, q_heads, kv_heads,
+            return launch_tiled<T, 16, small_head_bk>(batch_size, q_heads, kv_heads,
                 q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
                 query, key, value, out);
         }
-        return launch_tiled<T, 8, 128>(batch_size, q_heads, kv_heads,
+        return launch_tiled<T, 8, small_head_bk>(batch_size, q_heads, kv_heads,
             q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
             query, key, value, out);
     } else if (head_dim <= 128) {
         if (long_seq) {
-            return launch_tiled<T, 16, 64>(batch_size, q_heads, kv_heads,
+            return launch_tiled<T, 16, medium_head_bk>(batch_size, q_heads, kv_heads,
                 q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
                 query, key, value, out);
         }
-        return launch_tiled<T, 8, 64>(batch_size, q_heads, kv_heads,
+        return launch_tiled<T, 8, medium_head_bk>(batch_size, q_heads, kv_heads,
             q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
             query, key, value, out);
     } else if (long_seq) {
@@ -591,10 +593,8 @@ int delta_recurrent_prefill_device(
         const char* e = std::getenv("SUPERSONIC_REC_WARP");
         return e != nullptr && e[0] == '0';
     }();
-    // Capture/trace needs the original one-thread-per-v walk so the
-    // exported state dump stays element-order identical.
-    if (state_trace == nullptr && !disable_warp && seq_len > 1 &&
-        k_head_dim == 128 && v_head_dim == 128) {
+    if (!disable_warp && k_head_dim == 128 && v_head_dim == 128 &&
+        (seq_len > 1 || state_trace != nullptr)) {
         constexpr int warps_per_block = 4;
         const size_t total_warps =
             static_cast<size_t>(batch_heads) *
@@ -616,10 +616,14 @@ int delta_recurrent_prefill_device(
             static_cast<const T*>(value),
             static_cast<const T*>(beta),
             static_cast<const T*>(g),
-            static_cast<T*>(out));
+            static_cast<T*>(out),
+            static_cast<half*>(state_trace));
         if (hipGetLastError() != hipSuccess) return 67;
         if (maybe_sync() != hipSuccess) return 68;
         return 0;
+    }
+    if (state_trace != nullptr) {
+        return 70;
     }
     if (state_trace == nullptr && !disable_warp && seq_len > 1) {
         constexpr int warps_per_block = 8;
@@ -676,6 +680,43 @@ int delta_recurrent_prefill_device(
     return 0;
 }
 
+int delta_recurrent_extract_device(
+    int device_ordinal,
+    int batch_heads,
+    int seq_len,
+    int k_head_dim,
+    int v_head_dim,
+    const void* recurrent_out,
+    void* recurrent_state,
+    void* attn_output
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int block = 256;
+    const size_t state_elems =
+        static_cast<size_t>(batch_heads) * k_head_dim * v_head_dim;
+    const size_t attn_elems =
+        static_cast<size_t>(batch_heads) * seq_len * v_head_dim;
+    const size_t total = state_elems + attn_elems;
+    const unsigned int grid =
+        static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_recurrent_extract_kernel),
+        dim3(grid > 0 ? grid : 1u),
+        dim3(block),
+        0,
+        0,
+        batch_heads,
+        seq_len,
+        k_head_dim,
+        v_head_dim,
+        static_cast<const float*>(recurrent_out),
+        static_cast<float*>(recurrent_state),
+        static_cast<hip_bfloat16*>(attn_output));
+    if (hipGetLastError() != hipSuccess) return 67;
+    if (maybe_sync() != hipSuccess) return 68;
+    return 0;
+}
+
 template <typename T>
 int delta_recurrent_prefill_device_stream(
     int device_ordinal,
@@ -721,7 +762,8 @@ int delta_recurrent_prefill_device_stream(
             static_cast<const T*>(value),
             static_cast<const T*>(beta),
             static_cast<const T*>(g),
-            static_cast<T*>(out));
+            static_cast<T*>(out),
+            static_cast<half*>(nullptr));
         return hipGetLastError() == hipSuccess ? 0 : 67;
     }
     if (!disable_warp && seq_len >= 1) {
@@ -2314,7 +2356,8 @@ extern "C" int supersonic_qwen35_hip_full_attention_prefill(
     void* out) {
     DecodeBridgeLockGuard guard;
 
-    // Default: use the K-tiled FlashAttention-style kernel for BF16 prefill.
+    // Default: use the K-tiled FlashAttention-style kernel for F32 and BF16
+    // prefill. F32 is required by the DFlash2 draft attention path.
     // SUPERSONIC_PREFILL_ATTN_TILED=0 forces the legacy single-warp
     // online-softmax kernel (kept as a bisect/escape hatch).
     static const bool disable_tiled = []{
@@ -2322,11 +2365,24 @@ extern "C" int supersonic_qwen35_hip_full_attention_prefill(
         return e != nullptr && e[0] == '0';
     }();
 
-    if (!disable_tiled && dtype == 2) {  // BF16 only for the tiled path; non-BF16 falls through
-        int rc = full_attention_prefill_tiled_device<hip_bfloat16>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(batch_size),
-            static_cast<int>(q_heads),
+    if (!disable_tiled && (dtype == 1 || dtype == 2)) {
+        int rc = dtype == 1
+            ? full_attention_prefill_tiled_device<float>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(batch_size),
+                static_cast<int>(q_heads),
+                static_cast<int>(kv_heads),
+                static_cast<int>(q_len),
+                static_cast<int>(kv_len),
+                static_cast<int>(head_dim),
+                static_cast<int>(num_kv_groups),
+                scale,
+                static_cast<int>(seqlen_offset),
+                query, key, value, out)
+            : full_attention_prefill_tiled_device<hip_bfloat16>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(batch_size),
+                static_cast<int>(q_heads),
             static_cast<int>(kv_heads),
             static_cast<int>(q_len),
             static_cast<int>(kv_len),
@@ -2509,6 +2565,92 @@ extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill(
     default:
         return 66;
     }
+}
+
+extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill_trace(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_heads,
+    size_t seq_len,
+    size_t k_head_dim,
+    size_t v_head_dim,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    void* out,
+    void* state_trace) {
+    switch (dtype) {
+    case 0:
+        return delta_recurrent_prefill_device<half>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_heads),
+            static_cast<int>(seq_len),
+            static_cast<int>(k_head_dim),
+            static_cast<int>(v_head_dim),
+            initial_state,
+            query,
+            key,
+            value,
+            beta,
+            g,
+            out,
+            state_trace);
+    case 1:
+        return delta_recurrent_prefill_device<float>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_heads),
+            static_cast<int>(seq_len),
+            static_cast<int>(k_head_dim),
+            static_cast<int>(v_head_dim),
+            initial_state,
+            query,
+            key,
+            value,
+            beta,
+            g,
+            out,
+            state_trace);
+    case 2:
+        return delta_recurrent_prefill_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_heads),
+            static_cast<int>(seq_len),
+            static_cast<int>(k_head_dim),
+            static_cast<int>(v_head_dim),
+            initial_state,
+            query,
+            key,
+            value,
+            beta,
+            g,
+            out,
+            state_trace);
+    default:
+        return 66;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_delta_recurrent_extract(
+    size_t device_ordinal,
+    size_t batch_heads,
+    size_t seq_len,
+    size_t k_head_dim,
+    size_t v_head_dim,
+    const void* recurrent_out,
+    void* recurrent_state,
+    void* attn_output) {
+    return delta_recurrent_extract_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(batch_heads),
+        static_cast<int>(seq_len),
+        static_cast<int>(k_head_dim),
+        static_cast<int>(v_head_dim),
+        recurrent_out,
+        recurrent_state,
+        attn_output);
 }
 
 extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill_on_stream(

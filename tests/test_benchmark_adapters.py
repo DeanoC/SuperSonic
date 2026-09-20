@@ -74,6 +74,19 @@ class BenchmarkAdapterTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--context-size") + 1], "2048")
         self.assertEqual(argv[argv.index("--sampling-seed") + 1], "7")
 
+    def test_supersonic_dflash_requires_explicit_draft_artifact(self):
+        draft_artifact = Path("/artifacts/qwen38-dflash2-q8_0-canonical.gguf")
+        dflash_case = replace(self.supersonic_case, mode="dflash", engines=("supersonic",))
+
+        inputs = replace(self.inputs, draft_artifact=draft_artifact)
+        argv = self.adapters.build_command(self.supersonic, dflash_case, inputs)
+        self.assertEqual(argv[argv.index("--draft-gguf-file") + 1], str(draft_artifact))
+        self.assertNotIn("--speculative-decode", argv)
+
+        missing_draft = replace(inputs, draft_artifact=None)
+        with self.assertRaisesRegex(ValueError, "draft.*artifact"):
+            self.adapters.build_command(self.supersonic, dflash_case, missing_draft)
+
     def test_build_command_fails_closed_for_out_of_scope_engine_or_mode(self):
         with self.assertRaisesRegex(ValueError, "case.*engine|outside|scope"):
             self.adapters.build_command(self.llama_cpp, self.mtp_case, self.inputs)
@@ -108,6 +121,19 @@ class BenchmarkAdapterTests(unittest.TestCase):
         self.assertIn("--chat", argv)
         self.assertEqual(argv[argv.index("--context-size") + 1], "4096")
         self.assertEqual(argv[argv.index("--seed") + 1], "7")
+
+    def test_geo_humaneval_performance_honors_eos(self):
+        quick = self.manifest.load_suite("quick")
+        case = next(
+            case for case in quick.performance_cases
+            if case.mode == "dflash" and case.id.endswith("has-close-elements-dflash")
+        )
+        inputs = replace(self.inputs, draft_artifact=Path("/artifacts/qwen38-dflash2-q8_0-canonical.gguf"))
+
+        argv = self.adapters.build_command(self.supersonic, case, inputs)
+
+        self.assertNotIn("--ignore-eos", argv)
+        self.assertEqual(argv[argv.index("--draft-gguf-file") + 1], "/artifacts/qwen38-dflash2-q8_0-canonical.gguf")
 
     def test_quality_commands_honor_eos_instead_of_forcing_the_token_cap(self):
         inputs = replace(self.inputs, chat=True, fixed_token_count=False)
